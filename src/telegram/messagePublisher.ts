@@ -1,12 +1,12 @@
 import type { DomainEvent } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
-import type TelegramBot from "node-telegram-bot-api";
+import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
 
 export class MessagePublisher {
   constructor(
     private governor: MessageGovernor,
-    private bot: TelegramBot,
+    private bot: TelegramBotLike,
     private chatId: number
   ) {}
 

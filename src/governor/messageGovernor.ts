@@ -1,5 +1,5 @@
 import type { BotMode, DomainEvent, DomainEventType } from "../types.js";
-import type TelegramBot from "node-telegram-bot-api";
+import type { TelegramBotLike } from "../telegram/sendTelegramMessageSafe.js";
 
 export class MessageGovernor {
   private mode: BotMode = "QUIET";
@@ -30,7 +30,7 @@ export class MessageGovernor {
    * Single choke point for all Telegram messages
    * Returns true if message should be sent, false if blocked
    */
-  shouldSend(event: DomainEvent, bot: TelegramBot, chatId: number): boolean {
+  shouldSend(event: DomainEvent, bot: TelegramBotLike, chatId: number): boolean {
     // Always allow /status replies (handled separately, not through events)
     
     // Always allow fatal errors (optional, but we'll allow them)

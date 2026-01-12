@@ -1,4 +1,11 @@
-import type TelegramBot from "node-telegram-bot-api";
+// Type only the methods we actually use (most robust for production builds)
+export type TelegramBotLike = {
+  sendMessage: (
+    chatId: number,
+    text: string,
+    options?: any
+  ) => Promise<any>;
+};
 
 function chunkString(str: string, maxLen: number): string[] {
   if (str.length <= maxLen) return [str];
@@ -19,7 +26,7 @@ function chunkString(str: string, maxLen: number): string[] {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function sendTelegramMessageSafe(
-  bot: TelegramBot,
+  bot: TelegramBotLike,
   chatId: number,
   text: string
 ) {
