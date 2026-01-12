@@ -1,12 +1,15 @@
 export type Direction = "LONG" | "SHORT";
+export type BotMode = "QUIET" | "ACTIVE";
+export type TradeAction = "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
 
 export type DomainEventType =
   | "PLAY_ARMED"
   | "TIMING_COACH"
-  | "ENTRY_ELIGIBLE"
-  | "STOP_THREATENED"
-  | "STOP_HIT"
-  | "HEARTBEAT";
+  | "LLM_VERIFY"
+  | "TRADE_PLAN"
+  | "LLM_COACH_UPDATE"
+  | "PLAY_CLOSED"
+  | "PLAN_OF_DAY";
 
 export interface DomainEvent {
   type: DomainEventType;
@@ -31,6 +34,14 @@ export interface Play {
   inEntryZone?: boolean;
   stopThreatened?: boolean;
   stopHit?: boolean;
+  
+  // LLM fields
+  legitimacy?: number;
+  followThroughProb?: number;
+  action?: TradeAction;
+  
+  // tracking
+  lastCoachUpdate?: number;
 }
 
 export interface BotState {
@@ -39,4 +50,6 @@ export interface BotState {
   session: string;
   price?: number;
   activePlay?: Play | null;
+  mode: BotMode;
+  lastPlanSent?: number;
 }

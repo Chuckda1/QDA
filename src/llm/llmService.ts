@@ -1,0 +1,229 @@
+export interface LLMCoachingContext {
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  entryPrice: number;
+  currentPrice: number;
+  stop: number;
+  targets: { t1: number; t2: number; t3: number };
+  positionSize?: string;
+  unrealizedPnL?: number;
+  timeInTrade?: number; // minutes
+  priceAction?: string; // brief description of recent price action
+  rulesContext?: {
+    distanceToStop: number;
+    distanceToStopDollars: number;
+    distanceToT1: number;
+    distanceToT1Dollars: number;
+    stopThreatened: boolean;
+    nearTarget: "T1" | "T2" | "T3" | null;
+    targetHit: "T1" | "T2" | "T3" | null;
+    risk: number; // |entry - stop| per share
+    rewardT1: number; // reward to T1 per share
+    rMultipleT1: number; // R-multiple to T1
+    rMultipleT2: number; // R-multiple to T2
+    rMultipleT3: number; // R-multiple to T3
+    profitPercent: number;
+  };
+}
+
+export interface LLMCoachingResponse {
+  action: "HOLD" | "TAKE_PROFIT" | "TIGHTEN_STOP" | "STOP_OUT" | "SCALE_OUT";
+  reasoning: string;
+  urgency: "LOW" | "MEDIUM" | "HIGH";
+  specificPrice?: number; // if action requires a price
+}
+
+export class LLMService {
+  private apiKey: string;
+  private baseUrl: string;
+  private model: string;
+
+  constructor() {
+    this.apiKey = process.env.OPENAI_API_KEY || "";
+    this.baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+    this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    
+    if (!this.apiKey) {
+      throw new Error("OPENAI_API_KEY environment variable is required");
+    }
+  }
+
+  async getCoachingUpdate(context: LLMCoachingContext): Promise<LLMCoachingResponse> {
+    const prompt = this.buildCoachingPrompt(context);
+    
+    try {
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            {
+              role: "system",
+              content: `You are a professional day trading coach. Your job is to provide clear, actionable coaching on when to take profit and when to exit trades. Be decisive and specific.`
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 300
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices[0]?.message?.content || "";
+      
+      return this.parseLLMResponse(content, context);
+    } catch (error: any) {
+      console.error("LLM API error:", error);
+      // Fallback response
+      return {
+        action: "HOLD",
+        reasoning: `Error calling LLM: ${error.message}. Defaulting to HOLD.`,
+        urgency: "LOW"
+      };
+    }
+  }
+
+  private buildCoachingPrompt(context: LLMCoachingContext): string {
+    const { symbol, direction, entryPrice, currentPrice, stop, targets, timeInTrade, priceAction, rulesContext } = context;
+    
+    // All numbers MUST be computed in code - LLM never calculates
+    if (!rulesContext) {
+      throw new Error("rulesContext is required - all metrics must be computed deterministically in code");
+    }
+
+    // Build structured JSON object with all computed metrics
+    // This ensures LLM receives real tangible numbers, not vague descriptions
+    const metricsJson = JSON.stringify({
+      // Raw inputs (for reference only)
+      close: Number(currentPrice.toFixed(2)),
+      entry: Number(entryPrice.toFixed(2)),
+      stop: Number(stop.toFixed(2)),
+      t1: Number(targets.t1.toFixed(2)),
+      t2: Number(targets.t2.toFixed(2)),
+      t3: Number(targets.t3.toFixed(2)),
+      
+      // Computed metrics (deterministic, no LLM calculation)
+      risk: Number(rulesContext.risk.toFixed(2)), // |entry - stop| per share
+      rewardT1: Number(rulesContext.rewardT1.toFixed(2)), // reward to T1 per share
+      rewardT2: Number(rulesContext.rewardT2.toFixed(2)), // reward to T2 per share
+      rewardT3: Number(rulesContext.rewardT3.toFixed(2)), // reward to T3 per share
+      rr_t1: Number(rulesContext.rMultipleT1.toFixed(2)), // R-multiple to T1
+      rr_t2: Number(rulesContext.rMultipleT2.toFixed(2)), // R-multiple to T2
+      rr_t3: Number(rulesContext.rMultipleT3.toFixed(2)), // R-multiple to T3
+      
+      // Distance metrics (dollar and percent)
+      distanceToStopDollar: Number(rulesContext.distanceToStopDollars.toFixed(2)),
+      distanceToStopPct: Number(rulesContext.distanceToStop.toFixed(2)),
+      distanceToT1Dollar: Number(rulesContext.distanceToT1Dollars.toFixed(2)),
+      distanceToT1Pct: Number(rulesContext.distanceToT1.toFixed(2)),
+      distanceToT2Dollar: Number(rulesContext.distanceToT2Dollars.toFixed(2)),
+      distanceToT2Pct: Number(rulesContext.distanceToT2.toFixed(2)),
+      distanceToT3Dollar: Number(rulesContext.distanceToT3Dollars.toFixed(2)),
+      distanceToT3Pct: Number(rulesContext.distanceToT3.toFixed(2)),
+      
+      // Status booleans (computed in code)
+      stopThreatened: rulesContext.stopThreatened, // within 0.25R of stop (warning only)
+      targetHit: rulesContext.targetHit, // close-based target hit
+      nearTarget: rulesContext.nearTarget, // within $0.03 of target
+      profitPercent: Number(rulesContext.profitPercent.toFixed(2)) // if entered
+    }, null, 2);
+
+    let prompt = `You are coaching a ${direction} trade on ${symbol}.
+
+CRITICAL: All numbers below are computed deterministically in code. You MUST NOT calculate any metrics yourself - use the provided exact values. Do not recalculate risk, reward, R-multiples, or distances.
+
+TRADE CONTEXT:
+- Symbol: ${symbol}
+- Direction: ${direction}
+- Time in trade: ${timeInTrade || 0} minutes
+- Price action: ${priceAction || "Monitoring"}
+
+COMPUTED METRICS (use these exact values - do not recalculate):
+\`\`\`json
+${metricsJson}
+\`\`\`
+
+RULES (for your reasoning):
+1. Stop loss triggers ONLY on candle close (not wicks)
+   - LONG: if close <= stop → exit (hard rule, bypasses LLM)
+   - SHORT: if close >= stop → exit (hard rule, bypasses LLM)
+2. Stop threatened is a WARNING only (within 0.25R of stop) - not an exit trigger
+3. Target hit is close-based (close >= T1 for LONG, close <= T1 for SHORT)
+4. All distances use close price as denominator for percentages
+5. Risk = |entry - stop|, Reward = T1 - entry (LONG) or entry - T1 (SHORT)
+6. R-multiple = Reward / Risk
+
+COACHING REQUEST:
+Analyze this trade using the provided metrics for pattern analysis and probability calculations. Your decision is FINAL - if you say HOLD, we hold (unless hard stop on close). Should the trader:
+1. HOLD - continue holding (your decision is final)
+2. TAKE_PROFIT - take profit now (specify which target or partial)
+3. TIGHTEN_STOP - move stop to breakeven or better
+4. STOP_OUT - exit immediately (you see risk)
+5. SCALE_OUT - take partial profit
+
+Respond in this EXACT JSON format:
+{
+  "action": "HOLD|TAKE_PROFIT|TIGHTEN_STOP|STOP_OUT|SCALE_OUT",
+  "reasoning": "Brief explanation using the provided metrics for pattern analysis and probability reasoning (2-3 sentences max)",
+  "urgency": "LOW|MEDIUM|HIGH",
+  "specificPrice": null or number (if action requires a price)
+}`;
+
+    return prompt;
+  }
+
+  private parseLLMResponse(content: string, context: LLMCoachingContext): LLMCoachingResponse {
+    // Try to extract JSON from response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return {
+          action: parsed.action || "HOLD",
+          reasoning: parsed.reasoning || "No reasoning provided",
+          urgency: parsed.urgency || "LOW",
+          specificPrice: parsed.specificPrice || undefined
+        };
+      } catch (e) {
+        // Fall through to text parsing
+      }
+    }
+
+    // Fallback: parse from text
+    const upperContent = content.toUpperCase();
+    let action: LLMCoachingResponse["action"] = "HOLD";
+    let urgency: LLMCoachingResponse["urgency"] = "LOW";
+
+    if (upperContent.includes("TAKE PROFIT") || upperContent.includes("TAKE_PROFIT")) {
+      action = "TAKE_PROFIT";
+      urgency = upperContent.includes("NOW") || upperContent.includes("IMMEDIATELY") ? "HIGH" : "MEDIUM";
+    } else if (upperContent.includes("STOP OUT") || upperContent.includes("STOP_OUT") || upperContent.includes("EXIT NOW")) {
+      action = "STOP_OUT";
+      urgency = "HIGH";
+    } else if (upperContent.includes("TIGHTEN") || upperContent.includes("BREAKEVEN")) {
+      action = "TIGHTEN_STOP";
+      urgency = "MEDIUM";
+    } else if (upperContent.includes("SCALE") || upperContent.includes("PARTIAL")) {
+      action = "SCALE_OUT";
+      urgency = "MEDIUM";
+    }
+
+    return {
+      action,
+      reasoning: content.substring(0, 200),
+      urgency
+    };
+  }
+}
