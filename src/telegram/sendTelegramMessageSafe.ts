@@ -5,6 +5,15 @@ export type TelegramBotLike = {
     text: string,
     options?: any
   ) => Promise<any>;
+  
+  // Command handling
+  onText: (
+    regexp: RegExp,
+    callback: (msg: any, match: RegExpExecArray | null) => any
+  ) => any;
+  
+  // Generic event listeners (optional, prevents future build breaks)
+  on: (event: string, callback: (...args: any[]) => any) => any;
 };
 
 function chunkString(str: string, maxLen: number): string[] {
