@@ -50,8 +50,9 @@ export class MessageGovernor {
 
     // In ACTIVE mode: allow all trading events, but NEVER heartbeats
     if (this.mode === "ACTIVE") {
-      // Explicitly block any heartbeat-like events
-      if (event.type === "HEARTBEAT" || event.data?.type === "heartbeat") {
+      // Heartbeats should never be processed as domain events.
+      // Some producers encode heartbeat as event.data.type rather than event.type.
+      if (event.data?.type === "heartbeat") {
         return false;
       }
       return true;
