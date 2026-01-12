@@ -158,4 +158,46 @@ export class CommandHandler {
       return `❌ LLM test failed\nLatency: ${result.latency}ms\nError: ${result.error || "Unknown error"}`;
     }
   }
+
+  /**
+   * STAGE 1: Debug environment variables (for troubleshooting)
+   */
+  async envdebug(): Promise<string> {
+    const envVars = [
+      "OPENAI_API_KEY",
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_CHAT_ID",
+      "ALPACA_API_KEY",
+      "ALPACA_API_SECRET",
+      "ALPACA_BASE_URL",
+      "ALPACA_FEED",
+      "SYMBOLS",
+      "NODE_ENV",
+      "INSTANCE_ID"
+    ];
+
+    const results = envVars.map(varName => {
+      const value = process.env[varName];
+      if (!value) {
+        return `${varName}: ❌ NOT SET`;
+      }
+      // Show first 10 chars and length for sensitive vars
+      if (varName.includes("KEY") || varName.includes("SECRET") || varName.includes("TOKEN")) {
+        const preview = value.substring(0, 10);
+        return `${varName}: ✅ SET (length: ${value.length}, starts: ${preview}...)`;
+      }
+      return `${varName}: ✅ SET (${value})`;
+    });
+
+    return [
+      "=== Environment Variables Debug ===",
+      "",
+      ...results,
+      "",
+      "Note: If OPENAI_API_KEY shows NOT SET but you set it in Railway:",
+      "1. Check variable is saved in Railway Variables",
+      "2. Redeploy the service",
+      "3. Check if variable is set at service level (not just project level)"
+    ].join("\n");
+  }
 }

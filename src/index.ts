@@ -133,6 +133,12 @@ bot.onText(/\/llmtest/, async () => {
   await sendTelegramMessageSafe(bot, chatId, msg);
 });
 
+bot.onText(/\/envdebug/, async () => {
+  await yieldNow();
+  const msg = await commands.envdebug();
+  await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
 // Startup message
 await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
 
