@@ -113,4 +113,24 @@ export class CommandHandler {
 
     return `✅ Play ${play.id} CLOSED\nReason: ${reason || "Manual exit"}\nResult: ${result}\nEntry: $${entryPrice.toFixed(2)}\nExit: $${currentPrice.toFixed(2)}\nP&L: $${profit.toFixed(2)} (${profitPct > 0 ? "+" : ""}${profitPct.toFixed(2)}%)`;
   }
+
+  /**
+   * STAGE 0: Version command with BUILD_ID and git SHA
+   */
+  async version(buildId: string): Promise<string> {
+    const s = this.orch.getState();
+    const gitSha = process.env.RAILWAY_GIT_COMMIT_SHA || 
+                   process.env.RAILWAY_GIT_COMMIT_REF || 
+                   process.env.GIT_COMMIT_SHA || 
+                   "unknown";
+    
+    return [
+      "=== Version Info ===",
+      `BUILD_ID: ${buildId}`,
+      `Git SHA: ${gitSha}`,
+      `Mode: ${s.mode}`,
+      `Instance: ${this.instanceId}`,
+      `Uptime: ${Math.floor((Date.now() - s.startedAt) / 1000)}s`
+    ].join("\n");
+  }
 }

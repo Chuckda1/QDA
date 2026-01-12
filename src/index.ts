@@ -11,6 +11,53 @@ import { BarAggregator } from "./datafeed/barAggregator.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
+// STAGE 0: BUILD_ID for proof of execution
+const BUILD_ID = `QDAV1_STAGE0_${Date.now()}`;
+const ENTRY_MODE = "production";
+const NODE_ENV = process.env.NODE_ENV || "development";
+const HAS_OPENAI_KEY = !!process.env.OPENAI_API_KEY;
+const SYMBOLS = process.env.SYMBOLS || "SPY";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "not_set";
+
+// Print startup inventory
+console.log("=== STAGE 0 STARTUP INVENTORY ===");
+console.log(`BUILD_ID: ${BUILD_ID}`);
+console.log(`NODE_ENV: ${NODE_ENV}`);
+console.log(`ENTRY_MODE: ${ENTRY_MODE}`);
+console.log(`OPENAI_API_KEY: ${HAS_OPENAI_KEY}`);
+console.log(`SYMBOLS: ${SYMBOLS}`);
+console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
+console.log("=================================");
+
+// STAGE 0: Heartbeat tracker for once-per-minute logging
+let bars1mCount = 0;
+let bars5mCount = 0;
+let lastHeartbeatMinute = -1;
+
+function logHeartbeat(orch: Orchestrator, governor: MessageGovernor): void {
+  const now = new Date();
+  const currentMinute = now.getMinutes();
+  
+  // Only log once per minute
+  if (currentMinute === lastHeartbeatMinute) {
+    return;
+  }
+  
+  lastHeartbeatMinute = currentMinute;
+  const s = orch.getState();
+  const mode = governor.getMode();
+  const activePlay = s.activePlay ? s.activePlay.id : "none";
+  const entered = s.activePlay?.entered || false;
+  const last1m = s.last1mTs ? new Date(s.last1mTs).toISOString().substring(11, 19) : "none";
+  const last5m = s.last5mTs ? new Date(s.last5mTs).toISOString().substring(11, 19) : "none";
+  
+  console.log(`[HB] mode=${mode} bars1m=${bars1mCount} bars5m=${bars5mCount} activePlay=${activePlay} entered=${entered} last1m=${last1m} last5m=${last5m}`);
+  
+  // Reset counters for next minute
+  bars1mCount = 0;
+  bars5mCount = 0;
+}
+
 // Initialize Telegram
 const { bot, chatId } = initTelegram();
 
@@ -56,6 +103,12 @@ bot.onText(/\/exit(?:\s+(.+))?/, async (msg, match) => {
   await sendTelegramMessageSafe(bot, chatId, response);
 });
 
+bot.onText(/\/version/, async () => {
+  await yieldNow();
+  const msg = await commands.version(BUILD_ID);
+  await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
 // Startup message
 await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
 
@@ -92,6 +145,7 @@ if (alpacaKey && alpacaSecret) {
 
           try {
             // 1m processing
+            bars1mCount++;
             const events1m = await orch.processTick({
               ts: bar.ts,
               symbol: bar.symbol,
@@ -106,6 +160,7 @@ if (alpacaKey && alpacaSecret) {
             // 5m aggregation + processing (only fires when a 5m bar closes)
             const bar5m = agg.push1m(bar);
             if (bar5m) {
+              bars5mCount++;
               const events5m = await orch.processTick({
                 ts: bar5m.ts,
                 symbol: bar5m.symbol,
@@ -117,6 +172,9 @@ if (alpacaKey && alpacaSecret) {
               }, "5m");
               await publisher.publishOrdered(events5m);
             }
+            
+            // STAGE 0: Log heartbeat once per minute
+            logHeartbeat(orch, governor);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
@@ -136,6 +194,7 @@ if (alpacaKey && alpacaSecret) {
           }
 
           try {
+            bars1mCount++;
             const events1m = await orch.processTick({
               ts: bar.ts,
               symbol: bar.symbol,
@@ -149,6 +208,7 @@ if (alpacaKey && alpacaSecret) {
 
             const bar5m = agg.push1m(bar);
             if (bar5m) {
+              bars5mCount++;
               const events5m = await orch.processTick({
                 ts: bar5m.ts,
                 symbol: bar5m.symbol,
@@ -160,6 +220,9 @@ if (alpacaKey && alpacaSecret) {
               }, "5m");
               await publisher.publishOrdered(events5m);
             }
+            
+            // STAGE 0: Log heartbeat once per minute
+            logHeartbeat(orch, governor);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
