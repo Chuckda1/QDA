@@ -47,10 +47,21 @@ export class LLMService {
 
   constructor() {
     // STAGE 1: Standardize to OPENAI_API_KEY only
-    this.apiKey = process.env.OPENAI_API_KEY || "";
+    // Trim whitespace in case Railway adds it
+    const rawKey = process.env.OPENAI_API_KEY || "";
+    this.apiKey = rawKey.trim();
     this.baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
     this.enabled = !!this.apiKey;
+    
+    // Debug logging
+    if (rawKey && !this.apiKey) {
+      console.warn("[LLMService] OPENAI_API_KEY found but empty after trimming");
+    } else if (!rawKey) {
+      console.warn("[LLMService] OPENAI_API_KEY not found in environment");
+    } else {
+      console.log(`[LLMService] OPENAI_API_KEY found (length: ${this.apiKey.length}, starts with: ${this.apiKey.substring(0, 7)}...)`);
+    }
   }
 
   /**

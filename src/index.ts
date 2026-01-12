@@ -68,10 +68,17 @@ const governor = new MessageGovernor();
 let llmService: LLMService | undefined;
 let llmErrorLogged = false;
 try {
+  // Debug: Check if env var exists before creating service
+  const hasKey = !!process.env.OPENAI_API_KEY;
+  const keyLength = process.env.OPENAI_API_KEY?.length || 0;
+  console.log(`[STAGE 1] Checking OPENAI_API_KEY: exists=${hasKey}, length=${keyLength}`);
+  
   llmService = new LLMService();
   if (!llmService.isEnabled()) {
     // Log warning at startup (will check mode later when switching to ACTIVE)
-    console.warn("[STAGE 1] LLM service disabled: OPENAI_API_KEY missing");
+    console.warn("[STAGE 1] LLM service disabled: OPENAI_API_KEY missing or empty");
+  } else {
+    console.log("[STAGE 1] LLM service enabled");
   }
 } catch (error: any) {
   console.warn("LLM service initialization error:", error.message);
