@@ -7,6 +7,7 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
+import { BarAggregator } from "./datafeed/barAggregator.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
@@ -63,32 +64,71 @@ if (alpacaKey && alpacaSecret) {
       });
       
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+      const agg = new BarAggregator();
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
       
       // Use WebSocket for real-time bars (preferred)
       try {
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
-          if (governor.getMode() === "ACTIVE") {
-            const events = await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close
-            });
-            await publisher.publishOrdered(events);
+          if (governor.getMode() !== "ACTIVE") continue;
+
+          // 1m processing
+          const events1m = await orch.processTick({
+            ts: bar.ts,
+            symbol: bar.symbol,
+            close: bar.close,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            volume: bar.volume
+          }, "1m");
+          await publisher.publishOrdered(events1m);
+
+          // 5m aggregation + processing (only fires when a 5m bar closes)
+          const bar5m = agg.push1m(bar);
+          if (bar5m) {
+            const events5m = await orch.processTick({
+              ts: bar5m.ts,
+              symbol: bar5m.symbol,
+              close: bar5m.close,
+              open: bar5m.open,
+              high: bar5m.high,
+              low: bar5m.low,
+              volume: bar5m.volume
+            }, "5m");
+            await publisher.publishOrdered(events5m);
           }
         }
       } catch (wsError: any) {
         console.warn(`[${instanceId}] WebSocket failed, falling back to polling:`, wsError.message);
         // Fallback to REST API polling
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
-          if (governor.getMode() === "ACTIVE") {
-            const events = await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close
-            });
-            await publisher.publishOrdered(events);
+          if (governor.getMode() !== "ACTIVE") continue;
+
+          const events1m = await orch.processTick({
+            ts: bar.ts,
+            symbol: bar.symbol,
+            close: bar.close,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            volume: bar.volume
+          }, "1m");
+          await publisher.publishOrdered(events1m);
+
+          const bar5m = agg.push1m(bar);
+          if (bar5m) {
+            const events5m = await orch.processTick({
+              ts: bar5m.ts,
+              symbol: bar5m.symbol,
+              close: bar5m.close,
+              open: bar5m.open,
+              high: bar5m.high,
+              low: bar5m.low,
+              volume: bar5m.volume
+            }, "5m");
+            await publisher.publishOrdered(events5m);
           }
         }
       }

@@ -42,11 +42,16 @@ export interface Play {
   
   // tracking
   lastCoachUpdate?: number;
+  entered?: boolean;  // true when position is actually entered
+  entryPrice?: number; // actual entry price when entered
+  entryTimestamp?: number; // timestamp when entered
 }
 
 export interface BotState {
   startedAt: number;
   lastTickAt?: number;
+  last1mTs?: number;  // last 1m bar processed timestamp
+  last5mTs?: number;   // last 5m bar processed timestamp
   session: string;
   price?: number;
   activePlay?: Play | null;

@@ -14,11 +14,17 @@ export interface LLMCoachingContext {
     distanceToStopDollars: number;
     distanceToT1: number;
     distanceToT1Dollars: number;
+    distanceToT2: number;
+    distanceToT2Dollars: number;
+    distanceToT3: number;
+    distanceToT3Dollars: number;
     stopThreatened: boolean;
     nearTarget: "T1" | "T2" | "T3" | null;
     targetHit: "T1" | "T2" | "T3" | null;
     risk: number; // |entry - stop| per share
     rewardT1: number; // reward to T1 per share
+    rewardT2: number; // reward to T2 per share
+    rewardT3: number; // reward to T3 per share
     rMultipleT1: number; // R-multiple to T1
     rMultipleT2: number; // R-multiple to T2
     rMultipleT3: number; // R-multiple to T3

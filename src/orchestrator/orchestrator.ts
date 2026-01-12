@@ -2,11 +2,26 @@ import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 
+type TickInput = {
+  ts: number;
+  symbol: string;
+  close: number;
+  open?: number;
+  high?: number;
+  low?: number;
+  volume?: number;
+};
+
+type TickSnapshot = TickInput & {
+  timeframe: "1m" | "5m";
+};
+
 export class Orchestrator {
   private state: BotState;
   private instanceId: string;
   private llmService?: LLMService;
   private stopProfitRules: StopProfitRules;
+  private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -31,43 +46,73 @@ export class Orchestrator {
   /**
    * Process tick and return ordered events
    * 
-   * Entry zone: Rules first → LLM second
-   *   Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN
-   * 
-   * Stop/Take Profit: LLM first → Rules second
-   *   Order: LLM_COACH_UPDATE → Rules validation → PLAY_CLOSED (if exit)
+   * 1m: Entry + close-based stop checks
+   * 5m: Arming + LLM coaching (only if active play + entered)
    */
-  async processTick(input: { ts: number; symbol: string; close: number }): Promise<DomainEvent[]> {
+  async processTick(
+    input: TickInput,
+    timeframe: "1m" | "5m" = "1m"
+  ): Promise<DomainEvent[]> {
+    const snapshot = this.buildSnapshot(input, timeframe);
     const events: DomainEvent[] = [];
+
+    // Update state
     this.state.lastTickAt = input.ts;
     this.state.price = input.close;
+    if (timeframe === "1m") {
+      this.state.last1mTs = input.ts;
+    } else {
+      this.state.last5mTs = input.ts;
+    }
+
+    // Branch by timeframe
+    if (timeframe === "1m") {
+      events.push(...await this.handle1m(snapshot));
+    } else {
+      events.push(...await this.handle5m(snapshot));
+    }
+
+    return events;
+  }
+
+  private buildSnapshot(input: TickInput, timeframe: "1m" | "5m"): TickSnapshot {
+    return { ...input, timeframe };
+  }
+
+  /**
+   * Handle 1m bars: Entry detection + close-based stop checks
+   */
+  private async handle1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const events: DomainEvent[] = [];
+    const { ts, symbol, close } = snapshot;
 
     // If no active play, create one deterministically
     if (!this.state.activePlay) {
       const play: Play = {
-        id: `play_${input.ts}`,
-        symbol: input.symbol,
+        id: `play_${ts}`,
+        symbol,
         direction: "LONG",
         score: 53,
         grade: "C",
         mode: "SCOUT",
         confidence: 53,
-        entryZone: { low: input.close - 0.28, high: input.close + 0.20 },
-        stop: input.close - 0.72,
-        targets: { t1: input.close + 0.92, t2: input.close + 1.88, t3: input.close + 2.85 },
+        entryZone: { low: close - 0.28, high: close + 0.20 },
+        stop: close - 0.72,
+        targets: { t1: close + 0.92, t2: close + 1.88, t3: close + 2.85 },
         legitimacy: 72,
         followThroughProb: 65,
-        action: "SCALP" as TradeAction
+        action: "SCALP" as TradeAction,
+        entered: false
       };
       this.state.activePlay = play;
 
       // Strict ordering: all events in same tick
-      events.push(this.ev("PLAY_ARMED", input.ts, {
+      events.push(this.ev("PLAY_ARMED", ts, {
         play,
         headline: `${play.mode} PLAY ARMED`,
       }));
 
-      events.push(this.ev("TIMING_COACH", input.ts, {
+      events.push(this.ev("TIMING_COACH", ts, {
         playId: play.id,
         symbol: play.symbol,
         direction: play.direction,
@@ -77,7 +122,7 @@ export class Orchestrator {
         waitBars: 0
       }));
 
-      events.push(this.ev("LLM_VERIFY", input.ts, {
+      events.push(this.ev("LLM_VERIFY", ts, {
         playId: play.id,
         symbol: play.symbol,
         direction: play.direction,
@@ -87,7 +132,7 @@ export class Orchestrator {
         reasoning: "Setup looks valid with moderate confidence. Scalp approach recommended."
       }));
 
-      events.push(this.ev("TRADE_PLAN", input.ts, {
+      events.push(this.ev("TRADE_PLAN", ts, {
         playId: play.id,
         symbol: play.symbol,
         direction: play.direction,
@@ -101,22 +146,30 @@ export class Orchestrator {
     }
 
     const play = this.state.activePlay!;
-    const close = input.close;
 
-    // ============================================
-    // STOP/TAKE PROFIT: LLM FIRST (with rules context), LLM DECISION IS FINAL
-    // ============================================
-    
-    // Step 1: Get rules context for LLM pattern analysis
+    // Entry eligible tracking (assume entry when price touches zone)
+    const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
+    if (inZone && !play.entered && !play.inEntryZone) {
+      play.inEntryZone = true;
+      // Assume entry when price is in zone (or you can require manual confirmation)
+      play.entered = true;
+      play.entryPrice = close;
+      play.entryTimestamp = ts;
+    }
+    if (!inZone) {
+      play.inEntryZone = false;
+    }
+
+    // Hard stop check on CLOSE (only exit trigger - no override)
     // Use actual entry price if available, otherwise use entryZone midpoint
-    const entryPrice = play.entryZone.low + (play.entryZone.high - play.entryZone.low) / 2;
+    const entryPrice = play.entryPrice ?? (play.entryZone.low + (play.entryZone.high - play.entryZone.low) / 2);
     const rulesContext = this.stopProfitRules.getContext(play, close, entryPrice);
     
-    // Step 2: Check hard stop on CLOSE (only exit trigger - no override)
-    // Note: Only close price triggers stop, not wicks
+    // Check hard stop on CLOSE (only close price triggers stop, not wicks)
     if (rulesContext.stopHitOnClose && !play.stopHit) {
       play.stopHit = true;
-      events.push(this.ev("PLAY_CLOSED", input.ts, {
+      // INVARIANT: PLAY_CLOSED must have matching active play (verified - we have play)
+      events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
         symbol: play.symbol,
         direction: play.direction,
@@ -130,16 +183,54 @@ export class Orchestrator {
       this.state.activePlay = null;
       return events;
     }
-    
-    // Step 3: Call LLM with rules context for pattern analysis
-    let llmAction: "HOLD" | "TAKE_PROFIT" | "TIGHTEN_STOP" | "STOP_OUT" | "SCALE_OUT" = "HOLD";
-    let llmReasoning = "";
-    let llmUrgency: "LOW" | "MEDIUM" | "HIGH" = "LOW";
 
+    return events;
+  }
+
+  /**
+   * Handle 5m bars: LLM coaching loop (only if active play + entered)
+   */
+  private async handle5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const events: DomainEvent[] = [];
+    const { ts, symbol, close } = snapshot;
+
+    // Production sanity log: 5m bar close
+    const playId = this.state.activePlay?.id || "none";
+    const entered = this.state.activePlay?.entered || false;
+    console.log(`[5m] barClose ts=${ts} play=${playId} entered=${entered}`);
+
+    // If no active play → return []
+    if (!this.state.activePlay) {
+      return events;
+    }
+
+    const play = this.state.activePlay;
+
+    // INVARIANT CHECK: If active play exists but not entered → return [] (no coaching yet)
+    if (!play.entered) {
+      console.log(`[5m] Skipping coaching - play ${play.id} not yet entered`);
+      return events;
+    }
+
+    // Build telemetry packet (rules math)
+    const entryPrice = play.entryPrice ?? (play.entryZone.low + (play.entryZone.high - play.entryZone.low) / 2);
+    const rulesContext = this.stopProfitRules.getContext(play, close, entryPrice);
+
+    // Hard-boundary checks (cooldowns etc.)
+    // Check cache: llmCoachCacheKey = playId + "_" + snapshot.ts (5m close ts)
+    const cacheKey = `${play.id}_${ts}`;
+    
+    // Call LLM once per 5m bar (cache by barTs)
+    // Skip if already called for this exact 5m bar
+    if (this.llmCoachCache.has(cacheKey)) {
+      return events; // Already processed this 5m bar
+    }
+
+    // Call LLM with rules context for pattern analysis
     if (this.llmService && !play.stopHit) {
       try {
-        const timeInTrade = this.state.lastTickAt 
-          ? Math.floor((input.ts - this.state.lastTickAt) / 60000)
+        const timeInTrade = play.entryTimestamp
+          ? Math.floor((ts - play.entryTimestamp) / 60000)
           : 0;
         
         // Build enhanced context with rules information for LLM pattern analysis
@@ -166,11 +257,17 @@ export class Orchestrator {
             distanceToStopDollars: rulesContext.distanceToStopDollars,
             distanceToT1: rulesContext.distanceToT1,
             distanceToT1Dollars: rulesContext.distanceToT1Dollars,
+            distanceToT2: rulesContext.distanceToT2,
+            distanceToT2Dollars: rulesContext.distanceToT2Dollars,
+            distanceToT3: rulesContext.distanceToT3,
+            distanceToT3Dollars: rulesContext.distanceToT3Dollars,
             stopThreatened: rulesContext.stopThreatened,
             nearTarget: rulesContext.nearTarget,
             targetHit: rulesContext.targetHit,
             risk: rulesContext.risk,
             rewardT1: rulesContext.rewardT1,
+            rewardT2: rulesContext.rewardT2,
+            rewardT3: rulesContext.rewardT3,
             rMultipleT1: rulesContext.rMultipleT1,
             rMultipleT2: rulesContext.rMultipleT2,
             rMultipleT3: rulesContext.rMultipleT3,
@@ -178,12 +275,26 @@ export class Orchestrator {
           }
         });
 
-        llmAction = llmResponse.action;
-        llmReasoning = llmResponse.reasoning;
-        llmUrgency = llmResponse.urgency;
+        const llmAction = llmResponse.action;
+        const llmReasoning = llmResponse.reasoning;
+        const llmUrgency = llmResponse.urgency;
 
-        // Emit LLM coaching update
-        events.push(this.ev("LLM_COACH_UPDATE", input.ts, {
+        // Cache this call (mark as processed for this 5m bar)
+        // Cache key: playId + "_" + bar5m.ts (stable 5m close timestamp)
+        this.llmCoachCache.set(cacheKey, Date.now());
+        
+        // Clean old cache entries (keep last 10)
+        if (this.llmCoachCache.size > 10) {
+          const firstKey = this.llmCoachCache.keys().next().value;
+          if (firstKey) this.llmCoachCache.delete(firstKey);
+        }
+
+        // Production sanity log: coaching sent
+        console.log(`[5m] sentCoach play=${play.id} ts=${ts} action=${llmAction}`);
+
+        // Emit LLM_COACH_UPDATE only if materially changed OR cooldown expired
+        // (For now, emit every 5m bar - you can add material change detection later)
+        events.push(this.ev("LLM_COACH_UPDATE", ts, {
           playId: play.id,
           symbol: play.symbol,
           direction: play.direction,
@@ -195,14 +306,15 @@ export class Orchestrator {
           rulesContext // Include rules context in event
         }));
         
-        // Step 4: LLM decision is FINAL - if LLM says exit, we exit
+        // LLM decision is FINAL - if LLM says exit, we exit
         if (llmAction === "STOP_OUT" || llmAction === "TAKE_PROFIT") {
           play.stopHit = true;
           
           const result = llmAction === "TAKE_PROFIT" ? "WIN" : "LOSS";
           const exitType = llmAction === "TAKE_PROFIT" ? "TAKE_PROFIT" : "STOP_HIT";
           
-          events.push(this.ev("PLAY_CLOSED", input.ts, {
+          // INVARIANT: PLAY_CLOSED must have matching active play (verified - we have play)
+          events.push(this.ev("PLAY_CLOSED", ts, {
             playId: play.id,
             symbol: play.symbol,
             direction: play.direction,
@@ -227,28 +339,7 @@ export class Orchestrator {
         console.error("LLM call failed:", error.message);
         // If LLM fails, continue holding (don't exit on error)
       }
-    } else {
-      // No LLM service - use periodic updates
-      const tsMinutes = Math.floor(input.ts / 1000 / 60);
-      const fiveMinMark = tsMinutes % 5 === 0;
-      if (fiveMinMark && play.lastCoachUpdate !== tsMinutes) {
-        play.lastCoachUpdate = tsMinutes;
-        events.push(this.ev("LLM_COACH_UPDATE", input.ts, {
-          playId: play.id,
-          symbol: play.symbol,
-          direction: play.direction,
-          price: close,
-          update: "Monitoring price action. Stay disciplined with stop."
-        }));
-      }
     }
-
-    // Entry eligible tracking
-    const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
-    if (inZone && !play.inEntryZone) {
-      play.inEntryZone = true;
-    }
-    if (!inZone) play.inEntryZone = false;
 
     return events;
   }

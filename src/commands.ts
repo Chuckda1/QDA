@@ -19,15 +19,18 @@ export class CommandHandler {
       "=== Bot Status (Truthful) ===",
       "",
       "📊 PIPELINE:",
+      `Last 1m: ${fmt(s.last1mTs)}`,
+      `Last 5m: ${fmt(s.last5mTs)}`,
       `Last Tick: ${fmt(s.lastTickAt)}`,
       "",
       "📈 DATA:",
       `Session: ${s.session}`,
       `Price: ${s.price ?? "n/a"}`,
       `ActivePlay: ${s.activePlay ? s.activePlay.id : "None"}`,
+      s.activePlay?.entered ? `Entry Price: $${s.activePlay.entryPrice?.toFixed(2) ?? "n/a"}` : "",
       "",
       "⚙️ SYSTEM:",
       heartbeatInfo,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 }
