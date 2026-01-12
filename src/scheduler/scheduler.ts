@@ -6,6 +6,7 @@ import type { MessagePublisher } from "../telegram/messagePublisher.js";
 export class Scheduler {
   private checkInterval: NodeJS.Timeout | null = null;
   private planSentToday: boolean = false;
+  private lastTickTime: number = 0;
 
   constructor(
     private governor: MessageGovernor,
@@ -35,6 +36,13 @@ export class Scheduler {
     const { hour, minute } = getCurrentET();
     const currentMinutes = hour * 60 + minute;
     
+    // Debug: Log current ET time (only once per minute to avoid spam)
+    const now = Date.now();
+    if (!this.lastTickTime || now - this.lastTickTime >= 60000) {
+      console.log(`[Scheduler] Current ET time: ${hour}:${minute.toString().padStart(2, '0')} (UTC: ${new Date().toISOString()})`);
+      this.lastTickTime = now;
+    }
+    
     // Reset plan flag at midnight ET
     if (hour === 0 && minute < 5) {
       this.planSentToday = false;
@@ -47,25 +55,21 @@ export class Scheduler {
       this.planSentToday = true;
     }
 
-    // 09:30 ET: Switch to ACTIVE
-    if (hour === 9 && minute >= 30) {
+    // Determine mode based on time
+    // ACTIVE: 09:30 ET - 15:59 ET (market hours)
+    // QUIET: 16:00 ET - 09:29 ET (outside market hours)
+    const isActiveHours = (hour === 9 && minute >= 30) || (hour >= 10 && hour < 16);
+    const isQuietHours = hour >= 16 || hour < 9 || (hour === 9 && minute < 30);
+
+    if (isActiveHours) {
       if (this.governor.getMode() !== "ACTIVE") {
+        console.log(`[Scheduler] Switching to ACTIVE mode (ET: ${hour}:${minute.toString().padStart(2, '0')})`);
         this.governor.setMode("ACTIVE");
         this.onModeChange?.("ACTIVE");
       }
-    }
-
-    // 16:00 ET: Switch to QUIET
-    if (hour >= 16) {
+    } else if (isQuietHours) {
       if (this.governor.getMode() !== "QUIET") {
-        this.governor.setMode("QUIET");
-        this.onModeChange?.("QUIET");
-      }
-    }
-
-    // Before 09:30: QUIET
-    if (hour < 9 || (hour === 9 && minute < 30)) {
-      if (this.governor.getMode() !== "QUIET") {
+        console.log(`[Scheduler] Switching to QUIET mode (ET: ${hour}:${minute.toString().padStart(2, '0')})`);
         this.governor.setMode("QUIET");
         this.onModeChange?.("QUIET");
       }
