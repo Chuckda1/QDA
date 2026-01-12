@@ -83,65 +83,88 @@ if (alpacaKey && alpacaSecret) {
       
       // Use WebSocket for real-time bars (preferred)
       try {
+        console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
-          if (governor.getMode() !== "ACTIVE") continue;
+          if (governor.getMode() !== "ACTIVE") {
+            console.log(`[${instanceId}] Skipping bar - mode is ${governor.getMode()}, not ACTIVE`);
+            continue;
+          }
 
-          // 1m processing
-          const events1m = await orch.processTick({
-            ts: bar.ts,
-            symbol: bar.symbol,
-            close: bar.close,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            volume: bar.volume
-          }, "1m");
-          await publisher.publishOrdered(events1m);
+          try {
+            // 1m processing
+            const events1m = await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close,
+              open: bar.open,
+              high: bar.high,
+              low: bar.low,
+              volume: bar.volume
+            }, "1m");
+            await publisher.publishOrdered(events1m);
 
-          // 5m aggregation + processing (only fires when a 5m bar closes)
-          const bar5m = agg.push1m(bar);
-          if (bar5m) {
-            const events5m = await orch.processTick({
-              ts: bar5m.ts,
-              symbol: bar5m.symbol,
-              close: bar5m.close,
-              open: bar5m.open,
-              high: bar5m.high,
-              low: bar5m.low,
-              volume: bar5m.volume
-            }, "5m");
-            await publisher.publishOrdered(events5m);
+            // 5m aggregation + processing (only fires when a 5m bar closes)
+            const bar5m = agg.push1m(bar);
+            if (bar5m) {
+              const events5m = await orch.processTick({
+                ts: bar5m.ts,
+                symbol: bar5m.symbol,
+                close: bar5m.close,
+                open: bar5m.open,
+                high: bar5m.high,
+                low: bar5m.low,
+                volume: bar5m.volume
+              }, "5m");
+              await publisher.publishOrdered(events5m);
+            }
+          } catch (processError: any) {
+            // Log processing errors but continue the loop
+            console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
+            console.error(processError.stack);
+            // Continue to next bar instead of breaking the loop
           }
         }
       } catch (wsError: any) {
         console.warn(`[${instanceId}] WebSocket failed, falling back to polling:`, wsError.message);
+        console.warn(`[${instanceId}] WebSocket error stack:`, wsError.stack);
         // Fallback to REST API polling
+        console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
-          if (governor.getMode() !== "ACTIVE") continue;
+          if (governor.getMode() !== "ACTIVE") {
+            console.log(`[${instanceId}] Skipping bar - mode is ${governor.getMode()}, not ACTIVE`);
+            continue;
+          }
 
-          const events1m = await orch.processTick({
-            ts: bar.ts,
-            symbol: bar.symbol,
-            close: bar.close,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            volume: bar.volume
-          }, "1m");
-          await publisher.publishOrdered(events1m);
+          try {
+            const events1m = await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close,
+              open: bar.open,
+              high: bar.high,
+              low: bar.low,
+              volume: bar.volume
+            }, "1m");
+            await publisher.publishOrdered(events1m);
 
-          const bar5m = agg.push1m(bar);
-          if (bar5m) {
-            const events5m = await orch.processTick({
-              ts: bar5m.ts,
-              symbol: bar5m.symbol,
-              close: bar5m.close,
-              open: bar5m.open,
-              high: bar5m.high,
-              low: bar5m.low,
-              volume: bar5m.volume
-            }, "5m");
-            await publisher.publishOrdered(events5m);
+            const bar5m = agg.push1m(bar);
+            if (bar5m) {
+              const events5m = await orch.processTick({
+                ts: bar5m.ts,
+                symbol: bar5m.symbol,
+                close: bar5m.close,
+                open: bar5m.open,
+                high: bar5m.high,
+                low: bar5m.low,
+                volume: bar5m.volume
+              }, "5m");
+              await publisher.publishOrdered(events5m);
+            }
+          } catch (processError: any) {
+            // Log processing errors but continue the loop
+            console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
+            console.error(processError.stack);
+            // Continue to next bar instead of breaking the loop
           }
         }
       }

@@ -69,6 +69,8 @@ export class AlpacaDataFeed {
           this.ws = null;
         }
         
+        console.log(`[Alpaca] Connecting to WebSocket (attempt, backoff: ${this.reconnectBackoff}ms)...`);
+        
         // Connect WebSocket
         await this.connectWebSocket();
         
@@ -80,17 +82,28 @@ export class AlpacaDataFeed {
         
         // Reset backoff on successful connection
         this.reconnectBackoff = 5000;
+        console.log(`[Alpaca] Successfully connected and subscribed, starting bar processing...`);
         
         // Yield bars as they arrive
         while (this.isConnected) {
-          const bar = await this.waitForBar();
-          if (bar) {
-            yield bar;
+          try {
+            const bar = await this.waitForBar();
+            if (bar) {
+              yield bar;
+            }
+          } catch (barError: any) {
+            // If waitForBar throws an error, log it but continue the loop
+            console.error("[Alpaca] Error waiting for bar:", barError.message);
+            // If connection is still valid, continue; otherwise break to reconnect
+            if (!this.isConnected) {
+              break;
+            }
           }
         }
       } catch (error: any) {
         const errorMsg = error.message || String(error);
-        console.error("WebSocket error:", errorMsg);
+        console.error("[Alpaca] WebSocket error in generator loop:", errorMsg);
+        console.error("[Alpaca] Error stack:", error.stack);
         
         // Close connection properly
         this.isConnected = false;
@@ -115,7 +128,9 @@ export class AlpacaDataFeed {
           this.reconnectBackoff = Math.min(this.reconnectBackoff * 1.5, this.maxBackoff);
         }
         
+        console.log(`[Alpaca] Will reconnect in ${this.reconnectBackoff / 1000}s...`);
         await new Promise(resolve => setTimeout(resolve, this.reconnectBackoff));
+        console.log(`[Alpaca] Retrying connection...`);
       }
     }
   }
