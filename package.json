@@ -1,0 +1,19 @@
+{
+  "name": "golden-bot-v4-clean",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node node_modules/typescript/lib/tsc.js",
+    "start": "node dist/index_prod.js",
+    "mock": "node dist/mock/mockRunner.js",
+    "dev": "node node_modules/tsx/dist/cli.mjs src/index_prod.ts",
+    "mock:dev": "node node_modules/tsx/dist/cli.mjs src/mock/mockRunner.ts"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^5.6.3"
+  }
+}
