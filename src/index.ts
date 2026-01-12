@@ -45,8 +45,63 @@ bot.onText(/\/status/, async () => {
 // Startup message
 await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
 
-// Main loop: process ticks (this would be connected to your data feed)
-// For now, keeping it minimal - you'll wire your data source here
+// Main loop: process ticks (connect to your data feed)
+// Option 1: Alpaca data feed (if credentials provided)
+const alpacaKey = process.env.ALPACA_API_KEY;
+const alpacaSecret = process.env.ALPACA_API_SECRET;
+
+if (alpacaKey && alpacaSecret) {
+  (async () => {
+    try {
+      const { AlpacaDataFeed } = await import("./datafeed/alpacaFeed.js");
+      const feed = (process.env.ALPACA_FEED as "iex" | "sip") || "iex";
+      const alpacaFeed = new AlpacaDataFeed({
+        apiKey: alpacaKey,
+        apiSecret: alpacaSecret,
+        baseUrl: process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets",
+        feed: feed
+      });
+      
+      const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+      
+      console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
+      
+      // Use WebSocket for real-time bars (preferred)
+      try {
+        for await (const bar of alpacaFeed.subscribeBars(symbol)) {
+          if (governor.getMode() === "ACTIVE") {
+            const events = await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close
+            });
+            await publisher.publishOrdered(events);
+          }
+        }
+      } catch (wsError: any) {
+        console.warn(`[${instanceId}] WebSocket failed, falling back to polling:`, wsError.message);
+        // Fallback to REST API polling
+        for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
+          if (governor.getMode() === "ACTIVE") {
+            const events = await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close
+            });
+            await publisher.publishOrdered(events);
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error("Alpaca feed error:", error.message);
+    }
+  })().catch(err => console.error("Alpaca feed initialization error:", err));
+} else {
+  console.log(`[${instanceId}] ⚠️  No Alpaca credentials - bot running without market data feed`);
+  console.log(`[${instanceId}]    Wire your own data source or set ALPACA_API_KEY and ALPACA_API_SECRET`);
+}
+
+// Option 2: Wire your own data source here
 // Example: when you receive a bar, call:
 //   const events = await orch.processTick({ ts, symbol, close });
 //   await publisher.publishOrdered(events);
