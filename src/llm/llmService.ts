@@ -43,15 +43,21 @@ export class LLMService {
   private apiKey: string;
   private baseUrl: string;
   private model: string;
+  private enabled: boolean;
 
   constructor() {
+    // STAGE 1: Standardize to OPENAI_API_KEY only
     this.apiKey = process.env.OPENAI_API_KEY || "";
     this.baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    
-    if (!this.apiKey) {
-      throw new Error("OPENAI_API_KEY environment variable is required");
-    }
+    this.enabled = !!this.apiKey;
+  }
+
+  /**
+   * Check if LLM service is enabled (has API key)
+   */
+  isEnabled(): boolean {
+    return this.enabled;
   }
 
   /**
@@ -75,6 +81,16 @@ export class LLMService {
     reasoning: string;
     plan: string;
   }> {
+    // STAGE 1: Return fallback if LLM not enabled
+    if (!this.enabled) {
+      return {
+        legitimacy: 70,
+        followThroughProb: 60,
+        action: "SCALP",
+        reasoning: "LLM disabled: missing OPENAI_API_KEY. Using default values.",
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+      };
+    }
     const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice } = context;
     
     // Calculate risk/reward for LLM
@@ -190,6 +206,15 @@ Respond in EXACT JSON format:
   }
 
   async getCoachingUpdate(context: LLMCoachingContext): Promise<LLMCoachingResponse> {
+    // STAGE 1: Return fallback if LLM not enabled
+    if (!this.enabled) {
+      return {
+        action: "HOLD",
+        reasoning: "LLM disabled: missing OPENAI_API_KEY. Defaulting to HOLD.",
+        urgency: "LOW"
+      };
+    }
+    
     const prompt = this.buildCoachingPrompt(context);
     
     try {
@@ -239,6 +264,73 @@ Respond in EXACT JSON format:
         action: "HOLD",
         reasoning: `Error calling LLM: ${error.message}. Defaulting to HOLD.`,
         urgency: "LOW"
+      };
+    }
+  }
+
+  /**
+   * STAGE 1: Test LLM connection with simple prompt
+   */
+  async testConnection(): Promise<{ success: boolean; latency: number; error?: string }> {
+    if (!this.enabled) {
+      return {
+        success: false,
+        latency: 0,
+        error: "LLM disabled: missing OPENAI_API_KEY"
+      };
+    }
+
+    const startTime = Date.now();
+    try {
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            {
+              role: "user",
+              content: "reply with OK"
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 10
+        })
+      });
+
+      const latency = Date.now() - startTime;
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        // Sanitize error (remove API key if accidentally included)
+        const sanitized = errorText.replace(/sk-[a-zA-Z0-9]+/g, "sk-***");
+        return {
+          success: false,
+          latency,
+          error: `HTTP ${response.status}: ${sanitized.substring(0, 200)}`
+        };
+      }
+
+      const data = await response.json();
+      const content = data.choices[0]?.message?.content || "";
+      
+      return {
+        success: true,
+        latency
+      };
+    } catch (error: any) {
+      const latency = Date.now() - startTime;
+      // Sanitize error message
+      const errorMsg = error.message || String(error);
+      const sanitized = errorMsg.replace(/sk-[a-zA-Z0-9]+/g, "sk-***");
+      
+      return {
+        success: false,
+        latency,
+        error: sanitized.substring(0, 200)
       };
     }
   }

@@ -2,6 +2,7 @@ import type { Orchestrator } from "./orchestrator/orchestrator.js";
 import type { MessageGovernor } from "./governor/messageGovernor.js";
 import type { MessagePublisher } from "./telegram/messagePublisher.js";
 import type { DomainEvent } from "./types.js";
+import type { LLMService } from "./llm/llmService.js";
 
 export class CommandHandler {
   private instanceId: string;
@@ -10,7 +11,8 @@ export class CommandHandler {
     private orch: Orchestrator,
     private governor: MessageGovernor,
     private publisher: MessagePublisher,
-    instanceId: string
+    instanceId: string,
+    private llmService?: LLMService
   ) {
     this.instanceId = instanceId;
   }
@@ -22,6 +24,11 @@ export class CommandHandler {
     // Include heartbeat info in status (but never as push message)
     const uptime = Math.floor((Date.now() - s.startedAt) / 1000);
     const heartbeatInfo = `Uptime: ${uptime}s\nMode: ${s.mode}`;
+
+    // STAGE 1: Show LLM warning in QUIET mode
+    const llmWarning = (s.mode === "QUIET" && this.llmService && !this.llmService.isEnabled()) 
+      ? "⚠️ LLM disabled: missing OPENAI_API_KEY"
+      : null;
 
     return [
       "=== Bot Status (Truthful) ===",
@@ -40,6 +47,7 @@ export class CommandHandler {
       "",
       "⚙️ SYSTEM:",
       heartbeatInfo,
+      llmWarning,
     ].filter(Boolean).join("\n");
   }
 
@@ -132,5 +140,22 @@ export class CommandHandler {
       `Instance: ${this.instanceId}`,
       `Uptime: ${Math.floor((Date.now() - s.startedAt) / 1000)}s`
     ].join("\n");
+  }
+
+  /**
+   * STAGE 1: Test LLM connection
+   */
+  async llmtest(): Promise<string> {
+    if (!this.llmService) {
+      return "❌ LLM service not initialized";
+    }
+
+    const result = await this.llmService.testConnection();
+    
+    if (result.success) {
+      return `✅ LLM test successful\nLatency: ${result.latency}ms`;
+    } else {
+      return `❌ LLM test failed\nLatency: ${result.latency}ms\nError: ${result.error || "Unknown error"}`;
+    }
   }
 }

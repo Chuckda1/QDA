@@ -61,23 +61,34 @@ function logHeartbeat(orch: Orchestrator, governor: MessageGovernor): void {
 // Initialize Telegram
 const { bot, chatId } = initTelegram();
 
-// Initialize LLM service (optional - will work without it)
+// Initialize core components first
+const governor = new MessageGovernor();
+
+// STAGE 1: Initialize LLM service (always create, but may be disabled)
 let llmService: LLMService | undefined;
+let llmErrorLogged = false;
 try {
   llmService = new LLMService();
+  if (!llmService.isEnabled()) {
+    // Log warning at startup (will check mode later when switching to ACTIVE)
+    console.warn("[STAGE 1] LLM service disabled: OPENAI_API_KEY missing");
+  }
 } catch (error: any) {
-  console.warn("LLM service not available:", error.message);
+  console.warn("LLM service initialization error:", error.message);
 }
 
-// Initialize core components
-const governor = new MessageGovernor();
 const orch = new Orchestrator(instanceId, llmService);
 const publisher = new MessagePublisher(governor, bot, chatId);
-const commands = new CommandHandler(orch, governor, publisher, instanceId);
+const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
 
 // Initialize scheduler
 const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
   orch.setMode(mode);
+  // STAGE 1: Log error once when switching to ACTIVE mode if LLM disabled
+  if (mode === "ACTIVE" && llmService && !llmService.isEnabled() && !llmErrorLogged) {
+    console.error("[STAGE 1] LLM DISABLED: OPENAI_API_KEY missing. LLM calls will return fallback responses.");
+    llmErrorLogged = true;
+  }
 });
 
 // Start scheduler
@@ -106,6 +117,12 @@ bot.onText(/\/exit(?:\s+(.+))?/, async (msg, match) => {
 bot.onText(/\/version/, async () => {
   await yieldNow();
   const msg = await commands.version(BUILD_ID);
+  await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
+bot.onText(/\/llmtest/, async () => {
+  await yieldNow();
+  const msg = await commands.llmtest();
   await sendTelegramMessageSafe(bot, chatId, msg);
 });
 
