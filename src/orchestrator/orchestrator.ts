@@ -99,9 +99,9 @@ export class Orchestrator {
         entryZone: { low: close - 0.28, high: close + 0.20 },
         stop: close - 0.72,
         targets: { t1: close + 0.92, t2: close + 1.88, t3: close + 2.85 },
-        legitimacy: 72,
-        followThroughProb: 65,
-        action: "SCALP" as TradeAction,
+        legitimacy: 72, // Will be updated by LLM
+        followThroughProb: 65, // Will be updated by LLM
+        action: "SCALP" as TradeAction, // Will be updated by LLM
         entered: false
       };
       this.state.activePlay = play;
@@ -122,25 +122,91 @@ export class Orchestrator {
         waitBars: 0
       }));
 
-      events.push(this.ev("LLM_VERIFY", ts, {
-        playId: play.id,
-        symbol: play.symbol,
-        direction: play.direction,
-        legitimacy: play.legitimacy,
-        followThroughProb: play.followThroughProb,
-        action: play.action,
-        reasoning: "Setup looks valid with moderate confidence. Scalp approach recommended."
-      }));
+      // Call LLM for verification (if available)
+      if (this.llmService) {
+        try {
+          console.log(`[1m] Calling LLM for play verification: ${play.id}`);
+          const llmVerify = await this.llmService.verifyPlaySetup({
+            symbol: play.symbol,
+            direction: play.direction,
+            entryZone: play.entryZone,
+            stop: play.stop,
+            targets: play.targets,
+            score: play.score,
+            grade: play.grade,
+            confidence: play.confidence,
+            currentPrice: close
+          });
+          
+          // Update play with LLM results
+          play.legitimacy = llmVerify.legitimacy;
+          play.followThroughProb = llmVerify.followThroughProb;
+          play.action = llmVerify.action as TradeAction;
+          
+          events.push(this.ev("LLM_VERIFY", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            direction: play.direction,
+            legitimacy: llmVerify.legitimacy,
+            followThroughProb: llmVerify.followThroughProb,
+            action: llmVerify.action,
+            reasoning: llmVerify.reasoning
+          }));
 
-      events.push(this.ev("TRADE_PLAN", ts, {
-        playId: play.id,
-        symbol: play.symbol,
-        direction: play.direction,
-        action: play.action,
-        size: "1/3 position",
-        probability: play.followThroughProb,
-        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
-      }));
+          events.push(this.ev("TRADE_PLAN", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            direction: play.direction,
+            action: llmVerify.action,
+            size: llmVerify.action === "GO_ALL_IN" ? "Full position" : "1/3 position",
+            probability: llmVerify.followThroughProb,
+            plan: llmVerify.plan
+          }));
+        } catch (error: any) {
+          console.error(`[1m] LLM verification failed:`, error.message);
+          // Fallback to hardcoded values
+          events.push(this.ev("LLM_VERIFY", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            direction: play.direction,
+            legitimacy: play.legitimacy,
+            followThroughProb: play.followThroughProb,
+            action: play.action,
+            reasoning: "LLM unavailable - using default values"
+          }));
+
+          events.push(this.ev("TRADE_PLAN", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            direction: play.direction,
+            action: play.action,
+            size: "1/3 position",
+            probability: play.followThroughProb,
+            plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+          }));
+        }
+      } else {
+        // No LLM service - use hardcoded values
+        events.push(this.ev("LLM_VERIFY", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          legitimacy: play.legitimacy,
+          followThroughProb: play.followThroughProb,
+          action: play.action,
+          reasoning: "LLM service not available - using default values"
+        }));
+
+        events.push(this.ev("TRADE_PLAN", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          action: play.action,
+          size: "1/3 position",
+          probability: play.followThroughProb,
+          plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+        }));
+      }
 
       return events;
     }

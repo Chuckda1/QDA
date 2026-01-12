@@ -26,7 +26,7 @@ try {
 const governor = new MessageGovernor();
 const orch = new Orchestrator(instanceId, llmService);
 const publisher = new MessagePublisher(governor, bot, chatId);
-const commands = new CommandHandler(orch, governor);
+const commands = new CommandHandler(orch, governor, publisher, instanceId);
 
 // Initialize scheduler
 const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
@@ -36,11 +36,24 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
 // Start scheduler
 scheduler.start();
 
-// Register /status command
+// Register commands
 bot.onText(/\/status/, async () => {
   await yieldNow();
   const msg = await commands.status();
   await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
+bot.onText(/\/enter/, async () => {
+  await yieldNow();
+  const msg = await commands.enter();
+  await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
+bot.onText(/\/exit(?:\s+(.+))?/, async (msg, match) => {
+  await yieldNow();
+  const reason = match?.[1] || undefined;
+  const response = await commands.exit(reason);
+  await sendTelegramMessageSafe(bot, chatId, response);
 });
 
 // Startup message

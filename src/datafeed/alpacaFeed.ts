@@ -30,6 +30,8 @@ export class AlpacaDataFeed {
   private isConnected: boolean = false;
   private barQueue: Bar[] = [];
   private resolveQueue: ((value: Bar) => void)[] = [];
+  private reconnectBackoff: number = 5000; // Start with 5 seconds
+  private maxBackoff: number = 60000; // Max 60 seconds
 
   constructor(config: AlpacaConfig) {
     this.config = {
@@ -56,6 +58,17 @@ export class AlpacaDataFeed {
     
     while (true) {
       try {
+        // Ensure previous connection is closed
+        if (this.ws) {
+          try {
+            this.ws.removeAllListeners();
+            this.ws.close();
+          } catch (e) {
+            // Ignore errors when closing
+          }
+          this.ws = null;
+        }
+        
         // Connect WebSocket
         await this.connectWebSocket();
         
@@ -65,6 +78,9 @@ export class AlpacaDataFeed {
         // Subscribe to bars
         await this.subscribeToBars(symbol);
         
+        // Reset backoff on successful connection
+        this.reconnectBackoff = 5000;
+        
         // Yield bars as they arrive
         while (this.isConnected) {
           const bar = await this.waitForBar();
@@ -73,9 +89,33 @@ export class AlpacaDataFeed {
           }
         }
       } catch (error: any) {
-        console.error("WebSocket error:", error.message);
+        const errorMsg = error.message || String(error);
+        console.error("WebSocket error:", errorMsg);
+        
+        // Close connection properly
         this.isConnected = false;
-        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before reconnect
+        if (this.ws) {
+          try {
+            this.ws.removeAllListeners();
+            this.ws.close();
+          } catch (e) {
+            // Ignore errors when closing
+          }
+          this.ws = null;
+        }
+        
+        // Exponential backoff with special handling for connection limit errors
+        if (errorMsg.toLowerCase().includes("connection limit") || 
+            errorMsg.toLowerCase().includes("limit exceeded")) {
+          // Longer backoff for connection limit errors (30 seconds minimum)
+          this.reconnectBackoff = Math.max(30000, this.reconnectBackoff * 2);
+          console.log(`[Alpaca] Connection limit hit, backing off for ${this.reconnectBackoff / 1000}s`);
+        } else {
+          // Exponential backoff for other errors
+          this.reconnectBackoff = Math.min(this.reconnectBackoff * 1.5, this.maxBackoff);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, this.reconnectBackoff));
       }
     }
   }
@@ -100,9 +140,11 @@ export class AlpacaDataFeed {
         reject(error);
       });
       
-      this.ws.on("close", () => {
-        console.log("[Alpaca] WebSocket closed");
+      this.ws.on("close", (code: number, reason: Buffer) => {
+        const reasonStr = reason.toString();
+        console.log(`[Alpaca] WebSocket closed (code: ${code}, reason: ${reasonStr || "none"})`);
         this.isConnected = false;
+        // Don't trigger immediate reconnect here - let the outer loop handle it with backoff
       });
       
       this.ws.on("message", (data: Buffer | string) => {

@@ -54,10 +54,148 @@ export class LLMService {
     }
   }
 
+  /**
+   * Verify a new play setup and create trade plan
+   * Called when a new play is detected (before entry)
+   */
+  async verifyPlaySetup(context: {
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    entryZone: { low: number; high: number };
+    stop: number;
+    targets: { t1: number; t2: number; t3: number };
+    score: number;
+    grade: string;
+    confidence: number;
+    currentPrice: number;
+  }): Promise<{
+    legitimacy: number; // 0-100
+    followThroughProb: number; // 0-100
+    action: "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
+    reasoning: string;
+    plan: string;
+  }> {
+    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice } = context;
+    
+    // Calculate risk/reward for LLM
+    const entryMid = (entryZone.low + entryZone.high) / 2;
+    const risk = Math.abs(entryMid - stop);
+    const rewardT1 = direction === "LONG" ? targets.t1 - entryMid : entryMid - targets.t1;
+    const rrT1 = risk > 0 ? rewardT1 / risk : 0;
+    
+    const prompt = `You are analyzing a new ${direction} trading setup on ${symbol}.
+
+SETUP DETAILS:
+- Score: ${score} (Grade: ${grade})
+- Confidence: ${confidence}%
+- Entry Zone: $${entryZone.low.toFixed(2)} - $${entryZone.high.toFixed(2)}
+- Stop: $${stop.toFixed(2)}
+- Targets: T1=$${targets.t1.toFixed(2)}, T2=$${targets.t2.toFixed(2)}, T3=$${targets.t3.toFixed(2)}
+- Current Price: $${currentPrice.toFixed(2)}
+- Risk: $${risk.toFixed(2)} per share
+- Reward to T1: $${rewardT1.toFixed(2)} per share
+- R-multiple to T1: ${rrT1.toFixed(2)}R
+
+YOUR TASK:
+1. Assess legitimacy (0-100): How valid is this setup?
+2. Assess follow-through probability (0-100): Likelihood price reaches T1?
+3. Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
+4. Provide brief reasoning (2-3 sentences)
+5. Create a trade plan (entry strategy, position sizing, exit strategy)
+
+Respond in EXACT JSON format:
+{
+  "legitimacy": 0-100,
+  "followThroughProb": 0-100,
+  "action": "GO_ALL_IN|SCALP|WAIT|PASS",
+  "reasoning": "Brief explanation",
+  "plan": "Entry strategy, position size, exit strategy"
+}`;
+
+    try {
+      console.log(`[LLM] Calling OpenAI API for play verification: ${symbol} ${direction}`);
+      const startTime = Date.now();
+      
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            {
+              role: "system",
+              content: `You are a professional day trading analyst. Analyze trading setups and provide clear, actionable recommendations.`
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 400
+        })
+      });
+
+      const duration = Date.now() - startTime;
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`[LLM] API error (${duration}ms):`, response.status, error);
+        throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices[0]?.message?.content || "";
+      console.log(`[LLM] API call successful (${duration}ms): ${content.substring(0, 100)}...`);
+      
+      // Parse response
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            legitimacy: Math.max(0, Math.min(100, parsed.legitimacy || 70)),
+            followThroughProb: Math.max(0, Math.min(100, parsed.followThroughProb || 60)),
+            action: parsed.action || "SCALP",
+            reasoning: parsed.reasoning || "Setup analyzed",
+            plan: parsed.plan || "Enter on pullback to entry zone. Tight stop. Target T1."
+          };
+        } catch (e) {
+          console.error("[LLM] Failed to parse JSON response:", e);
+        }
+      }
+      
+      // Fallback
+      return {
+        legitimacy: 70,
+        followThroughProb: 60,
+        action: "SCALP",
+        reasoning: "Setup analyzed with moderate confidence",
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+      };
+    } catch (error: any) {
+      console.error(`[LLM] Verification error:`, error.message);
+      // Fallback response
+      return {
+        legitimacy: 70,
+        followThroughProb: 60,
+        action: "SCALP",
+        reasoning: `Error calling LLM: ${error.message}. Using default values.`,
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+      };
+    }
+  }
+
   async getCoachingUpdate(context: LLMCoachingContext): Promise<LLMCoachingResponse> {
     const prompt = this.buildCoachingPrompt(context);
     
     try {
+      console.log(`[LLM] Calling OpenAI API for coaching update: ${context.symbol} ${context.direction}`);
+      const startTime = Date.now();
+      
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -81,17 +219,21 @@ export class LLMService {
         })
       });
 
+      const duration = Date.now() - startTime;
+
       if (!response.ok) {
         const error = await response.text();
+        console.error(`[LLM] API error (${duration}ms):`, response.status, error);
         throw new Error(`OpenAI API error: ${response.status} - ${error}`);
       }
 
       const data = await response.json();
       const content = data.choices[0]?.message?.content || "";
+      console.log(`[LLM] API call successful (${duration}ms): action=${this.parseLLMResponse(content, context).action}`);
       
       return this.parseLLMResponse(content, context);
     } catch (error: any) {
-      console.error("LLM API error:", error);
+      console.error(`[LLM] Coaching error:`, error.message);
       // Fallback response
       return {
         action: "HOLD",

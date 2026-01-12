@@ -2,6 +2,7 @@ import type { DomainEvent } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
+import { orderEvents } from "./messageOrder.js";
 
 export class MessagePublisher {
   constructor(
@@ -24,7 +25,9 @@ export class MessagePublisher {
   }
 
   /**
-   * Publish multiple events in order (for same-tick ordering)
+   * Publish multiple events in strict priority order
+   * 
+   * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → LLM_COACH_UPDATE → PLAY_CLOSED
    * 
    * INVARIANT CHECKS:
    * - LLM_COACH_UPDATE only if play is entered
@@ -32,10 +35,11 @@ export class MessagePublisher {
    * - TRADE_PLAN only if LLM_VERIFY exists in same batch
    */
   async publishOrdered(events: DomainEvent[]): Promise<void> {
+    if (events.length === 0) return;
+
     // Track state for invariant checks
     const seenPlayIds = new Set<string>();
     const seenLLMVerify = new Set<string>();
-    let hasEnteredPlay = false;
 
     // First pass: validate invariants
     for (const event of events) {
@@ -51,8 +55,6 @@ export class MessagePublisher {
           console.warn(`[INVARIANT] LLM_COACH_UPDATE missing playId, skipping`);
           continue;
         }
-        // Note: We can't check entered state here without orchestrator state
-        // This is a best-effort check - full validation happens in orchestrator
       }
 
       // Check: PLAY_CLOSED should have matching playId
@@ -83,11 +85,16 @@ export class MessagePublisher {
       }
     }
 
-    // Second pass: publish valid events
-    for (const event of events) {
-      await this.publish(event);
-      // Small delay to ensure Telegram receives in order
-      await new Promise((r) => setTimeout(r, 100));
+    // Sort events by priority (strict ordering)
+    const orderedEvents = orderEvents(events);
+
+    // Second pass: publish in strict order
+    for (const event of orderedEvents) {
+      const sent = await this.publish(event);
+      if (sent) {
+        // Small delay to ensure Telegram receives in order
+        await new Promise((r) => setTimeout(r, 100));
+      }
     }
   }
 
