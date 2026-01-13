@@ -107,7 +107,7 @@ export class Scheduler {
 
     // STAGE 6: Determine mode based on time (explicit ranges)
     // ACTIVE: 09:30:00 ET - 15:59:59 ET → process bars + trading messages
-    // QUIET: 16:00:00 ET - 09:24:59 ET → do NOT process trading decisions, but DO log heartbeats and accept /status
+    // QUIET: 16:00:00 ET - 09:24:59 ET → do NOT process trading decisions, but DO log health lines and accept /status
     const isActiveHours = (hour === 9 && minute >= 30) || (hour >= 10 && hour < 16);
     const isQuietHours = hour >= 16 || hour < 9 || (hour === 9 && minute < 30);
 
@@ -119,7 +119,7 @@ export class Scheduler {
       }
     } else if (isQuietHours) {
       if (this.governor.getMode() !== "QUIET") {
-        console.log(`[Scheduler] Switching to QUIET mode (ET: ${hour}:${minute.toString().padStart(2, '0')}) - bars skipped, heartbeats continue, /status works`);
+        console.log(`[Scheduler] Switching to QUIET mode (ET: ${hour}:${minute.toString().padStart(2, '0')}) - bars skipped, health logging continues, /status works`);
         this.governor.setMode("QUIET");
         this.onModeChange?.("QUIET");
       }

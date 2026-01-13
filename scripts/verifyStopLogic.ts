@@ -42,7 +42,9 @@ const testCases: TestCase[] = [
     entry: 100.50,
     expected: {
       stopHitOnClose: false, // Wick doesn't matter, only close
-      stopThreatened: false,
+      // StopThreatened is a warning-only signal based on distance-to-stop (close-based),
+      // independent of whether the stop was actually hit.
+      stopThreatened: true,
       distanceToStopDollars: 0.05, // close - stop = 100.05 - 100
       distanceToStopPercent: 100 * (0.05 / 100.05), // ~0.05%
       risk: 0.50, // |100.50 - 100| = 0.50

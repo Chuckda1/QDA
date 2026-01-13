@@ -125,11 +125,11 @@ export class MessageGovernor {
       return false;
     }
 
-    // In ACTIVE mode: allow all trading events, but NEVER heartbeats
+    // In ACTIVE mode: allow all trading events, but NEVER health pings
     if (this.mode === "ACTIVE") {
-      // Heartbeats should never be processed as domain events.
-      // Some producers encode heartbeat as event.data.type rather than event.type.
-      if (event.data?.type === "heartbeat") {
+      // Health pings should never be processed as domain events.
+      // Some producers encode them as event.data.type rather than event.type.
+      if (event.data?.type === "health") {
         return false;
       }
       
