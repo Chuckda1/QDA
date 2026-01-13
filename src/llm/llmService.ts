@@ -1,3 +1,37 @@
+export interface IndicatorSnapshot {
+  vwap?: number;
+  ema9?: number;
+  ema20?: number;
+  atr?: number;
+  rsi14?: number;
+  vwapSlope?: "UP" | "DOWN" | "FLAT";
+  structure?: "BULLISH" | "BEARISH" | "MIXED";
+}
+
+export interface RuleScores {
+  regime?: "BULL" | "BEAR" | "CHOP";
+  directionInference?: {
+    direction?: "LONG" | "SHORT";
+    confidence?: number;
+    reasons?: string[];
+  };
+  entryFilters?: {
+    warnings?: string[];
+  };
+  warnings?: string[];
+}
+
+export interface LLMScorecardResponse {
+  biasDirection: "LONG" | "SHORT" | "NEUTRAL";
+  agreement: number; // 0-100: how much LLM agrees with rules direction
+  legitimacy: number; // 0-100
+  probability: number; // 0-100: probability of reaching T1
+  action: "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
+  reasoning: string;
+  plan: string;
+  flags?: string[]; // Optional flags/warnings
+}
+
 export interface LLMCoachingContext {
   symbol: string;
   direction: "LONG" | "SHORT";
@@ -9,6 +43,9 @@ export interface LLMCoachingContext {
   unrealizedPnL?: number;
   timeInTrade?: number; // minutes
   priceAction?: string; // brief description of recent price action
+  indicatorSnapshot?: IndicatorSnapshot;
+  recentBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+  ruleScores?: RuleScores;
   rulesContext?: {
     distanceToStop: number;
     distanceToStopDollars: number;
@@ -53,6 +90,9 @@ export interface ArmedCoachingContext {
   followThroughProb?: number;
   action?: "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
   timeSinceArmed?: number; // minutes since play was armed
+  indicatorSnapshot?: IndicatorSnapshot;
+  recentBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+  ruleScores?: RuleScores;
 }
 
 export interface ArmedCoachingResponse {
@@ -109,24 +149,26 @@ export class LLMService {
     confidence: number;
     currentPrice: number;
     warnings?: string[]; // Filter warnings that should inform probability/legitimacy
-  }): Promise<{
-    legitimacy: number; // 0-100
-    followThroughProb: number; // 0-100
-    action: "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
-    reasoning: string;
-    plan: string;
-  }> {
+    indicatorSnapshot?: IndicatorSnapshot;
+    recentBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+    ruleScores?: RuleScores;
+    setupCandidate?: import("../types.js").SetupCandidate;
+  }): Promise<LLMScorecardResponse & { followThroughProb: number }> {
     // STAGE 1: Return fallback if LLM not enabled
     if (!this.enabled) {
       return {
+        biasDirection: "NEUTRAL",
+        agreement: 50,
         legitimacy: 70,
+        probability: 60,
         followThroughProb: 60,
         action: "SCALP",
         reasoning: "LLM disabled: missing OPENAI_API_KEY. Using default values.",
-        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1.",
+        flags: []
       };
     }
-    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings } = context;
+    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores, setupCandidate } = context;
     
     // Calculate risk/reward for LLM
     const entryMid = (entryZone.low + entryZone.high) / 2;
@@ -138,8 +180,23 @@ export class LLMService {
     const warningsSection = warnings && warnings.length > 0
       ? `\n\n⚠️ FILTER WARNINGS (Consider these when assessing probability/legitimacy):\n${warnings.map(w => `- ${w}`).join("\n")}`
       : "";
+
+    // Build JSON snapshot for LLM
+    const snapshotJson = JSON.stringify({
+      recentBars: (recentBars ?? []).slice(-20).map(b => ({ 
+        ts: b.ts, 
+        o: b.open, 
+        h: b.high, 
+        l: b.low, 
+        c: b.close, 
+        v: b.volume 
+      })),
+      indicators: indicatorSnapshot ?? null,
+      ruleScores: ruleScores ?? null,
+      setupCandidate: setupCandidate ?? null
+    }, null, 2);
     
-    const prompt = `You are analyzing a new ${direction} trading setup on ${symbol}.
+    const prompt = `You are creating a SCORECARD for a new ${direction} trading setup on ${symbol}.
 
 SETUP DETAILS:
 - Score: ${score} (Grade: ${grade})
@@ -152,22 +209,43 @@ SETUP DETAILS:
 - Reward to T1: $${rewardT1.toFixed(2)} per share
 - R-multiple to T1: ${rrT1.toFixed(2)}R${warningsSection}
 
+MARKET SNAPSHOT + RULE OUTPUTS (JSON):
+\`\`\`json
+${snapshotJson}
+\`\`\`
+
 YOUR TASK:
-0. IMPORTANT: If the provided direction looks wrong for current conditions (e.g., clear sell pressure but direction is LONG),
-   you MUST say so explicitly in your reasoning (e.g., "market favors SHORT") and reduce conviction by choosing WAIT or PASS.
-1. Assess legitimacy (0-100): How valid is this setup? ${warnings && warnings.length > 0 ? "Consider warnings when scoring." : ""}
-2. Assess follow-through probability (0-100): Likelihood price reaches T1? ${warnings && warnings.length > 0 ? "Warnings may indicate reduced probability." : ""}
-3. Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
-4. Provide brief reasoning (2-3 sentences) ${warnings && warnings.length > 0 ? "Address warnings in your reasoning." : ""}
-5. Create a trade plan (entry strategy, position sizing, exit strategy)
+Step 1) Determine biasDirection: Look at the market snapshot (recent bars, indicators, rule scores) and determine what direction the market actually favors (LONG, SHORT, or NEUTRAL). This is your independent assessment, not necessarily matching the proposed ${direction} direction.
+
+Step 2) Determine what the RULES are implying: Look at ruleScores.regime, ruleScores.directionInference, and ruleScores.entryFilters. What direction do the rules suggest? What is their confidence?
+
+Step 3) Compute agreement (0-100): how aligned your bias is with the rules.
+
+Step 3b) Validate the RULES setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
+   - If pattern is REVERSAL_ATTEMPT (countertrend), be STRICT: default to WAIT or PASS unless the snapshot clearly shows a reversal trigger.
+
+Step 4) Assess legitimacy (0-100): How valid is this setup overall? Consider all factors: indicators, structure, regime, warnings.
+
+Step 5) Assess probability (0-100): Likelihood price reaches T1? Use the indicators and recent price action to inform this.
+
+Step 6) Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
+
+Step 7) Provide reasoning (2-3 sentences): Explain your biasDirection, agreement level, and action choice. If you disagree with the proposed direction, say so explicitly.
+
+Step 8) Create a trade plan (entry strategy, position sizing, exit strategy)
+
+Step 9) Optional flags: List any warnings or concerns (e.g., ["high RSI", "regime mismatch"])
 
 Respond in EXACT JSON format:
 {
+  "biasDirection": "LONG|SHORT|NEUTRAL",
+  "agreement": 0-100,
   "legitimacy": 0-100,
-  "followThroughProb": 0-100,
+  "probability": 0-100,
   "action": "GO_ALL_IN|SCALP|WAIT|PASS",
   "reasoning": "Brief explanation",
-  "plan": "Entry strategy, position size, exit strategy"
+  "plan": "Entry strategy, position size, exit strategy",
+  "flags": ["flag1", "flag2"] or []
 }`;
 
     try {
@@ -214,12 +292,18 @@ Respond in EXACT JSON format:
       if (jsonMatch) {
         try {
           const parsed = JSON.parse(jsonMatch[0]);
+          // Map probability to followThroughProb for backward compatibility
+          const probability = parsed.probability ?? parsed.followThroughProb ?? 60;
           return {
+            biasDirection: parsed.biasDirection || "NEUTRAL",
+            agreement: Math.max(0, Math.min(100, parsed.agreement ?? 50)),
             legitimacy: Math.max(0, Math.min(100, parsed.legitimacy || 70)),
-            followThroughProb: Math.max(0, Math.min(100, parsed.followThroughProb || 60)),
+            probability: Math.max(0, Math.min(100, probability)),
+            followThroughProb: Math.max(0, Math.min(100, probability)), // Backward compatibility
             action: parsed.action || "SCALP",
             reasoning: parsed.reasoning || "Setup analyzed",
-            plan: parsed.plan || "Enter on pullback to entry zone. Tight stop. Target T1."
+            plan: parsed.plan || "Enter on pullback to entry zone. Tight stop. Target T1.",
+            flags: Array.isArray(parsed.flags) ? parsed.flags : []
           };
         } catch (e) {
           console.error("[LLM] Failed to parse JSON response:", e);
@@ -228,21 +312,29 @@ Respond in EXACT JSON format:
       
       // Fallback
       return {
+        biasDirection: "NEUTRAL",
+        agreement: 50,
         legitimacy: 70,
+        probability: 60,
         followThroughProb: 60,
         action: "SCALP",
         reasoning: "Setup analyzed with moderate confidence",
-        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1.",
+        flags: []
       };
     } catch (error: any) {
       console.error(`[LLM] Verification error:`, error.message);
       // Fallback response
       return {
+        biasDirection: "NEUTRAL",
+        agreement: 50,
         legitimacy: 70,
+        probability: 60,
         followThroughProb: 60,
         action: "SCALP",
         reasoning: `Error calling LLM: ${error.message}. Using default values.`,
-        plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+        plan: "Enter on pullback to entry zone. Tight stop. Target T1.",
+        flags: []
       };
     }
   }

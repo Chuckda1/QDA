@@ -6,6 +6,8 @@ import { getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
 import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
+import { SetupEngine } from "../rules/setupEngine.js";
+import { detectStructureLLLH } from "../utils/structure.js";
 
 type TickInput = {
   ts: number;
@@ -27,6 +29,7 @@ export class Orchestrator {
   private llmService?: LLMService;
   private stopProfitRules: StopProfitRules;
   private entryFilters: EntryFilters;
+  private setupEngine: SetupEngine;
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
   private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
@@ -36,6 +39,7 @@ export class Orchestrator {
     this.llmService = llmService;
     this.stopProfitRules = new StopProfitRules();
     this.entryFilters = new EntryFilters();
+    this.setupEngine = new SetupEngine();
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
@@ -107,33 +111,25 @@ export class Orchestrator {
       if (this.recentBars.length > 80) this.recentBars.shift();
     }
 
-    // If no active play, check entry filters before creating one
+    // If no active play, use SetupEngine to find a pattern
     if (!this.state.activePlay) {
-      // Need at least some bar history to avoid hardcoded LONG bias
+      // Need at least some bar history
       if (this.recentBars.length < 6) {
         return events;
       }
 
-      // Regime gate: hard veto before any play is created
+      // Compute regime and structure
       const regime = computeRegime(this.recentBars, close);
+      const structure = detectStructureLLLH(this.recentBars, { lookback: 22, pivotWidth: 2 });
 
-      // Infer direction from recent 1m bars (prevents "LONG into dump" loops)
+      // Infer direction from recent 1m bars
       const dirInf = inferDirectionFromRecentBars(this.recentBars);
-      if (!dirInf.direction || dirInf.confidence < 55) {
-        console.log(`[1m] No new play: ${dirInf.reasons.join(" | ")} (confidence=${dirInf.confidence})`);
+      if (!dirInf.direction) {
+        console.log(`[1m] No direction inference: ${dirInf.reasons.join(" | ")}`);
         return events;
       }
 
-      const inferredDirection = dirInf.direction;
-
-      // Enforce regime hard-blocks
-      const regimeCheck = regimeAllowsDirection(regime.regime, inferredDirection);
-      if (!regimeCheck.allowed) {
-        console.log(`[1m] No new play: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
-        return events;
-      }
-
-      // Compute lightweight indicators from recent bars (so EntryFilters actually work)
+      // Compute indicators
       const atr = computeATR(this.recentBars, 14);
       const closes = this.recentBars.map((b) => b.close);
       const ema9 = computeEMA(closes.slice(-60), 9);
@@ -141,10 +137,39 @@ export class Orchestrator {
       const vwap = computeVWAP(this.recentBars, 30);
       const rsi14 = computeRSI(closes, 14);
 
+      // Find setup using SetupEngine
+      const setupResult = this.setupEngine.findSetup({
+        ts,
+        symbol,
+        currentPrice: close,
+        bars: this.recentBars,
+        regime,
+        directionInference: dirInf,
+        indicators: { vwap, ema9, ema20, atr, rsi14 }
+      });
+
+      if (!setupResult.candidate) {
+        console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
+        return events;
+      }
+
+      const setupCandidate = setupResult.candidate;
+
+      // Regime-direction enforcement happens AFTER setup selection.
+      // Trend setups must align with regime; reversal attempts are explicitly countertrend.
+      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
+        const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
+        if (!regimeCheck.allowed) {
+          console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
+          return events;
+        }
+      }
+
+      // Run entry filters on the candidate
       const filterContext: EntryFilterContext = {
         timestamp: ts,
         symbol,
-        direction: inferredDirection,
+        direction: setupCandidate.direction,
         close,
         high,
         low,
@@ -175,100 +200,161 @@ export class Orchestrator {
         return events;
       }
 
-      // Always add direction inference notes as warnings for LLM transparency
-      const dirWarning = `Direction inference: ${dirInf.direction} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
+      // Prepare warnings for LLM
+      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
         dirWarning,
         regimeWarning
       ];
-      
-      // Build play levels based on direction (avoid LONG-only targets/stops)
-      const playEntryZone = inferredDirection === "LONG"
-        ? { low: close - 0.28, high: close + 0.20 }
-        : { low: close - 0.20, high: close + 0.28 };
 
-      const playStop = inferredDirection === "LONG"
-        ? close - 0.72
-        : close + 0.72;
+      // Prepare data for LLM scorecard
+      const recentBarsForLLM = this.recentBars.slice(-20).map((b) => ({
+        ts: b.ts,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: b.volume
+      }));
 
-      const playTargets = inferredDirection === "LONG"
-        ? { t1: close + 0.92, t2: close + 1.88, t3: close + 2.85 }
-        : { t1: close - 0.92, t2: close - 1.88, t3: close - 2.85 };
-      
-      const play: Play = {
-        id: `play_${ts}`,
-        symbol,
-        direction: inferredDirection,
-        score: 53,
-        grade: "C",
-        mode: "SCOUT",
-        confidence: 53,
-        entryZone: playEntryZone,
-        stop: playStop,
-        targets: playTargets,
-        legitimacy: 72, // Will be updated by LLM
-        followThroughProb: 65, // Will be updated by LLM
-        action: "SCALP" as TradeAction, // Will be updated by LLM
-        armedTimestamp: ts, // Track when play was armed
-        entered: false
+      const indicatorSnapshot = {
+        vwap,
+        ema9,
+        ema20,
+        atr,
+        rsi14,
+        vwapSlope: regime.vwapSlope,
+        structure: regime.structure
       };
-      this.state.activePlay = play;
 
-      // Strict ordering: all events in same tick
-      events.push(this.ev("PLAY_ARMED", ts, {
-        play,
-        headline: `${play.mode} PLAY ARMED`,
-      }));
+      const ruleScores = {
+        regime: regime.regime,
+        directionInference: {
+          direction: dirInf.direction,
+          confidence: dirInf.confidence,
+          reasons: dirInf.reasons
+        },
+        entryFilters: {
+          warnings: filterResult.warnings ?? []
+        },
+        warnings: llmWarnings
+      };
 
-      events.push(this.ev("TIMING_COACH", ts, {
-        playId: play.id,
-        symbol: play.symbol,
-        direction: play.direction,
-        mode: play.mode,
-        confidence: play.confidence,
-        eligibility: "READY", // READY or NOT_READY
-        eligibilityReason: "entry zone active",
-        waitBars: 0, // Keep for cooldown logic if needed
-        llmStatus: "Pending decision"
-      }));
-
-      // Call LLM for verification (if available)
+      // Call LLM BEFORE arming a play
       if (this.llmService) {
         try {
-          console.log(`[1m] Calling LLM for play verification: ${play.id}`);
-          // STAGE 3: Track LLM call
+          console.log(`[1m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
+
           const llmVerify = await this.llmService.verifyPlaySetup({
-            symbol: play.symbol,
-            direction: play.direction,
-            entryZone: play.entryZone,
-            stop: play.stop,
-            targets: play.targets,
-            score: play.score,
-            grade: play.grade,
-            confidence: play.confidence,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            entryZone: setupCandidate.entryZone,
+            stop: setupCandidate.stop,
+            targets: setupCandidate.targets,
+            score: setupCandidate.score.total,
+            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
+            confidence: setupCandidate.score.total,
             currentPrice: close,
-            warnings: llmWarnings // Pass filter + direction warnings to LLM
+            warnings: llmWarnings,
+            indicatorSnapshot,
+            recentBars: recentBarsForLLM,
+            ruleScores,
+            setupCandidate
           });
-          
-          // STAGE 3: Track LLM decision
+
           this.state.lastLLMDecision = `VERIFY:${llmVerify.action}`;
-          
-          // Update play with LLM results
-          play.legitimacy = llmVerify.legitimacy;
-          play.followThroughProb = llmVerify.followThroughProb;
-          play.action = llmVerify.action as TradeAction;
-          
+
+          // Always emit LLM_VERIFY + SCORECARD
           events.push(this.ev("LLM_VERIFY", ts, {
-            playId: play.id,
-            symbol: play.symbol,
-            direction: play.direction,
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
             legitimacy: llmVerify.legitimacy,
             followThroughProb: llmVerify.followThroughProb,
             action: llmVerify.action,
             reasoning: llmVerify.reasoning
+          }));
+
+          events.push(this.ev("SCORECARD", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            proposedDirection: setupCandidate.direction,
+            setup: {
+              pattern: setupCandidate.pattern,
+              triggerPrice: setupCandidate.triggerPrice,
+              stop: setupCandidate.stop
+            },
+            rules: {
+              regime: {
+                regime: regime.regime,
+                structure: regime.structure,
+                vwapSlope: regime.vwapSlope,
+                reasons: regime.reasons
+              },
+              directionInference: {
+                direction: dirInf.direction,
+                confidence: dirInf.confidence,
+                reasons: dirInf.reasons
+              },
+              indicators: indicatorSnapshot,
+              ruleScores
+            },
+            llm: {
+              biasDirection: llmVerify.biasDirection,
+              agreement: llmVerify.agreement,
+              legitimacy: llmVerify.legitimacy,
+              probability: llmVerify.probability,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning,
+              flags: llmVerify.flags ?? []
+            }
+          }));
+
+          // If LLM says PASS, don't arm the play
+          if (llmVerify.action === "PASS") {
+            console.log(`[1m] LLM rejected setup: ${llmVerify.reasoning}`);
+            return events;
+          }
+
+          // Create Play from approved setupCandidate
+          const play: Play = {
+            id: `play_${ts}`,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            score: setupCandidate.score.total,
+            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
+            mode: "SCOUT",
+            confidence: setupCandidate.score.total,
+            entryZone: setupCandidate.entryZone,
+            stop: setupCandidate.stop,
+            targets: setupCandidate.targets,
+            legitimacy: llmVerify.legitimacy,
+            followThroughProb: llmVerify.followThroughProb,
+            action: llmVerify.action as TradeAction,
+            armedTimestamp: ts,
+            entered: false
+          };
+          this.state.activePlay = play;
+
+          // Emit play events
+          events.push(this.ev("PLAY_ARMED", ts, {
+            play,
+            headline: `${play.mode} PLAY ARMED`,
+          }));
+
+          events.push(this.ev("TIMING_COACH", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            direction: play.direction,
+            mode: play.mode,
+            confidence: play.confidence,
+            eligibility: "READY",
+            eligibilityReason: "entry zone active",
+            waitBars: 0,
+            llmStatus: "Approved"
           }));
 
           events.push(this.ev("TRADE_PLAN", ts, {
@@ -282,48 +368,13 @@ export class Orchestrator {
           }));
         } catch (error: any) {
           console.error(`[1m] LLM verification failed:`, error.message);
-          // Fallback to hardcoded values
-          events.push(this.ev("LLM_VERIFY", ts, {
-            playId: play.id,
-            symbol: play.symbol,
-            direction: play.direction,
-            legitimacy: play.legitimacy,
-            followThroughProb: play.followThroughProb,
-            action: play.action,
-            reasoning: "LLM unavailable - using default values"
-          }));
-
-          events.push(this.ev("TRADE_PLAN", ts, {
-            playId: play.id,
-            symbol: play.symbol,
-            direction: play.direction,
-            action: play.action,
-            size: "1/3 position",
-            probability: play.followThroughProb,
-            plan: "Enter on pullback to entry zone. Tight stop. Target T1."
-          }));
+          // On error, don't arm the play (safety first)
+          return events;
         }
       } else {
-        // No LLM service - use hardcoded values
-        events.push(this.ev("LLM_VERIFY", ts, {
-          playId: play.id,
-          symbol: play.symbol,
-          direction: play.direction,
-          legitimacy: play.legitimacy,
-          followThroughProb: play.followThroughProb,
-          action: play.action,
-          reasoning: "LLM service not available - using default values"
-        }));
-
-        events.push(this.ev("TRADE_PLAN", ts, {
-          playId: play.id,
-          symbol: play.symbol,
-          direction: play.direction,
-          action: play.action,
-          size: "1/3 position",
-          probability: play.followThroughProb,
-          plan: "Enter on pullback to entry zone. Tight stop. Target T1."
-        }));
+        // No LLM service - don't arm plays (require LLM approval)
+        console.log(`[1m] No LLM service - setup found but requires LLM approval`);
+        return events;
       }
 
       return events;
