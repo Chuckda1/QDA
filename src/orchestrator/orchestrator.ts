@@ -126,6 +126,8 @@ export class Orchestrator {
       if (this.llmService) {
         try {
           console.log(`[1m] Calling LLM for play verification: ${play.id}`);
+          // STAGE 3: Track LLM call
+          this.state.lastLLMCallAt = Date.now();
           const llmVerify = await this.llmService.verifyPlaySetup({
             symbol: play.symbol,
             direction: play.direction,
@@ -137,6 +139,9 @@ export class Orchestrator {
             confidence: play.confidence,
             currentPrice: close
           });
+          
+          // STAGE 3: Track LLM decision
+          this.state.lastLLMDecision = `VERIFY:${llmVerify.action}`;
           
           // Update play with LLM results
           play.legitimacy = llmVerify.legitimacy;
@@ -295,6 +300,8 @@ export class Orchestrator {
     // Call LLM with rules context for pattern analysis
     if (this.llmService && !play.stopHit) {
       try {
+        // STAGE 3: Track LLM call
+        this.state.lastLLMCallAt = Date.now();
         const timeInTrade = play.entryTimestamp
           ? Math.floor((ts - play.entryTimestamp) / 60000)
           : 0;
@@ -344,6 +351,9 @@ export class Orchestrator {
         const llmAction = llmResponse.action;
         const llmReasoning = llmResponse.reasoning;
         const llmUrgency = llmResponse.urgency;
+        
+        // STAGE 3: Track LLM decision
+        this.state.lastLLMDecision = `COACH:${llmAction}`;
 
         // Cache this call (mark as processed for this 5m bar)
         // Cache key: playId + "_" + bar5m.ts (stable 5m close timestamp)

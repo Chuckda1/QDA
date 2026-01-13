@@ -57,4 +57,7 @@ export interface BotState {
   activePlay?: Play | null;
   mode: BotMode;
   lastPlanSent?: number;
+  // STAGE 3: LLM tracking
+  lastLLMCallAt?: number;
+  lastLLMDecision?: string;
 }

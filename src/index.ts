@@ -8,6 +8,7 @@ import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
+import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
@@ -29,31 +30,44 @@ console.log(`SYMBOLS: ${SYMBOLS}`);
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
 console.log("=================================");
 
-// STAGE 0: Heartbeat tracker for once-per-minute logging
+// STAGE 3: Structured heartbeat tracker
 let bars1mCount = 0;
 let bars5mCount = 0;
-let lastHeartbeatMinute = -1;
 
-function logHeartbeat(orch: Orchestrator, governor: MessageGovernor): void {
-  const now = new Date();
-  const currentMinute = now.getMinutes();
-  
-  // Only log once per minute
-  if (currentMinute === lastHeartbeatMinute) {
-    return;
+function getPlayState(play: Play | null | undefined): "NONE" | "ARMED" | "ENTERED" | "MANAGING" | "CLOSED" {
+  if (!play) return "NONE";
+  if (play.stopHit) return "CLOSED";
+  if (play.entered) {
+    // If entered and managing, it's MANAGING
+    return "MANAGING";
   }
-  
-  lastHeartbeatMinute = currentMinute;
+  // Play exists but not entered = ARMED
+  return "ARMED";
+}
+
+function logStructuredHeartbeat(orch: Orchestrator, governor: MessageGovernor, symbol: string): void {
   const s = orch.getState();
   const mode = governor.getMode();
-  const activePlay = s.activePlay ? s.activePlay.id : "none";
-  const entered = s.activePlay?.entered || false;
-  const last1m = s.last1mTs ? new Date(s.last1mTs).toISOString().substring(11, 19) : "none";
-  const last5m = s.last5mTs ? new Date(s.last5mTs).toISOString().substring(11, 19) : "none";
+  const play = s.activePlay;
   
-  console.log(`[HB] mode=${mode} bars1m=${bars1mCount} bars5m=${bars5mCount} activePlay=${activePlay} entered=${entered} last1m=${last1m} last5m=${last5m}`);
+  const heartbeat = {
+    mode,
+    symbol,
+    last1mTs: s.last1mTs || null,
+    last5mTs: s.last5mTs || null,
+    bars1mCount,
+    bars5mCount,
+    activePlayId: play?.id || null,
+    entered: play?.entered || false,
+    state: getPlayState(play),
+    lastLLMCallAt: s.lastLLMCallAt || null,
+    lastLLMDecision: s.lastLLMDecision || null
+  };
   
-  // Reset counters for next minute
+  // Log as single JSON line
+  console.log(`[HB] ${JSON.stringify(heartbeat)}`);
+  
+  // Reset counters for next interval
   bars1mCount = 0;
   bars5mCount = 0;
 }
@@ -100,6 +114,17 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
 
 // Start scheduler
 scheduler.start();
+
+// STAGE 3: Start structured heartbeat timer (every 60 seconds, runs in all modes)
+const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+setInterval(() => {
+  logStructuredHeartbeat(orch, governor, symbol);
+}, 60000); // 60 seconds
+
+// Log initial heartbeat immediately
+setTimeout(() => {
+  logStructuredHeartbeat(orch, governor, symbol);
+}, 1000); // After 1 second to let everything initialize
 
 // Register commands
 bot.onText(/\/status/, async () => {
@@ -202,9 +227,6 @@ if (alpacaKey && alpacaSecret) {
               }, "5m");
               await publisher.publishOrdered(events5m);
             }
-            
-            // STAGE 0: Log heartbeat once per minute
-            logHeartbeat(orch, governor);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
@@ -250,9 +272,6 @@ if (alpacaKey && alpacaSecret) {
               }, "5m");
               await publisher.publishOrdered(events5m);
             }
-            
-            // STAGE 0: Log heartbeat once per minute
-            logHeartbeat(orch, governor);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
