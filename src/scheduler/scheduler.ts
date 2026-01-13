@@ -85,6 +85,7 @@ export class Scheduler {
         plan: "Market analysis and trade setup monitoring. Ready for active trading session."
       }
     };
-    await this.publisher.publish(event);
+    // STAGE 4: All messages must go through publishOrdered for serialization
+    await this.publisher.publishOrdered([event]);
   }
 }

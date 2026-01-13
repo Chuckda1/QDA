@@ -5,6 +5,9 @@ import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
 import { orderEvents } from "./messageOrder.js";
 
 export class MessagePublisher {
+  // STAGE 4: Single publish queue to serialize all messages
+  private publishQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private governor: MessageGovernor,
     private bot: TelegramBotLike,
@@ -13,8 +16,9 @@ export class MessagePublisher {
 
   /**
    * Publish event through MessageGovernor (single choke point)
+   * STAGE 4: This should only be called from publishOrdered to ensure serialization
    */
-  async publish(event: DomainEvent): Promise<boolean> {
+  private async publish(event: DomainEvent): Promise<boolean> {
     if (!this.governor.shouldSend(event, this.bot, this.chatId)) {
       return false;
     }
@@ -27,6 +31,7 @@ export class MessagePublisher {
   /**
    * Publish multiple events in strict priority order
    * 
+   * STAGE 4: All messages must go through this method to ensure serialization
    * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → LLM_COACH_UPDATE → PLAY_CLOSED
    * 
    * INVARIANT CHECKS:
@@ -37,6 +42,18 @@ export class MessagePublisher {
   async publishOrdered(events: DomainEvent[]): Promise<void> {
     if (events.length === 0) return;
 
+    // STAGE 4: Queue this batch to ensure no interleaving
+    this.publishQueue = this.publishQueue.then(async () => {
+      await this._publishOrderedInternal(events);
+    });
+
+    await this.publishQueue;
+  }
+
+  /**
+   * Internal publish method (called from queue)
+   */
+  private async _publishOrderedInternal(events: DomainEvent[]): Promise<void> {
     // Track state for invariant checks
     const seenPlayIds = new Set<string>();
     const seenLLMVerify = new Set<string>();
@@ -88,12 +105,24 @@ export class MessagePublisher {
     // Sort events by priority (strict ordering)
     const orderedEvents = orderEvents(events);
 
-    // Second pass: publish in strict order
-    for (const event of orderedEvents) {
+    // STAGE 4: Publish in strict order with logging
+    const total = orderedEvents.length;
+    for (let idx = 0; idx < orderedEvents.length; idx++) {
+      const event = orderedEvents[idx];
+      const playId = event.data.playId || event.data.play?.id || "none";
+      
+      const startTime = Date.now();
+      console.log(`[PUB] sending ${event.type} playId=${playId} idx=${idx + 1}/${total}`);
+      
       const sent = await this.publish(event);
+      const duration = Date.now() - startTime;
+      
       if (sent) {
+        console.log(`[PUB] done ${event.type} durationMs=${duration}`);
         // Small delay to ensure Telegram receives in order
         await new Promise((r) => setTimeout(r, 100));
+      } else {
+        console.log(`[PUB] skipped ${event.type} (blocked by governor)`);
       }
     }
   }
