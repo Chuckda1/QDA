@@ -1,6 +1,7 @@
 import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
+import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 
 type TickInput = {
   ts: number;
@@ -21,12 +22,15 @@ export class Orchestrator {
   private instanceId: string;
   private llmService?: LLMService;
   private stopProfitRules: StopProfitRules;
+  private entryFilters: EntryFilters;
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp
+  private recentBars: Array<{ ts: number; high: number; low: number; close: number }> = []; // For pullback detection
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
     this.llmService = llmService;
     this.stopProfitRules = new StopProfitRules();
+    this.entryFilters = new EntryFilters();
     this.state = {
       startedAt: Date.now(),
       session: "RTH",
@@ -84,10 +88,45 @@ export class Orchestrator {
    */
   private async handle1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const events: DomainEvent[] = [];
-    const { ts, symbol, close } = snapshot;
+    const { ts, symbol, close, high, low, open, volume } = snapshot;
 
-    // If no active play, create one deterministically
+    // Update recent bars buffer for pullback detection (keep last 20 bars)
+    if (high !== undefined && low !== undefined) {
+      this.recentBars.push({ ts, high, low, close });
+      if (this.recentBars.length > 20) {
+        this.recentBars.shift();
+      }
+    }
+
+    // If no active play, check entry filters before creating one
     if (!this.state.activePlay) {
+      // Build entry filter context
+      // Note: Indicators (VWAP, EMA, ATR, RSI) are optional - filters gracefully degrade if not available
+      const filterContext: EntryFilterContext = {
+        timestamp: ts,
+        symbol,
+        direction: "LONG", // Default direction (can be determined by setup detection logic)
+        close,
+        high,
+        low,
+        open,
+        volume,
+        indicators: undefined, // TODO: Calculate or fetch indicators if available
+        recentBars: this.recentBars.length >= 5 ? [...this.recentBars] : undefined
+      };
+
+      // Check entry filters
+      const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
+      if (!filterResult.allowed) {
+        console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
+        return events; // Return empty events - no play created
+      }
+      
+      // Log warnings if any (these don't block but inform LLM)
+      if (filterResult.warnings && filterResult.warnings.length > 0) {
+        console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join("; ")}`);
+      }
+      
       const play: Play = {
         id: `play_${ts}`,
         symbol,
@@ -137,7 +176,8 @@ export class Orchestrator {
             score: play.score,
             grade: play.grade,
             confidence: play.confidence,
-            currentPrice: close
+            currentPrice: close,
+            warnings: filterResult.warnings // Pass filter warnings to LLM
           });
           
           // STAGE 3: Track LLM decision

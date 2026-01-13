@@ -85,6 +85,7 @@ export class LLMService {
     grade: string;
     confidence: number;
     currentPrice: number;
+    warnings?: string[]; // Filter warnings that should inform probability/legitimacy
   }): Promise<{
     legitimacy: number; // 0-100
     followThroughProb: number; // 0-100
@@ -102,13 +103,18 @@ export class LLMService {
         plan: "Enter on pullback to entry zone. Tight stop. Target T1."
       };
     }
-    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice } = context;
+    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings } = context;
     
     // Calculate risk/reward for LLM
     const entryMid = (entryZone.low + entryZone.high) / 2;
     const risk = Math.abs(entryMid - stop);
     const rewardT1 = direction === "LONG" ? targets.t1 - entryMid : entryMid - targets.t1;
     const rrT1 = risk > 0 ? rewardT1 / risk : 0;
+    
+    // Build warnings section if present
+    const warningsSection = warnings && warnings.length > 0
+      ? `\n\n⚠️ FILTER WARNINGS (Consider these when assessing probability/legitimacy):\n${warnings.map(w => `- ${w}`).join("\n")}`
+      : "";
     
     const prompt = `You are analyzing a new ${direction} trading setup on ${symbol}.
 
@@ -121,13 +127,13 @@ SETUP DETAILS:
 - Current Price: $${currentPrice.toFixed(2)}
 - Risk: $${risk.toFixed(2)} per share
 - Reward to T1: $${rewardT1.toFixed(2)} per share
-- R-multiple to T1: ${rrT1.toFixed(2)}R
+- R-multiple to T1: ${rrT1.toFixed(2)}R${warningsSection}
 
 YOUR TASK:
-1. Assess legitimacy (0-100): How valid is this setup?
-2. Assess follow-through probability (0-100): Likelihood price reaches T1?
+1. Assess legitimacy (0-100): How valid is this setup? ${warnings && warnings.length > 0 ? "Consider warnings when scoring." : ""}
+2. Assess follow-through probability (0-100): Likelihood price reaches T1? ${warnings && warnings.length > 0 ? "Warnings may indicate reduced probability." : ""}
 3. Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
-4. Provide brief reasoning (2-3 sentences)
+4. Provide brief reasoning (2-3 sentences) ${warnings && warnings.length > 0 ? "Address warnings in your reasoning." : ""}
 5. Create a trade plan (entry strategy, position sizing, exit strategy)
 
 Respond in EXACT JSON format:
