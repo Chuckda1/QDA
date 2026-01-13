@@ -9,6 +9,7 @@ import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
 import { announceStartupThrottled } from "./utils/startupAnnounce.js";
+import { StateStore } from "./persistence/stateStore.js";
 import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
@@ -76,8 +77,12 @@ function logStructuredHeartbeat(orch: Orchestrator, governor: MessageGovernor, s
 // Initialize Telegram
 const { bot, chatId } = initTelegram();
 
-// Initialize core components first
-const governor = new MessageGovernor();
+// Load persisted state
+const store = new StateStore(instanceId);
+const persisted = await store.load();
+
+// Initialize core components first (with persisted state)
+const governor = new MessageGovernor(persisted?.governor);
 
 // STAGE 1: Initialize LLM service (always create, but may be disabled)
 let llmService: LLMService | undefined;
@@ -99,7 +104,7 @@ try {
   console.warn("LLM service initialization error:", error.message);
 }
 
-const orch = new Orchestrator(instanceId, llmService);
+const orch = new Orchestrator(instanceId, llmService, { activePlay: persisted?.activePlay ?? null });
 const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
 
@@ -172,6 +177,20 @@ await announceStartupThrottled({
   instanceId,
   text: `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`,
 });
+
+// Periodic state persistence (every 15 seconds)
+setInterval(() => {
+  const state = {
+    version: 1 as const,
+    instanceId,
+    savedAt: Date.now(),
+    activePlay: orch.getState().activePlay ?? null,
+    governor: governor.exportState(),
+  };
+  store.save(state).catch((err) => {
+    console.warn(`[persist] save failed: ${err?.message || String(err)}`);
+  });
+}, 15000);
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)

@@ -73,6 +73,28 @@ export function getETParts(date: Date): { hour: number; minute: number; weekday:
 }
 
 /**
+ * Get ET clock (alias for getETParts for consistency)
+ */
+export function getETClock(date: Date = new Date()): { hour: number; minute: number; weekday: number } {
+  return getETParts(date);
+}
+
+/**
+ * Get ET date string (YYYY-MM-DD) for a given date
+ */
+export function getETDateString(date: Date = new Date()): string {
+  const etOffset = isDSTInEffect(date) ? 4 : 5;
+  const etTime = new Date(date.getTime() - etOffset * 60 * 60 * 1000);
+  
+  // Get the ET date components (using UTC methods since we've already offset)
+  const year = etTime.getUTCFullYear();
+  const month = String(etTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(etTime.getUTCDate()).padStart(2, '0');
+  
+  return `${year}-${month}-${day}`;
+}
+
+/**
  * Get current ET time as hours:minutes
  */
 export function getCurrentET(): { hour: number; minute: number; weekday: number } {
