@@ -21,6 +21,7 @@ export interface SetupCandidate {
     quality: number;
     total: number;
   };
+  flags?: string[]; // e.g. ["CHOP_OVERRIDE"]
 }
 
 export type DomainEventType =

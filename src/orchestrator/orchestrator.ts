@@ -159,7 +159,11 @@ export class Orchestrator {
       // Trend setups must align with regime; reversal attempts are explicitly countertrend.
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
         const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
-        if (!regimeCheck.allowed) {
+
+        const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
+
+        // Allow CHOP setups only when explicitly marked as override
+        if (!regimeCheck.allowed && !(regime.regime === "CHOP" && hasChopOverride)) {
           console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
           return events;
         }
@@ -191,7 +195,9 @@ export class Orchestrator {
               close: b.close, 
               volume: b.volume ?? 0 
             }))
-          : undefined
+          : undefined,
+        setupPattern: setupCandidate.pattern,
+        setupFlags: setupCandidate.flags
       };
 
       const filterResult = this.entryFilters.canCreateNewPlay(filterContext);

@@ -5,7 +5,7 @@
  * They do NOT affect management/exits of existing plays.
  */
 
-import type { Direction } from "../types.js";
+import type { Direction, SetupPattern } from "../types.js";
 import { getETClock } from "../utils/timeUtils.js";
 
 export interface IndicatorData {
@@ -35,6 +35,8 @@ export interface EntryFilterContext {
     close: number;
     volume: number;
   }>;
+  setupPattern?: SetupPattern;
+  setupFlags?: string[];
 }
 
 export interface EntryFilterResult {
@@ -197,6 +199,13 @@ export class EntryFilters {
    * - Reclaim signal (close back above EMA9/EMA20 for LONG, or below for SHORT)
    */
   private checkImpulseThenPullback(context: EntryFilterContext): EntryFilterResult {
+    const { setupPattern, setupFlags } = context;
+
+    // Skip this filter for break/breakdown style setups
+    if (setupPattern === "BREAK_RETEST" || setupFlags?.includes("CHOP_OVERRIDE")) {
+      return { allowed: true };
+    }
+
     const { close, direction, indicators, recentBars } = context;
 
     // If no indicators or recent bars, allow (graceful degradation)

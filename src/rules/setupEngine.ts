@@ -119,6 +119,7 @@ export class SetupEngine {
     // CHOP default is to block new setups, but allow a "momentum + alignment" override.
     // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
     // then break lower) that often classify as CHOP by the stricter regime gate.
+    let chopOverride = false;
     if (regime.regime === "CHOP") {
       const lookback = Math.min(12, closes.length);
       const first = closes[closes.length - lookback]!;
@@ -139,6 +140,7 @@ export class SetupEngine {
         };
       }
 
+      chopOverride = true;
       baseReasons.push(`chopOverride=true slope=${slopeAtr.toFixed(2)} ATR`);
     }
 
@@ -147,7 +149,13 @@ export class SetupEngine {
     if (vwap !== undefined) baseReasons.push(`vwap=${vwap.toFixed(2)} vwapSlope=${regime.vwapSlope ?? "N/A"}`);
 
     const candidates: SetupCandidate[] = [];
-    const pushCandidate = (candidate: SetupCandidate) => candidates.push(candidate);
+    const pushCandidate = (candidate: SetupCandidate) => {
+      // Add CHOP_OVERRIDE flag if applicable
+      if (chopOverride) {
+        candidate.flags = [...(candidate.flags ?? []), "CHOP_OVERRIDE"];
+      }
+      candidates.push(candidate);
+    };
 
     // Try PULLBACK_CONTINUATION pattern
     const pullbackResult = this.findPullbackContinuation({
