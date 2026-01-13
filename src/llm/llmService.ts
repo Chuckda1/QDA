@@ -153,6 +153,8 @@ SETUP DETAILS:
 - R-multiple to T1: ${rrT1.toFixed(2)}R${warningsSection}
 
 YOUR TASK:
+0. IMPORTANT: If the provided direction looks wrong for current conditions (e.g., clear sell pressure but direction is LONG),
+   you MUST say so explicitly in your reasoning (e.g., "market favors SHORT") and reduce conviction by choosing WAIT or PASS.
 1. Assess legitimacy (0-100): How valid is this setup? ${warnings && warnings.length > 0 ? "Consider warnings when scoring." : ""}
 2. Assess follow-through probability (0-100): Likelihood price reaches T1? ${warnings && warnings.length > 0 ? "Warnings may indicate reduced probability." : ""}
 3. Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
@@ -294,6 +296,7 @@ SETUP DETAILS:
 - Price position: ${inEntryZone ? "IN entry zone" : currentPrice < entryZone.low ? `${distanceToEntryZone.toFixed(2)} below entry zone` : `${distanceToEntryZone.toFixed(2)} above entry zone`}
 
 YOUR TASK (You are NOT in a position yet - this is pre-entry coaching):
+0. If direction looks wrong for current conditions, explicitly call it out (e.g., "market favors SHORT") and set entryReadiness to WAIT or CAUTION.
 1. Provide commentary on setup quality and current market conditions
 2. Assess entry readiness: WAIT | READY | CAUTION
 3. Provide brief reasoning (2-3 sentences)
@@ -587,6 +590,8 @@ Analyze this trade using the provided metrics for pattern analysis and probabili
 3. TIGHTEN_STOP - move stop to breakeven or better
 4. STOP_OUT - exit immediately (you see risk)
 5. SCALE_OUT - take partial profit
+
+If the tape is clearly moving against the trade direction (e.g., repeated lower closes for LONG), you should say so explicitly and consider STOP_OUT or TIGHTEN_STOP with HIGH urgency.
 
 Respond in this EXACT JSON format:
 {
