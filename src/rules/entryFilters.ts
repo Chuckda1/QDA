@@ -29,9 +29,11 @@ export interface EntryFilterContext {
   // For pullback detection - recent price history
   recentBars?: Array<{
     ts: number;
+    open: number;
     high: number;
     low: number;
     close: number;
+    volume: number;
   }>;
 }
 

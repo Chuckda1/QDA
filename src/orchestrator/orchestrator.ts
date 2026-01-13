@@ -3,6 +3,9 @@ import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 import { getMarketSessionLabel } from "../utils/timeUtils.js";
+import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
+import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
+import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 
 type TickInput = {
   ts: number;
@@ -26,7 +29,7 @@ export class Orchestrator {
   private entryFilters: EntryFilters;
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
-  private recentBars: Array<{ ts: number; high: number; low: number; close: number }> = []; // For pullback detection
+  private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
 
   constructor(instanceId: string, llmService?: LLMService, initialState?: { activePlay?: Play | null }) {
     this.instanceId = instanceId;
@@ -95,54 +98,116 @@ export class Orchestrator {
     const events: DomainEvent[] = [];
     const { ts, symbol, close, high, low, open, volume } = snapshot;
 
-    // Update recent bars buffer for pullback detection (keep last 20 bars)
+    // Tightened: do NOT require open/volume; default them if missing so we still infer direction/regime.
     if (high !== undefined && low !== undefined) {
-      this.recentBars.push({ ts, high, low, close });
-      if (this.recentBars.length > 20) {
-        this.recentBars.shift();
-      }
+      const safeOpen = open ?? close;
+      const safeVol = volume ?? 0;
+      this.recentBars.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+      // Keep enough history for ATR/RSI/EMA (direction + filters)
+      if (this.recentBars.length > 80) this.recentBars.shift();
     }
 
     // If no active play, check entry filters before creating one
     if (!this.state.activePlay) {
-      // Build entry filter context
-      // Note: Indicators (VWAP, EMA, ATR, RSI) are optional - filters gracefully degrade if not available
+      // Need at least some bar history to avoid hardcoded LONG bias
+      if (this.recentBars.length < 6) {
+        return events;
+      }
+
+      // Regime gate: hard veto before any play is created
+      const regime = computeRegime(this.recentBars, close);
+
+      // Infer direction from recent 1m bars (prevents "LONG into dump" loops)
+      const dirInf = inferDirectionFromRecentBars(this.recentBars);
+      if (!dirInf.direction || dirInf.confidence < 55) {
+        console.log(`[1m] No new play: ${dirInf.reasons.join(" | ")} (confidence=${dirInf.confidence})`);
+        return events;
+      }
+
+      const inferredDirection = dirInf.direction;
+
+      // Enforce regime hard-blocks
+      const regimeCheck = regimeAllowsDirection(regime.regime, inferredDirection);
+      if (!regimeCheck.allowed) {
+        console.log(`[1m] No new play: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
+        return events;
+      }
+
+      // Compute lightweight indicators from recent bars (so EntryFilters actually work)
+      const atr = computeATR(this.recentBars, 14);
+      const closes = this.recentBars.map((b) => b.close);
+      const ema9 = computeEMA(closes.slice(-60), 9);
+      const ema20 = computeEMA(closes.slice(-80), 20);
+      const vwap = computeVWAP(this.recentBars, 30);
+      const rsi14 = computeRSI(closes, 14);
+
       const filterContext: EntryFilterContext = {
         timestamp: ts,
         symbol,
-        direction: "LONG", // Default direction (can be determined by setup detection logic)
+        direction: inferredDirection,
         close,
         high,
         low,
         open,
         volume,
-        indicators: undefined, // TODO: Calculate or fetch indicators if available
-        recentBars: this.recentBars.length >= 5 ? [...this.recentBars] : undefined
+        indicators: {
+          vwap,
+          ema20,
+          ema9,
+          atr,
+          rsi14
+        },
+        recentBars: this.recentBars.length >= 5
+          ? this.recentBars.slice(-20).map((b) => ({ 
+              ts: b.ts, 
+              open: b.open ?? b.close, 
+              high: b.high, 
+              low: b.low, 
+              close: b.close, 
+              volume: b.volume ?? 0 
+            }))
+          : undefined
       };
 
-      // Check entry filters
       const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
       if (!filterResult.allowed) {
         console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
-        return events; // Return empty events - no play created
+        return events;
       }
+
+      // Always add direction inference notes as warnings for LLM transparency
+      const dirWarning = `Direction inference: ${dirInf.direction} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
+      const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
+      const llmWarnings = [
+        ...(filterResult.warnings ?? []),
+        dirWarning,
+        regimeWarning
+      ];
       
-      // Log warnings if any (these don't block but inform LLM)
-      if (filterResult.warnings && filterResult.warnings.length > 0) {
-        console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join("; ")}`);
-      }
+      // Build play levels based on direction (avoid LONG-only targets/stops)
+      const playEntryZone = inferredDirection === "LONG"
+        ? { low: close - 0.28, high: close + 0.20 }
+        : { low: close - 0.20, high: close + 0.28 };
+
+      const playStop = inferredDirection === "LONG"
+        ? close - 0.72
+        : close + 0.72;
+
+      const playTargets = inferredDirection === "LONG"
+        ? { t1: close + 0.92, t2: close + 1.88, t3: close + 2.85 }
+        : { t1: close - 0.92, t2: close - 1.88, t3: close - 2.85 };
       
       const play: Play = {
         id: `play_${ts}`,
         symbol,
-        direction: "LONG",
+        direction: inferredDirection,
         score: 53,
         grade: "C",
         mode: "SCOUT",
         confidence: 53,
-        entryZone: { low: close - 0.28, high: close + 0.20 },
-        stop: close - 0.72,
-        targets: { t1: close + 0.92, t2: close + 1.88, t3: close + 2.85 },
+        entryZone: playEntryZone,
+        stop: playStop,
+        targets: playTargets,
         legitimacy: 72, // Will be updated by LLM
         followThroughProb: 65, // Will be updated by LLM
         action: "SCALP" as TradeAction, // Will be updated by LLM
@@ -185,7 +250,7 @@ export class Orchestrator {
             grade: play.grade,
             confidence: play.confidence,
             currentPrice: close,
-            warnings: filterResult.warnings // Pass filter warnings to LLM
+            warnings: llmWarnings // Pass filter + direction warnings to LLM
           });
           
           // STAGE 3: Track LLM decision
