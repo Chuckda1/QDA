@@ -144,16 +144,29 @@ export class MessagePublisher {
         ].join("\n");
       }
       
-      case "TIMING_COACH":
-        return [
+      case "TIMING_COACH": {
+        const eligibility = event.data.eligibility || (event.data.waitBars === 0 ? "READY" : "NOT_READY");
+        const eligibilityReason = event.data.eligibilityReason || (event.data.waitBars === 0 ? "entry zone active" : "cooldown");
+        const checkmark = eligibility === "READY" ? "✅" : "";
+        const lines = [
           `[${instanceId}] 🧠 TIMING COACH`,
           `${event.data.direction} ${event.data.symbol}`,
           `Mode: ${event.data.mode}`,
-          `Wait: ${event.data.waitBars} bar(s)`,
-          `Confidence: ${event.data.confidence}%`,
-          ``,
-          `${event.data.text}`
-        ].join("\n");
+          `Eligibility: ${eligibility} ${checkmark} (${eligibilityReason})`
+        ];
+        
+        // Add cooldown info if not ready
+        if (eligibility === "NOT_READY" && event.data.waitBars > 0) {
+          lines.push(`Cooldown remaining: ${event.data.waitBars} bar(s)`);
+        }
+        
+        // Add LLM status
+        if (event.data.llmStatus) {
+          lines.push(`LLM: ${event.data.llmStatus}`);
+        }
+        
+        return lines.join("\n");
+      }
 
       case "LLM_VERIFY":
         return [

@@ -159,8 +159,10 @@ export class Orchestrator {
         direction: play.direction,
         mode: play.mode,
         confidence: play.confidence,
-        text: `Entry zone active. Ready to enter now.`,
-        waitBars: 0
+        eligibility: "READY", // READY or NOT_READY
+        eligibilityReason: "entry zone active",
+        waitBars: 0, // Keep for cooldown logic if needed
+        llmStatus: "Pending decision"
       }));
 
       // Call LLM for verification (if available)
