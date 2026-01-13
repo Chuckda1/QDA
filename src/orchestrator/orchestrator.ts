@@ -6,6 +6,7 @@ import { getMarketSessionLabel } from "../utils/timeUtils.js";
 import type { OHLCVBar } from "../utils/indicators.js";
 import { computeATR, computeEMA, computeRSI, computeVWAP } from "../utils/indicators.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
+import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 
 type TickInput = {
   ts: number;
@@ -99,13 +100,11 @@ export class Orchestrator {
     const { ts, symbol, close, high, low, open, volume } = snapshot;
 
     // Update recent bars buffer for pullback detection (keep last 20 bars)
-    if (
-      high !== undefined &&
-      low !== undefined &&
-      open !== undefined &&
-      volume !== undefined
-    ) {
-      this.recentBars.push({ ts, open, high, low, close, volume });
+    // Tightened: do NOT require open/volume; default them if missing so we still infer direction/regime.
+    if (high !== undefined && low !== undefined) {
+      const safeOpen = open ?? close;
+      const safeVol = volume ?? 0;
+      this.recentBars.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
       // Keep enough history for ATR/RSI/EMA (direction + filters)
       if (this.recentBars.length > 80) this.recentBars.shift();
     }
@@ -117,6 +116,12 @@ export class Orchestrator {
         return events;
       }
 
+      // Regime gate: hard veto before any play is created
+      const regime = computeRegime(this.recentBars, close);
+      if (regime.regime !== "CHOP") {
+        console.log(`[1m] Regime=${regime.regime}: ${regime.reasons[0]}`);
+      }
+
       // Infer direction from recent 1m bars (prevents "LONG into dump" loops)
       const dirInf = inferDirectionFromRecentBars(this.recentBars);
       if (!dirInf.direction || dirInf.confidence < 55) {
@@ -125,6 +130,13 @@ export class Orchestrator {
       }
 
       const inferredDirection = dirInf.direction;
+
+      // Enforce regime hard-blocks (prevents LONG in BEAR momentum, etc.)
+      const regimeCheck = regimeAllowsDirection(regime.regime, inferredDirection);
+      if (!regimeCheck.allowed) {
+        console.log(`[1m] No new play: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
+        return events;
+      }
 
       // Compute lightweight indicators from recent bars (so EntryFilters actually work)
       const atr = computeATR(this.recentBars, 14);
@@ -171,9 +183,11 @@ export class Orchestrator {
 
       // Always add direction inference notes as warnings for LLM transparency
       const dirWarning = `Direction inference: ${dirInf.direction} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
+      const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
-        dirWarning
+        dirWarning,
+        regimeWarning
       ];
       
       // Build play levels based on direction (avoid LONG-only targets/stops)

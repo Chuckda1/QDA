@@ -1,6 +1,6 @@
 import type { Direction } from "../types.js";
 import type { OHLCVBar } from "../utils/indicators.js";
-import { computeATR, computeEMA } from "../utils/indicators.js";
+import { computeATR, computeEMA, computeVWAP } from "../utils/indicators.js";
 
 export interface DirectionInference {
   direction?: Direction; // undefined means "no edge / unclear"
@@ -44,6 +44,7 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   const atr14 = computeATR(bars, 14);
   const ema9 = computeEMA(bars.slice(-30).map((b) => b.close), 9);
   const ema20 = computeEMA(bars.slice(-60).map((b) => b.close), 20);
+  const vwap30 = computeVWAP(bars, 30);
 
   const slope = lastClose - firstClose;
   const slopePct = pctMove(firstClose, lastClose);
@@ -114,11 +115,31 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   reasons.push(`maxDownStreak=${maxConsecutiveDown} maxUpStreak=${maxConsecutiveUp}`);
   if (ema9 !== undefined) reasons.push(`ema9=${ema9.toFixed(2)}`);
   if (ema20 !== undefined) reasons.push(`ema20=${ema20.toFixed(2)}`);
+  if (vwap30 !== undefined) reasons.push(`vwap30=${vwap30.toFixed(2)}`);
 
   let direction: Direction | undefined;
   if (bearishEvidence && !bullishEvidence) direction = "SHORT";
   else if (bullishEvidence && !bearishEvidence) direction = "LONG";
   else direction = undefined;
+
+  // Fast safety veto: VWAP + EMA alignment (closer to a regime gate)
+  // - If price below VWAP and EMA stack is bearish, refuse LONG
+  // - If price above VWAP and EMA stack is bullish, refuse SHORT
+  const last = bars[bars.length - 1]!;
+  if (direction === "LONG" && vwap30 !== undefined) {
+    const emaBearStack = ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : false;
+    if (last.close < vwap30 && emaBearStack) {
+      direction = undefined;
+      reasons.unshift("veto: price<VWAP and EMA9<EMA20 (bear alignment) — block LONG");
+    }
+  }
+  if (direction === "SHORT" && vwap30 !== undefined) {
+    const emaBullStack = ema9 !== undefined && ema20 !== undefined ? ema9 > ema20 : false;
+    if (last.close > vwap30 && emaBullStack) {
+      direction = undefined;
+      reasons.unshift("veto: price>VWAP and EMA9>EMA20 (bull alignment) — block SHORT");
+    }
+  }
 
   // Confidence: combine strength components + EMA alignment bonus
   const base = 0.45 * slopeStrength + 0.35 * pressureStrength + 0.20 * streakStrength;

@@ -1,10 +1,10 @@
 export type OHLCVBar = {
   ts: number;
-  open: number;
+  open?: number;
   high: number;
   low: number;
   close: number;
-  volume: number;
+  volume?: number;
 };
 
 function lastN<T>(arr: T[], n: number): T[] {
@@ -58,9 +58,11 @@ export function computeVWAP(bars: OHLCVBar[], period: number): number | undefine
   let pv = 0;
   let v = 0;
   for (const b of window) {
+    const vol = b.volume ?? 0;
+    if (vol <= 0) continue;
     const typical = (b.high + b.low + b.close) / 3;
-    pv += typical * b.volume;
-    v += b.volume;
+    pv += typical * vol;
+    v += vol;
   }
   if (v <= 0) return undefined;
   return pv / v;
