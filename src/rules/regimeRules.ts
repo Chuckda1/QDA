@@ -65,8 +65,11 @@ export function vwapSlopeFromHistory(
   const diff = currentVWAP - pastVWAP;
   const diffPct = pastVWAP !== 0 ? (diff / pastVWAP) * 100 : 0;
 
-  // Threshold: 0.1% change to consider slope meaningful
-  const threshold = 0.1;
+  // Threshold: 0.02% change to consider slope meaningful.
+  // On SPY intraday, 0.1% over ~10 minutes is ~0.70 points and is far too strict,
+  // causing almost everything to classify as FLAT → CHOP. 0.02% (~0.14 points at 700)
+  // is still conservative but allows regimes to register during real moves.
+  const threshold = 0.02;
   let slope: "UP" | "DOWN" | "FLAT";
   if (diffPct > threshold) {
     slope = "UP";

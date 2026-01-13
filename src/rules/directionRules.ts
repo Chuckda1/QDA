@@ -103,15 +103,38 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   }
 
   // Evidence thresholds
+  //
+  // Base logic is intentionally strict to avoid "direction" in chop, but
+  // real intraday moves often present with strong slope while candle-ratio
+  // is only ~55-60% due to wicks/mean-reversion bars. When slope is strong
+  // AND VWAP/EMA alignment agrees, we relax the candle-ratio requirement.
+  const baseCandleRatio = 0.65;
+  const strongSlopeAtr = 1.2;
+  const strongSlopePct = 0.30;
+  const strongCandleRatio = 0.55;
+
+  const vwapAlignedBear = vwap30 !== undefined ? lastClose < vwap30 : true;
+  const vwapAlignedBull = vwap30 !== undefined ? lastClose > vwap30 : true;
+
+  const isStrongBearMove =
+    slopeAtr !== undefined ? slopeAtr <= -strongSlopeAtr : slopePct <= -strongSlopePct;
+  const isStrongBullMove =
+    slopeAtr !== undefined ? slopeAtr >= strongSlopeAtr : slopePct >= strongSlopePct;
+
+  const requiredBearRatio = isStrongBearMove && vwapAlignedBear && emaBear ? strongCandleRatio : baseCandleRatio;
+  const requiredBullRatio = isStrongBullMove && vwapAlignedBull && emaBull ? strongCandleRatio : baseCandleRatio;
+
   const bearishEvidence =
     (slopeAtr !== undefined ? slopeAtr <= -0.6 : slopePct <= -0.15) &&
-    redRatio >= 0.65 &&
-    (emaBear !== false);
+    redRatio >= requiredBearRatio &&
+    (emaBear !== false) &&
+    vwapAlignedBear;
 
   const bullishEvidence =
     (slopeAtr !== undefined ? slopeAtr >= 0.6 : slopePct >= 0.15) &&
-    greenRatio >= 0.65 &&
-    (emaBull !== false);
+    greenRatio >= requiredBullRatio &&
+    (emaBull !== false) &&
+    vwapAlignedBull;
 
   let direction: Direction | undefined;
   if (bearishEvidence && !bullishEvidence) {
@@ -157,7 +180,8 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
     } else {
       reasons.push(`slope=${slopePct.toFixed(2)}% (need |slope| >= 0.15%)`);
     }
-    reasons.push(`greenRatio=${(greenRatio * 100).toFixed(0)}% redRatio=${(redRatio * 100).toFixed(0)}% (need >= 65%)`);
+    const needPct = Math.round(baseCandleRatio * 100);
+    reasons.push(`greenRatio=${(greenRatio * 100).toFixed(0)}% redRatio=${(redRatio * 100).toFixed(0)}% (need >= ${needPct}%)`);
     if (emaBull === false && emaBear === false) {
       reasons.push("EMA alignment unclear");
     }
