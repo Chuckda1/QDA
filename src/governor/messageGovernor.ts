@@ -125,11 +125,11 @@ export class MessageGovernor {
       return false;
     }
 
-    // In ACTIVE mode: allow all trading events, but NEVER heartbeats
+    // In ACTIVE mode: allow all trading events, but NEVER pulse/telemetry events
     if (this.mode === "ACTIVE") {
-      // Heartbeats should never be processed as domain events.
-      // Some producers encode heartbeat as event.data.type rather than event.type.
-      if (event.data?.type === "heartbeat") {
+      // Telemetry pulses should never be processed as domain events.
+      // Some producers encode a pulse as event.data.type rather than event.type.
+      if (event.data?.type === "pulse") {
         return false;
       }
       
