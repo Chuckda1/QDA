@@ -30,6 +30,17 @@ export class CommandHandler {
       ? "⚠️ LLM disabled: missing OPENAI_API_KEY"
       : null;
 
+    // Diagnostics tail (pull-only; compact view)
+    const d = this.orch.getLastDiagnostics();
+    const diagTail = d
+      ? [
+          "🧩 DIAG (latest):",
+          `At: ${new Date(d.ts).toISOString()}  Price: ${d.close.toFixed(2)}`,
+          `Regime: ${d.regime.regime}  |  Dir: ${d.directionInference.direction ?? "N/A"} (${d.directionInference.confidence}%)`,
+          d.candidate ? `Top candidate: ${d.candidate.direction} ${d.candidate.pattern} score=${d.candidate.score.total}` : `Top candidate: none (${d.setupReason ?? "n/a"})`,
+        ].join("\n")
+      : null;
+
     return [
       "=== Bot Status (Truthful) ===",
       "",
@@ -48,7 +59,50 @@ export class CommandHandler {
       "⚙️ SYSTEM:",
       uptimeInfo,
       llmWarning,
+      "",
+      diagTail,
     ].filter(Boolean).join("\n");
+  }
+
+  async diag(): Promise<string> {
+    const d = this.orch.getLastDiagnostics();
+    if (!d) {
+      return "No diagnostics yet (waiting for enough bars).";
+    }
+
+    const lines: string[] = [];
+    lines.push("=== Diagnostics (/diag) ===");
+    lines.push(`Time: ${new Date(d.ts).toISOString()}`);
+    lines.push(`Symbol: ${d.symbol}`);
+    lines.push(`Price: ${d.close.toFixed(2)}`);
+    lines.push("");
+    lines.push("REGIME:");
+    lines.push(`- ${d.regime.regime}`);
+    lines.push(`- ${d.regime.reasons.join(" | ")}`);
+    lines.push("");
+    lines.push("DIRECTION:");
+    lines.push(`- ${d.directionInference.direction ?? "N/A"} (confidence=${d.directionInference.confidence}%)`);
+    lines.push(`- ${d.directionInference.reasons.join(" | ")}`);
+    lines.push("");
+    lines.push("SETUP:");
+    if (d.candidate) {
+      lines.push(`- Top: ${d.candidate.direction} ${d.candidate.pattern} score=${d.candidate.score.total}`);
+      lines.push(`- Entry: ${d.candidate.entryZone.low.toFixed(2)} - ${d.candidate.entryZone.high.toFixed(2)}  Stop: ${d.candidate.stop.toFixed(2)}`);
+      lines.push(`- Targets: ${d.candidate.targets.t1.toFixed(2)}, ${d.candidate.targets.t2.toFixed(2)}, ${d.candidate.targets.t3.toFixed(2)}`);
+    } else {
+      lines.push(`- None (${d.setupReason ?? "no reason"})`);
+    }
+    if (d.entryFilterWarnings?.length) {
+      lines.push("");
+      lines.push("FILTER WARNINGS:");
+      lines.push(`- ${d.entryFilterWarnings.join(" | ")}`);
+    }
+    if (d.setupDebug) {
+      lines.push("");
+      lines.push("DEBUG:");
+      lines.push(`- ${JSON.stringify(d.setupDebug)}`);
+    }
+    return lines.join("\n");
   }
 
   /**

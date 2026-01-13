@@ -204,6 +204,22 @@ export class MessagePublisher {
         ].filter(Boolean).join("\n");
       }
 
+      case "SETUP_SUMMARY": {
+        const c = event.data?.candidate;
+        if (!c) {
+          return `[${instanceId}] 🧩 SETUP SUMMARY\n${event.data?.summary ?? "No candidate"}`;
+        }
+        return [
+          `[${instanceId}] 🧩 SETUP SUMMARY (5m)`,
+          `${c.direction} ${c.symbol}  |  ${c.pattern}`,
+          `Score: ${c.score?.total ?? "n/a"}`,
+          `Trigger: $${Number.isFinite(c.triggerPrice) ? c.triggerPrice.toFixed(2) : "n/a"}`,
+          `Entry: $${c.entryZone?.low?.toFixed?.(2) ?? "n/a"} - $${c.entryZone?.high?.toFixed?.(2) ?? "n/a"}`,
+          `Stop: $${Number.isFinite(c.stop) ? c.stop.toFixed(2) : "n/a"}`,
+          event.data?.notes ? `Notes: ${event.data.notes}` : "",
+        ].filter(Boolean).join("\n");
+      }
+
       case "TRADE_PLAN":
         return [
           `[${instanceId}] 📋 TRADE PLAN`,

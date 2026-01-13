@@ -1,4 +1,4 @@
-import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
+import type { BotState, DomainEvent, Play, SetupCandidate, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
@@ -8,6 +8,20 @@ import { computeRegime } from "../rules/regimeRules.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine } from "../rules/setupEngine.js";
 import { detectStructureLLLH } from "../utils/structure.js";
+import type { RegimeResult } from "../rules/regimeRules.js";
+import type { DirectionInference } from "../rules/directionRules.js";
+
+type SetupDiagnosticsSnapshot = {
+  ts: number;
+  symbol: string;
+  close: number;
+  regime: RegimeResult;
+  directionInference: DirectionInference;
+  candidate?: SetupCandidate;
+  setupReason?: string;
+  setupDebug?: any;
+  entryFilterWarnings?: string[];
+};
 
 type TickInput = {
   ts: number;
@@ -33,6 +47,8 @@ export class Orchestrator {
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
   private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
+  private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
+  private lastSetupSummary5mTs: number | null = null;
 
   constructor(instanceId: string, llmService?: LLMService, initialState?: { activePlay?: Play | null }) {
     this.instanceId = instanceId;
@@ -52,6 +68,10 @@ export class Orchestrator {
     // Keep session "truthful" even if no market data has arrived yet.
     this.state.session = getMarketSessionLabel();
     return this.state;
+  }
+
+  getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
+    return this.lastDiagnostics;
   }
 
   setMode(mode: BotState["mode"]): void {
@@ -146,6 +166,15 @@ export class Orchestrator {
       });
 
       if (!setupResult.candidate) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime,
+          directionInference: dirInf,
+          setupReason: setupResult.reason || "unknown",
+          setupDebug: setupResult.debug,
+        };
         console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
         return events;
       }
@@ -187,6 +216,17 @@ export class Orchestrator {
       if (filterResult.warnings?.length) {
         console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
       }
+
+      this.lastDiagnostics = {
+        ts,
+        symbol,
+        close,
+        regime,
+        directionInference: dirInf,
+        candidate: setupCandidate,
+        entryFilterWarnings: filterResult.warnings,
+        setupDebug: setupResult.debug,
+      };
 
       // Prepare warnings for LLM
       const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
@@ -425,6 +465,20 @@ export class Orchestrator {
 
     // Gate 1 - If no active play → return [] (no coaching)
     if (!this.state.activePlay) {
+      // Optional low-volume push: send a 5m summary of the best current candidate.
+      // This is deliberately small and runs through the normal governor→publisher pipeline.
+      if (this.state.mode === "ACTIVE" && this.lastDiagnostics?.candidate && this.lastSetupSummary5mTs !== ts) {
+        const c = this.lastDiagnostics.candidate;
+        // Avoid spam: only send if the candidate is reasonably strong.
+        if ((c.score?.total ?? 0) >= 65) {
+          events.push(this.ev("SETUP_SUMMARY", ts, {
+            symbol: c.symbol,
+            candidate: c,
+            notes: `regime=${this.lastDiagnostics.regime.regime} dir=${this.lastDiagnostics.directionInference.direction ?? "N/A"}`,
+          }));
+          this.lastSetupSummary5mTs = ts;
+        }
+      }
       console.log(`[5m] coaching skipped (no play)`);
       return events;
     }

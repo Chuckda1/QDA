@@ -24,6 +24,15 @@ export interface SetupEngineContext {
 export interface SetupEngineResult {
   candidate?: SetupCandidate;
   reason?: string;
+  debug?: {
+    breakRetest?: Array<{
+      direction: Direction;
+      level: number;
+      broke: boolean;
+      retested: boolean;
+      reclaimed: boolean;
+    }>;
+  };
 }
 
 /**
@@ -99,6 +108,7 @@ export class SetupEngine {
   findSetup(ctx: SetupEngineContext): SetupEngineResult {
     const { ts, symbol, currentPrice, bars, regime, directionInference, indicators } = ctx;
     const baseReasons: string[] = [];
+    const debug: SetupEngineResult["debug"] = {};
 
     if (!bars || bars.length < 30) {
       return { reason: "insufficient bars for setup detection (< 30)" };
@@ -196,6 +206,8 @@ export class SetupEngine {
         }
 
         const reclaimed = direction === "LONG" ? last.close > level : last.close < level;
+        debug.breakRetest ??= [];
+        debug.breakRetest.push({ direction, level, broke, retested, reclaimed });
         if (broke && retested && reclaimed) {
           reasons.push(`breakLevel=${level.toFixed(2)} broke=${broke} retested=${retested} reclaimed=${reclaimed}`);
 
@@ -313,12 +325,12 @@ export class SetupEngine {
 
     // Select best candidate deterministically
     if (candidates.length === 0) {
-      return { reason: "no qualifying setup patterns found" };
+      return { reason: "no qualifying setup patterns found", debug };
     }
 
     // Pick best candidate by deterministic score
     candidates.sort((a, b) => b.score.total - a.score.total);
-    return { candidate: candidates[0]! };
+    return { candidate: candidates[0]!, debug };
   }
 
   /**

@@ -28,6 +28,7 @@ export type DomainEventType =
   | "TIMING_COACH"
   | "LLM_VERIFY"
   | "SCORECARD"
+  | "SETUP_SUMMARY"
   | "TRADE_PLAN"
   | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
