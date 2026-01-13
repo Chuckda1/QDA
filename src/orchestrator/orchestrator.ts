@@ -134,13 +134,6 @@ export class Orchestrator {
 
       const inferredDirection = dirInf.direction;
 
-      // Enforce regime hard-blocks (prevents LONG in BEAR momentum, etc.)
-      const regimeCheck = regimeAllowsDirection(regime.regime, inferredDirection);
-      if (!regimeCheck.allowed) {
-        console.log(`[1m] No new play: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
-        return events;
-      }
-
       // Compute lightweight indicators from recent bars (so EntryFilters actually work)
       const atr = computeATR(this.recentBars, 14);
       const closes = this.recentBars.map((b) => b.close);
@@ -166,6 +159,16 @@ export class Orchestrator {
       }
 
       const setupCandidate: SetupCandidate = setupResult.candidate;
+
+      // Regime-direction enforcement happens AFTER setup selection.
+      // Trend setups must align with regime; reversal attempts are explicitly countertrend.
+      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
+        const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
+        if (!regimeCheck.allowed) {
+          console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
+          return events;
+        }
+      }
 
       // Build entry filter context
       // Note: Indicators (VWAP, EMA, ATR, RSI) are optional - filters gracefully degrade if not available

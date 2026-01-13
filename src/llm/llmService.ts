@@ -239,6 +239,7 @@ Step 1) Determine your independent biasDirection (LONG/SHORT/NEUTRAL) using the 
 Step 2) Determine what the RULES are implying (from ruleScores).
 Step 3) Compute agreement (0-100): how aligned your bias is with the rules.
 Step 3b) Validate the RULES setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
+   - If pattern is REVERSAL_ATTEMPT (countertrend), be STRICT: default to WAIT or PASS unless the snapshot clearly shows a reversal trigger.
 Step 4) Score the setup:
  - legitimacy (0-100)
  - probability (0-100) = probability price reaches T1
