@@ -8,6 +8,7 @@ import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
+import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
@@ -165,7 +166,12 @@ bot.onText(/\/envdebug/, async () => {
 });
 
 // Startup message
-await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
+await announceStartupThrottled({
+  bot,
+  chatId,
+  instanceId,
+  text: `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`,
+});
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)
