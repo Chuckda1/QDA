@@ -179,6 +179,29 @@ export class MessagePublisher {
           `${event.data.reasoning || ""}`
         ].join("\n");
 
+      case "SCORECARD": {
+        const r = event.data.rules ?? {};
+        const l = event.data.llm ?? {};
+        const ind = r.indicators ?? {};
+        const regime = r.regime ?? {};
+        const dir = r.directionInference ?? {};
+
+        const fmtNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x.toFixed(2) : "n/a");
+        const fmtPct = (x: any) => (typeof x === "number" && Number.isFinite(x) ? `${Math.round(x)}%` : "n/a");
+
+        return [
+          `[${instanceId}] 🧾 SCORECARD`,
+          `${event.data.symbol}  Proposed: ${event.data.proposedDirection}  |  LLM Bias: ${l.biasDirection ?? "N/A"}`,
+          `Regime: ${regime.regime ?? "N/A"}  |  Structure: ${regime.structure ?? "N/A"}  |  VWAP slope: ${regime.vwapSlope ?? "N/A"}`,
+          `Rules dir: ${dir.direction ?? "N/A"} (${fmtPct(dir.confidence)})`,
+          `Ind: VWAP=${fmtNum(ind.vwap)} EMA9=${fmtNum(ind.ema9)} EMA20=${fmtNum(ind.ema20)} RSI=${fmtNum(ind.rsi14)} ATR=${fmtNum(ind.atr)}`,
+          `Agreement: ${fmtPct(l.agreement)}  |  Legitimacy: ${fmtPct(l.legitimacy)}  |  Prob(T1): ${fmtPct(l.probability)}`,
+          `Action: ${l.action ?? "N/A"}`,
+          ``,
+          `${l.reasoning ?? ""}`.trim(),
+        ].filter(Boolean).join("\n");
+      }
+
       case "TRADE_PLAN":
         return [
           `[${instanceId}] 📋 TRADE PLAN`,

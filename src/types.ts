@@ -7,6 +7,7 @@ export type DomainEventType =
   | "PLAY_ARMED"
   | "TIMING_COACH"
   | "LLM_VERIFY"
+  | "SCORECARD"
   | "TRADE_PLAN"
   | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
