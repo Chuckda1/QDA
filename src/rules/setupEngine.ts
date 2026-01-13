@@ -104,8 +104,9 @@ export class SetupEngine {
       return { reason: "insufficient bars for setup detection (< 30)" };
     }
 
-    const trendDirection = directionInference.direction;
-    if (!trendDirection) return { reason: "no direction inference" };
+    // Direction inference is advisory only; we can still generate deterministic candidates
+    // without it (LLM will approve/veto after scoring).
+    const inferredDirection = directionInference.direction;
 
     const atr = indicators.atr ?? computeATR(bars, 14);
     const closes = bars.map((b) => b.close);
@@ -116,30 +117,14 @@ export class SetupEngine {
     if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
 
-    // CHOP default is to block new setups, but allow a "momentum + alignment" override.
-    // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
-    // then break lower) that often classify as CHOP by the stricter regime gate.
+    // Regime is advisory only; do not hard-block setups here.
+    // We still annotate CHOP because it materially affects likelihood/quality.
     if (regime.regime === "CHOP") {
       const lookback = Math.min(12, closes.length);
       const first = closes[closes.length - lookback]!;
       const last = closes[closes.length - 1]!;
       const slopeAtr = (last - first) / atr;
-
-      const vwapOk = vwap !== undefined
-        ? (trendDirection === "LONG" ? currentPrice > vwap : currentPrice < vwap)
-        : true;
-
-      const emaOk = trendDirection === "LONG" ? (currentPrice > ema9 && ema9 > ema20) : (currentPrice < ema9 && ema9 < ema20);
-
-      const momentumOk = Math.abs(slopeAtr) >= 1.2;
-
-      if (!(momentumOk && vwapOk && emaOk)) {
-        return {
-          reason: `chop regime blocks setups (override needs |slope|>=1.2 ATR + VWAP/EMA alignment; got slope=${slopeAtr.toFixed(2)} ATR vwapOk=${vwapOk} emaOk=${emaOk})`
-        };
-      }
-
-      baseReasons.push(`chopOverride=true slope=${slopeAtr.toFixed(2)} ATR`);
+      baseReasons.push(`regimeNote=CHOP slope=${slopeAtr.toFixed(2)} ATR`);
     }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
@@ -167,15 +152,16 @@ export class SetupEngine {
     // Pattern 2: BREAK_RETEST (trend)
     // -------------------------
     {
-      const direction = trendDirection;
+      const directionsToTry: Direction[] = inferredDirection ? [inferredDirection] : ["LONG", "SHORT"];
 
-      // Require regime + structure alignment (hard) for trend patterns
-      const regimeAligned = (regime.regime === "BULL" && direction === "LONG") || (regime.regime === "BEAR" && direction === "SHORT");
-      const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
+      for (const direction of directionsToTry) {
+        // Alignment is used to score/annotate, not to veto.
+        const regimeAligned = (regime.regime === "BULL" && direction === "LONG") || (regime.regime === "BEAR" && direction === "SHORT");
+        const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
 
-      if (regimeAligned || structureAligned) {
         const pattern: SetupPattern = "BREAK_RETEST";
         const reasons = [...baseReasons, `pattern=${pattern}`];
+        reasons.push(`aligned(regime|structure)=${regimeAligned || structureAligned}`);
 
         const breakoutLookback = 20;
         const excludeLast = 3;
@@ -227,7 +213,10 @@ export class SetupEngine {
             const entryMid = (entryZone.low + entryZone.high) / 2;
             const targets = makeTargetsFromR(direction, entryMid, stop);
 
-            const alignment = clamp(0.7 * (directionInference.confidence ?? 50) + 0.3 * 85, 0, 100);
+            const dirMatch = inferredDirection ? (inferredDirection === direction) : true;
+            const baseConf = directionInference.confidence ?? 50;
+            const confUsed = dirMatch ? baseConf : 35;
+            const alignment = clamp(0.7 * confUsed + 0.3 * 85, 0, 100);
             const structureScore = clamp(regime.structure === "BULLISH" || regime.structure === "BEARISH" ? 85 : 60, 0, 100);
             const quality = clamp(
               75

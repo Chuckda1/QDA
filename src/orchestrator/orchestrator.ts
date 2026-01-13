@@ -4,7 +4,7 @@ import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 import { getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
-import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
+import { computeRegime } from "../rules/regimeRules.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine } from "../rules/setupEngine.js";
 import { detectStructureLLLH } from "../utils/structure.js";
@@ -124,10 +124,7 @@ export class Orchestrator {
 
       // Infer direction from recent 1m bars
       const dirInf = inferDirectionFromRecentBars(this.recentBars);
-      if (!dirInf.direction) {
-        console.log(`[1m] No direction inference: ${dirInf.reasons.join(" | ")}`);
-        return events;
-      }
+      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
 
       // Compute indicators
       const atr = computeATR(this.recentBars, 14);
@@ -155,15 +152,7 @@ export class Orchestrator {
 
       const setupCandidate = setupResult.candidate;
 
-      // Regime-direction enforcement happens AFTER setup selection.
-      // Trend setups must align with regime; reversal attempts are explicitly countertrend.
-      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
-        const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
-        if (!regimeCheck.allowed) {
-          console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
-          return events;
-        }
-      }
+      // Rules do NOT veto setups. Regime is advisory and passed to LLM as warning/context.
 
       // Run entry filters on the candidate
       const filterContext: EntryFilterContext = {
@@ -195,13 +184,11 @@ export class Orchestrator {
       };
 
       const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
-      if (!filterResult.allowed) {
-        console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
-        return events;
+      if (filterResult.warnings?.length) {
+        console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
       }
 
       // Prepare warnings for LLM
-      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
       const llmWarnings = [
         ...(filterResult.warnings ?? []),

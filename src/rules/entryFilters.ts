@@ -65,9 +65,10 @@ export class EntryFilters {
   private readonly rsiExhaustionVwapDistanceATR = 1.0;
 
   /**
-   * Check if a new play is allowed (all filters must pass)
-   * Returns false if ANY filter blocks the entry
-   * Returns warnings for filters that don't block but should inform LLM
+   * Check entry conditions for a new play.
+   *
+   * IMPORTANT: These are now advisory-only (warnings). We do NOT hard-block
+   * plays here; the LLM is the final gate to approve/veto after scoring.
    */
   canCreateNewPlay(context: EntryFilterContext): EntryFilterResult {
     const warnings: string[] = [];
@@ -75,19 +76,19 @@ export class EntryFilters {
     // Filter 1: Time-of-day cutoff
     const timeCheck = this.checkTimeOfDayCutoff(context.timestamp);
     if (!timeCheck.allowed) {
-      return timeCheck;
+      warnings.push(`FILTER (non-blocking): ${timeCheck.reason}`);
     }
 
     // Filter 2: Extended-from-mean (anti-chase)
     const meanCheck = this.checkExtendedFromMean(context);
     if (!meanCheck.allowed) {
-      return meanCheck;
+      warnings.push(`FILTER (non-blocking): ${meanCheck.reason}`);
     }
 
     // Filter 3: Impulse-then-pullback structure
     const pullbackCheck = this.checkImpulseThenPullback(context);
     if (!pullbackCheck.allowed) {
-      return pullbackCheck;
+      warnings.push(`FILTER (non-blocking): ${pullbackCheck.reason}`);
     }
 
     // Filter 4: RSI/momentum exhaustion guard (warning only, doesn't block)
@@ -98,7 +99,7 @@ export class EntryFilters {
 
     return { 
       allowed: true,
-      warnings: warnings.length > 0 ? warnings : undefined
+      warnings: warnings.length > 0 ? warnings : undefined,
     };
   }
 
