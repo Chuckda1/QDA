@@ -260,26 +260,28 @@ export class Orchestrator {
 
   /**
    * Handle 5m bars: LLM coaching loop (only if active play + entered)
+   * STAGE 3: Coaching gate - only runs if activePlay exists AND activePlay.entered === true
    */
   private async handle5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const events: DomainEvent[] = [];
-    const { ts, symbol, close } = snapshot;
+    const { ts, symbol, close, open, high, low, volume } = snapshot;
 
-    // Production sanity log: 5m bar close
+    // STAGE 3: Explicit log for 5m bar close with full bar data
     const playId = this.state.activePlay?.id || "none";
     const entered = this.state.activePlay?.entered || false;
-    console.log(`[5m] barClose ts=${ts} play=${playId} entered=${entered}`);
+    console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
-    // If no active play → return []
+    // STAGE 3: Gate 1 - If no active play → return [] (no coaching)
     if (!this.state.activePlay) {
+      console.log(`[5m] coaching skipped (no play)`);
       return events;
     }
 
     const play = this.state.activePlay;
 
-    // INVARIANT CHECK: If active play exists but not entered → return [] (no coaching yet)
+    // STAGE 3: Gate 2 - If active play exists but not entered → return [] (no coaching yet)
     if (!play.entered) {
-      console.log(`[5m] Skipping coaching - play ${play.id} not yet entered`);
+      console.log(`[5m] coaching skipped (no play or not entered)`);
       return events;
     }
 
@@ -297,8 +299,10 @@ export class Orchestrator {
       return events; // Already processed this 5m bar
     }
 
+    // STAGE 3: Coaching runs here (we've passed both gates: play exists AND entered)
     // Call LLM with rules context for pattern analysis
     if (this.llmService && !play.stopHit) {
+      const coachingStartTime = Date.now();
       try {
         // STAGE 3: Track LLM call
         this.state.lastLLMCallAt = Date.now();
@@ -365,8 +369,9 @@ export class Orchestrator {
           if (firstKey) this.llmCoachCache.delete(firstKey);
         }
 
-        // Production sanity log: coaching sent
-        console.log(`[5m] sentCoach play=${play.id} ts=${ts} action=${llmAction}`);
+        // STAGE 3: Log coaching run with latency
+        const coachingLatency = Date.now() - coachingStartTime;
+        console.log(`[5m] coaching run playId=${play.id} latencyMs=${coachingLatency}`);
 
         // Emit LLM_COACH_UPDATE only if materially changed OR cooldown expired
         // (For now, emit every 5m bar - you can add material change detection later)
@@ -412,8 +417,16 @@ export class Orchestrator {
         // (TIGHTEN_STOP would update stop level, SCALE_OUT is partial)
         
       } catch (error: any) {
-        console.error("LLM call failed:", error.message);
+        const coachingLatency = Date.now() - coachingStartTime;
+        console.error(`[5m] coaching error playId=${play.id} latencyMs=${coachingLatency} error=${error.message}`);
         // If LLM fails, continue holding (don't exit on error)
+      }
+    } else {
+      // STAGE 3: Log when coaching is skipped due to missing LLM service or stop hit
+      if (!this.llmService) {
+        console.log(`[5m] coaching skipped (LLM service not available)`);
+      } else if (play.stopHit) {
+        console.log(`[5m] coaching skipped (stop hit)`);
       }
     }
 
