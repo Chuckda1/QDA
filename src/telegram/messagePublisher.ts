@@ -185,6 +185,7 @@ export class MessagePublisher {
         const ind = r.indicators ?? {};
         const regime = r.regime ?? {};
         const dir = r.directionInference ?? {};
+        const setup = event.data.setupCandidate ?? {};
 
         const fmtNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x.toFixed(2) : "n/a");
         const fmtPct = (x: any) => (typeof x === "number" && Number.isFinite(x) ? `${Math.round(x)}%` : "n/a");
@@ -192,6 +193,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] 🧾 SCORECARD`,
           `${event.data.symbol}  Proposed: ${event.data.proposedDirection}  |  LLM Bias: ${l.biasDirection ?? "N/A"}`,
+          `Setup: ${setup.pattern ?? "N/A"}  |  Trigger: $${fmtNum(setup.triggerPrice)}  |  Stop: $${fmtNum(setup.stop)}`,
           `Regime: ${regime.regime ?? "N/A"}  |  Structure: ${regime.structure ?? "N/A"}  |  VWAP slope: ${regime.vwapSlope ?? "N/A"}`,
           `Rules dir: ${dir.direction ?? "N/A"} (${fmtPct(dir.confidence)})`,
           `Ind: VWAP=${fmtNum(ind.vwap)} EMA9=${fmtNum(ind.ema9)} EMA20=${fmtNum(ind.ema20)} RSI=${fmtNum(ind.rsi14)} ATR=${fmtNum(ind.atr)}`,

@@ -2,6 +2,26 @@ export type Direction = "LONG" | "SHORT";
 export type Regime = "BULL" | "BEAR" | "CHOP";
 export type BotMode = "QUIET" | "ACTIVE";
 export type TradeAction = "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
+export type SetupPattern = "PULLBACK_CONTINUATION" | "BREAK_RETEST" | "REVERSAL_ATTEMPT";
+
+export interface SetupCandidate {
+  id: string;
+  ts: number;
+  symbol: string;
+  direction: Direction;
+  pattern: SetupPattern;
+  triggerPrice: number;
+  entryZone: { low: number; high: number };
+  stop: number;
+  targets: { t1: number; t2: number; t3: number };
+  rationale: string[];
+  score: {
+    alignment: number; // 0-100
+    structure: number; // 0-100
+    quality: number; // 0-100
+    total: number; // 0-100
+  };
+}
 
 export type DomainEventType =
   | "PLAY_ARMED"

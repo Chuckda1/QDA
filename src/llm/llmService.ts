@@ -170,6 +170,7 @@ export class LLMService {
       volume?: number;
     }>;
     ruleScores?: RuleScores;
+    setupCandidate?: import("../types.js").SetupCandidate;
   }): Promise<LLMScorecardResponse & { followThroughProb: number }> {
     // STAGE 1: Return fallback if LLM not enabled
     if (!this.enabled) {
@@ -185,7 +186,7 @@ export class LLMService {
         flags: ["LLM_DISABLED"]
       };
     }
-    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores } = context;
+    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores, setupCandidate } = context;
     
     // Calculate risk/reward for LLM
     const entryMid = (entryZone.low + entryZone.high) / 2;
@@ -210,7 +211,9 @@ export class LLMService {
       })),
       indicators: indicatorSnapshot ?? null,
       // RULE ENGINE OUTPUTS (LLM should compare against these)
-      ruleScores: ruleScores ?? null
+      ruleScores: ruleScores ?? null,
+      // RULES SETUP CANDIDATE (levels + pattern) - LLM must validate, not invent
+      setupCandidate: setupCandidate ?? null
     }, null, 2);
 
     const prompt = `You are creating a SCORECARD for a proposed ${direction} setup on ${symbol}.
@@ -235,6 +238,7 @@ YOUR TASK:
 Step 1) Determine your independent biasDirection (LONG/SHORT/NEUTRAL) using the RAW market snapshot (recentBars + indicators).
 Step 2) Determine what the RULES are implying (from ruleScores).
 Step 3) Compute agreement (0-100): how aligned your bias is with the rules.
+Step 3b) Validate the RULES setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
 Step 4) Score the setup:
  - legitimacy (0-100)
  - probability (0-100) = probability price reaches T1
