@@ -6,8 +6,23 @@ import { getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
 import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
-import { SetupEngine } from "../rules/setupEngine.js";
+import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import { detectStructureLLLH } from "../utils/structure.js";
+import type { SetupCandidate } from "../types.js";
+import type { DirectionInference } from "../rules/directionRules.js";
+import type { RegimeResult } from "../rules/regimeRules.js";
+
+type SetupDiagnosticsSnapshot = {
+  ts: number;
+  symbol: string;
+  close: number;
+  regime: RegimeResult;
+  directionInference: DirectionInference;
+  candidate?: SetupCandidate;
+  setupReason?: string;
+  setupDebug?: any;
+  entryFilterWarnings?: string[];
+};
 
 type TickInput = {
   ts: number;
@@ -33,6 +48,8 @@ export class Orchestrator {
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
   private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
+  private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
+  private lastSetupSummary5mTs: number | null = null;
 
   constructor(instanceId: string, llmService?: LLMService, initialState?: { activePlay?: Play | null }) {
     this.instanceId = instanceId;
@@ -52,6 +69,10 @@ export class Orchestrator {
     // Keep session "truthful" even if no market data has arrived yet.
     this.state.session = getMarketSessionLabel();
     return this.state;
+  }
+
+  getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
+    return this.lastDiagnostics;
   }
 
   setMode(mode: BotState["mode"]): void {
@@ -149,6 +170,15 @@ export class Orchestrator {
       });
 
       if (!setupResult.candidate) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime,
+          directionInference: dirInf,
+          setupReason: setupResult.reason || "unknown",
+          setupDebug: setupResult.debug,
+        };
         console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
         return events;
       }
@@ -201,10 +231,36 @@ export class Orchestrator {
       };
 
       const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
+      if (filterResult.warnings?.length) {
+        console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
+      }
       if (!filterResult.allowed) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime,
+          directionInference: dirInf,
+          candidate: setupCandidate,
+          setupReason: filterResult.reason,
+          entryFilterWarnings: filterResult.warnings,
+          setupDebug: setupResult.debug,
+        };
         console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
         return events;
       }
+
+      // Update diagnostics with successful candidate
+      this.lastDiagnostics = {
+        ts,
+        symbol,
+        close,
+        regime,
+        directionInference: dirInf,
+        candidate: setupCandidate,
+        entryFilterWarnings: filterResult.warnings,
+        setupDebug: setupResult.debug,
+      };
 
       // Prepare warnings for LLM
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
@@ -442,8 +498,20 @@ export class Orchestrator {
     const entered = this.state.activePlay?.entered || false;
     console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
-    // Gate 1 - If no active play → return [] (no coaching)
+    // Gate 1 - If no active play → check for SETUP_SUMMARY
     if (!this.state.activePlay) {
+      // Emit SETUP_SUMMARY on 5m close when there's no play (and candidate is strong)
+      if (this.state.mode === "ACTIVE" && this.lastDiagnostics?.candidate && this.lastSetupSummary5mTs !== ts) {
+        const c = this.lastDiagnostics.candidate;
+        if ((c.score?.total ?? 0) >= 65) {
+          events.push(this.ev("SETUP_SUMMARY", ts, {
+            symbol: c.symbol,
+            candidate: c,
+            notes: `regime=${this.lastDiagnostics.regime.regime} dir=${this.lastDiagnostics.directionInference.direction ?? "N/A"}`,
+          }));
+          this.lastSetupSummary5mTs = ts;
+        }
+      }
       console.log(`[5m] coaching skipped (no play)`);
       return events;
     }

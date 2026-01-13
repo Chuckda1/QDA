@@ -24,6 +24,15 @@ export interface SetupEngineContext {
 export interface SetupEngineResult {
   candidate?: SetupCandidate;
   reason?: string;
+  debug?: {
+    breakRetest?: Array<{
+      direction: Direction;
+      level: number;
+      broke: boolean;
+      retested: boolean;
+      reclaimed: boolean;
+    }>;
+  };
 }
 
 /**

@@ -139,6 +139,12 @@ bot.onText(/\/status/, async () => {
   await sendTelegramMessageSafe(bot, chatId, msg);
 });
 
+bot.onText(/\/diag/, async () => {
+  await yieldNow();
+  const msg = await commands.diag();
+  await sendTelegramMessageSafe(bot, chatId, msg);
+});
+
 bot.onText(/\/enter/, async () => {
   await yieldNow();
   const msg = await commands.enter();
