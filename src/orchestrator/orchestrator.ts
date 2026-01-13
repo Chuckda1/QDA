@@ -146,8 +146,8 @@ export class Orchestrator {
       // Infer direction from recent 1m bars
       const dirInf = inferDirectionFromRecentBars(this.recentBars);
       if (!dirInf.direction) {
-        console.log(`[1m] No direction inference: ${dirInf.reasons.join(" | ")}`);
-        return events;
+        // Don't hard-block setup detection; SetupEngine can still use regime/structure patterns.
+        console.log(`[1m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
       }
 
       // Compute indicators
