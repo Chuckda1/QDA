@@ -8,6 +8,7 @@ import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
+import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
@@ -164,8 +165,13 @@ bot.onText(/\/envdebug/, async () => {
   await sendTelegramMessageSafe(bot, chatId, msg);
 });
 
-// Startup message
-await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
+// Startup message (throttled to prevent spam on restart loops)
+await announceStartupThrottled({
+  bot,
+  chatId,
+  instanceId,
+  text: `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`,
+});
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)
@@ -193,8 +199,10 @@ if (alpacaKey && alpacaSecret) {
       try {
         console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
+          // STAGE 6: In QUIET mode, skip trading decisions but continue heartbeat logging
           if (governor.getMode() !== "ACTIVE") {
-            console.log(`[${instanceId}] Skipping bar - mode is ${governor.getMode()}, not ACTIVE`);
+            // Explicit: QUIET mode skips bar processing (no trading decisions)
+            // But heartbeat logging continues (handled by separate timer)
             continue;
           }
 
@@ -240,8 +248,10 @@ if (alpacaKey && alpacaSecret) {
         // Fallback to REST API polling
         console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
+          // STAGE 6: In QUIET mode, skip trading decisions but continue heartbeat logging
           if (governor.getMode() !== "ACTIVE") {
-            console.log(`[${instanceId}] Skipping bar - mode is ${governor.getMode()}, not ACTIVE`);
+            // Explicit: QUIET mode skips bar processing (no trading decisions)
+            // But heartbeat logging continues (handled by separate timer)
             continue;
           }
 

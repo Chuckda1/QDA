@@ -60,13 +60,23 @@ function getNthSunday(year: number, month: number, n: number): number {
 }
 
 /**
+ * Get ET time parts from a date
+ */
+export function getETParts(date: Date): { hour: number; minute: number; weekday: number } {
+  const etOffset = isDSTInEffect(date) ? 4 : 5;
+  const etTime = new Date(date.getTime() - etOffset * 60 * 60 * 1000);
+  return {
+    hour: etTime.getUTCHours(),
+    minute: etTime.getUTCMinutes(),
+    weekday: date.getUTCDay() // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  };
+}
+
+/**
  * Get current ET time as hours:minutes
  */
-export function getCurrentET(): { hour: number; minute: number } {
-  const now = new Date();
-  const etOffset = isDSTInEffect(now) ? 4 : 5;
-  const etTime = new Date(now.getTime() - etOffset * 60 * 60 * 1000);
-  return { hour: etTime.getUTCHours(), minute: etTime.getUTCMinutes() };
+export function getCurrentET(): { hour: number; minute: number; weekday: number } {
+  return getETParts(new Date());
 }
 
 /**
@@ -85,4 +95,19 @@ export function isInETRange(startHour: number, startMinute: number, endHour: num
     // Wraps midnight (e.g., 16:00 to 09:24)
     return currentMinutes >= startMinutes || currentMinutes < endMinutes;
   }
+}
+
+/**
+ * RTH is used for the 09:30–16:00 ET session.
+ * OFF_HOURS covers all other times (including weekends).
+ */
+export function getMarketSessionLabel(date: Date = new Date()): "RTH" | "OFF_HOURS" {
+  const { hour, minute, weekday } = getETParts(date);
+  const isWeekday = weekday >= 1 && weekday <= 5;
+  const cur = hour * 60 + minute;
+  const rthStart = 9 * 60 + 30;
+  const rthEnd = 16 * 60;
+
+  if (isWeekday && cur >= rthStart && cur < rthEnd) return "RTH";
+  return "OFF_HOURS";
 }
