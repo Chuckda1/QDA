@@ -21,9 +21,9 @@ export class CommandHandler {
     const s = this.orch.getState();
     const fmt = (ts?: number) => (ts ? new Date(ts).toISOString() : "n/a");
 
-    // Include heartbeat info in status (but never as push message)
+    // Include runtime info in status (but never as push message)
     const uptime = Math.floor((Date.now() - s.startedAt) / 1000);
-    const heartbeatInfo = `Uptime: ${uptime}s\nMode: ${s.mode}`;
+    const runtimeInfo = `Uptime: ${uptime}s\nMode: ${s.mode}`;
 
     // STAGE 1: Show LLM warning in QUIET mode
     const llmWarning = (s.mode === "QUIET" && this.llmService && !this.llmService.isEnabled()) 
@@ -46,7 +46,7 @@ export class CommandHandler {
       s.activePlay ? `Entered: ${s.activePlay.entered ? "Yes" : "No"}` : "",
       "",
       "⚙️ SYSTEM:",
-      heartbeatInfo,
+      runtimeInfo,
       llmWarning,
     ].filter(Boolean).join("\n");
   }
