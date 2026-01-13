@@ -8,6 +8,7 @@ import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
+import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
@@ -30,7 +31,7 @@ console.log(`SYMBOLS: ${SYMBOLS}`);
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
 console.log("=================================");
 
-// STAGE 3: Structured heartbeat tracker
+// STAGE 3: Structured health tracker
 let bars1mCount = 0;
 let bars5mCount = 0;
 
@@ -45,12 +46,12 @@ function getPlayState(play: Play | null | undefined): "NONE" | "ARMED" | "ENTERE
   return "ARMED";
 }
 
-function logStructuredHeartbeat(orch: Orchestrator, governor: MessageGovernor, symbol: string): void {
+function logStructuredHealth(orch: Orchestrator, governor: MessageGovernor, symbol: string): void {
   const s = orch.getState();
   const mode = governor.getMode();
   const play = s.activePlay;
   
-  const heartbeat = {
+  const health = {
     mode,
     symbol,
     last1mTs: s.last1mTs || null,
@@ -65,7 +66,7 @@ function logStructuredHeartbeat(orch: Orchestrator, governor: MessageGovernor, s
   };
   
   // Log as single JSON line
-  console.log(`[HB] ${JSON.stringify(heartbeat)}`);
+  console.log(`[HB] ${JSON.stringify(health)}`);
   
   // Reset counters for next interval
   bars1mCount = 0;
@@ -115,15 +116,15 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
 // Start scheduler
 scheduler.start();
 
-// STAGE 3: Start structured heartbeat timer (every 60 seconds, runs in all modes)
+// STAGE 3: Start structured health timer (every 60 seconds, runs in all modes)
 const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
 setInterval(() => {
-  logStructuredHeartbeat(orch, governor, symbol);
+  logStructuredHealth(orch, governor, symbol);
 }, 60000); // 60 seconds
 
-// Log initial heartbeat immediately
+// Log initial health snapshot immediately
 setTimeout(() => {
-  logStructuredHeartbeat(orch, governor, symbol);
+  logStructuredHealth(orch, governor, symbol);
 }, 1000); // After 1 second to let everything initialize
 
 // Register commands
@@ -165,7 +166,12 @@ bot.onText(/\/envdebug/, async () => {
 });
 
 // Startup message
-await sendTelegramMessageSafe(bot, chatId, `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`);
+await announceStartupThrottled({
+  bot,
+  chatId,
+  instanceId,
+  text: `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`,
+});
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)

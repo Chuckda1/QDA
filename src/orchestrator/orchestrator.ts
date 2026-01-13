@@ -2,6 +2,7 @@ import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
+import { getMarketSessionLabel } from "../utils/timeUtils.js";
 
 type TickInput = {
   ts: number;
@@ -34,13 +35,15 @@ export class Orchestrator {
     this.entryFilters = new EntryFilters();
     this.state = {
       startedAt: Date.now(),
-      session: "RTH",
+      session: getMarketSessionLabel(),
       activePlay: null,
       mode: "QUIET"
     };
   }
 
   getState(): BotState {
+    // Keep session "truthful" even if no market data has arrived yet.
+    this.state.session = getMarketSessionLabel();
     return this.state;
   }
 
@@ -62,6 +65,7 @@ export class Orchestrator {
     const events: DomainEvent[] = [];
 
     // Update state
+    this.state.session = getMarketSessionLabel(new Date(input.ts));
     this.state.lastTickAt = input.ts;
     this.state.price = input.close;
     if (timeframe === "1m") {
