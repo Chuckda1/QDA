@@ -39,6 +39,29 @@ export interface LLMCoachingResponse {
   specificPrice?: number; // if action requires a price
 }
 
+export interface ArmedCoachingContext {
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  entryZone: { low: number; high: number };
+  currentPrice: number;
+  stop: number;
+  targets: { t1: number; t2: number; t3: number };
+  score: number;
+  grade: string;
+  confidence: number;
+  legitimacy?: number;
+  followThroughProb?: number;
+  action?: "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
+  timeSinceArmed?: number; // minutes since play was armed
+}
+
+export interface ArmedCoachingResponse {
+  commentary: string; // Commentary on setup quality and entry timing
+  entryReadiness: "WAIT" | "READY" | "CAUTION"; // Entry readiness assessment
+  reasoning: string;
+  urgency: "LOW" | "MEDIUM" | "HIGH";
+}
+
 export class LLMService {
   private apiKey: string;
   private baseUrl: string;
@@ -218,6 +241,141 @@ Respond in EXACT JSON format:
         action: "SCALP",
         reasoning: `Error calling LLM: ${error.message}. Using default values.`,
         plan: "Enter on pullback to entry zone. Tight stop. Target T1."
+      };
+    }
+  }
+
+  /**
+   * Get coaching for ARMED play (before entry)
+   * Provides commentary on setup quality and entry timing without pretending we're in a position
+   */
+  async getArmedCoaching(context: ArmedCoachingContext): Promise<ArmedCoachingResponse> {
+    // Return fallback if LLM not enabled
+    if (!this.enabled) {
+      return {
+        commentary: "LLM disabled: missing OPENAI_API_KEY. Setup looks reasonable.",
+        entryReadiness: "READY",
+        reasoning: "LLM not available - using default assessment",
+        urgency: "LOW"
+      };
+    }
+
+    const { symbol, direction, entryZone, currentPrice, stop, targets, score, grade, confidence, legitimacy, followThroughProb, action, timeSinceArmed } = context;
+    
+    // Calculate distances for context
+    const entryMid = (entryZone.low + entryZone.high) / 2;
+    const distanceToEntryZone = currentPrice < entryZone.low 
+      ? entryZone.low - currentPrice 
+      : currentPrice > entryZone.high 
+      ? currentPrice - entryZone.high 
+      : 0;
+    const inEntryZone = currentPrice >= entryZone.low && currentPrice <= entryZone.high;
+    
+    const risk = Math.abs(entryMid - stop);
+    const rewardT1 = direction === "LONG" ? targets.t1 - entryMid : entryMid - targets.t1;
+    const rrT1 = risk > 0 ? rewardT1 / risk : 0;
+
+    const prompt = `You are analyzing a ${direction} trading setup on ${symbol} that is ARMED but NOT YET ENTERED.
+
+SETUP DETAILS:
+- Score: ${score} (Grade: ${grade})
+- Confidence: ${confidence}%
+- Legitimacy: ${legitimacy ?? "N/A"}%
+- Follow-through probability: ${followThroughProb ?? "N/A"}%
+- Recommended action: ${action ?? "N/A"}
+- Entry Zone: $${entryZone.low.toFixed(2)} - $${entryZone.high.toFixed(2)}
+- Current Price: $${currentPrice.toFixed(2)}
+- Stop: $${stop.toFixed(2)}
+- Targets: T1=$${targets.t1.toFixed(2)}, T2=$${targets.t2.toFixed(2)}, T3=$${targets.t3.toFixed(2)}
+- Risk: $${risk.toFixed(2)} per share
+- Reward to T1: $${rewardT1.toFixed(2)} per share
+- R-multiple to T1: ${rrT1.toFixed(2)}R
+- Time since armed: ${timeSinceArmed ?? 0} minutes
+- Price position: ${inEntryZone ? "IN entry zone" : currentPrice < entryZone.low ? `${distanceToEntryZone.toFixed(2)} below entry zone` : `${distanceToEntryZone.toFixed(2)} above entry zone`}
+
+YOUR TASK (You are NOT in a position yet - this is pre-entry coaching):
+1. Provide commentary on setup quality and current market conditions
+2. Assess entry readiness: WAIT | READY | CAUTION
+3. Provide brief reasoning (2-3 sentences)
+4. Assess urgency: LOW | MEDIUM | HIGH
+
+Respond in EXACT JSON format:
+{
+  "commentary": "Your commentary on the setup and market conditions",
+  "entryReadiness": "WAIT|READY|CAUTION",
+  "reasoning": "Brief explanation of your assessment",
+  "urgency": "LOW|MEDIUM|HIGH"
+}`;
+
+    try {
+      console.log(`[LLM] Calling OpenAI API for ARMED coaching: ${symbol} ${direction}`);
+      const startTime = Date.now();
+      
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            {
+              role: "system",
+              content: `You are a professional day trading coach. You provide pre-entry commentary on trading setups. You are NOT managing a position - you are assessing whether to enter.`
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 300
+        })
+      });
+
+      const duration = Date.now() - startTime;
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error(`[LLM] API error (${duration}ms):`, response.status, error);
+        throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+      }
+
+      const data = await response.json();
+      const content = data.choices[0]?.message?.content || "";
+      console.log(`[LLM] ARMED coaching call successful (${duration}ms)`);
+      
+      // Parse JSON response
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            commentary: parsed.commentary || "Setup looks reasonable",
+            entryReadiness: parsed.entryReadiness || "READY",
+            reasoning: parsed.reasoning || "No reasoning provided",
+            urgency: parsed.urgency || "LOW"
+          };
+        } catch (e) {
+          console.error("[LLM] Failed to parse ARMED coaching JSON:", e);
+        }
+      }
+      
+      // Fallback
+      return {
+        commentary: "Setup analyzed. Waiting for entry signal.",
+        entryReadiness: "READY",
+        reasoning: "Setup looks reasonable based on available data",
+        urgency: "LOW"
+      };
+    } catch (error: any) {
+      console.error(`[LLM] ARMED coaching error:`, error.message);
+      return {
+        commentary: "Setup analyzed with moderate confidence",
+        entryReadiness: "READY",
+        reasoning: `Error calling LLM: ${error.message}. Using default assessment.`,
+        urgency: "LOW"
       };
     }
   }

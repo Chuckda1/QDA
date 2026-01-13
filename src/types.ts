@@ -7,6 +7,7 @@ export type DomainEventType =
   | "TIMING_COACH"
   | "LLM_VERIFY"
   | "TRADE_PLAN"
+  | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
   | "PLAY_CLOSED"
   | "PLAN_OF_DAY";
@@ -42,6 +43,7 @@ export interface Play {
   
   // tracking
   lastCoachUpdate?: number;
+  armedTimestamp?: number; // timestamp when play was armed
   entered?: boolean;  // true when position is actually entered
   entryPrice?: number; // actual entry price when entered
   entryTimestamp?: number; // timestamp when entered

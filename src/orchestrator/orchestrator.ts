@@ -23,7 +23,8 @@ export class Orchestrator {
   private llmService?: LLMService;
   private stopProfitRules: StopProfitRules;
   private entryFilters: EntryFilters;
-  private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp
+  private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
+  private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
   private recentBars: Array<{ ts: number; high: number; low: number; close: number }> = []; // For pullback detection
 
   constructor(instanceId: string, llmService?: LLMService) {
@@ -141,6 +142,7 @@ export class Orchestrator {
         legitimacy: 72, // Will be updated by LLM
         followThroughProb: 65, // Will be updated by LLM
         action: "SCALP" as TradeAction, // Will be updated by LLM
+        armedTimestamp: ts, // Track when play was armed
         entered: false
       };
       this.state.activePlay = play;
@@ -299,19 +301,20 @@ export class Orchestrator {
   }
 
   /**
-   * Handle 5m bars: LLM coaching loop (only if active play + entered)
-   * STAGE 3: Coaching gate - only runs if activePlay exists AND activePlay.entered === true
+   * Handle 5m bars: Two separate LLM coaching loops
+   * 1. ARMED_COACH: If play is ARMED but not entered (pre-entry commentary)
+   * 2. LLM_COACH_UPDATE: If play is entered (position management)
    */
   private async handle5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const events: DomainEvent[] = [];
     const { ts, symbol, close, open, high, low, volume } = snapshot;
 
-    // STAGE 3: Explicit log for 5m bar close with full bar data
+    // Explicit log for 5m bar close with full bar data
     const playId = this.state.activePlay?.id || "none";
     const entered = this.state.activePlay?.entered || false;
     console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
-    // STAGE 3: Gate 1 - If no active play → return [] (no coaching)
+    // Gate 1 - If no active play → return [] (no coaching)
     if (!this.state.activePlay) {
       console.log(`[5m] coaching skipped (no play)`);
       return events;
@@ -319,11 +322,103 @@ export class Orchestrator {
 
     const play = this.state.activePlay;
 
-    // STAGE 3: Gate 2 - If active play exists but not entered → return [] (no coaching yet)
+    // Branch: ARMED (not entered) vs ENTERED
     if (!play.entered) {
-      console.log(`[5m] coaching skipped (no play or not entered)`);
-      return events;
+      // Path 1: ARMED_COACH - Pre-entry commentary
+      return await this.handleArmedCoaching(snapshot, play, events);
+    } else {
+      // Path 2: LLM_COACH_UPDATE - Position management
+      return await this.handleManageCoaching(snapshot, play, events);
     }
+  }
+
+  /**
+   * Handle ARMED coaching (play exists but not entered)
+   * Provides pre-entry commentary without pretending we're in a position
+   */
+  private async handleArmedCoaching(snapshot: TickSnapshot, play: Play, events: DomainEvent[]): Promise<DomainEvent[]> {
+    const { ts, symbol, close } = snapshot;
+
+    // Check cache: armedCoachCacheKey = playId + "_armed_" + snapshot.ts
+    const cacheKey = `${play.id}_armed_${ts}`;
+    
+    // Call LLM once per 5m bar (cache by barTs)
+    if (this.llmArmedCoachCache.has(cacheKey)) {
+      return events; // Already processed this 5m bar
+    }
+
+    if (this.llmService && !play.stopHit) {
+      const coachingStartTime = Date.now();
+      try {
+        this.state.lastLLMCallAt = Date.now();
+        
+        // Calculate time since armed
+        const armedTimestamp = play.armedTimestamp || ts;
+        const timeSinceArmed = Math.floor((ts - armedTimestamp) / 60000);
+
+        const armedResponse = await this.llmService.getArmedCoaching({
+          symbol: play.symbol,
+          direction: play.direction,
+          entryZone: play.entryZone,
+          currentPrice: close,
+          stop: play.stop,
+          targets: play.targets,
+          score: play.score,
+          grade: play.grade,
+          confidence: play.confidence,
+          legitimacy: play.legitimacy,
+          followThroughProb: play.followThroughProb,
+          action: play.action,
+          timeSinceArmed
+        });
+
+        this.state.lastLLMDecision = `ARMED_COACH:${armedResponse.entryReadiness}`;
+
+        // Cache this call
+        this.llmArmedCoachCache.set(cacheKey, Date.now());
+        
+        // Clean old cache entries (keep last 10)
+        if (this.llmArmedCoachCache.size > 10) {
+          const firstKey = this.llmArmedCoachCache.keys().next().value;
+          if (firstKey) this.llmArmedCoachCache.delete(firstKey);
+        }
+
+        const coachingLatency = Date.now() - coachingStartTime;
+        console.log(`[5m] ARMED coaching run playId=${play.id} latencyMs=${coachingLatency}`);
+
+        // Emit ARMED_COACH event
+        events.push(this.ev("ARMED_COACH", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          price: close,
+          commentary: armedResponse.commentary,
+          entryReadiness: armedResponse.entryReadiness,
+          reasoning: armedResponse.reasoning,
+          urgency: armedResponse.urgency
+        }));
+        
+      } catch (error: any) {
+        const coachingLatency = Date.now() - coachingStartTime;
+        console.error(`[5m] ARMED coaching error playId=${play.id} latencyMs=${coachingLatency} error=${error.message}`);
+      }
+    } else {
+      if (!this.llmService) {
+        console.log(`[5m] ARMED coaching skipped (LLM service not available)`);
+      } else if (play.stopHit) {
+        console.log(`[5m] ARMED coaching skipped (stop hit)`);
+      }
+    }
+
+    return events;
+  }
+
+  /**
+   * Handle MANAGE coaching (play is entered - position management)
+   * This is the existing LLM_COACH_UPDATE logic
+   */
+  private async handleManageCoaching(snapshot: TickSnapshot, play: Play, events: DomainEvent[]): Promise<DomainEvent[]> {
+    const { ts, symbol, close } = snapshot;
 
     // Build telemetry packet (rules math)
     const entryPrice = play.entryPrice ?? (play.entryZone.low + (play.entryZone.high - play.entryZone.low) / 2);
