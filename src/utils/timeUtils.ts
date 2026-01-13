@@ -2,6 +2,8 @@
  * Convert ET (Eastern Time) to UTC timestamp
  * Handles EST (UTC-5) and EDT (UTC-4) automatically based on date
  */
+const ET_TIME_ZONE = "America/New_York";
+
 export function etToUtcTimestamp(etHour: number, etMinute: number, date: Date = new Date()): number {
   const year = date.getUTCFullYear();
   const month = date.getUTCMonth();
@@ -59,14 +61,63 @@ function getNthSunday(year: number, month: number, n: number): number {
   return 31;
 }
 
+function getETParts(date: Date): { hour: number; minute: number; weekday: number } {
+  // Use IANA timezone to avoid DST/offset bugs on servers running in UTC.
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    weekday: "short",
+  });
+
+  const parts = dtf.formatToParts(date);
+  const hourStr = parts.find((p) => p.type === "hour")?.value;
+  const minuteStr = parts.find((p) => p.type === "minute")?.value;
+  const weekdayStr = parts.find((p) => p.type === "weekday")?.value;
+
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+
+  // Map "Sun".."Sat" -> 0..6
+  const weekdayMap: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+  const weekday = weekdayStr ? (weekdayMap[weekdayStr] ?? new Date(date).getDay()) : new Date(date).getDay();
+
+  return {
+    hour: Number.isFinite(hour) ? hour : 0,
+    minute: Number.isFinite(minute) ? minute : 0,
+    weekday,
+  };
+}
+
 /**
  * Get current ET time as hours:minutes
  */
-export function getCurrentET(): { hour: number; minute: number } {
-  const now = new Date();
-  const etOffset = isDSTInEffect(now) ? 4 : 5;
-  const etTime = new Date(now.getTime() - etOffset * 60 * 60 * 1000);
-  return { hour: etTime.getUTCHours(), minute: etTime.getUTCMinutes() };
+export function getCurrentET(): { hour: number; minute: number; weekday: number } {
+  return getETParts(new Date());
+}
+
+/**
+ * RTH is used for the 09:30–16:00 ET session.
+ * OFF_HOURS covers all other times (including weekends).
+ */
+export function getMarketSessionLabel(date: Date = new Date()): "RTH" | "OFF_HOURS" {
+  const { hour, minute, weekday } = getETParts(date);
+  const isWeekday = weekday >= 1 && weekday <= 5;
+  const cur = hour * 60 + minute;
+  const rthStart = 9 * 60 + 30;
+  const rthEnd = 16 * 60;
+
+  if (isWeekday && cur >= rthStart && cur < rthEnd) return "RTH";
+  return "OFF_HOURS";
 }
 
 /**
