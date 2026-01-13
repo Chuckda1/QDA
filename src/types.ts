@@ -1,4 +1,5 @@
 export type Direction = "LONG" | "SHORT";
+export type Regime = "BULL" | "BEAR" | "CHOP";
 export type BotMode = "QUIET" | "ACTIVE";
 export type TradeAction = "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
 

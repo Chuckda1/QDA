@@ -32,6 +32,8 @@ export interface EntryFilterContext {
     high: number;
     low: number;
     close: number;
+    open?: number;
+    volume?: number;
   }>;
 }
 
