@@ -6,6 +6,7 @@
  */
 
 import type { Direction } from "../types.js";
+import { getETClock } from "../utils/timeUtils.js";
 
 export interface IndicatorData {
   vwap?: number;
@@ -105,12 +106,7 @@ export class EntryFilters {
    * Still allows management + exits after cutoff
    */
   private checkTimeOfDayCutoff(timestamp: number): EntryFilterResult {
-    // Convert timestamp to ET time
-    const date = new Date(timestamp);
-    const etOffset = this.isDSTInEffect(date) ? 4 : 5; // EDT = UTC-4, EST = UTC-5
-    const etTime = new Date(date.getTime() - etOffset * 60 * 60 * 1000);
-    const hour = etTime.getUTCHours();
-    const minute = etTime.getUTCMinutes();
+    const { hour, minute } = getETClock(new Date(timestamp));
     
     const currentMinutes = hour * 60 + minute;
     const cutoffMinutes = this.cutoffHour * 60 + this.cutoffMinute;
@@ -123,48 +119,6 @@ export class EntryFilters {
     }
 
     return { allowed: true };
-  }
-
-  /**
-   * Check if DST is in effect for a given date
-   */
-  private isDSTInEffect(date: Date): boolean {
-    const year = date.getUTCFullYear();
-    const month = date.getUTCMonth();
-    const day = date.getUTCDate();
-    
-    // DST: 2nd Sunday in March to 1st Sunday in November
-    if (month < 2 || month > 10) return false; // Jan, Feb, Dec = EST
-    if (month > 2 && month < 10) return true; // Apr-Oct = EDT
-    
-    if (month === 2) { // March
-      // 2nd Sunday
-      const secondSunday = this.getNthSunday(year, 2, 2);
-      return day >= secondSunday;
-    }
-    
-    if (month === 10) { // November
-      // 1st Sunday
-      const firstSunday = this.getNthSunday(year, 10, 1);
-      return day < firstSunday;
-    }
-    
-    return false;
-  }
-
-  /**
-   * Find the nth Sunday of the month
-   */
-  private getNthSunday(year: number, month: number, n: number): number {
-    let count = 0;
-    for (let day = 1; day <= 31; day++) {
-      const date = new Date(year, month, day);
-      if (date.getDay() === 0) {
-        count++;
-        if (count === n) return day;
-      }
-    }
-    return 31;
   }
 
   /**

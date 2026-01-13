@@ -9,6 +9,8 @@ import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
 import { announceStartupThrottled } from "./utils/startupAnnounce.js";
+import { StateStore } from "./persistence/stateStore.js";
+import type { PersistedBotStateV1 } from "./persistence/persistedState.js";
 import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
@@ -76,8 +78,12 @@ function logStructuredHealth(orch: Orchestrator, governor: MessageGovernor, symb
 // Initialize Telegram
 const { bot, chatId } = initTelegram();
 
+// Load persisted state (active play + dedupe keys + plan-sent)
+const store = new StateStore(instanceId);
+const persisted = await store.load();
+
 // Initialize core components first
-const governor = new MessageGovernor();
+const governor = new MessageGovernor(persisted?.governor);
 
 // STAGE 1: Initialize LLM service (always create, but may be disabled)
 let llmService: LLMService | undefined;
@@ -99,7 +105,7 @@ try {
   console.warn("LLM service initialization error:", error.message);
 }
 
-const orch = new Orchestrator(instanceId, llmService);
+const orch = new Orchestrator(instanceId, llmService, { activePlay: persisted?.activePlay ?? null });
 const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
 
@@ -115,6 +121,18 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
 
 // Start scheduler
 scheduler.start();
+
+// Persist state periodically (best-effort)
+setInterval(() => {
+  const state: PersistedBotStateV1 = {
+    version: 1,
+    instanceId,
+    savedAt: Date.now(),
+    activePlay: orch.getState().activePlay ?? null,
+    governor: governor.exportState(),
+  };
+  store.save(state).catch((err) => console.warn(`[persist] save failed: ${err?.message || String(err)}`));
+}, 15000);
 
 // STAGE 3: Start structured health timer (every 60 seconds, runs in all modes)
 const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";

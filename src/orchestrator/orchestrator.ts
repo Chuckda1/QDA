@@ -28,7 +28,7 @@ export class Orchestrator {
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
   private recentBars: Array<{ ts: number; high: number; low: number; close: number }> = []; // For pullback detection
 
-  constructor(instanceId: string, llmService?: LLMService) {
+  constructor(instanceId: string, llmService?: LLMService, initial?: { activePlay?: Play | null }) {
     this.instanceId = instanceId;
     this.llmService = llmService;
     this.stopProfitRules = new StopProfitRules();
@@ -36,7 +36,7 @@ export class Orchestrator {
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
-      activePlay: null,
+      activePlay: initial?.activePlay ?? null,
       mode: "QUIET"
     };
   }

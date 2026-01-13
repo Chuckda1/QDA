@@ -5,7 +5,6 @@ import type { MessagePublisher } from "../telegram/messagePublisher.js";
 
 export class Scheduler {
   private checkInterval: NodeJS.Timeout | null = null;
-  private planSentToday: boolean = false;
   private lastTickTime: number = 0;
 
   constructor(
@@ -43,16 +42,9 @@ export class Scheduler {
       this.lastTickTime = now;
     }
     
-    // Reset plan flag at midnight ET
-    if (hour === 0 && minute < 5) {
-      this.planSentToday = false;
-      this.governor.resetPlanFlag();
-    }
-
     // 09:25 ET: Send Plan of Day (once per day)
-    if (hour === 9 && minute >= 25 && minute < 30 && !this.planSentToday) {
+    if (hour === 9 && minute >= 25 && minute < 30 && !this.governor.hasSentPlanToday()) {
       this.sendPlanOfDay().catch(err => console.error("Failed to send Plan of Day:", err));
-      this.planSentToday = true;
     }
 
     // Determine mode based on time
