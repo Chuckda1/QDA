@@ -246,6 +246,38 @@ export class Orchestrator {
           console.log(`[1m] Calling LLM for play verification: ${play.id}`);
           // STAGE 3: Track LLM call
           this.state.lastLLMCallAt = Date.now();
+          const recentBarsForLLM = this.recentBars.slice(-20).map((b) => ({
+            ts: b.ts,
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume
+          }));
+
+          const indicatorSnapshot = {
+            vwap,
+            ema9,
+            ema20,
+            atr,
+            rsi14,
+            vwapSlope: regime.vwapSlope,
+            structure: regime.structure
+          };
+
+          const ruleScores = {
+            regime: regime.regime,
+            directionInference: {
+              direction: dirInf.direction,
+              confidence: dirInf.confidence,
+              reasons: dirInf.reasons
+            },
+            entryFilters: {
+              warnings: filterResult.warnings ?? []
+            },
+            warnings: llmWarnings
+          };
+
           const llmVerify = await this.llmService.verifyPlaySetup({
             symbol: play.symbol,
             direction: play.direction,
@@ -256,11 +288,14 @@ export class Orchestrator {
             grade: play.grade,
             confidence: play.confidence,
             currentPrice: close,
-            warnings: llmWarnings // Pass filter + direction warnings to LLM
+            warnings: llmWarnings, // Pass filter + direction warnings to LLM
+            indicatorSnapshot,
+            recentBars: recentBarsForLLM,
+            ruleScores
           });
           
           // STAGE 3: Track LLM decision
-          this.state.lastLLMDecision = `VERIFY:${llmVerify.action}`;
+          this.state.lastLLMDecision = `SCORECARD:${llmVerify.action}`;
           
           // Update play with LLM results
           play.legitimacy = llmVerify.legitimacy;
@@ -275,6 +310,37 @@ export class Orchestrator {
             followThroughProb: llmVerify.followThroughProb,
             action: llmVerify.action,
             reasoning: llmVerify.reasoning
+          }));
+
+          // Unified scorecard event (Way 4)
+          events.push(this.ev("SCORECARD", ts, {
+            playId: play.id,
+            symbol: play.symbol,
+            proposedDirection: play.direction,
+            rules: {
+              regime: {
+                regime: regime.regime,
+                vwap: indicatorSnapshot.vwap,
+                vwapSlope: indicatorSnapshot.vwapSlope,
+                structure: indicatorSnapshot.structure
+              },
+              directionInference: {
+                direction: dirInf.direction,
+                confidence: dirInf.confidence,
+                reasons: dirInf.reasons
+              },
+              indicators: indicatorSnapshot,
+              ruleScores
+            },
+            llm: {
+              biasDirection: llmVerify.biasDirection,
+              agreement: llmVerify.agreement,
+              legitimacy: llmVerify.legitimacy,
+              probability: llmVerify.probability,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning,
+              flags: llmVerify.flags
+            }
           }));
 
           events.push(this.ev("TRADE_PLAN", ts, {
