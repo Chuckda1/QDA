@@ -106,7 +106,6 @@ export class SetupEngine {
 
     const trendDirection = directionInference.direction;
     if (!trendDirection) return { reason: "no direction inference" };
-    if (regime.regime === "CHOP") return { reason: "chop regime blocks setups" };
 
     const atr = indicators.atr ?? computeATR(bars, 14);
     const closes = bars.map((b) => b.close);
@@ -116,6 +115,32 @@ export class SetupEngine {
 
     if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
+
+    // CHOP default is to block new setups, but allow a "momentum + alignment" override.
+    // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
+    // then break lower) that often classify as CHOP by the stricter regime gate.
+    if (regime.regime === "CHOP") {
+      const lookback = Math.min(12, closes.length);
+      const first = closes[closes.length - lookback]!;
+      const last = closes[closes.length - 1]!;
+      const slopeAtr = (last - first) / atr;
+
+      const vwapOk = vwap !== undefined
+        ? (trendDirection === "LONG" ? currentPrice > vwap : currentPrice < vwap)
+        : true;
+
+      const emaOk = trendDirection === "LONG" ? (currentPrice > ema9 && ema9 > ema20) : (currentPrice < ema9 && ema9 < ema20);
+
+      const momentumOk = Math.abs(slopeAtr) >= 1.2;
+
+      if (!(momentumOk && vwapOk && emaOk)) {
+        return {
+          reason: `chop regime blocks setups (override needs |slope|>=1.2 ATR + VWAP/EMA alignment; got slope=${slopeAtr.toFixed(2)} ATR vwapOk=${vwapOk} emaOk=${emaOk})`
+        };
+      }
+
+      baseReasons.push(`chopOverride=true slope=${slopeAtr.toFixed(2)} ATR`);
+    }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
     baseReasons.push(`ema9=${ema9.toFixed(2)} ema20=${ema20.toFixed(2)} atr=${atr.toFixed(2)}`);
