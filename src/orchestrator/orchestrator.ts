@@ -71,6 +71,11 @@ export class Orchestrator {
   private readonly dataGapCooldownBars: number; // Bars to skip after gap (default 3)
   private readonly allowSyntheticBars: boolean; // Allow synthetic bars from close-only data
 
+  // LLM reliability config
+  private readonly llmTimeoutMs: number; // LLM timeout in ms (default 10s)
+  private readonly allowRulesOnlyWhenLLMDown: boolean; // Allow A-grade setups without LLM when LLM is down
+  private readonly rulesOnlyMinScore: number = 75; // Minimum score for rules-only mode
+
   // Guardrail config (from env vars with defaults)
   private readonly maxPlaysPerETDay: number;
   private readonly cooldownAfterStopMin: number;
@@ -94,6 +99,10 @@ export class Orchestrator {
     this.maxGapMs = parseInt(process.env.MAX_DATA_GAP_MS || "180000", 10); // Default 3 minutes
     this.dataGapCooldownBars = parseInt(process.env.DATA_GAP_COOLDOWN_BARS || "3", 10);
     this.allowSyntheticBars = process.env.ALLOW_SYNTHETIC_BARS === "true";
+
+    // Load LLM reliability config from env vars
+    this.llmTimeoutMs = parseInt(process.env.LLM_TIMEOUT_MS || "10000", 10); // Default 10 seconds
+    this.allowRulesOnlyWhenLLMDown = process.env.ALLOW_RULES_ONLY_WHEN_LLM_DOWN === "true";
 
     // Initialize ET day tracking
     this.currentETDay = getETDateString();
@@ -585,7 +594,8 @@ export class Orchestrator {
           console.log(`[1m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
 
-          const llmVerify = await this.llmService.verifyPlaySetup({
+          // Add timeout wrapper
+          const llmVerifyPromise = this.llmService.verifyPlaySetup({
             symbol: setupCandidate.symbol,
             direction: setupCandidate.direction,
             entryZone: setupCandidate.entryZone,
@@ -602,7 +612,62 @@ export class Orchestrator {
             setupCandidate
           });
 
-          this.state.lastLLMDecision = `VERIFY:${llmVerify.action}`;
+          // Create timeout promise
+          const timeoutPromise = new Promise<Awaited<typeof llmVerifyPromise>>((_, reject) => {
+            setTimeout(() => reject(new Error(`LLM timeout after ${this.llmTimeoutMs}ms`)), this.llmTimeoutMs);
+          });
+
+          let llmVerify: Awaited<typeof llmVerifyPromise>;
+          let llmTimedOut = false;
+          try {
+            llmVerify = await Promise.race([llmVerifyPromise, timeoutPromise]);
+          } catch (error: any) {
+            if (error.message?.includes("timeout")) {
+              llmTimedOut = true;
+              console.log(`[1m] LLM timeout after ${this.llmTimeoutMs}ms - treating as PASS (safe)`);
+              
+              // Check if we should allow rules-only mode for A-grade setups
+              if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+                console.log(`[1m] LLM down but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+                // Create a synthetic LLM response that allows the trade
+                llmVerify = {
+                  biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+                  agreement: 75,
+                  legitimacy: 70,
+                  probability: 60,
+                  action: "SCALP" as const, // Conservative action for rules-only
+                  reasoning: `LLM timeout - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+                  plan: "Rules-only trade due to LLM timeout",
+                  flags: ["LLM_TIMEOUT", "RULES_ONLY"],
+                  followThroughProb: 60,
+                };
+              } else {
+                // Timeout = PASS (safe default)
+                this.lastDiagnostics = {
+                  ts,
+                  symbol,
+                  close,
+                  regime,
+                  directionInference: dirInf,
+                  candidate: setupCandidate,
+                  setupReason: `LLM timeout: ${this.llmTimeoutMs}ms exceeded (treated as PASS)`,
+                  entryFilterWarnings: filterResult.warnings,
+                  setupDebug: setupResult.debug,
+                  regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+                    bullScore: regime.bullScore,
+                    bearScore: regime.bearScore,
+                  } : undefined,
+                };
+                this.cooldownAfterLLMPass = Date.now();
+                return events;
+              }
+            } else {
+              // Other error - rethrow
+              throw error;
+            }
+          }
+
+          this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}`;
 
           // Always emit LLM_VERIFY + SCORECARD
           events.push(this.ev("LLM_VERIFY", ts, {
@@ -672,57 +737,7 @@ export class Orchestrator {
             return events;
           }
 
-          // Create Play from approved setupCandidate
-          const play: Play = {
-            id: `play_${ts}`,
-            symbol: setupCandidate.symbol,
-            direction: setupCandidate.direction,
-            score: setupCandidate.score.total,
-            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
-            mode: "SCOUT",
-            confidence: setupCandidate.score.total,
-            entryZone: setupCandidate.entryZone,
-            stop: setupCandidate.stop,
-            targets: setupCandidate.targets,
-            legitimacy: llmVerify.legitimacy,
-            followThroughProb: llmVerify.followThroughProb,
-            action: llmVerify.action as TradeAction,
-            armedTimestamp: ts,
-            entered: false
-          };
-          this.state.activePlay = play;
-
-          // Track play arming (increment counter)
-          this.playsToday++;
-          console.log(`[Guardrails] Play armed: ${this.playsToday}/${this.maxPlaysPerETDay} plays today`);
-
-          // Emit play events
-          events.push(this.ev("PLAY_ARMED", ts, {
-            play,
-            headline: `${play.mode} PLAY ARMED`,
-          }));
-
-          events.push(this.ev("TIMING_COACH", ts, {
-            playId: play.id,
-            symbol: play.symbol,
-            direction: play.direction,
-            mode: play.mode,
-            confidence: play.confidence,
-            eligibility: "READY",
-            eligibilityReason: "entry zone active",
-            waitBars: 0,
-            llmStatus: "Approved"
-          }));
-
-          events.push(this.ev("TRADE_PLAN", ts, {
-            playId: play.id,
-            symbol: play.symbol,
-            direction: play.direction,
-            action: llmVerify.action,
-            size: llmVerify.action === "GO_ALL_IN" ? "Full position" : "1/3 position",
-            probability: llmVerify.followThroughProb,
-            plan: llmVerify.plan
-          }));
+          // Continue to play creation (below)
         } catch (error: any) {
           this.lastDiagnostics = {
             ts,
@@ -744,25 +759,349 @@ export class Orchestrator {
           return events;
         }
       } else {
-        // No LLM service - don't arm plays (require LLM approval)
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: dirInf,
-          candidate: setupCandidate,
-          setupReason: "no LLM service - setup requires LLM approval",
-          entryFilterWarnings: filterResult.warnings,
-          setupDebug: setupResult.debug,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
-        console.log(`[1m] No LLM service - setup found but requires LLM approval`);
-        return events;
+        // No LLM service - check if rules-only mode is allowed
+        if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+          console.log(`[1m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+          
+          // Create synthetic LLM response for rules-only mode
+          const llmVerify = {
+            biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+            agreement: 75,
+            legitimacy: 70,
+            probability: 60,
+            action: "SCALP" as const, // Conservative action for rules-only
+            reasoning: `No LLM service - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+            plan: "Rules-only trade due to LLM service unavailable",
+            flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
+            followThroughProb: 60,
+          };
+
+          this.state.lastLLMDecision = `VERIFY:${llmVerify.action} (rules-only)`;
+
+          // Emit events
+          events.push(this.ev("LLM_VERIFY", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            legitimacy: llmVerify.legitimacy,
+            followThroughProb: llmVerify.followThroughProb,
+            action: llmVerify.action,
+            reasoning: llmVerify.reasoning
+          }));
+
+          events.push(this.ev("SCORECARD", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            proposedDirection: setupCandidate.direction,
+            setup: {
+              pattern: setupCandidate.pattern,
+              triggerPrice: setupCandidate.triggerPrice,
+              stop: setupCandidate.stop
+            },
+            rules: {
+              regime: {
+                regime: regime.regime,
+                structure: regime.structure,
+                vwapSlope: regime.vwapSlope,
+                reasons: regime.reasons
+              },
+              directionInference: {
+                direction: dirInf.direction,
+                confidence: dirInf.confidence,
+                reasons: dirInf.reasons
+              },
+              indicators: indicatorSnapshot,
+              ruleScores
+            },
+            llm: {
+              biasDirection: llmVerify.biasDirection,
+              agreement: llmVerify.agreement,
+              legitimacy: llmVerify.legitimacy,
+              probability: llmVerify.probability,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning,
+              flags: llmVerify.flags ?? []
+            }
+          }));
+        } else {
+          // No LLM service and rules-only not allowed or setup not A-grade
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime,
+            directionInference: dirInf,
+            candidate: setupCandidate,
+            setupReason: `no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`,
+            entryFilterWarnings: filterResult.warnings,
+            setupDebug: setupResult.debug,
+            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+              bullScore: regime.bullScore,
+              bearScore: regime.bearScore,
+            } : undefined,
+          };
+          console.log(`[1m] No LLM service - setup found but requires LLM approval`);
+          return events;
+        }
       }
+
+      // Declare llmVerify outside the if/else so it's accessible for play creation
+      type LLMVerifyType = Awaited<ReturnType<NonNullable<typeof this.llmService>["verifyPlaySetup"]>>;
+      let llmVerify: LLMVerifyType | undefined;
+
+      // Call LLM BEFORE arming a play
+      if (this.llmService) {
+        try {
+          console.log(`[1m] Calling LLM for setup validation: ${setupCandidate.id}`);
+          this.state.lastLLMCallAt = Date.now();
+
+          // Add timeout wrapper
+          const llmVerifyPromise = this.llmService.verifyPlaySetup({
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            entryZone: setupCandidate.entryZone,
+            stop: setupCandidate.stop,
+            targets: setupCandidate.targets,
+            score: setupCandidate.score.total,
+            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
+            confidence: setupCandidate.score.total,
+            currentPrice: close,
+            warnings: llmWarnings,
+            indicatorSnapshot,
+            recentBars: recentBarsForLLM,
+            ruleScores,
+            setupCandidate
+          });
+
+          // Create timeout promise
+          const timeoutPromise = new Promise<Awaited<typeof llmVerifyPromise>>((_, reject) => {
+            setTimeout(() => reject(new Error(`LLM timeout after ${this.llmTimeoutMs}ms`)), this.llmTimeoutMs);
+          });
+
+          let llmTimedOut = false;
+          try {
+            llmVerify = await Promise.race([llmVerifyPromise, timeoutPromise]);
+          } catch (error: any) {
+            if (error.message?.includes("timeout")) {
+              llmTimedOut = true;
+              console.log(`[1m] LLM timeout after ${this.llmTimeoutMs}ms - treating as PASS (safe)`);
+              
+              // Check if we should allow rules-only mode for A-grade setups
+              if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+                console.log(`[1m] LLM down but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+                // Create a synthetic LLM response that allows the trade
+                llmVerify = {
+                  biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+                  agreement: 75,
+                  legitimacy: 70,
+                  probability: 60,
+                  action: "SCALP" as const, // Conservative action for rules-only
+                  reasoning: `LLM timeout - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+                  plan: "Rules-only trade due to LLM timeout",
+                  flags: ["LLM_TIMEOUT", "RULES_ONLY"],
+                  followThroughProb: 60,
+                };
+              } else {
+                // Timeout = PASS (safe default)
+                this.lastDiagnostics = {
+                  ts,
+                  symbol,
+                  close,
+                  regime,
+                  directionInference: dirInf,
+                  candidate: setupCandidate,
+                  setupReason: `LLM timeout: ${this.llmTimeoutMs}ms exceeded (treated as PASS)`,
+                  entryFilterWarnings: filterResult.warnings,
+                  setupDebug: setupResult.debug,
+                  regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+                    bullScore: regime.bullScore,
+                    bearScore: regime.bearScore,
+                  } : undefined,
+                };
+                this.cooldownAfterLLMPass = Date.now();
+                return events;
+              }
+            } else {
+              // Other error - rethrow
+              throw error;
+            }
+          }
+
+          this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}`;
+
+          // Always emit LLM_VERIFY + SCORECARD
+          events.push(this.ev("LLM_VERIFY", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            legitimacy: llmVerify.legitimacy,
+            followThroughProb: llmVerify.followThroughProb,
+            action: llmVerify.action,
+            reasoning: llmVerify.reasoning
+          }));
+
+          events.push(this.ev("SCORECARD", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            proposedDirection: setupCandidate.direction,
+            setup: {
+              pattern: setupCandidate.pattern,
+              triggerPrice: setupCandidate.triggerPrice,
+              stop: setupCandidate.stop
+            },
+            rules: {
+              regime: {
+                regime: regime.regime,
+                structure: regime.structure,
+                vwapSlope: regime.vwapSlope,
+                reasons: regime.reasons
+              },
+              directionInference: {
+                direction: dirInf.direction,
+                confidence: dirInf.confidence,
+                reasons: dirInf.reasons
+              },
+              indicators: indicatorSnapshot,
+              ruleScores
+            },
+            llm: {
+              biasDirection: llmVerify.biasDirection,
+              agreement: llmVerify.agreement,
+              legitimacy: llmVerify.legitimacy,
+              probability: llmVerify.probability,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning,
+              flags: llmVerify.flags ?? []
+            }
+          }));
+
+          // If LLM says PASS, don't arm the play and set cooldown
+          if (llmVerify.action === "PASS") {
+            this.lastDiagnostics = {
+              ts,
+              symbol,
+              close,
+              regime,
+              directionInference: dirInf,
+              candidate: setupCandidate,
+              setupReason: `LLM PASS: ${llmVerify.reasoning}`,
+              entryFilterWarnings: filterResult.warnings,
+              setupDebug: setupResult.debug,
+              regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+                bullScore: regime.bullScore,
+                bearScore: regime.bearScore,
+              } : undefined,
+            };
+            console.log(`[1m] LLM rejected setup: ${llmVerify.reasoning}`);
+            this.cooldownAfterLLMPass = Date.now();
+            return events;
+          }
+        } catch (error: any) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime,
+            directionInference: dirInf,
+            candidate: setupCandidate,
+            setupReason: `LLM error: ${error.message}`,
+            entryFilterWarnings: filterResult.warnings,
+            setupDebug: setupResult.debug,
+            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+              bullScore: regime.bullScore,
+              bearScore: regime.bearScore,
+            } : undefined,
+          };
+          console.error(`[1m] LLM verification failed:`, error.message);
+          // On error, don't arm the play (safety first)
+          return events;
+        }
+      } else {
+        // No LLM service - check if rules-only mode is allowed
+        if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+          console.log(`[1m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+          
+          // Create synthetic LLM response for rules-only mode
+          llmVerify = {
+              biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+              agreement: 75,
+              legitimacy: 70,
+              probability: 60,
+              action: "SCALP" as const, // Conservative action for rules-only
+              reasoning: `No LLM service - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+              plan: "Rules-only trade due to LLM service unavailable",
+              flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
+              followThroughProb: 60,
+            };
+
+            this.state.lastLLMDecision = `VERIFY:${llmVerify.action} (rules-only)`;
+
+            // Emit events and continue with play creation (same flow as normal LLM response)
+            events.push(this.ev("LLM_VERIFY", ts, {
+              playId: setupCandidate.id,
+              symbol: setupCandidate.symbol,
+              direction: setupCandidate.direction,
+              legitimacy: llmVerify.legitimacy,
+              followThroughProb: llmVerify.followThroughProb,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning
+            }));
+
+          events.push(this.ev("SCORECARD", ts, {
+            playId: setupCandidate.id,
+            symbol: setupCandidate.symbol,
+            proposedDirection: setupCandidate.direction,
+            setup: {
+              pattern: setupCandidate.pattern,
+              triggerPrice: setupCandidate.triggerPrice,
+              stop: setupCandidate.stop
+            },
+            rules: {
+              regime: {
+                regime: regime.regime,
+                structure: regime.structure,
+                vwapSlope: regime.vwapSlope,
+                reasons: regime.reasons
+              },
+              directionInference: {
+                direction: dirInf.direction,
+                confidence: dirInf.confidence,
+                reasons: dirInf.reasons
+              },
+              indicators: indicatorSnapshot,
+              ruleScores
+            },
+            llm: {
+              biasDirection: llmVerify.biasDirection,
+              agreement: llmVerify.agreement,
+              legitimacy: llmVerify.legitimacy,
+              probability: llmVerify.probability,
+              action: llmVerify.action,
+              reasoning: llmVerify.reasoning,
+              flags: llmVerify.flags ?? []
+            }
+          }));
+        } else {
+            // No LLM service and rules-only not allowed or setup not A-grade
+            this.lastDiagnostics = {
+              ts,
+              symbol,
+              close,
+              regime,
+              directionInference: dirInf,
+              candidate: setupCandidate,
+              setupReason: `no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`,
+              entryFilterWarnings: filterResult.warnings,
+              setupDebug: setupResult.debug,
+              regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+                bullScore: regime.bullScore,
+                bearScore: regime.bearScore,
+              } : undefined,
+            };
+            console.log(`[1m] No LLM service - setup found but requires LLM approval`);
+            return events;
+          }
+        }
 
       return events;
     }
