@@ -132,6 +132,8 @@ export class Orchestrator {
       if (this.recentBars.length > 80) this.recentBars.shift();
     }
 
+    const watchOnly = this.state.mode !== "ACTIVE";
+
     // If no active play, use SetupEngine to find a pattern
     if (!this.state.activePlay) {
       // Need at least some bar history
@@ -261,6 +263,11 @@ export class Orchestrator {
         entryFilterWarnings: filterResult.warnings,
         setupDebug: setupResult.debug,
       };
+
+      // WATCH-ONLY mode: track setups/diagnostics but never arm a play or call the LLM.
+      if (watchOnly) {
+        return events;
+      }
 
       // Prepare warnings for LLM
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
