@@ -69,14 +69,34 @@ export class CommandHandler {
     const d = this.orch.getLastDiagnostics();
     if (!d) return "No diagnostics yet (waiting for enough bars).";
 
+    const guardrailStatus = this.orch.getGuardrailStatus();
+
     const lines: string[] = [];
     lines.push("=== Diagnostics (/diag) ===");
     lines.push(`Time: ${new Date(d.ts).toISOString()}`);
     lines.push(`Symbol: ${d.symbol}`);
     lines.push(`Price: ${d.close.toFixed(2)}`);
     lines.push("");
+    lines.push("🛡️ GUARDRAILS:");
+    lines.push(`- Plays today: ${guardrailStatus.playsToday}/${guardrailStatus.maxPlaysPerETDay} (ET day: ${guardrailStatus.currentETDay})`);
+    if (guardrailStatus.cooldownAfterStop.active) {
+      lines.push(`- Cooldown after stop: ${guardrailStatus.cooldownAfterStop.remainingMin} min remaining`);
+    }
+    if (guardrailStatus.cooldownAfterLLMPass.active) {
+      lines.push(`- Cooldown after LLM PASS: ${guardrailStatus.cooldownAfterLLMPass.remainingMin} min remaining`);
+    }
+    if (guardrailStatus.cooldownAfterPlayClosed.active) {
+      lines.push(`- Cooldown after play closed: ${guardrailStatus.cooldownAfterPlayClosed.remainingMin} min remaining`);
+    }
+    if (!guardrailStatus.cooldownAfterStop.active && !guardrailStatus.cooldownAfterLLMPass.active && !guardrailStatus.cooldownAfterPlayClosed.active) {
+      lines.push(`- No active cooldowns`);
+    }
+    lines.push("");
     lines.push("REGIME:");
     lines.push(`- ${d.regime.regime}`);
+    if (d.regimeEvidence) {
+      lines.push(`- Evidence scores: bull=${d.regimeEvidence.bullScore}/3 bear=${d.regimeEvidence.bearScore}/3`);
+    }
     lines.push(`- ${d.regime.reasons.join(" | ")}`);
     lines.push("");
     lines.push("DIRECTION:");
@@ -89,7 +109,16 @@ export class CommandHandler {
       lines.push(`- Entry: ${d.candidate.entryZone.low.toFixed(2)} - ${d.candidate.entryZone.high.toFixed(2)}  Stop: ${d.candidate.stop.toFixed(2)}`);
       lines.push(`- Targets: ${d.candidate.targets.t1.toFixed(2)}, ${d.candidate.targets.t2.toFixed(2)}, ${d.candidate.targets.t3.toFixed(2)}`);
     } else {
-      lines.push(`- None (${d.setupReason ?? "no reason"})`);
+      lines.push(`- None`);
+    }
+    lines.push("");
+    lines.push("🚫 BLOCK REASON:");
+    if (d.guardrailBlock) {
+      lines.push(`- Guardrail: ${d.guardrailBlock}`);
+    } else if (d.setupReason) {
+      lines.push(`- ${d.setupReason}`);
+    } else {
+      lines.push(`- No block (setup found)`);
     }
     if (d.entryFilterWarnings?.length) {
       lines.push("");

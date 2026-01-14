@@ -23,6 +23,10 @@ type SetupDiagnosticsSnapshot = {
   setupDebug?: any;
   entryFilterWarnings?: string[];
   guardrailBlock?: string; // Reason if blocked by guardrails
+  regimeEvidence?: {
+    bullScore: number;
+    bearScore: number;
+  };
 };
 
 type TickInput = {
@@ -97,6 +101,39 @@ export class Orchestrator {
 
   getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
     return this.lastDiagnostics;
+  }
+
+  /**
+   * Get guardrail status for diagnostics
+   */
+  getGuardrailStatus(): {
+    playsToday: number;
+    maxPlaysPerETDay: number;
+    currentETDay: string;
+    cooldownAfterStop: { active: boolean; remainingMin?: number };
+    cooldownAfterLLMPass: { active: boolean; remainingMin?: number };
+    cooldownAfterPlayClosed: { active: boolean; remainingMin?: number };
+  } {
+    const now = Date.now();
+    
+    const getCooldownStatus = (cooldownTs: number | null, cooldownMin: number) => {
+      if (cooldownTs === null) return { active: false };
+      const cooldownMs = cooldownMin * 60 * 1000;
+      const remaining = Math.ceil((cooldownTs + cooldownMs - now) / 1000 / 60);
+      if (now < cooldownTs + cooldownMs) {
+        return { active: true, remainingMin: remaining };
+      }
+      return { active: false };
+    };
+
+    return {
+      playsToday: this.playsToday,
+      maxPlaysPerETDay: this.maxPlaysPerETDay,
+      currentETDay: this.currentETDay,
+      cooldownAfterStop: getCooldownStatus(this.cooldownAfterStop, this.cooldownAfterStopMin),
+      cooldownAfterLLMPass: getCooldownStatus(this.cooldownAfterLLMPass, this.cooldownAfterLLMPassMin),
+      cooldownAfterPlayClosed: getCooldownStatus(this.cooldownAfterPlayClosed, this.cooldownAfterPlayClosedMin),
+    };
   }
 
   /**
@@ -227,19 +264,34 @@ export class Orchestrator {
     if (!this.state.activePlay) {
       // Need at least some bar history
       if (this.recentBars.length < 6) {
+        const regime = computeRegime(this.recentBars, close);
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime,
+          directionInference: inferDirectionFromRecentBars(this.recentBars),
+          setupReason: "insufficient bar history (< 6 bars)",
+        };
         return events;
       }
 
       // Check guardrails before proceeding
       const guardrailCheck = this.checkGuardrails(ts);
       if (!guardrailCheck.allowed) {
+        const regime = computeRegime(this.recentBars, close);
         this.lastDiagnostics = {
           ts,
           symbol,
           close,
-          regime: computeRegime(this.recentBars, close),
+          regime,
           directionInference: inferDirectionFromRecentBars(this.recentBars),
           guardrailBlock: guardrailCheck.reason,
+          setupReason: `guardrail: ${guardrailCheck.reason}`,
+          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+            bullScore: regime.bullScore,
+            bearScore: regime.bearScore,
+          } : undefined,
         };
         console.log(`[1m] Guardrail block: ${guardrailCheck.reason}`);
         return events;
@@ -282,8 +334,12 @@ export class Orchestrator {
           close,
           regime,
           directionInference: dirInf,
-          setupReason: setupResult.reason || "unknown",
+          setupReason: setupResult.reason || "no setup pattern found",
           setupDebug: setupResult.debug,
+          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+            bullScore: regime.bullScore,
+            bearScore: regime.bearScore,
+          } : undefined,
         };
         console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
         return events;
@@ -300,6 +356,19 @@ export class Orchestrator {
 
         // Allow CHOP setups only when explicitly marked as override
         if (!regimeCheck.allowed && !(regime.regime === "CHOP" && hasChopOverride)) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime,
+            directionInference: dirInf,
+            candidate: setupCandidate,
+            setupReason: `regime gate: ${regimeCheck.reason}`,
+            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+              bullScore: regime.bullScore,
+              bearScore: regime.bearScore,
+            } : undefined,
+          };
           console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
           return events;
         }
@@ -348,9 +417,13 @@ export class Orchestrator {
           regime,
           directionInference: dirInf,
           candidate: setupCandidate,
-          setupReason: filterResult.reason,
+          setupReason: `entry filter: ${filterResult.reason}`,
           entryFilterWarnings: filterResult.warnings,
           setupDebug: setupResult.debug,
+          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+            bullScore: regime.bullScore,
+            bearScore: regime.bearScore,
+          } : undefined,
         };
         console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
         return events;
@@ -366,6 +439,10 @@ export class Orchestrator {
         candidate: setupCandidate,
         entryFilterWarnings: filterResult.warnings,
         setupDebug: setupResult.debug,
+        regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+          bullScore: regime.bullScore,
+          bearScore: regime.bearScore,
+        } : undefined,
       };
 
       // Prepare warnings for LLM
@@ -483,6 +560,21 @@ export class Orchestrator {
 
           // If LLM says PASS, don't arm the play and set cooldown
           if (llmVerify.action === "PASS") {
+            this.lastDiagnostics = {
+              ts,
+              symbol,
+              close,
+              regime,
+              directionInference: dirInf,
+              candidate: setupCandidate,
+              setupReason: `LLM PASS: ${llmVerify.reasoning}`,
+              entryFilterWarnings: filterResult.warnings,
+              setupDebug: setupResult.debug,
+              regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+                bullScore: regime.bullScore,
+                bearScore: regime.bearScore,
+              } : undefined,
+            };
             console.log(`[1m] LLM rejected setup: ${llmVerify.reasoning}`);
             this.cooldownAfterLLMPass = Date.now();
             return events;
@@ -540,12 +632,42 @@ export class Orchestrator {
             plan: llmVerify.plan
           }));
         } catch (error: any) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime,
+            directionInference: dirInf,
+            candidate: setupCandidate,
+            setupReason: `LLM error: ${error.message}`,
+            entryFilterWarnings: filterResult.warnings,
+            setupDebug: setupResult.debug,
+            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+              bullScore: regime.bullScore,
+              bearScore: regime.bearScore,
+            } : undefined,
+          };
           console.error(`[1m] LLM verification failed:`, error.message);
           // On error, don't arm the play (safety first)
           return events;
         }
       } else {
         // No LLM service - don't arm plays (require LLM approval)
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime,
+          directionInference: dirInf,
+          candidate: setupCandidate,
+          setupReason: "no LLM service - setup requires LLM approval",
+          entryFilterWarnings: filterResult.warnings,
+          setupDebug: setupResult.debug,
+          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
+            bullScore: regime.bullScore,
+            bearScore: regime.bearScore,
+          } : undefined,
+        };
         console.log(`[1m] No LLM service - setup found but requires LLM approval`);
         return events;
       }

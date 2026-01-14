@@ -9,6 +9,8 @@ export interface RegimeResult {
   vwap?: number;
   vwapSlope?: "UP" | "DOWN" | "FLAT";
   structure?: "BULLISH" | "BEARISH" | "MIXED";
+  bullScore?: number;
+  bearScore?: number;
 }
 
 export interface VWAPSlopeResult {
@@ -149,6 +151,8 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
       vwap,
       vwapSlope,
       structure,
+      bullScore,
+      bearScore,
     };
   }
 
@@ -160,6 +164,8 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
       vwap,
       vwapSlope,
       structure,
+      bullScore,
+      bearScore,
     };
   }
 
@@ -170,6 +176,8 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
     vwap,
     vwapSlope,
     structure,
+    bullScore,
+    bearScore,
   };
 }
 
