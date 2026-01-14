@@ -2,7 +2,7 @@ import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
-import { getMarketSessionLabel } from "../utils/timeUtils.js";
+import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
 import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
@@ -22,6 +22,7 @@ type SetupDiagnosticsSnapshot = {
   setupReason?: string;
   setupDebug?: any;
   entryFilterWarnings?: string[];
+  guardrailBlock?: string; // Reason if blocked by guardrails
 };
 
 type TickInput = {
@@ -51,12 +52,35 @@ export class Orchestrator {
   private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
   private lastSetupSummary5mTs: number | null = null;
 
+  // Guardrail tracking
+  private playsToday: number = 0;
+  private currentETDay: string = "";
+  private cooldownAfterStop: number | null = null;
+  private cooldownAfterLLMPass: number | null = null;
+  private cooldownAfterPlayClosed: number | null = null;
+
+  // Guardrail config (from env vars with defaults)
+  private readonly maxPlaysPerETDay: number;
+  private readonly cooldownAfterStopMin: number;
+  private readonly cooldownAfterLLMPassMin: number;
+  private readonly cooldownAfterPlayClosedMin: number;
+
   constructor(instanceId: string, llmService?: LLMService, initialState?: { activePlay?: Play | null }) {
     this.instanceId = instanceId;
     this.llmService = llmService;
     this.stopProfitRules = new StopProfitRules();
     this.entryFilters = new EntryFilters();
     this.setupEngine = new SetupEngine();
+
+    // Load guardrail config from env vars
+    this.maxPlaysPerETDay = parseInt(process.env.MAX_PLAYS_PER_ET_DAY || "3", 10);
+    this.cooldownAfterStopMin = parseInt(process.env.COOLDOWN_AFTER_STOP_MIN || "20", 10);
+    this.cooldownAfterLLMPassMin = parseInt(process.env.COOLDOWN_AFTER_LLM_PASS_MIN || "5", 10);
+    this.cooldownAfterPlayClosedMin = parseInt(process.env.COOLDOWN_AFTER_PLAY_CLOSED_MIN || "3", 10);
+
+    // Initialize ET day tracking
+    this.currentETDay = getETDateString();
+
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
@@ -73,6 +97,73 @@ export class Orchestrator {
 
   getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
     return this.lastDiagnostics;
+  }
+
+  /**
+   * Check guardrails before arming a new play
+   */
+  private checkGuardrails(ts: number): { allowed: boolean; reason?: string } {
+    const now = Date.now();
+    const currentETDay = getETDateString(new Date(ts));
+
+    // Reset counters on ET day rollover
+    if (currentETDay !== this.currentETDay) {
+      this.playsToday = 0;
+      this.currentETDay = currentETDay;
+      console.log(`[Guardrails] ET day rollover: ${currentETDay}, reset play counter`);
+    }
+
+    // Check max plays per day
+    if (this.playsToday >= this.maxPlaysPerETDay) {
+      return {
+        allowed: false,
+        reason: `max plays per day reached (${this.playsToday}/${this.maxPlaysPerETDay})`
+      };
+    }
+
+    // Check cooldown after stop
+    if (this.cooldownAfterStop !== null) {
+      const cooldownMs = this.cooldownAfterStopMin * 60 * 1000;
+      const remaining = Math.ceil((this.cooldownAfterStop + cooldownMs - now) / 1000 / 60);
+      if (now < this.cooldownAfterStop + cooldownMs) {
+        return {
+          allowed: false,
+          reason: `cooldown after stop active (${remaining} min remaining)`
+        };
+      }
+      // Cooldown expired, clear it
+      this.cooldownAfterStop = null;
+    }
+
+    // Check cooldown after LLM pass
+    if (this.cooldownAfterLLMPass !== null) {
+      const cooldownMs = this.cooldownAfterLLMPassMin * 60 * 1000;
+      const remaining = Math.ceil((this.cooldownAfterLLMPass + cooldownMs - now) / 1000 / 60);
+      if (now < this.cooldownAfterLLMPass + cooldownMs) {
+        return {
+          allowed: false,
+          reason: `cooldown after LLM pass active (${remaining} min remaining)`
+        };
+      }
+      // Cooldown expired, clear it
+      this.cooldownAfterLLMPass = null;
+    }
+
+    // Check cooldown after play closed
+    if (this.cooldownAfterPlayClosed !== null) {
+      const cooldownMs = this.cooldownAfterPlayClosedMin * 60 * 1000;
+      const remaining = Math.ceil((this.cooldownAfterPlayClosed + cooldownMs - now) / 1000 / 60);
+      if (now < this.cooldownAfterPlayClosed + cooldownMs) {
+        return {
+          allowed: false,
+          reason: `cooldown after play closed active (${remaining} min remaining)`
+        };
+      }
+      // Cooldown expired, clear it
+      this.cooldownAfterPlayClosed = null;
+    }
+
+    return { allowed: true };
   }
 
   setMode(mode: BotState["mode"]): void {
@@ -136,6 +227,21 @@ export class Orchestrator {
     if (!this.state.activePlay) {
       // Need at least some bar history
       if (this.recentBars.length < 6) {
+        return events;
+      }
+
+      // Check guardrails before proceeding
+      const guardrailCheck = this.checkGuardrails(ts);
+      if (!guardrailCheck.allowed) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime: computeRegime(this.recentBars, close),
+          directionInference: inferDirectionFromRecentBars(this.recentBars),
+          guardrailBlock: guardrailCheck.reason,
+        };
+        console.log(`[1m] Guardrail block: ${guardrailCheck.reason}`);
         return events;
       }
 
@@ -375,9 +481,10 @@ export class Orchestrator {
             }
           }));
 
-          // If LLM says PASS, don't arm the play
+          // If LLM says PASS, don't arm the play and set cooldown
           if (llmVerify.action === "PASS") {
             console.log(`[1m] LLM rejected setup: ${llmVerify.reasoning}`);
+            this.cooldownAfterLLMPass = Date.now();
             return events;
           }
 
@@ -400,6 +507,10 @@ export class Orchestrator {
             entered: false
           };
           this.state.activePlay = play;
+
+          // Track play arming (increment counter)
+          this.playsToday++;
+          console.log(`[Guardrails] Play armed: ${this.playsToday}/${this.maxPlaysPerETDay} plays today`);
 
           // Emit play events
           events.push(this.ev("PLAY_ARMED", ts, {
@@ -465,6 +576,11 @@ export class Orchestrator {
     // Check hard stop on CLOSE (only close price triggers stop, not wicks)
     if (rulesContext.stopHitOnClose && !play.stopHit) {
       play.stopHit = true;
+      // Set cooldown after stop
+      this.cooldownAfterStop = Date.now();
+      console.log(`[Guardrails] Stop hit, cooldown set for ${this.cooldownAfterStopMin} minutes`);
+      // Set cooldown after play closed
+      this.cooldownAfterPlayClosed = Date.now();
       // INVARIANT: PLAY_CLOSED must have matching active play (verified - we have play)
       events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
@@ -739,6 +855,10 @@ export class Orchestrator {
             llmAction,
             llmReasoning
           }));
+          
+          // Set cooldown after play closed
+          this.cooldownAfterPlayClosed = Date.now();
+          console.log(`[Guardrails] Play closed, cooldown set for ${this.cooldownAfterPlayClosedMin} minutes`);
           
           this.state.activePlay = null;
           return events;
