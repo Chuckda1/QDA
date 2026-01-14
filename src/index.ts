@@ -116,7 +116,7 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
     console.error("[STAGE 1] LLM DISABLED: OPENAI_API_KEY missing. LLM calls will return fallback responses.");
     llmErrorLogged = true;
   }
-});
+}, () => orch.getLastDiagnostics());
 
 // Start scheduler
 scheduler.start();
