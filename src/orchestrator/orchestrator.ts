@@ -27,6 +27,7 @@ type SetupDiagnosticsSnapshot = {
     bullScore: number;
     bearScore: number;
   };
+  datafeedIssue?: string; // Reason if blocked by datafeed issues
 };
 
 type TickInput = {
@@ -63,6 +64,13 @@ export class Orchestrator {
   private cooldownAfterLLMPass: number | null = null;
   private cooldownAfterPlayClosed: number | null = null;
 
+  // Datafeed resilience tracking
+  private lastBarTs: number | null = null;
+  private dataGapCooldown: number = 0; // Number of bars to skip after a gap
+  private readonly maxGapMs: number; // Maximum allowed gap in ms (default 3 minutes)
+  private readonly dataGapCooldownBars: number; // Bars to skip after gap (default 3)
+  private readonly allowSyntheticBars: boolean; // Allow synthetic bars from close-only data
+
   // Guardrail config (from env vars with defaults)
   private readonly maxPlaysPerETDay: number;
   private readonly cooldownAfterStopMin: number;
@@ -81,6 +89,11 @@ export class Orchestrator {
     this.cooldownAfterStopMin = parseInt(process.env.COOLDOWN_AFTER_STOP_MIN || "20", 10);
     this.cooldownAfterLLMPassMin = parseInt(process.env.COOLDOWN_AFTER_LLM_PASS_MIN || "5", 10);
     this.cooldownAfterPlayClosedMin = parseInt(process.env.COOLDOWN_AFTER_PLAY_CLOSED_MIN || "3", 10);
+
+    // Load datafeed resilience config from env vars
+    this.maxGapMs = parseInt(process.env.MAX_DATA_GAP_MS || "180000", 10); // Default 3 minutes
+    this.dataGapCooldownBars = parseInt(process.env.DATA_GAP_COOLDOWN_BARS || "3", 10);
+    this.allowSyntheticBars = process.env.ALLOW_SYNTHETIC_BARS === "true";
 
     // Initialize ET day tracking
     this.currentETDay = getETDateString();
@@ -251,13 +264,92 @@ export class Orchestrator {
     const events: DomainEvent[] = [];
     const { ts, symbol, close, high, low, open, volume } = snapshot;
 
-    // Tightened: do NOT require open/volume; default them if missing so we still infer direction/regime.
-    if (high !== undefined && low !== undefined) {
+    // Datafeed resilience: Check for time gaps
+    if (this.lastBarTs !== null) {
+      const gapMs = ts - this.lastBarTs;
+      if (gapMs > this.maxGapMs) {
+        const gapMinutes = Math.round(gapMs / 60000);
+        console.log(`[Datafeed] Time gap detected: ${gapMinutes} minutes (${gapMs}ms). Resetting recentBars and starting cooldown.`);
+        this.recentBars = []; // Reset history after gap
+        this.dataGapCooldown = this.dataGapCooldownBars;
+        this.lastBarTs = ts;
+        
+        // Set diagnostics for gap
+        if (!this.state.activePlay) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime: computeRegime(this.recentBars, close),
+            directionInference: inferDirectionFromRecentBars(this.recentBars),
+            setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
+            datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
+          };
+        }
+        return events; // Skip this bar
+      }
+    }
+
+    // Datafeed resilience: Check for missing high/low (required for OHLC)
+    if (high === undefined || low === undefined) {
+      if (this.allowSyntheticBars && close !== undefined) {
+        // Create synthetic bar from close-only data
+        const syntheticHigh = close;
+        const syntheticLow = close;
+        const safeOpen = open ?? close;
+        const safeVol = volume ?? 0;
+        console.log(`[Datafeed] Missing high/low, creating synthetic bar from close=${close} (ALLOW_SYNTHETIC_BARS=true)`);
+        this.recentBars.push({ ts, open: safeOpen, high: syntheticHigh, low: syntheticLow, close, volume: safeVol });
+        this.lastBarTs = ts;
+        if (this.dataGapCooldown > 0) this.dataGapCooldown--;
+        // Keep enough history for ATR/RSI/EMA (direction + filters)
+        if (this.recentBars.length > 80) this.recentBars.shift();
+      } else {
+        // Missing required OHLC data - log and set diagnostics
+        const missing = [];
+        if (high === undefined) missing.push("high");
+        if (low === undefined) missing.push("low");
+        console.log(`[Datafeed] Insufficient OHLC data: missing ${missing.join(", ")}. Skipping bar.`);
+        
+        if (!this.state.activePlay) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime: computeRegime(this.recentBars, close),
+            directionInference: inferDirectionFromRecentBars(this.recentBars),
+            setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
+            datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
+          };
+        }
+        return events; // Skip this bar
+      }
+    } else {
+      // Valid bar with high/low - process normally
       const safeOpen = open ?? close;
       const safeVol = volume ?? 0;
       this.recentBars.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+      this.lastBarTs = ts;
+      if (this.dataGapCooldown > 0) this.dataGapCooldown--;
       // Keep enough history for ATR/RSI/EMA (direction + filters)
       if (this.recentBars.length > 80) this.recentBars.shift();
+    }
+
+    // Skip processing during data gap cooldown
+    if (this.dataGapCooldown > 0) {
+      console.log(`[Datafeed] Data gap cooldown active: ${this.dataGapCooldown} bars remaining`);
+      if (!this.state.activePlay) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime: computeRegime(this.recentBars, close),
+          directionInference: inferDirectionFromRecentBars(this.recentBars),
+          setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
+          datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
+        };
+      }
+      return events; // Skip processing during cooldown
     }
 
     // If no active play, use SetupEngine to find a pattern

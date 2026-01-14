@@ -113,11 +113,16 @@ export class CommandHandler {
     }
     lines.push("");
     lines.push("🚫 BLOCK REASON:");
+    if (d.datafeedIssue) {
+      lines.push(`- Datafeed: ${d.datafeedIssue}`);
+    }
     if (d.guardrailBlock) {
       lines.push(`- Guardrail: ${d.guardrailBlock}`);
-    } else if (d.setupReason) {
+    }
+    if (d.setupReason && !d.datafeedIssue) {
       lines.push(`- ${d.setupReason}`);
-    } else {
+    }
+    if (!d.datafeedIssue && !d.guardrailBlock && !d.setupReason) {
       lines.push(`- No block (setup found)`);
     }
     if (d.entryFilterWarnings?.length) {
