@@ -122,6 +122,9 @@ export class SetupEngine {
     if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
 
+    // CHOP default is to block new setups, but allow a "momentum + alignment" override.
+    // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
+    // then break lower) that often classify as CHOP by the stricter regime gate.
     let chopOverride = false;
     let chopOverrideDirection: Direction | undefined = undefined;
     if (regime.regime === "CHOP") {
@@ -187,6 +190,8 @@ export class SetupEngine {
     // Pattern 2: BREAK_RETEST (trend)
     // -------------------------
     for (const direction of ["LONG", "SHORT"] as const) {
+      // Require regime OR structure alignment for trend patterns.
+      // In CHOP, allow only if we explicitly have chopOverride for that direction.
       const regimeAligned = (regime.regime === "BULL" && direction === "LONG") || (regime.regime === "BEAR" && direction === "SHORT");
       const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
       const chopAligned = chopOverride && chopOverrideDirection === direction;
@@ -194,85 +199,88 @@ export class SetupEngine {
       if (!(regimeAligned || structureAligned || chopAligned)) continue;
 
       const pattern: SetupPattern = "BREAK_RETEST";
-      const reasons = [...baseReasons, `pattern=${pattern}`];
+      const reasons = [
+        ...baseReasons,
+        `pattern=${pattern}`,
+        `aligned: regimeAligned=${regimeAligned} structureAligned=${structureAligned} chopAligned=${chopAligned}`,
+      ];
 
-        const breakoutLookback = 20;
-        const excludeLast = 3;
-        const level = direction === "LONG"
-          ? recentSwingHighExcludingTail(bars, breakoutLookback, excludeLast)
-          : recentSwingLowExcludingTail(bars, breakoutLookback, excludeLast);
+      const breakoutLookback = 20;
+      const excludeLast = 3;
+      const level = direction === "LONG"
+        ? recentSwingHighExcludingTail(bars, breakoutLookback, excludeLast)
+        : recentSwingLowExcludingTail(bars, breakoutLookback, excludeLast);
 
-        const breakBuffer = 0.10 * atr;
-        const retestTol = 0.20 * atr;
-        const window = bars.slice(-12);
-        const last = bars[bars.length - 1]!;
+      const breakBuffer = 0.10 * atr;
+      const retestTol = 0.20 * atr;
+      const window = bars.slice(-12);
+      const last = bars[bars.length - 1]!;
 
-        let broke = false;
-        let retested = false;
-        let retestExtreme = direction === "LONG" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+      let broke = false;
+      let retested = false;
+      let retestExtreme = direction === "LONG" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
 
-        for (let i = 0; i < window.length; i++) {
-          const b = window[i]!;
-          if (direction === "LONG") {
-            if (!broke && b.close > level + breakBuffer) broke = true;
-            if (broke && !retested && b.low <= level + retestTol) {
-              retested = true;
-              retestExtreme = Math.min(retestExtreme, b.low);
-            }
-          } else {
-            if (!broke && b.close < level - breakBuffer) broke = true;
-            if (broke && !retested && b.high >= level - retestTol) {
-              retested = true;
-              retestExtreme = Math.max(retestExtreme, b.high);
-            }
+      for (let i = 0; i < window.length; i++) {
+        const b = window[i]!;
+        if (direction === "LONG") {
+          if (!broke && b.close > level + breakBuffer) broke = true;
+          if (broke && !retested && b.low <= level + retestTol) {
+            retested = true;
+            retestExtreme = Math.min(retestExtreme, b.low);
           }
-        }
-
-        const reclaimed = direction === "LONG" ? last.close > level : last.close < level;
-        if (broke && retested && reclaimed) {
-          reasons.push(`breakLevel=${level.toFixed(2)} broke=${broke} retested=${retested} reclaimed=${reclaimed}`);
-
-          const triggerPrice = last.close;
-          const stop = direction === "LONG"
-            ? (Number.isFinite(retestExtreme) ? retestExtreme : recentSwingLow(bars, 8)) - 0.10 * atr
-            : (Number.isFinite(retestExtreme) ? retestExtreme : recentSwingHigh(bars, 8)) + 0.10 * atr;
-
-          const risk = Math.abs(triggerPrice - stop);
-          if (risk > 0) {
-            const entryZone = direction === "LONG"
-              ? { low: level, high: level + 0.25 * risk }
-              : { low: level - 0.25 * risk, high: level };
-
-            const entryMid = (entryZone.low + entryZone.high) / 2;
-            const targets = makeTargetsFromR(direction, entryMid, stop);
-
-            const alignment = clamp(0.7 * (directionInference.confidence ?? 50) + 0.3 * 85, 0, 100);
-            const structureScore = clamp(regime.structure === "BULLISH" || regime.structure === "BEARISH" ? 85 : 60, 0, 100);
-            const quality = clamp(
-              75
-                + (vwap !== undefined ? (direction === "LONG" ? (currentPrice >= vwap ? 5 : -8) : (currentPrice <= vwap ? 5 : -8)) : 0)
-                + (Math.abs(entryMid - ema20) <= 1.2 * atr ? 5 : -5),
-              0,
-              100
-            );
-            const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
-
-            pushCandidate({
-              id: `setup_${ts}_breakretest_${direction.toLowerCase()}`,
-              ts,
-              symbol,
-              direction,
-              pattern,
-              triggerPrice,
-              entryZone,
-              stop,
-              targets,
-              rationale: reasons,
-              score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
-            });
+        } else {
+          if (!broke && b.close < level - breakBuffer) broke = true;
+          if (broke && !retested && b.high >= level - retestTol) {
+            retested = true;
+            retestExtreme = Math.max(retestExtreme, b.high);
           }
         }
       }
+
+      const reclaimed = direction === "LONG" ? last.close > level : last.close < level;
+      if (!(broke && retested && reclaimed)) continue;
+
+      reasons.push(`breakLevel=${level.toFixed(2)} broke=${broke} retested=${retested} reclaimed=${reclaimed}`);
+
+      const triggerPrice = last.close;
+      const stop = direction === "LONG"
+        ? (Number.isFinite(retestExtreme) ? retestExtreme : recentSwingLow(bars, 8)) - 0.10 * atr
+        : (Number.isFinite(retestExtreme) ? retestExtreme : recentSwingHigh(bars, 8)) + 0.10 * atr;
+
+      const risk = Math.abs(triggerPrice - stop);
+      if (risk <= 0) continue;
+
+      const entryZone = direction === "LONG"
+        ? { low: level, high: level + 0.25 * risk }
+        : { low: level - 0.25 * risk, high: level };
+
+      const entryMid = (entryZone.low + entryZone.high) / 2;
+      const targets = makeTargetsFromR(direction, entryMid, stop);
+
+      const alignment = clamp(0.7 * (directionInference.confidence ?? 50) + 0.3 * 85, 0, 100);
+      const structureScore = clamp(regime.structure === "BULLISH" || regime.structure === "BEARISH" ? 85 : 60, 0, 100);
+      const quality = clamp(
+        75
+          + (vwap !== undefined ? (direction === "LONG" ? (currentPrice >= vwap ? 5 : -8) : (currentPrice <= vwap ? 5 : -8)) : 0)
+          + (Math.abs(entryMid - ema20) <= 1.2 * atr ? 5 : -5),
+        0,
+        100
+      );
+      const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
+
+      pushCandidate({
+        id: `setup_${ts}_breakretest_${direction.toLowerCase()}`,
+        ts,
+        symbol,
+        direction,
+        pattern,
+        triggerPrice,
+        entryZone,
+        stop,
+        targets,
+        rationale: reasons,
+        score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
+      });
     }
 
     // -------------------------
@@ -287,6 +295,9 @@ export class SetupEngine {
       const prev1 = bars[bars.length - 2]!;
       const prev2 = bars[bars.length - 3]!;
 
+      // In BEAR: look for oversold bounce attempt (LONG)
+      // In BULL: look for overbought fade attempt (SHORT)
+      // In CHOP: allow either extreme (lower confidence)
       const reversalDirections: Array<{ direction: Direction; needRsi: number }> =
         regime.regime === "BEAR"
           ? [{ direction: "LONG", needRsi: 35 }]
@@ -303,8 +314,8 @@ export class SetupEngine {
 
         const momentumTurn =
           direction === "LONG"
-            ? (prev2.close <= prev1.close && prev1.close <= last.close)
-            : (prev2.close >= prev1.close && prev1.close >= last.close);
+            ? (prev2.close <= prev1.close && prev1.close <= last.close) // 2-step higher closes
+            : (prev2.close >= prev1.close && prev1.close >= last.close); // 2-step lower closes
 
         const reclaimEma9 = direction === "LONG" ? last.close > ema9 : last.close < ema9;
 
@@ -314,7 +325,12 @@ export class SetupEngine {
 
         if (!(momentumTurn && reclaimEma9 && rsiOk)) continue;
 
-        const reversalReasons = [...reasons, `rsi14=${rsi!.toFixed(1)} turn=${momentumTurn} reclaimEma9=${reclaimEma9}`];
+        const reversalReasons = [
+          ...reasons,
+          `reversalDir=${direction}`,
+          `rsi14=${rsi!.toFixed(1)} needRsi=${needRsi}`,
+          `turn=${momentumTurn} reclaimEma9=${reclaimEma9}`,
+        ];
 
         const triggerPrice = last.close;
         const swingLookback = 12;
@@ -324,33 +340,35 @@ export class SetupEngine {
           : recentSwingHigh(bars, swingLookback) + buffer;
 
         const risk = Math.abs(triggerPrice - stop);
-        if (risk > 0) {
-          const entryLow = direction === "LONG" ? triggerPrice - 0.15 * risk : triggerPrice - 0.05 * risk;
-          const entryHigh = direction === "LONG" ? triggerPrice + 0.05 * risk : triggerPrice + 0.15 * risk;
-          const entryZone = { low: Math.min(entryLow, entryHigh), high: Math.max(entryLow, entryHigh) };
-          const entryMid = (entryZone.low + entryZone.high) / 2;
-          const targets = makeTargetsFromR(direction, entryMid, stop);
+        if (risk <= 0) continue;
 
-          const chopPenalty = regime.regime === "CHOP" ? 10 : 0;
-          const alignment = clamp(45 - chopPenalty, 0, 100);
-          const structureScore = clamp(45 - chopPenalty, 0, 100);
-          const quality = clamp(60 - chopPenalty, 0, 100);
-          const total = Math.min(65 - chopPenalty, Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality));
+        const entryLow = direction === "LONG" ? triggerPrice - 0.15 * risk : triggerPrice - 0.05 * risk;
+        const entryHigh = direction === "LONG" ? triggerPrice + 0.05 * risk : triggerPrice + 0.15 * risk;
+        const entryZone = { low: Math.min(entryLow, entryHigh), high: Math.max(entryLow, entryHigh) };
+        const entryMid = (entryZone.low + entryZone.high) / 2;
+        const targets = makeTargetsFromR(direction, entryMid, stop);
 
-          pushCandidate({
-            id: `setup_${ts}_reversal_${direction.toLowerCase()}`,
-            ts,
-            symbol,
-            direction,
-            pattern,
-            triggerPrice,
-            entryZone,
-            stop,
-            targets,
-            rationale: reversalReasons,
-            score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
-          });
-        }
+        // Cap scores lower because countertrend is inherently riskier
+        // (and even lower in CHOP).
+        const chopPenalty = regime.regime === "CHOP" ? 10 : 0;
+        const alignment = clamp(45 - chopPenalty, 0, 100);
+        const structureScore = clamp(45 - chopPenalty, 0, 100);
+        const quality = clamp(60 - chopPenalty, 0, 100);
+        const total = Math.min(65 - chopPenalty, Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality));
+
+        pushCandidate({
+          id: `setup_${ts}_reversal_${direction.toLowerCase()}`,
+          ts,
+          symbol,
+          direction,
+          pattern,
+          triggerPrice,
+          entryZone,
+          stop,
+          targets,
+          rationale: reversalReasons,
+          score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
+        });
       }
     }
 

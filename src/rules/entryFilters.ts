@@ -63,7 +63,8 @@ export class EntryFilters {
   private readonly maxPullbackATR = 1.0; // Maximum 1.0 ATR pullback (sweet spot)
 
   // RSI exhaustion guard
-  private readonly rsiExhaustionThreshold = 70;
+  private readonly rsiExhaustionLongThreshold = 70;
+  private readonly rsiExhaustionShortThreshold = 30;
   private readonly rsiExhaustionVwapDistanceATR = 1.0;
 
   /**
