@@ -1,7 +1,27 @@
-import type { BotMode } from "../types.js";
+import type { BotMode, Direction, Regime, SetupCandidate } from "../types.js";
 import { getCurrentET } from "../utils/timeUtils.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { MessagePublisher } from "../telegram/messagePublisher.js";
+
+type PlanDiagnosticsSnapshot = {
+  ts: number;
+  symbol: string;
+  close: number;
+  regime: {
+    regime: Regime;
+    reasons: string[];
+    vwapSlope?: "UP" | "DOWN" | "FLAT";
+    structure?: "BULLISH" | "BEARISH" | "MIXED";
+  };
+  directionInference: {
+    direction: Direction | undefined;
+    confidence: number;
+    reasons: string[];
+  };
+  candidate?: SetupCandidate;
+  setupReason?: string;
+  entryFilterWarnings?: string[];
+};
 
 // STAGE 6: Helper to check if DST is in effect (simplified, matches timeUtils logic)
 function isDSTInEffect(date: Date): boolean {
@@ -48,7 +68,8 @@ export class Scheduler {
     private governor: MessageGovernor,
     private publisher: MessagePublisher,
     private instanceId: string,
-    private onModeChange?: (mode: BotMode) => void
+    private onModeChange?: (mode: BotMode) => void,
+    private getLatestDiagnostics?: () => PlanDiagnosticsSnapshot | null
   ) {}
 
   start(): void {
@@ -152,12 +173,58 @@ export class Scheduler {
   }
 
   private async sendPlanOfDay(): Promise<void> {
+    const d = this.getLatestDiagnostics?.() ?? null;
+    const now = Date.now();
+
+    const fmtAge = (ts?: number) => {
+      if (!ts) return "n/a";
+      const ms = Math.max(0, now - ts);
+      const min = Math.floor(ms / 60000);
+      if (min < 1) return "<1m";
+      if (min < 60) return `${min}m`;
+      const hr = Math.floor(min / 60);
+      const rem = min % 60;
+      return `${hr}h${rem.toString().padStart(2, "0")}m`;
+    };
+
+    const fmtNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x.toFixed(2) : "n/a");
+
+    const planLines: string[] = [];
+    planLines.push("MARKET MONITOR (pre-09:30):");
+
+    if (!d) {
+      planLines.push("- No monitoring snapshot yet (need live bars to populate).");
+      planLines.push("- Plan: wait for first bars; confirm feed + regime at/after open.");
+    } else {
+      planLines.push(`- Symbol: ${d.symbol}  Last: $${fmtNum(d.close)}  Age: ${fmtAge(d.ts)}`);
+      planLines.push(`- Regime: ${d.regime.regime} (VWAP slope=${d.regime.vwapSlope ?? "n/a"} structure=${d.regime.structure ?? "n/a"})`);
+      planLines.push(`- Direction: ${d.directionInference.direction ?? "N/A"} (${Math.round(d.directionInference.confidence ?? 0)}%)`);
+
+      if (d.candidate) {
+        const c = d.candidate;
+        planLines.push(`- Top setup: ${c.direction} ${c.pattern} score=${c.score.total}`);
+        planLines.push(`  Entry: $${fmtNum(c.entryZone.low)}-$${fmtNum(c.entryZone.high)}  Stop: $${fmtNum(c.stop)}`);
+      } else {
+        planLines.push(`- Top setup: none (${d.setupReason ?? "n/a"})`);
+      }
+
+      if (d.entryFilterWarnings?.length) {
+        planLines.push(`- Warnings: ${d.entryFilterWarnings.join(" | ")}`);
+      }
+
+      planLines.push("");
+      planLines.push("PLAN:");
+      planLines.push("- At 09:30, trade ONLY when setup + filters + LLM agree.");
+      planLines.push("- If regime flips early, follow regime (don't force longs in BEAR / shorts in BULL).");
+      planLines.push("- Use /diag at open if no plays are arming to see the exact blocker.");
+    }
+
     const event = {
       type: "PLAN_OF_DAY" as const,
       timestamp: Date.now(),
       instanceId: this.instanceId,
       data: {
-        plan: "Market analysis and trade setup monitoring. Ready for active trading session."
+        plan: planLines.join("\n")
       }
     };
     // STAGE 4: All messages must go through publishOrdered for serialization
