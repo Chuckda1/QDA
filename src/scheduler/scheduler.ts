@@ -140,7 +140,7 @@ export class Scheduler {
       }
     } else if (isQuietHours) {
       if (this.governor.getMode() !== "QUIET") {
-        console.log(`[Scheduler] Switching to QUIET mode (ET: ${hour}:${minute.toString().padStart(2, '0')}) - bars skipped, health logging continues, /status works`);
+        console.log(`[Scheduler] Switching to QUIET mode (ET: ${hour}:${minute.toString().padStart(2, '0')}) - trading disabled, monitoring continues, /status works`);
         this.governor.setMode("QUIET");
         this.onModeChange?.("QUIET");
       }

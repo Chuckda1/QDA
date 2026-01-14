@@ -120,8 +120,14 @@ export class MessageGovernor {
       return true;
     }
 
-    // In QUIET mode: block everything except plan (already handled above)
+    // In QUIET mode: block everything except plan (handled above) and critical closure alerts.
     if (this.mode === "QUIET") {
+      if (event.type === "PLAY_CLOSED") {
+        const key = this.getDedupeKey(event);
+        if (this.hasDedupe(key)) return false;
+        this.markDedupe(key, event.timestamp);
+        return true;
+      }
       return false;
     }
 
