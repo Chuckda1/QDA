@@ -115,19 +115,37 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   reasons.push(...vwapInfo.reasons);
   reasons.push(...struct.reasons);
 
-  const belowVWAP = vwap !== undefined ? currentPrice < vwap : false;
-  const aboveVWAP = vwap !== undefined ? currentPrice > vwap : false;
+  // Regime should not be so strict that it collapses into CHOP during real intraday trends.
+  // We score 3 independent evidences and require 2-of-3 to classify BULL/BEAR.
+  //
+  // Evidence:
+  // 1) price relative to VWAP (if VWAP exists)
+  // 2) VWAP slope direction
+  // 3) structure (HH+HL or LH+LL)
+  let bullScore = 0;
+  let bearScore = 0;
 
-  // BEAR gate: price < VWAP AND VWAP slope DOWN AND structure BEARISH
-  const bearGate = vwap !== undefined && belowVWAP && vwapSlope === "DOWN" && structure === "BEARISH";
+  if (vwap !== undefined) {
+    if (currentPrice > vwap) bullScore += 1;
+    else if (currentPrice < vwap) bearScore += 1;
+  }
 
-  // BULL gate: price > VWAP AND VWAP slope UP AND structure BULLISH
-  const bullGate = vwap !== undefined && aboveVWAP && vwapSlope === "UP" && structure === "BULLISH";
+  if (vwapSlope === "UP") bullScore += 1;
+  else if (vwapSlope === "DOWN") bearScore += 1;
+
+  if (structure === "BULLISH") bullScore += 1;
+  else if (structure === "BEARISH") bearScore += 1;
+
+  reasons.push(`regimeEvidence: bullScore=${bullScore}/3 bearScore=${bearScore}/3`);
+
+  const bullGate = bullScore >= 2 && bullScore > bearScore;
+  const bearGate = bearScore >= 2 && bearScore > bullScore;
 
   if (bearGate) {
+    const strength = bearScore === 3 ? "strong" : "weak";
     return {
       regime: "BEAR",
-      reasons: [...reasons, "BEAR regime: price<VWAP + VWAP slope DOWN + BEARISH structure"],
+      reasons: [...reasons, `BEAR regime (${strength}): 2-of-3+ bear evidences`],
       vwap,
       vwapSlope,
       structure,
@@ -135,9 +153,10 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   }
 
   if (bullGate) {
+    const strength = bullScore === 3 ? "strong" : "weak";
     return {
       regime: "BULL",
-      reasons: [...reasons, "BULL regime: price>VWAP + VWAP slope UP + BULLISH structure"],
+      reasons: [...reasons, `BULL regime (${strength}): 2-of-3+ bull evidences`],
       vwap,
       vwapSlope,
       structure,
@@ -147,7 +166,7 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   // Default to CHOP
   return {
     regime: "CHOP",
-    reasons: [...reasons, "CHOP regime: conditions not met for BULL or BEAR"],
+    reasons: [...reasons, "CHOP regime: no 2-of-3 consensus for BULL/BEAR"],
     vwap,
     vwapSlope,
     structure,

@@ -202,7 +202,11 @@ export class EntryFilters {
     const { setupPattern, setupFlags } = context;
 
     // Skip this filter for break/breakdown style setups
-    if (setupPattern === "BREAK_RETEST" || setupFlags?.includes("CHOP_OVERRIDE")) {
+    if (
+      setupPattern === "BREAK_RETEST" ||
+      setupPattern === "REVERSAL_ATTEMPT" ||
+      setupFlags?.includes("CHOP_OVERRIDE")
+    ) {
       return { allowed: true };
     }
 
@@ -275,16 +279,12 @@ export class EntryFilters {
 
   /**
    * Filter 4: RSI / momentum exhaustion guard
-   * Warns LLM (doesn't block) if RSI(14) > 70 and price is above VWAP by > 1 ATR
-   * LLM can use this to adjust probability/legitimacy
+   * Warns LLM (doesn't block) on likely exhaustion:
+   * - LONG: RSI(14) > 70 AND price above VWAP by > 1 ATR (late long chase risk)
+   * - SHORT: RSI(14) < 30 AND price below VWAP by > 1 ATR (late short chase risk)
    */
   private checkRSIExhaustion(context: EntryFilterContext): EntryFilterResult {
     const { close, direction, indicators } = context;
-
-    // Only applies to LONG direction
-    if (direction !== "LONG") {
-      return { allowed: true };
-    }
 
     // If no indicators available, allow (graceful degradation)
     if (!indicators || !indicators.rsi14 || !indicators.vwap || !indicators.atr || indicators.atr <= 0) {
@@ -296,15 +296,29 @@ export class EntryFilters {
     const atr = indicators.atr;
 
     // Check if RSI is exhausted - warn but don't block
-    if (rsi > this.rsiExhaustionThreshold) {
-      const vwapDistance = close - vwap;
+    if (direction === "LONG" && rsi > this.rsiExhaustionLongThreshold) {
+      const vwapDistance = close - vwap; // positive if above VWAP
       const maxAllowedDistance = this.rsiExhaustionVwapDistanceATR * atr;
 
       if (vwapDistance > maxAllowedDistance) {
         return {
           allowed: true, // Don't block, just warn
           warnings: [
-            `RSI exhaustion warning: RSI(14) = ${rsi.toFixed(1)} > ${this.rsiExhaustionThreshold} and price is ${vwapDistance.toFixed(2)} above VWAP (threshold: ${maxAllowedDistance.toFixed(2)} = ${this.rsiExhaustionVwapDistanceATR} * ATR). Consider reducing probability/legitimacy due to momentum exhaustion risk.`
+            `RSI exhaustion warning (LONG): RSI(14)=${rsi.toFixed(1)} > ${this.rsiExhaustionLongThreshold} and price is ${vwapDistance.toFixed(2)} above VWAP (threshold: ${maxAllowedDistance.toFixed(2)} = ${this.rsiExhaustionVwapDistanceATR} * ATR). Consider reducing probability/legitimacy due to momentum exhaustion risk.`
+          ]
+        };
+      }
+    }
+
+    if (direction === "SHORT" && rsi < this.rsiExhaustionShortThreshold) {
+      const vwapDistance = vwap - close; // positive if below VWAP
+      const maxAllowedDistance = this.rsiExhaustionVwapDistanceATR * atr;
+
+      if (vwapDistance > maxAllowedDistance) {
+        return {
+          allowed: true, // Don't block, just warn
+          warnings: [
+            `RSI exhaustion warning (SHORT): RSI(14)=${rsi.toFixed(1)} < ${this.rsiExhaustionShortThreshold} and price is ${vwapDistance.toFixed(2)} below VWAP (threshold: ${maxAllowedDistance.toFixed(2)} = ${this.rsiExhaustionVwapDistanceATR} * ATR). Consider reducing probability/legitimacy due to capitulation / mean-reversion risk.`
           ]
         };
       }

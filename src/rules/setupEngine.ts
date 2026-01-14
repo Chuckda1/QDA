@@ -113,9 +113,6 @@ export class SetupEngine {
       return { reason: "insufficient bars for setup detection (< 30)" };
     }
 
-    const trendDirection = directionInference.direction;
-    if (!trendDirection) return { reason: "no direction inference" };
-
     const atr = indicators.atr ?? computeATR(bars, 14);
     const closes = bars.map((b) => b.close);
     const ema9 = indicators.ema9 ?? computeEMA(closes.slice(-60), 9);
@@ -125,37 +122,43 @@ export class SetupEngine {
     if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
 
-    // CHOP default is to block new setups, but allow a "momentum + alignment" override.
-    // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
-    // then break lower) that often classify as CHOP by the stricter regime gate.
     let chopOverride = false;
+    let chopOverrideDirection: Direction | undefined = undefined;
     if (regime.regime === "CHOP") {
       const lookback = Math.min(12, closes.length);
       const first = closes[closes.length - lookback]!;
       const last = closes[closes.length - 1]!;
       const slopeAtr = (last - first) / atr;
 
-      const vwapOk = vwap !== undefined
-        ? (trendDirection === "LONG" ? currentPrice > vwap : currentPrice < vwap)
-        : true;
+      const bullAligned =
+        Math.abs(slopeAtr) >= 1.2 &&
+        slopeAtr > 0 &&
+        (vwap !== undefined ? currentPrice > vwap : true) &&
+        (currentPrice > ema9 && ema9 > ema20);
 
-      const emaOk = trendDirection === "LONG" ? (currentPrice > ema9 && ema9 > ema20) : (currentPrice < ema9 && ema9 < ema20);
+      const bearAligned =
+        Math.abs(slopeAtr) >= 1.2 &&
+        slopeAtr < 0 &&
+        (vwap !== undefined ? currentPrice < vwap : true) &&
+        (currentPrice < ema9 && ema9 < ema20);
 
-      const momentumOk = Math.abs(slopeAtr) >= 1.2;
-
-      if (!(momentumOk && vwapOk && emaOk)) {
+      if (!bullAligned && !bearAligned) {
         return {
-          reason: `chop regime blocks setups (override needs |slope|>=1.2 ATR + VWAP/EMA alignment; got slope=${slopeAtr.toFixed(2)} ATR vwapOk=${vwapOk} emaOk=${emaOk})`
+          reason: `chop regime blocks setups (override needs |slope|>=1.2 ATR + VWAP/EMA alignment; got slope=${slopeAtr.toFixed(2)} ATR bullAligned=${bullAligned} bearAligned=${bearAligned})`
         };
       }
 
       chopOverride = true;
-      baseReasons.push(`chopOverride=true slope=${slopeAtr.toFixed(2)} ATR`);
+      chopOverrideDirection = bullAligned ? "LONG" : "SHORT";
+      baseReasons.push(`chopOverride=true dir=${chopOverrideDirection} slope=${slopeAtr.toFixed(2)} ATR`);
     }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
     baseReasons.push(`ema9=${ema9.toFixed(2)} ema20=${ema20.toFixed(2)} atr=${atr.toFixed(2)}`);
     if (vwap !== undefined) baseReasons.push(`vwap=${vwap.toFixed(2)} vwapSlope=${regime.vwapSlope ?? "N/A"}`);
+    baseReasons.push(
+      `dirInf=${directionInference.direction ?? "N/A"} conf=${directionInference.confidence ?? 0} (${(directionInference.reasons ?? []).join(" | ")})`
+    );
 
     const candidates: SetupCandidate[] = [];
     const pushCandidate = (candidate: SetupCandidate) => {
@@ -183,16 +186,15 @@ export class SetupEngine {
     // -------------------------
     // Pattern 2: BREAK_RETEST (trend)
     // -------------------------
-    {
-      const direction = trendDirection;
-
-      // Require regime + structure alignment (hard) for trend patterns
+    for (const direction of ["LONG", "SHORT"] as const) {
       const regimeAligned = (regime.regime === "BULL" && direction === "LONG") || (regime.regime === "BEAR" && direction === "SHORT");
       const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
+      const chopAligned = chopOverride && chopOverrideDirection === direction;
 
-      if (regimeAligned || structureAligned) {
-        const pattern: SetupPattern = "BREAK_RETEST";
-        const reasons = [...baseReasons, `pattern=${pattern}`];
+      if (!(regimeAligned || structureAligned || chopAligned)) continue;
+
+      const pattern: SetupPattern = "BREAK_RETEST";
+      const reasons = [...baseReasons, `pattern=${pattern}`];
 
         const breakoutLookback = 20;
         const excludeLast = 3;
@@ -256,7 +258,7 @@ export class SetupEngine {
             const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
 
             pushCandidate({
-              id: `setup_${ts}_breakretest`,
+              id: `setup_${ts}_breakretest_${direction.toLowerCase()}`,
               ts,
               symbol,
               direction,
@@ -285,21 +287,34 @@ export class SetupEngine {
       const prev1 = bars[bars.length - 2]!;
       const prev2 = bars[bars.length - 3]!;
 
-      // In BEAR regime, look for oversold bounce attempt (LONG)
-      // In BULL regime, look for overbought fade attempt (SHORT)
-      const direction = regime.regime === "BEAR" ? "LONG" as Direction : "SHORT" as Direction;
-      const needRsi = regime.regime === "BEAR" ? 35 : 65;
+      const reversalDirections: Array<{ direction: Direction; needRsi: number }> =
+        regime.regime === "BEAR"
+          ? [{ direction: "LONG", needRsi: 35 }]
+          : regime.regime === "BULL"
+          ? [{ direction: "SHORT", needRsi: 65 }]
+          : [
+              { direction: "LONG", needRsi: 30 },
+              { direction: "SHORT", needRsi: 70 },
+            ];
 
-      const momentumTurn = regime.regime === "BEAR"
-        ? (prev2.close <= prev1.close && prev1.close <= last.close) // 2-step higher closes
-        : (prev2.close >= prev1.close && prev1.close >= last.close); // 2-step lower closes
+      for (const rd of reversalDirections) {
+        const direction = rd.direction;
+        const needRsi = rd.needRsi;
 
-      const reclaimEma9 = direction === "LONG" ? last.close > ema9 : last.close < ema9;
+        const momentumTurn =
+          direction === "LONG"
+            ? (prev2.close <= prev1.close && prev1.close <= last.close)
+            : (prev2.close >= prev1.close && prev1.close >= last.close);
 
-      const rsiOk = rsi !== undefined ? (regime.regime === "BEAR" ? rsi <= needRsi : rsi >= needRsi) : false;
+        const reclaimEma9 = direction === "LONG" ? last.close > ema9 : last.close < ema9;
 
-      if (momentumTurn && reclaimEma9 && rsiOk) {
-        reasons.push(`rsi14=${rsi!.toFixed(1)} turn=${momentumTurn} reclaimEma9=${reclaimEma9}`);
+        const rsiOk = rsi !== undefined
+          ? (direction === "LONG" ? rsi <= needRsi : rsi >= needRsi)
+          : false;
+
+        if (!(momentumTurn && reclaimEma9 && rsiOk)) continue;
+
+        const reversalReasons = [...reasons, `rsi14=${rsi!.toFixed(1)} turn=${momentumTurn} reclaimEma9=${reclaimEma9}`];
 
         const triggerPrice = last.close;
         const swingLookback = 12;
@@ -316,14 +331,14 @@ export class SetupEngine {
           const entryMid = (entryZone.low + entryZone.high) / 2;
           const targets = makeTargetsFromR(direction, entryMid, stop);
 
-          // Cap scores lower because countertrend is inherently riskier
-          const alignment = clamp(45, 0, 100);
-          const structureScore = clamp(45, 0, 100);
-          const quality = clamp(60, 0, 100);
-          const total = Math.min(65, Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality));
+          const chopPenalty = regime.regime === "CHOP" ? 10 : 0;
+          const alignment = clamp(45 - chopPenalty, 0, 100);
+          const structureScore = clamp(45 - chopPenalty, 0, 100);
+          const quality = clamp(60 - chopPenalty, 0, 100);
+          const total = Math.min(65 - chopPenalty, Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality));
 
           pushCandidate({
-            id: `setup_${ts}_reversal`,
+            id: `setup_${ts}_reversal_${direction.toLowerCase()}`,
             ts,
             symbol,
             direction,
@@ -332,7 +347,7 @@ export class SetupEngine {
             entryZone,
             stop,
             targets,
-            rationale: reasons,
+            rationale: reversalReasons,
             score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
           });
         }
