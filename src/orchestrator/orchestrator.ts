@@ -320,7 +320,7 @@ export class Orchestrator {
         if (low === undefined) missing.push("low");
         console.log(`[Datafeed] Insufficient OHLC data: missing ${missing.join(", ")}. Skipping bar.`);
         
-        if (!this.state.activePlay) {
+    if (!this.state.activePlay) {
           this.lastDiagnostics = {
             ts,
             symbol,
@@ -363,6 +363,8 @@ export class Orchestrator {
 
     // If no active play, use SetupEngine to find a pattern
     if (!this.state.activePlay) {
+      const watchOnly = this.state.mode !== "ACTIVE";
+
       // Need at least some bar history
       if (this.recentBars.length < 6) {
         const regime = computeRegime(this.recentBars, close);
@@ -546,6 +548,11 @@ export class Orchestrator {
         } : undefined,
       };
 
+      // WATCH-ONLY mode: track setups/diagnostics but never arm a play or call the LLM.
+      if (watchOnly) {
+        return events;
+      }
+
       // Prepare warnings for LLM
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
@@ -709,7 +716,7 @@ export class Orchestrator {
               agreement: llmVerify.agreement,
               legitimacy: llmVerify.legitimacy,
               probability: llmVerify.probability,
-              action: llmVerify.action,
+            action: llmVerify.action,
               reasoning: llmVerify.reasoning,
               flags: llmVerify.flags ?? []
             }
@@ -901,7 +908,7 @@ export class Orchestrator {
                   flags: ["LLM_TIMEOUT", "RULES_ONLY"],
                   followThroughProb: 60,
                 };
-              } else {
+      } else {
                 // Timeout = PASS (safe default)
                 this.lastDiagnostics = {
                   ts,
@@ -930,7 +937,7 @@ export class Orchestrator {
           this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}`;
 
           // Always emit LLM_VERIFY + SCORECARD
-          events.push(this.ev("LLM_VERIFY", ts, {
+        events.push(this.ev("LLM_VERIFY", ts, {
             playId: setupCandidate.id,
             symbol: setupCandidate.symbol,
             direction: setupCandidate.direction,

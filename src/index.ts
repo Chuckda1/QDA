@@ -224,13 +224,6 @@ if (alpacaKey && alpacaSecret) {
       try {
         console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
-          // STAGE 6: In QUIET mode, skip trading decisions but continue heartbeat logging
-          if (governor.getMode() !== "ACTIVE") {
-            // Explicit: QUIET mode skips bar processing (no trading decisions)
-            // But heartbeat logging continues (handled by separate timer)
-            continue;
-          }
-
           try {
             // 1m processing
             bars1mCount++;
@@ -273,13 +266,6 @@ if (alpacaKey && alpacaSecret) {
         // Fallback to REST API polling
         console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
-          // STAGE 6: In QUIET mode, skip trading decisions but continue heartbeat logging
-          if (governor.getMode() !== "ACTIVE") {
-            // Explicit: QUIET mode skips bar processing (no trading decisions)
-            // But heartbeat logging continues (handled by separate timer)
-            continue;
-          }
-
           try {
             bars1mCount++;
             const events1m = await orch.processTick({
