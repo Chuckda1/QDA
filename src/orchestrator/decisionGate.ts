@@ -28,6 +28,9 @@ export type DecisionLlmSummary = {
 
 export type DecisionRulesSnapshot = {
   regime: Record<string, any>;
+  macroBias?: Record<string, any>;
+  entryPermission?: string;
+  indicatorMeta?: Record<string, any>;
   directionInference: Record<string, any>;
   indicators: Record<string, any>;
   ruleScores: Record<string, any>;
@@ -92,11 +95,11 @@ export function buildDecision(inputs: DecisionGateInputs): AuthoritativeDecision
     };
   }
 
-  const llmApproved = !!llm && llm.action !== "PASS";
+  const llmApproved = !!llm && llm.action !== "PASS" && llm.action !== "WAIT";
   const baseBlockers = [...blockers];
 
   if (!llm) {
-    if (!baseBlockers.includes("arming_failed")) {
+    if (baseBlockers.length === 0 && !baseBlockers.includes("arming_failed")) {
       baseBlockers.push("arming_failed");
     }
   } else if (!llmApproved) {

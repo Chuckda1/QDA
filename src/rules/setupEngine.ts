@@ -1,4 +1,4 @@
-import type { Direction, SetupCandidate, SetupPattern } from "../types.js";
+import type { Bias, Direction, SetupCandidate, SetupPattern } from "../types.js";
 import type { OHLCVBar } from "../utils/indicators.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI } from "../utils/indicators.js";
 import type { RegimeResult } from "./regimeRules.js";
@@ -11,6 +11,7 @@ export interface SetupEngineContext {
   currentPrice: number;
   bars: OHLCVBar[];
   regime: RegimeResult;
+  macroBias?: Bias;
   directionInference: DirectionInference;
   indicators: {
     atr?: number;
@@ -122,6 +123,8 @@ export class SetupEngine {
     if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
 
+    const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
+
     // CHOP default is to block new setups, but allow a "momentum + alignment" override.
     // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
     // then break lower) that often classify as CHOP by the stricter regime gate.
@@ -157,6 +160,9 @@ export class SetupEngine {
     }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
+    if (ctx.macroBias) {
+      baseReasons.push(`macroBias=${ctx.macroBias}`);
+    }
     baseReasons.push(`ema9=${ema9.toFixed(2)} ema20=${ema20.toFixed(2)} atr=${atr.toFixed(2)}`);
     if (vwap !== undefined) baseReasons.push(`vwap=${vwap.toFixed(2)} vwapSlope=${regime.vwapSlope ?? "N/A"}`);
     baseReasons.push(
@@ -168,6 +174,9 @@ export class SetupEngine {
       // Add CHOP_OVERRIDE flag if applicable
       if (chopOverride) {
         candidate.flags = [...(candidate.flags ?? []), "CHOP_OVERRIDE"];
+      }
+      if (chaseRisk) {
+        candidate.flags = [...(candidate.flags ?? []), "CHASE_RISK"];
       }
       candidates.push(candidate);
     };
@@ -186,13 +195,30 @@ export class SetupEngine {
       pushCandidate(pullbackResult.candidate);
     }
 
+    // Try VALUE_RECLAIM pattern (high-expectancy pullback reclaim)
+    const valueReclaimResult = this.findValueReclaim({
+      ts,
+      symbol,
+      currentPrice,
+      bars,
+      regime,
+      macroBias: ctx.macroBias,
+      directionInference,
+      indicators: { atr, ema9, ema20, vwap }
+    });
+    if (valueReclaimResult.candidate) {
+      pushCandidate(valueReclaimResult.candidate);
+    }
+
     // -------------------------
     // Pattern 2: BREAK_RETEST (trend)
     // -------------------------
     for (const direction of ["LONG", "SHORT"] as const) {
       // Require regime OR structure alignment for trend patterns.
       // In CHOP, allow only if we explicitly have chopOverride for that direction.
-      const regimeAligned = (regime.regime === "BULL" && direction === "LONG") || (regime.regime === "BEAR" && direction === "SHORT");
+      const regimeAligned =
+        (regime.regime === "TREND_UP" && direction === "LONG") ||
+        (regime.regime === "TREND_DOWN" && direction === "SHORT");
       const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
       const chopAligned = chopOverride && chopOverrideDirection === direction;
 
@@ -259,10 +285,12 @@ export class SetupEngine {
 
       const alignment = clamp(0.7 * (directionInference.confidence ?? 50) + 0.3 * 85, 0, 100);
       const structureScore = clamp(regime.structure === "BULLISH" || regime.structure === "BEARISH" ? 85 : 60, 0, 100);
+      const chasePenalty = chaseRisk ? -12 : 0;
       const quality = clamp(
         75
           + (vwap !== undefined ? (direction === "LONG" ? (currentPrice >= vwap ? 5 : -8) : (currentPrice <= vwap ? 5 : -8)) : 0)
-          + (Math.abs(entryMid - ema20) <= 1.2 * atr ? 5 : -5),
+          + (Math.abs(entryMid - ema20) <= 1.2 * atr ? 5 : -5)
+          + chasePenalty,
         0,
         100
       );
@@ -295,13 +323,13 @@ export class SetupEngine {
       const prev1 = bars[bars.length - 2]!;
       const prev2 = bars[bars.length - 3]!;
 
-      // In BEAR: look for oversold bounce attempt (LONG)
-      // In BULL: look for overbought fade attempt (SHORT)
+    // In TREND_DOWN: look for oversold bounce attempt (LONG)
+    // In TREND_UP: look for overbought fade attempt (SHORT)
       // In CHOP: allow either extreme (lower confidence)
       const reversalDirections: Array<{ direction: Direction; needRsi: number }> =
-        regime.regime === "BEAR"
+        regime.regime === "TREND_DOWN"
           ? [{ direction: "LONG", needRsi: 35 }]
-          : regime.regime === "BULL"
+          : regime.regime === "TREND_UP"
           ? [{ direction: "SHORT", needRsi: 65 }]
           : [
               { direction: "LONG", needRsi: 30 },
@@ -403,9 +431,9 @@ export class SetupEngine {
 
     // Determine direction from regime
     let direction: Direction | undefined;
-    if (regime.regime === "BULL" && structure.structure === "BULLISH") {
+    if (regime.regime === "TREND_UP" && structure.structure === "BULLISH") {
       direction = "LONG";
-    } else if (regime.regime === "BEAR" && structure.structure === "BEARISH") {
+    } else if (regime.regime === "TREND_DOWN" && structure.structure === "BEARISH") {
       direction = "SHORT";
     } else {
       return { reason: "Regime/structure misalignment" };
@@ -462,7 +490,8 @@ export class SetupEngine {
     // Calculate scores
     const alignmentScore = this.scoreAlignment(regime, structure, direction);
     const structureScore = this.scoreStructure(structure, direction);
-    const qualityScore = this.scoreQuality(atr, risk, ema9, ema20, currentPrice, direction);
+    const chasePenalty = chaseRisk ? -12 : 0;
+    const qualityScore = clamp(this.scoreQuality(atr, risk, ema9, ema20, currentPrice, direction) + chasePenalty, 0, 100);
     const totalScore = Math.round((alignmentScore + structureScore + qualityScore) / 3);
 
     const rationale: string[] = [
@@ -470,7 +499,8 @@ export class SetupEngine {
       `Structure: ${structure.structure}`,
       `EMA9 reclaim: ${direction === "LONG" ? "above" : "below"}`,
       `Swing: ${swingPoint.toFixed(2)}`,
-      `Risk: ${risk.toFixed(2)} (${(risk / atr).toFixed(2)} ATR)`
+      `Risk: ${risk.toFixed(2)} (${(risk / atr).toFixed(2)} ATR)`,
+      chaseRisk ? "chaseRisk=true (distance to VWAP > 0.8 ATR)" : "chaseRisk=false"
     ];
 
     const candidate: SetupCandidate = {
@@ -502,9 +532,9 @@ export class SetupEngine {
     let score = 0;
 
     // Regime alignment
-    if (direction === "LONG" && regime.regime === "BULL") {
+    if (direction === "LONG" && regime.regime === "TREND_UP") {
       score += 40;
-    } else if (direction === "SHORT" && regime.regime === "BEAR") {
+    } else if (direction === "SHORT" && regime.regime === "TREND_DOWN") {
       score += 40;
     }
 
@@ -523,6 +553,114 @@ export class SetupEngine {
     }
 
     return Math.min(100, score);
+  }
+
+  /**
+   * Find VALUE_RECLAIM pattern
+   * Requirements:
+   * - Macro bias aligns (LONG bias for LONG reclaim, SHORT bias for SHORT reclaim)
+   * - Price pulls into VWAP/EMA20 band
+   * - Higher low / lower high signal (rejection)
+   * - Close back above/below EMA9 and hold 1-2 bars
+   */
+  private findValueReclaim(ctx: SetupEngineContext): SetupEngineResult {
+    const { ts, symbol, currentPrice, bars, regime, macroBias, indicators } = ctx;
+    const atr = indicators.atr!;
+    const ema9 = indicators.ema9!;
+    const ema20 = indicators.ema20!;
+    const vwap = indicators.vwap;
+
+    if (!atr || !ema9 || !ema20) {
+      return { reason: "Missing required indicators for value reclaim" };
+    }
+
+    if (bars.length < 6) {
+      return { reason: "Insufficient bars for value reclaim" };
+    }
+
+    const direction: Direction | undefined =
+      macroBias === "LONG" ? "LONG" : macroBias === "SHORT" ? "SHORT" : undefined;
+    if (!direction) {
+      return { reason: "Macro bias neutral - value reclaim skipped" };
+    }
+
+    const bandLow = vwap !== undefined ? Math.min(vwap, ema20) : ema20;
+    const bandHigh = vwap !== undefined ? Math.max(vwap, ema20) : ema20;
+
+    const last = bars[bars.length - 1]!;
+    const prev = bars[bars.length - 2]!;
+    const prev2 = bars[bars.length - 3]!;
+
+    const pulledIntoValue = [prev2, prev, last].some((b) => b.low <= bandHigh && b.close >= bandLow);
+    const rejectionSignal = direction === "LONG"
+      ? last.low > prev.low && last.close > prev.close
+      : last.high < prev.high && last.close < prev.close;
+
+    const emaHold = direction === "LONG"
+      ? last.close > ema9 && prev.close > ema9
+      : last.close < ema9 && prev.close < ema9;
+
+    if (!pulledIntoValue || !rejectionSignal || !emaHold) {
+      return { reason: "Value reclaim conditions not met" };
+    }
+
+    const triggerPrice = last.close;
+    const swingLookback = 12;
+    const buffer = 0.10 * atr;
+    const stop = direction === "LONG"
+      ? recentSwingLow(bars, swingLookback) - buffer
+      : recentSwingHigh(bars, swingLookback) + buffer;
+
+    const risk = Math.abs(triggerPrice - stop);
+    if (risk <= 0) return { reason: "Invalid risk for value reclaim" };
+
+    const entryZone = direction === "LONG"
+      ? { low: triggerPrice - 0.15 * risk, high: triggerPrice + 0.05 * risk }
+      : { low: triggerPrice - 0.05 * risk, high: triggerPrice + 0.15 * risk };
+    const entryMid = (entryZone.low + entryZone.high) / 2;
+    const targets = makeTargetsFromR(direction, entryMid, stop);
+
+    const alignment = clamp(
+      (direction === "LONG" && macroBias === "LONG") || (direction === "SHORT" && macroBias === "SHORT") ? 85 : 60,
+      0,
+      100
+    );
+    const structureScore = clamp(regime.structure === "BULLISH" || regime.structure === "BEARISH" ? 80 : 60, 0, 100);
+    const chasePenalty = chaseRisk ? -12 : 0;
+    const quality = clamp(
+      78
+        + (vwap !== undefined ? (direction === "LONG" ? (currentPrice >= vwap ? 4 : -6) : (currentPrice <= vwap ? 4 : -6)) : 0)
+        + (Math.abs(entryMid - ema20) <= 0.8 * atr ? 6 : -6)
+        + chasePenalty,
+      0,
+      100
+    );
+    const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
+
+    const rationale = [
+      `pattern=VALUE_RECLAIM`,
+      `macroBias=${macroBias}`,
+      `valueBand=${bandLow.toFixed(2)}-${bandHigh.toFixed(2)}`,
+      `rejection=${rejectionSignal}`,
+      `emaHold=${emaHold}`,
+      chaseRisk ? "chaseRisk=true (distance to VWAP > 0.8 ATR)" : "chaseRisk=false",
+    ];
+
+    return {
+      candidate: {
+        id: `setup_${ts}_valuereclaim_${direction.toLowerCase()}`,
+        ts,
+        symbol,
+        direction,
+        pattern: "VALUE_RECLAIM",
+        triggerPrice,
+        entryZone,
+        stop,
+        targets,
+        rationale,
+        score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
+      }
+    };
   }
 
   /**

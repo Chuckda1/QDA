@@ -36,7 +36,7 @@ export class CommandHandler {
           "",
           "🧩 DIAG (latest):",
           `At: ${new Date(d.ts).toISOString()}  Price: ${d.close.toFixed(2)}`,
-          `Regime: ${d.regime.regime}  |  Dir: ${d.directionInference.direction ?? "N/A"} (${d.directionInference.confidence}%)`,
+          `Regime: ${d.regime.regime}  |  Bias: ${d.macroBias ?? "N/A"}  |  Dir: ${d.directionInference.direction ?? "N/A"} (${d.directionInference.confidence}%)`,
           d.candidate
             ? `Top candidate: ${d.candidate.direction} ${d.candidate.pattern} score=${d.candidate.score.total}`
             : `Top candidate: none (${d.setupReason ?? "n/a"})`,
@@ -49,6 +49,7 @@ export class CommandHandler {
       "📊 PIPELINE:",
       `Last 1m: ${fmt(s.last1mTs)}`,
       `Last 5m: ${fmt(s.last5mTs)}`,
+      `Last 15m: ${fmt(s.last15mTs)}`,
       `Last Tick: ${fmt(s.lastTickAt)}`,
       "",
       "📈 DATA:",
@@ -94,6 +95,9 @@ export class CommandHandler {
     lines.push("");
     lines.push("REGIME:");
     lines.push(`- ${d.regime.regime}`);
+    if (d.macroBias) {
+      lines.push(`- Macro bias: ${d.macroBias}`);
+    }
     if (d.regimeEvidence) {
       lines.push(`- Evidence scores: bull=${d.regimeEvidence.bullScore}/3 bear=${d.regimeEvidence.bearScore}/3`);
     }
@@ -129,6 +133,11 @@ export class CommandHandler {
       lines.push("");
       lines.push("FILTER WARNINGS:");
       lines.push(`- ${d.entryFilterWarnings.join(" | ")}`);
+    }
+    if (d.entryPermission) {
+      lines.push("");
+      lines.push("ENTRY PERMISSION:");
+      lines.push(`- ${d.entryPermission}`);
     }
     if (d.setupDebug) {
       lines.push("");

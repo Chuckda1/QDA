@@ -9,39 +9,43 @@ export type Bar = {
   volume: number;
 };
 
-function floorTo5m(ts: number): number {
-  const ms = 5 * 60 * 1000;
-  return Math.floor(ts / ms) * ms;
-}
-
 export class BarAggregator {
+  private bucketMinutes: number;
   private bucketStartTs: number | null = null;
   private cur: Bar | null = null;
 
+  constructor(bucketMinutes: number = 5) {
+    this.bucketMinutes = bucketMinutes;
+  }
+
+  private floorToBucket(ts: number): number {
+    const ms = this.bucketMinutes * 60 * 1000;
+    return Math.floor(ts / ms) * ms;
+  }
+
   /** 
-   * Push a CLOSED 1m bar; returns a CLOSED 5m bar when bucket completes.
+   * Push a CLOSED 1m bar; returns a CLOSED N-minute bar when bucket completes.
    * 
-   * 5m bar timestamp represents the close time: bucketStart + 5min - 1ms
+   * Bar timestamp represents the close time: bucketStart + N minutes - 1ms
    * This ensures stable, consistent timestamps for cache keys across WS/REST.
    */
   push1m(bar: Bar): Bar | null {
-    const start = floorTo5m(bar.ts);
-    // 5m bar close time: start of bucket + 5 minutes - 1ms
-    // This represents the last millisecond of the 5m bar (stable across WS/REST)
-    const bar5mCloseTs = start + 5 * 60 * 1000 - 1;
+    const start = this.floorToBucket(bar.ts);
+    // Bar close time: start of bucket + N minutes - 1ms
+    const barCloseTs = start + this.bucketMinutes * 60 * 1000 - 1;
 
     if (this.bucketStartTs === null) {
       this.bucketStartTs = start;
-      this.cur = { ...bar, ts: bar5mCloseTs };
+      this.cur = { ...bar, ts: barCloseTs };
       return null;
     }
 
     if (start !== this.bucketStartTs) {
       const finished = this.cur!;
       // Update finished bar's timestamp to represent its close time
-      finished.ts = this.bucketStartTs + 5 * 60 * 1000 - 1;
+      finished.ts = this.bucketStartTs + this.bucketMinutes * 60 * 1000 - 1;
       this.bucketStartTs = start;
-      this.cur = { ...bar, ts: bar5mCloseTs };
+      this.cur = { ...bar, ts: barCloseTs };
       return finished;
     }
 

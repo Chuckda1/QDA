@@ -47,6 +47,20 @@ OPENAI_MODEL=gpt-4o-mini                    # Default if not set
 
 **Note:** If `OPENAI_API_KEY` is not set, the bot will run without LLM coaching (rules-only mode).
 
+---
+
+## ⚙️ Default Strategy Settings
+
+These are built-in defaults (not env vars) aimed at stable behavior:
+
+- Regime timeframe: 15m (bias + regime anchor)
+- Entry timeframe: 5m (setup detection + entry permission)
+- Extended-from-mean max: 1.0 * ATR (VWAP/EMA20 distance)
+- Wait-for-pullback re-arm: distance_to_VWAP <= 0.8 * ATR
+- GO_ALL_IN allowed only if distance_to_VWAP <= 0.8 * ATR and ATR slope not rising
+- TRANSITION: ATR slope rising + impulse/counter-impulse within 3 bars OR mixed structure with mild VWAP slope
+- Bias flips require 2 closes beyond VWAP+EMA20 plus structure confirmation on 15m
+
 ### Alpaca Market Data (Optional - for real-time data)
 ```bash
 ALPACA_API_KEY=your_alpaca_api_key_here

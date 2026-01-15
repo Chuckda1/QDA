@@ -1,13 +1,12 @@
-import type { BotState, DomainEvent, Play, TradeAction } from "../types.js";
+import type { Bias, BotState, DomainEvent, EntryPermission, Play, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
-import { computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
-import { computeATR, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
+import { computeMacroBias, computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
+import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
-import { detectStructureLLLH } from "../utils/structure.js";
 import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
@@ -25,11 +24,13 @@ type SetupDiagnosticsSnapshot = {
   symbol: string;
   close: number;
   regime: RegimeResult;
+  macroBias?: Bias;
   directionInference: DirectionInference;
   candidate?: SetupCandidate;
   setupReason?: string;
   setupDebug?: any;
   entryFilterWarnings?: string[];
+  entryPermission?: EntryPermission;
   guardrailBlock?: string; // Reason if blocked by guardrails
   regimeEvidence?: {
     bullScore: number;
@@ -49,7 +50,7 @@ type TickInput = {
 };
 
 type TickSnapshot = TickInput & {
-  timeframe: "1m" | "5m";
+  timeframe: "1m" | "5m" | "15m";
 };
 
 export class Orchestrator {
@@ -61,10 +62,15 @@ export class Orchestrator {
   private setupEngine: SetupEngine;
   private llmCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for entered plays)
   private llmArmedCoachCache: Map<string, number> = new Map(); // playId_barTs -> timestamp (for armed plays)
-  private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
+  private recentBars1m: OHLCVBar[] = []; // For entry tracking and stop checks
+  private recentBars5m: OHLCVBar[] = []; // For setup detection (entries)
+  private recentBars15m: OHLCVBar[] = []; // For regime + macro bias anchor
   private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
   private lastSetupSummary5mTs: number | null = null;
   private lastDecision: AuthoritativeDecision | null = null;
+  private lastRegime15m: RegimeResult | null = null;
+  private lastMacroBias: Bias = "NEUTRAL";
+  private lastRegime15mTs: number | null = null;
 
   // Guardrail tracking
   private playsToday: number = 0;
@@ -267,7 +273,7 @@ export class Orchestrator {
    */
   async processTick(
     input: TickInput,
-    timeframe: "1m" | "5m" = "1m"
+    timeframe: "1m" | "5m" | "15m" = "1m"
   ): Promise<DomainEvent[]> {
     const snapshot = this.buildSnapshot(input, timeframe);
     const events: DomainEvent[] = [];
@@ -278,21 +284,25 @@ export class Orchestrator {
     this.state.price = input.close;
     if (timeframe === "1m") {
       this.state.last1mTs = input.ts;
-    } else {
+    } else if (timeframe === "5m") {
       this.state.last5mTs = input.ts;
+    } else {
+      this.state.last15mTs = input.ts;
     }
 
     // Branch by timeframe
     if (timeframe === "1m") {
       events.push(...await this.handle1m(snapshot));
-    } else {
+    } else if (timeframe === "5m") {
       events.push(...await this.handle5m(snapshot));
+    } else {
+      events.push(...await this.handle15m(snapshot));
     }
 
     return events;
   }
 
-  private buildSnapshot(input: TickInput, timeframe: "1m" | "5m"): TickSnapshot {
+  private buildSnapshot(input: TickInput, timeframe: "1m" | "5m" | "15m"): TickSnapshot {
     return { ...input, timeframe };
   }
 
@@ -309,7 +319,7 @@ export class Orchestrator {
       if (gapMs > this.maxGapMs) {
         const gapMinutes = Math.round(gapMs / 60000);
         console.log(`[Datafeed] Time gap detected: ${gapMinutes} minutes (${gapMs}ms). Resetting recentBars and starting cooldown.`);
-        this.recentBars = []; // Reset history after gap
+        this.recentBars1m = []; // Reset 1m history after gap
         this.dataGapCooldown = this.dataGapCooldownBars;
         this.lastBarTs = ts;
         
@@ -319,8 +329,9 @@ export class Orchestrator {
             ts,
             symbol,
             close,
-            regime: computeRegime(this.recentBars, close),
-            directionInference: inferDirectionFromRecentBars(this.recentBars),
+            regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
+            macroBias: this.lastMacroBias,
+            directionInference: inferDirectionFromRecentBars(this.recentBars1m),
             setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
             datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
           };
@@ -344,11 +355,11 @@ export class Orchestrator {
         const safeOpen = open ?? close;
         const safeVol = volume ?? 0;
         console.log(`[Datafeed] Missing high/low, creating synthetic bar from close=${close} (ALLOW_SYNTHETIC_BARS=true)`);
-        this.recentBars.push({ ts, open: safeOpen, high: syntheticHigh, low: syntheticLow, close, volume: safeVol });
+        this.recentBars1m.push({ ts, open: safeOpen, high: syntheticHigh, low: syntheticLow, close, volume: safeVol });
         this.lastBarTs = ts;
         if (this.dataGapCooldown > 0) this.dataGapCooldown--;
         // Keep enough history for ATR/RSI/EMA (direction + filters)
-        if (this.recentBars.length > 80) this.recentBars.shift();
+        if (this.recentBars1m.length > 80) this.recentBars1m.shift();
       } else {
         // Missing required OHLC data - log and set diagnostics
         const missing = [];
@@ -356,13 +367,14 @@ export class Orchestrator {
         if (low === undefined) missing.push("low");
         console.log(`[Datafeed] Insufficient OHLC data: missing ${missing.join(", ")}. Skipping bar.`);
         
-    if (!this.state.activePlay) {
+        if (!this.state.activePlay) {
           this.lastDiagnostics = {
             ts,
             symbol,
             close,
-            regime: computeRegime(this.recentBars, close),
-            directionInference: inferDirectionFromRecentBars(this.recentBars),
+            regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
+            macroBias: this.lastMacroBias,
+            directionInference: inferDirectionFromRecentBars(this.recentBars1m),
             setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
             datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
           };
@@ -379,11 +391,11 @@ export class Orchestrator {
       // Valid bar with high/low - process normally
       const safeOpen = open ?? close;
       const safeVol = volume ?? 0;
-      this.recentBars.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+      this.recentBars1m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
       this.lastBarTs = ts;
       if (this.dataGapCooldown > 0) this.dataGapCooldown--;
       // Keep enough history for ATR/RSI/EMA (direction + filters)
-      if (this.recentBars.length > 80) this.recentBars.shift();
+      if (this.recentBars1m.length > 80) this.recentBars1m.shift();
     }
 
     // Skip processing during data gap cooldown
@@ -394,8 +406,9 @@ export class Orchestrator {
           ts,
           symbol,
           close,
-          regime: computeRegime(this.recentBars, close),
-          directionInference: inferDirectionFromRecentBars(this.recentBars),
+          regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
+          macroBias: this.lastMacroBias,
+          directionInference: inferDirectionFromRecentBars(this.recentBars1m),
           setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
           datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
         };
@@ -409,456 +422,8 @@ export class Orchestrator {
       return events; // Skip processing during cooldown
     }
 
-    // If no active play, use SetupEngine to find a pattern
+    // Entries are evaluated on 5m bars; 1m bars only manage entry + stops.
     if (!this.state.activePlay) {
-      const watchOnly = this.state.mode !== "ACTIVE";
-
-      // Need at least some bar history
-      if (this.recentBars.length < 6) {
-        const regime = computeRegime(this.recentBars, close);
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: inferDirectionFromRecentBars(this.recentBars),
-          setupReason: "insufficient bar history (< 6 bars)",
-        };
-        this.lastDecision = buildDecision({
-          ts,
-          symbol,
-          blockers: ["no_active_play"],
-          blockerReasons: ["insufficient bar history (< 6 bars)"],
-          expiryMs: 30 * 60 * 1000
-        });
-        return events;
-      }
-
-      // Compute regime and structure
-      const regime = computeRegime(this.recentBars, close);
-      const structure = detectStructureLLLH(this.recentBars, { lookback: 22, pivotWidth: 2 });
-
-      // Infer direction from recent 1m bars
-      const dirInf = inferDirectionFromRecentBars(this.recentBars);
-      if (!dirInf.direction) {
-        // Don't hard-block setup detection; SetupEngine can still use regime/structure patterns.
-        console.log(`[1m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
-      }
-
-      // Compute indicators
-      const atr = computeATR(this.recentBars, 14);
-      const closes = this.recentBars.map((b) => b.close);
-      const ema9 = computeEMA(closes.slice(-60), 9);
-      const ema20 = computeEMA(closes.slice(-80), 20);
-      const vwap = computeVWAP(this.recentBars, 30);
-      const rsi14 = computeRSI(closes, 14);
-
-      // Find setup using SetupEngine
-      const setupResult = this.setupEngine.findSetup({
-        ts,
-        symbol,
-        currentPrice: close,
-        bars: this.recentBars,
-        regime,
-        directionInference: dirInf,
-        indicators: { vwap, ema9, ema20, atr, rsi14 }
-      });
-
-      if (!setupResult.candidate) {
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: dirInf,
-          setupReason: setupResult.reason || "no setup pattern found",
-          setupDebug: setupResult.debug,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
-        console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
-        this.lastDecision = buildDecision({
-          ts,
-          symbol,
-          blockers: ["no_active_play"],
-          blockerReasons: [setupResult.reason || "no setup pattern found"],
-          expiryMs: 30 * 60 * 1000
-        });
-        return events;
-      }
-
-      const setupCandidate = setupResult.candidate;
-
-      const blockers: DecisionBlocker[] = [];
-      const blockerReasons: string[] = [];
-
-      // Regime-direction enforcement happens AFTER setup selection.
-      // Trend setups must align with regime; reversal attempts are explicitly countertrend.
-      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
-        const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
-        const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
-        if (!regimeCheck.allowed && !(regime.regime === "CHOP" && hasChopOverride)) {
-          blockers.push(regime.regime === "CHOP" ? "chop" : "guardrail");
-          blockerReasons.push(regimeCheck.reason);
-        }
-      }
-
-      // Run entry filters on the candidate
-      const filterContext: EntryFilterContext = {
-        timestamp: ts,
-        symbol,
-        direction: setupCandidate.direction,
-        close,
-        high,
-        low,
-        open,
-        volume,
-        indicators: {
-          vwap,
-          ema20,
-          ema9,
-          atr,
-          rsi14
-        },
-        recentBars: this.recentBars.length >= 5
-          ? this.recentBars.slice(-20).map((b) => ({ 
-              ts: b.ts, 
-              open: b.open ?? b.close, 
-              high: b.high, 
-              low: b.low, 
-              close: b.close, 
-              volume: b.volume ?? 0 
-            }))
-          : undefined,
-        setupPattern: setupCandidate.pattern,
-        setupFlags: setupCandidate.flags
-      };
-
-      const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
-      if (filterResult.warnings?.length) {
-        console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
-      }
-      if (!filterResult.allowed) {
-        blockers.push("entry_filter");
-        if (filterResult.reason) {
-          blockerReasons.push(filterResult.reason);
-        }
-        console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
-      }
-
-      // Update diagnostics with successful candidate
-      this.lastDiagnostics = {
-        ts,
-        symbol,
-        close,
-        regime,
-        directionInference: dirInf,
-        candidate: setupCandidate,
-        entryFilterWarnings: filterResult.warnings,
-        setupDebug: setupResult.debug,
-        regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-          bullScore: regime.bullScore,
-          bearScore: regime.bearScore,
-        } : undefined,
-      };
-
-      const guardrailCheck = this.checkGuardrails(ts);
-      if (!guardrailCheck.allowed) {
-        const isCooldown = guardrailCheck.reason?.includes("cooldown");
-        blockers.push(isCooldown ? "cooldown" : "guardrail");
-        if (guardrailCheck.reason) blockerReasons.push(guardrailCheck.reason);
-        this.lastDiagnostics = {
-          ...this.lastDiagnostics,
-          guardrailBlock: guardrailCheck.reason,
-          setupReason: `guardrail: ${guardrailCheck.reason}`
-        };
-      }
-
-      if (watchOnly) {
-        if (!blockers.includes("arming_failed")) {
-          blockers.push("arming_failed");
-        }
-        blockerReasons.push("mode QUIET");
-      }
-
-      // Prepare warnings for LLM
-      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
-      const regimeWarning = `Regime gate: ${regime.regime} | ${regime.reasons.join(" | ")}`;
-      const llmWarnings = [
-        ...(filterResult.warnings ?? []),
-        dirWarning,
-        regimeWarning
-      ];
-
-      // Prepare data for LLM scorecard
-      const recentBarsForLLM = this.recentBars.slice(-20).map((b) => ({
-        ts: b.ts,
-        open: b.open,
-        high: b.high,
-        low: b.low,
-        close: b.close,
-        volume: b.volume
-      }));
-
-      const indicatorSnapshot = {
-        vwap,
-        ema9,
-        ema20,
-        atr,
-        rsi14,
-        vwapSlope: regime.vwapSlope,
-        structure: regime.structure
-      };
-
-      const ruleScores = {
-        regime: regime.regime,
-        directionInference: {
-          direction: dirInf.direction,
-          confidence: dirInf.confidence,
-          reasons: dirInf.reasons
-        },
-        entryFilters: {
-          warnings: filterResult.warnings ?? []
-        },
-        warnings: llmWarnings
-      };
-
-      type LLMVerifyType = Awaited<ReturnType<NonNullable<typeof this.llmService>["verifyPlaySetup"]>>;
-      let llmVerify: LLMVerifyType | undefined;
-      let llmTimedOut = false;
-      let llmRulesOnly = false;
-      let llmSummary: DecisionLlmSummary | undefined;
-
-      if (this.llmService && !watchOnly) {
-        try {
-          console.log(`[1m] Calling LLM for setup validation: ${setupCandidate.id}`);
-          this.state.lastLLMCallAt = Date.now();
-
-          const llmVerifyPromise = this.llmService.verifyPlaySetup({
-            symbol: setupCandidate.symbol,
-            direction: setupCandidate.direction,
-            entryZone: setupCandidate.entryZone,
-            stop: setupCandidate.stop,
-            targets: setupCandidate.targets,
-            score: setupCandidate.score.total,
-            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
-            confidence: setupCandidate.score.total,
-            currentPrice: close,
-            warnings: llmWarnings,
-            indicatorSnapshot,
-            recentBars: recentBarsForLLM,
-            ruleScores,
-            setupCandidate
-          });
-
-          const timeoutPromise = new Promise<Awaited<typeof llmVerifyPromise>>((_, reject) => {
-            setTimeout(() => reject(new Error(`LLM timeout after ${this.llmTimeoutMs}ms`)), this.llmTimeoutMs);
-          });
-
-          try {
-            llmVerify = await Promise.race([llmVerifyPromise, timeoutPromise]);
-          } catch (error: any) {
-            if (error.message?.includes("timeout")) {
-              llmTimedOut = true;
-              console.log(`[1m] LLM timeout after ${this.llmTimeoutMs}ms - treating as PASS (safe)`);
-
-              if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
-                console.log(`[1m] LLM down but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
-                llmRulesOnly = true;
-                llmVerify = {
-                  biasDirection: setupCandidate.direction as "LONG" | "SHORT",
-                  agreement: 75,
-                  legitimacy: 70,
-                  probability: 60,
-                  action: "SCALP" as const,
-                  reasoning: `LLM timeout - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
-                  plan: "Rules-only trade due to LLM timeout",
-                  flags: ["LLM_TIMEOUT", "RULES_ONLY"],
-                  followThroughProb: 60,
-                };
-              } else {
-                blockers.push("arming_failed");
-                blockerReasons.push(`LLM timeout: ${this.llmTimeoutMs}ms`);
-              }
-            } else {
-              throw error;
-            }
-          }
-        } catch (error: any) {
-          this.lastDiagnostics = {
-            ts,
-            symbol,
-            close,
-            regime,
-            directionInference: dirInf,
-            candidate: setupCandidate,
-            setupReason: `LLM error: ${error.message}`,
-            entryFilterWarnings: filterResult.warnings,
-            setupDebug: setupResult.debug,
-            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-              bullScore: regime.bullScore,
-              bearScore: regime.bearScore,
-            } : undefined,
-          };
-          console.error(`[1m] LLM verification failed:`, error.message);
-          blockers.push("arming_failed");
-          blockerReasons.push(`LLM error: ${error.message}`);
-        }
-      } else if (!this.llmService && this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore && !watchOnly) {
-        console.log(`[1m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
-        llmRulesOnly = true;
-        llmVerify = {
-          biasDirection: setupCandidate.direction as "LONG" | "SHORT",
-          agreement: 75,
-          legitimacy: 70,
-          probability: 60,
-          action: "SCALP" as const,
-          reasoning: `No LLM service - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
-          plan: "Rules-only trade due to LLM service unavailable",
-          flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
-          followThroughProb: 60,
-        };
-      } else if (!this.llmService && !watchOnly) {
-        blockers.push("arming_failed");
-        blockerReasons.push(`no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`);
-        console.log(`[1m] No LLM service - setup found but requires LLM approval`);
-      }
-
-      if (llmVerify) {
-        llmSummary = {
-          biasDirection: llmVerify.biasDirection,
-          agreement: llmVerify.agreement,
-          legitimacy: llmVerify.legitimacy,
-          probability: llmVerify.probability,
-          followThroughProb: llmVerify.followThroughProb,
-          action: llmVerify.action,
-          reasoning: llmVerify.reasoning,
-          plan: llmVerify.plan,
-          flags: llmVerify.flags ?? [],
-          note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
-        };
-        this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
-
-        if (llmVerify.action === "PASS") {
-          this.cooldownAfterLLMPass = Date.now();
-        }
-      }
-
-      const highProbGate = (this.enforceHighProbabilitySetups || this.autoAllInOnHighProb)
-        ? this.evaluateHighProbabilityGate({
-            candidate: setupCandidate,
-            directionInference: dirInf,
-            llm: llmSummary
-          })
-        : null;
-
-      if (this.enforceHighProbabilitySetups && highProbGate && !highProbGate.allowed) {
-        if (!blockers.includes("low_probability")) {
-          blockers.push("low_probability");
-        }
-        if (highProbGate.reason) {
-          blockerReasons.push(highProbGate.reason);
-          console.log(`[1m] High-probability gate blocked: ${highProbGate.reason}`);
-        }
-      }
-
-      if (this.autoAllInOnHighProb && highProbGate?.allowed && llmSummary?.action === "SCALP") {
-        llmSummary.action = "GO_ALL_IN";
-        const flags = new Set([...(llmSummary.flags ?? [])]);
-        flags.add("AUTO_ALL_IN");
-        llmSummary.flags = Array.from(flags);
-        llmSummary.note = [llmSummary.note, "auto-all-in"].filter(Boolean).join(" | ");
-      }
-
-      const rulesSnapshot: DecisionRulesSnapshot = {
-        regime: {
-          regime: regime.regime,
-          structure: regime.structure,
-          vwapSlope: regime.vwapSlope,
-          reasons: regime.reasons
-        },
-        directionInference: {
-          direction: dirInf.direction,
-          confidence: dirInf.confidence,
-          reasons: dirInf.reasons
-        },
-        indicators: indicatorSnapshot,
-        ruleScores
-      };
-
-      const decision = buildDecision({
-        ts,
-        symbol,
-        candidate: setupCandidate,
-        rules: rulesSnapshot,
-        llm: llmSummary,
-        blockers,
-        blockerReasons,
-        expiryMs: 30 * 60 * 1000
-      });
-      this.lastDecision = decision;
-
-      const decisionSummary = {
-        decisionId: decision.decisionId,
-        status: decision.status,
-        blockers: decision.blockers,
-        blockerReasons: decision.blockerReasons
-      };
-
-      if (decision.llm) {
-        events.push(this.ev("LLM_VERIFY", ts, {
-          playId: setupCandidate.id,
-          symbol: setupCandidate.symbol,
-          direction: setupCandidate.direction,
-          legitimacy: decision.llm.legitimacy,
-          followThroughProb: decision.llm.followThroughProb,
-          action: decision.llm.action,
-          reasoning: decision.llm.reasoning,
-          decision: decisionSummary
-        }));
-      }
-
-      events.push(this.ev("SCORECARD", ts, {
-        playId: setupCandidate.id,
-        symbol: setupCandidate.symbol,
-        proposedDirection: setupCandidate.direction,
-        setup: {
-          pattern: setupCandidate.pattern,
-          triggerPrice: setupCandidate.triggerPrice,
-          stop: setupCandidate.stop
-        },
-        rules: rulesSnapshot,
-        llm: decision.llm,
-        decision: decisionSummary
-      }));
-
-      if (decision.status !== "ARMED") {
-        events.push(this.ev("NO_ENTRY", ts, {
-          playId: decision.decisionId,
-          symbol: setupCandidate.symbol,
-          direction: setupCandidate.direction,
-          decision: decisionSummary
-        }));
-      }
-
-      if (decision.status === "ARMED" && decision.play) {
-        this.state.activePlay = decision.play;
-        this.playsToday += 1;
-        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary }));
-        events.push(this.ev("TRADE_PLAN", ts, {
-          playId: decision.play.id,
-          symbol: decision.play.symbol,
-          direction: decision.play.direction,
-          action: decision.llm?.action,
-          size: decision.play.mode,
-          probability: decision.llm?.probability,
-          plan: decision.llm?.plan,
-          decision: decisionSummary
-        }));
-      }
-
       return events;
     }
 
@@ -996,6 +561,76 @@ export class Orchestrator {
   }
 
   /**
+   * Handle 15m bars: update regime + macro bias anchor (with hysteresis)
+   */
+  private async handle15m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const { ts, close, open, high, low, volume } = snapshot;
+
+    if (high !== undefined && low !== undefined) {
+      const safeOpen = open ?? close;
+      const safeVol = volume ?? 0;
+      this.recentBars15m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+      if (this.recentBars15m.length > 120) this.recentBars15m.shift();
+    }
+
+    if (this.recentBars15m.length < 6) {
+      return [];
+    }
+
+    const rawRegime = computeRegime(this.recentBars15m, close);
+    const rawBias = computeMacroBias(this.recentBars15m, close);
+
+    const closes = this.recentBars15m.map((b) => b.close);
+    const ema20 = computeEMA(closes.slice(-80), 20);
+    const vwap = computeVWAP(this.recentBars15m, 30);
+
+    const lastTwo = this.recentBars15m.slice(-2);
+    const hasTwo = lastTwo.length === 2;
+    const belowMean = hasTwo && vwap !== undefined && ema20 !== undefined
+      ? lastTwo.every((b) => b.close < vwap && b.close < ema20)
+      : false;
+    const aboveMean = hasTwo && vwap !== undefined && ema20 !== undefined
+      ? lastTwo.every((b) => b.close > vwap && b.close > ema20)
+      : false;
+    const structure = rawRegime.structure;
+
+    const confirmDown = belowMean && structure === "BEARISH";
+    const confirmUp = aboveMean && structure === "BULLISH";
+
+    const hysteresisNotes: string[] = [];
+
+    let finalRegime = rawRegime.regime;
+    if (this.lastRegime15m?.regime === "TREND_UP" && rawRegime.regime === "TREND_DOWN" && !confirmDown) {
+      finalRegime = "TRANSITION";
+      hysteresisNotes.push("hysteresis: TREND_UP->TREND_DOWN needs 2 closes below VWAP+EMA20 + BEARISH structure");
+    } else if (this.lastRegime15m?.regime === "TREND_DOWN" && rawRegime.regime === "TREND_UP" && !confirmUp) {
+      finalRegime = "TRANSITION";
+      hysteresisNotes.push("hysteresis: TREND_DOWN->TREND_UP needs 2 closes above VWAP+EMA20 + BULLISH structure");
+    }
+
+    let finalBias = rawBias.bias;
+    if (this.lastMacroBias === "LONG" && rawBias.bias === "SHORT" && !confirmDown) {
+      finalBias = "LONG";
+      hysteresisNotes.push("bias hold: LONG bias until confirmed downshift");
+    } else if (this.lastMacroBias === "SHORT" && rawBias.bias === "LONG" && !confirmUp) {
+      finalBias = "SHORT";
+      hysteresisNotes.push("bias hold: SHORT bias until confirmed upshift");
+    }
+
+    const mergedRegime: RegimeResult = {
+      ...rawRegime,
+      regime: finalRegime,
+      reasons: hysteresisNotes.length ? [...rawRegime.reasons, ...hysteresisNotes] : rawRegime.reasons
+    };
+
+    this.lastRegime15m = mergedRegime;
+    this.lastMacroBias = finalBias;
+    this.lastRegime15mTs = ts;
+
+    return [];
+  }
+
+  /**
    * Handle 5m bars: Two separate LLM coaching loops
    * 1. ARMED_COACH: If play is ARMED but not entered (pre-entry commentary)
    * 2. LLM_COACH_UPDATE: If play is entered (position management)
@@ -1009,30 +644,525 @@ export class Orchestrator {
     const entered = this.state.activePlay?.status === "ENTERED";
     console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
-    // Gate 1 - If no active play → check for SETUP_SUMMARY
+    // Track 5m history for setup detection
+    if (high !== undefined && low !== undefined) {
+      const safeOpen = open ?? close;
+      const safeVol = volume ?? 0;
+      this.recentBars5m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+      if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+    }
+
+    // Gate 1 - If no active play → evaluate new setups on 5m bars
     if (!this.state.activePlay) {
+      const watchOnly = this.state.mode !== "ACTIVE";
+
+      if (this.recentBars5m.length < 6) {
+        const fallbackRegime = this.lastRegime15m ?? computeRegime(this.recentBars5m, close);
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime: fallbackRegime,
+          macroBias: this.lastMacroBias,
+          directionInference: inferDirectionFromRecentBars(this.recentBars5m),
+          setupReason: "insufficient 5m history (< 6 bars)",
+        };
+        this.lastDecision = buildDecision({
+          ts,
+          symbol,
+          blockers: ["no_active_play"],
+          blockerReasons: ["insufficient 5m history (< 6 bars)"],
+          expiryMs: 30 * 60 * 1000
+        });
+        return events;
+      }
+
+      const rawRegime5m = computeRegime(this.recentBars5m, close);
+      const anchorRegime = this.lastRegime15m ?? {
+        ...rawRegime5m,
+        regime: "TRANSITION",
+        reasons: [...rawRegime5m.reasons, "anchor pending: default TRANSITION until 15m confirms"]
+      };
+      const macroBiasInfo = this.lastRegime15m
+        ? { bias: this.lastMacroBias, reasons: ["anchor=15m"] }
+        : { bias: "NEUTRAL" as Bias, reasons: ["anchor pending: bias neutral until 15m confirms"] };
+
+      const dirInf = inferDirectionFromRecentBars(this.recentBars5m);
+      if (!dirInf.direction) {
+        console.log(`[5m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
+      }
+
+      const atr = computeATR(this.recentBars5m, 14);
+      const closes = this.recentBars5m.map((b) => b.close);
+      const ema9 = computeEMA(closes.slice(-60), 9);
+      const ema20 = computeEMA(closes.slice(-80), 20);
+      const vwap = computeVWAP(this.recentBars5m, 30);
+      const rsi14 = computeRSI(closes, 14);
+
+      const setupResult = this.setupEngine.findSetup({
+        ts,
+        symbol,
+        currentPrice: close,
+        bars: this.recentBars5m,
+        regime: anchorRegime,
+        macroBias: macroBiasInfo.bias,
+        directionInference: dirInf,
+        indicators: { vwap, ema9, ema20, atr, rsi14 }
+      });
+
+      if (!setupResult.candidate) {
+        this.lastDiagnostics = {
+          ts,
+          symbol,
+          close,
+          regime: anchorRegime,
+          macroBias: macroBiasInfo.bias,
+          directionInference: dirInf,
+          setupReason: setupResult.reason || "no setup pattern found",
+          setupDebug: setupResult.debug,
+          regimeEvidence: anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined ? {
+            bullScore: anchorRegime.bullScore,
+            bearScore: anchorRegime.bearScore,
+          } : undefined,
+        };
+        console.log(`[5m] No setup candidate: ${setupResult.reason || "unknown"}`);
+        this.lastDecision = buildDecision({
+          ts,
+          symbol,
+          blockers: ["no_active_play"],
+          blockerReasons: [setupResult.reason || "no setup pattern found"],
+          expiryMs: 30 * 60 * 1000
+        });
+        return events;
+      }
+
+      const setupCandidate = setupResult.candidate;
+      const blockers: DecisionBlocker[] = [];
+      const blockerReasons: string[] = [];
+
+      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
+        const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
+        const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
+        if (!regimeCheck.allowed && !(anchorRegime.regime === "CHOP" && hasChopOverride)) {
+          blockers.push(anchorRegime.regime === "CHOP" ? "chop" : "guardrail");
+          blockerReasons.push(regimeCheck.reason);
+        }
+      }
+
+      if (macroBiasInfo.bias === "LONG" && setupCandidate.direction === "SHORT" && anchorRegime.regime !== "TREND_DOWN") {
+        blockers.push("guardrail");
+        blockerReasons.push("bias gate: 15m bias LONG blocks SHORT setups until 15m turns");
+      }
+      if (macroBiasInfo.bias === "SHORT" && setupCandidate.direction === "LONG" && anchorRegime.regime !== "TREND_UP") {
+        blockers.push("guardrail");
+        blockerReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
+      }
+
+      const filterContext: EntryFilterContext = {
+        timestamp: ts,
+        symbol,
+        direction: setupCandidate.direction,
+        close,
+        high,
+        low,
+        open,
+        volume,
+        indicators: { vwap, ema20, ema9, atr, rsi14 },
+        recentBars: this.recentBars5m.length >= 5
+          ? this.recentBars5m.slice(-20).map((b) => ({
+              ts: b.ts,
+              open: b.open ?? b.close,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+              volume: b.volume ?? 0
+            }))
+          : undefined,
+        setupPattern: setupCandidate.pattern,
+        setupFlags: setupCandidate.flags
+      };
+
+      const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
+      if (filterResult.warnings?.length) {
+        console.log(`[5m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
+      }
+      if (!filterResult.allowed) {
+        blockers.push("entry_filter");
+        if (filterResult.reason) {
+          blockerReasons.push(filterResult.reason);
+        }
+        console.log(`[5m] Entry blocked by filter: ${filterResult.reason}`);
+      }
+
+      this.lastDiagnostics = {
+        ts,
+        symbol,
+        close,
+        regime: anchorRegime,
+        macroBias: macroBiasInfo.bias,
+        directionInference: dirInf,
+        candidate: setupCandidate,
+        entryFilterWarnings: filterResult.warnings,
+        entryPermission: filterResult.permission,
+        setupDebug: setupResult.debug,
+        regimeEvidence: anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined ? {
+          bullScore: anchorRegime.bullScore,
+          bearScore: anchorRegime.bearScore,
+        } : undefined,
+      };
+
+      const guardrailCheck = this.checkGuardrails(ts);
+      if (!guardrailCheck.allowed) {
+        const isCooldown = guardrailCheck.reason?.includes("cooldown");
+        blockers.push(isCooldown ? "cooldown" : "guardrail");
+        if (guardrailCheck.reason) blockerReasons.push(guardrailCheck.reason);
+        this.lastDiagnostics = {
+          ...this.lastDiagnostics,
+          guardrailBlock: guardrailCheck.reason,
+          setupReason: `guardrail: ${guardrailCheck.reason}`
+        };
+      }
+
+      if (watchOnly) {
+        if (!blockers.includes("arming_failed")) {
+          blockers.push("arming_failed");
+        }
+        blockerReasons.push("mode QUIET");
+      }
+
+      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
+      const regimeWarning = `Regime gate (15m): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
+      const biasWarning = `Macro bias (15m): ${macroBiasInfo.bias}`;
+      const entryPermission = filterResult.permission ?? "ALLOWED";
+      const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
+      const indicatorMeta = {
+        entryTF: "5m",
+        atrLen: 14,
+        vwapLen: 30,
+        emaLens: [9, 20],
+        regimeTF: "15m"
+      };
+      const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=15m`;
+
+      const llmWarnings = [
+        ...(filterResult.warnings ?? []),
+        dirWarning,
+        regimeWarning,
+        biasWarning,
+        permissionWarning,
+        indicatorMetaLine
+      ];
+
+      const recentBarsForLLM = this.recentBars5m.slice(-20).map((b) => ({
+        ts: b.ts,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: b.volume
+      }));
+
+      const indicatorSnapshot = {
+        vwap,
+        ema9,
+        ema20,
+        atr,
+        rsi14,
+        vwapSlope: anchorRegime.vwapSlope,
+        structure: anchorRegime.structure
+      };
+
+      const ruleScores = {
+        regime: anchorRegime.regime,
+        macroBias: macroBiasInfo.bias,
+        entryPermission,
+        indicatorMeta,
+        directionInference: {
+          direction: dirInf.direction,
+          confidence: dirInf.confidence,
+          reasons: dirInf.reasons
+        },
+        entryFilters: {
+          warnings: filterResult.warnings ?? []
+        },
+        warnings: llmWarnings
+      };
+
+      type LLMVerifyType = Awaited<ReturnType<NonNullable<typeof this.llmService>["verifyPlaySetup"]>>;
+      let llmVerify: LLMVerifyType | undefined;
+      let llmTimedOut = false;
+      let llmRulesOnly = false;
+      let llmSummary: DecisionLlmSummary | undefined;
+
+      const shouldRunLlm = !!this.llmService && !watchOnly && blockers.length === 0;
+
+      if (shouldRunLlm) {
+        try {
+          console.log(`[5m] Calling LLM for setup validation: ${setupCandidate.id}`);
+          this.state.lastLLMCallAt = Date.now();
+
+          const llmVerifyPromise = this.llmService.verifyPlaySetup({
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            entryZone: setupCandidate.entryZone,
+            stop: setupCandidate.stop,
+            targets: setupCandidate.targets,
+            score: setupCandidate.score.total,
+            grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
+            confidence: setupCandidate.score.total,
+            currentPrice: close,
+            warnings: llmWarnings,
+            indicatorSnapshot,
+            recentBars: recentBarsForLLM,
+            ruleScores,
+            setupCandidate
+          });
+
+          const timeoutPromise = new Promise<Awaited<typeof llmVerifyPromise>>((_, reject) => {
+            setTimeout(() => reject(new Error(`LLM timeout after ${this.llmTimeoutMs}ms`)), this.llmTimeoutMs);
+          });
+
+          try {
+            llmVerify = await Promise.race([llmVerifyPromise, timeoutPromise]);
+          } catch (error: any) {
+            if (error.message?.includes("timeout")) {
+              llmTimedOut = true;
+              console.log(`[5m] LLM timeout after ${this.llmTimeoutMs}ms - treating as PASS (safe)`);
+
+              if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+                console.log(`[5m] LLM down but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+                llmRulesOnly = true;
+                llmVerify = {
+                  biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+                  agreement: 75,
+                  legitimacy: 70,
+                  probability: 60,
+                  action: "SCALP" as const,
+                  reasoning: `LLM timeout - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+                  plan: "Rules-only trade due to LLM timeout",
+                  flags: ["LLM_TIMEOUT", "RULES_ONLY"],
+                  followThroughProb: 60,
+                };
+              } else {
+                blockers.push("arming_failed");
+                blockerReasons.push(`LLM timeout: ${this.llmTimeoutMs}ms`);
+              }
+            } else {
+              throw error;
+            }
+          }
+        } catch (error: any) {
+          this.lastDiagnostics = {
+            ts,
+            symbol,
+            close,
+            regime: anchorRegime,
+            macroBias: macroBiasInfo.bias,
+            directionInference: dirInf,
+            candidate: setupCandidate,
+            setupReason: `LLM error: ${error.message}`,
+            entryFilterWarnings: filterResult.warnings,
+            entryPermission: filterResult.permission,
+            setupDebug: setupResult.debug,
+            regimeEvidence: anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined ? {
+              bullScore: anchorRegime.bullScore,
+              bearScore: anchorRegime.bearScore,
+            } : undefined,
+          };
+          console.error(`[5m] LLM verification failed:`, error.message);
+          blockers.push("arming_failed");
+          blockerReasons.push(`LLM error: ${error.message}`);
+        }
+      } else if (!this.llmService && this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore && !watchOnly && blockers.length === 0) {
+        console.log(`[5m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
+        llmRulesOnly = true;
+        llmVerify = {
+          biasDirection: setupCandidate.direction as "LONG" | "SHORT",
+          agreement: 75,
+          legitimacy: 70,
+          probability: 60,
+          action: "SCALP" as const,
+          reasoning: `No LLM service - rules-only mode: A-grade setup (score=${setupCandidate.score.total})`,
+          plan: "Rules-only trade due to LLM service unavailable",
+          flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
+          followThroughProb: 60,
+        };
+      } else if (!this.llmService && !watchOnly && blockers.length === 0) {
+        blockers.push("arming_failed");
+        blockerReasons.push(`no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`);
+        console.log(`[5m] No LLM service - setup found but requires LLM approval`);
+      }
+
+      if (llmVerify) {
+        llmSummary = {
+          biasDirection: llmVerify.biasDirection,
+          agreement: llmVerify.agreement,
+          legitimacy: llmVerify.legitimacy,
+          probability: llmVerify.probability,
+          followThroughProb: llmVerify.followThroughProb,
+          action: llmVerify.action,
+          reasoning: llmVerify.reasoning,
+          plan: llmVerify.plan,
+          flags: llmVerify.flags ?? [],
+          note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
+        };
+        this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
+
+        if (llmVerify.action === "PASS") {
+          this.cooldownAfterLLMPass = Date.now();
+        }
+      }
+
+      const highProbGate = (this.enforceHighProbabilitySetups || this.autoAllInOnHighProb)
+        ? this.evaluateHighProbabilityGate({
+            candidate: setupCandidate,
+            directionInference: dirInf,
+            llm: llmSummary
+          })
+        : null;
+
+      if (this.enforceHighProbabilitySetups && highProbGate && !highProbGate.allowed) {
+        if (!blockers.includes("low_probability")) {
+          blockers.push("low_probability");
+        }
+        if (highProbGate.reason) {
+          blockerReasons.push(highProbGate.reason);
+          console.log(`[5m] High-probability gate blocked: ${highProbGate.reason}`);
+        }
+      }
+
+      if (this.autoAllInOnHighProb && highProbGate?.allowed && llmSummary?.action === "SCALP") {
+        llmSummary.action = "GO_ALL_IN";
+        const flags = new Set([...(llmSummary.flags ?? [])]);
+        flags.add("AUTO_ALL_IN");
+        llmSummary.flags = Array.from(flags);
+        llmSummary.note = [llmSummary.note, "auto-all-in"].filter(Boolean).join(" | ");
+      }
+
+      const distanceToVwap = vwap !== undefined && atr ? Math.abs(close - vwap) : undefined;
+      const atrSlopeRising = anchorRegime.atrSlope !== undefined && anchorRegime.atrSlope > 0;
+      const patternAllowsAllIn = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"].includes(setupCandidate.pattern);
+      const chaseRisk = setupCandidate.flags?.includes("CHASE_RISK") ?? false;
+      const goAllInAllowed = distanceToVwap !== undefined && atr
+        ? distanceToVwap <= 0.8 * atr && !atrSlopeRising && patternAllowsAllIn && !chaseRisk
+        : false;
+      if (llmSummary?.action === "GO_ALL_IN" && !goAllInAllowed) {
+        llmSummary.action = "SCALP";
+        const flags = new Set([...(llmSummary.flags ?? [])]);
+        flags.add("GO_ALL_IN_BLOCKED");
+        llmSummary.flags = Array.from(flags);
+        llmSummary.note = [llmSummary.note, "go-all-in blocked by vwap/ATR slope/pattern/chase risk"].filter(Boolean).join(" | ");
+      }
+
+      const rulesSnapshot: DecisionRulesSnapshot = {
+        regime: {
+          regime: anchorRegime.regime,
+          structure: anchorRegime.structure,
+          vwapSlope: anchorRegime.vwapSlope,
+          reasons: anchorRegime.reasons
+        },
+        macroBias: {
+          bias: macroBiasInfo.bias,
+          reasons: macroBiasInfo.reasons
+        },
+        entryPermission,
+        indicatorMeta,
+        directionInference: {
+          direction: dirInf.direction,
+          confidence: dirInf.confidence,
+          reasons: dirInf.reasons
+        },
+        indicators: indicatorSnapshot,
+        ruleScores
+      };
+
+      const decision = buildDecision({
+        ts,
+        symbol,
+        candidate: setupCandidate,
+        rules: rulesSnapshot,
+        llm: llmSummary,
+        blockers,
+        blockerReasons,
+        expiryMs: 30 * 60 * 1000
+      });
+      this.lastDecision = decision;
+
+      const decisionSummary = {
+        decisionId: decision.decisionId,
+        status: decision.status,
+        blockers: decision.blockers,
+        blockerReasons: decision.blockerReasons
+      };
+
+      if (decision.llm) {
+        events.push(this.ev("LLM_VERIFY", ts, {
+          playId: setupCandidate.id,
+          symbol: setupCandidate.symbol,
+          direction: setupCandidate.direction,
+          legitimacy: decision.llm.legitimacy,
+          followThroughProb: decision.llm.followThroughProb,
+          action: decision.llm.action,
+          reasoning: decision.llm.reasoning,
+          decision: decisionSummary
+        }));
+      }
+
+      events.push(this.ev("SCORECARD", ts, {
+        playId: setupCandidate.id,
+        symbol: setupCandidate.symbol,
+        proposedDirection: setupCandidate.direction,
+        setup: {
+          pattern: setupCandidate.pattern,
+          triggerPrice: setupCandidate.triggerPrice,
+          stop: setupCandidate.stop
+        },
+        rules: rulesSnapshot,
+        llm: decision.llm,
+        decision: decisionSummary
+      }));
+
+      if (decision.status !== "ARMED") {
+        events.push(this.ev("NO_ENTRY", ts, {
+          playId: decision.decisionId,
+          symbol: setupCandidate.symbol,
+          direction: setupCandidate.direction,
+          decision: decisionSummary
+        }));
+      }
+
+      if (decision.status === "ARMED" && decision.play) {
+        this.state.activePlay = decision.play;
+        this.playsToday += 1;
+        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary }));
+        events.push(this.ev("TRADE_PLAN", ts, {
+          playId: decision.play.id,
+          symbol: decision.play.symbol,
+          direction: decision.play.direction,
+          action: decision.llm?.action,
+          size: decision.play.mode,
+          probability: decision.llm?.probability,
+          plan: decision.llm?.plan,
+          decision: decisionSummary
+        }));
+      }
+
       // Emit SETUP_SUMMARY on 5m close when there's no play (and candidate is strong)
       if (this.state.mode === "ACTIVE" && this.lastDecision?.candidate && this.lastSetupSummary5mTs !== ts) {
         const c = this.lastDecision.candidate;
         if ((c.score?.total ?? 0) >= 65) {
-          const decisionSummary = {
-            decisionId: this.lastDecision.decisionId,
-            status: this.lastDecision.status,
-            blockers: this.lastDecision.blockers,
-            blockerReasons: this.lastDecision.blockerReasons
-          };
           events.push(this.ev("SETUP_SUMMARY", ts, {
             symbol: c.symbol,
             candidate: c,
             notes: this.lastDecision.rules
-              ? `regime=${this.lastDecision.rules.regime.regime} dir=${this.lastDecision.rules.directionInference.direction ?? "N/A"}`
+              ? `regime=${this.lastDecision.rules.regime.regime} bias=${this.lastDecision.rules.macroBias?.bias ?? "N/A"}`
               : undefined,
             decision: decisionSummary
           }));
           this.lastSetupSummary5mTs = ts;
         }
       }
-      console.log(`[5m] coaching skipped (no play)`);
+
       return events;
     }
 
@@ -1140,6 +1270,88 @@ export class Orchestrator {
     const entryPrice = play.entryPrice ?? (play.entryZone.low + (play.entryZone.high - play.entryZone.low) / 2);
     const rulesContext = this.stopProfitRules.getContext(play, close, entryPrice);
 
+    const bars5m = this.recentBars5m;
+    const closes5m = bars5m.map((b) => b.close);
+    const ema9_5m = computeEMA(closes5m.slice(-60), 9);
+    const rsiNow = computeRSI(closes5m, 14);
+    const rsiPrev = closes5m.length > 15 ? computeRSI(closes5m.slice(0, -1), 14) : undefined;
+    const bb = computeBollingerBands(closes5m, 20, 2);
+
+    const regimeForStops = this.lastRegime15m ?? computeRegime(bars5m, close);
+
+    const t1HitNow = rulesContext.targetHit === "T1" || rulesContext.targetHit === "T2" || rulesContext.targetHit === "T3";
+    if (t1HitNow && !play.t1Hit) {
+      play.t1Hit = true;
+    }
+
+    if (t1HitNow && !play.stopAdjusted) {
+      const preferEmaStop = regimeForStops.regime === "TREND_UP" || regimeForStops.regime === "TREND_DOWN";
+      const desiredStop = preferEmaStop && ema9_5m !== undefined
+        ? (play.direction === "LONG" ? Math.max(entryPrice, ema9_5m) : Math.min(entryPrice, ema9_5m))
+        : entryPrice;
+
+      const adjustedStop = play.direction === "LONG"
+        ? Math.min(desiredStop, close - 0.01)
+        : Math.max(desiredStop, close + 0.01);
+
+      play.stop = adjustedStop;
+      play.stopAdjusted = true;
+      console.log(`[5m] Stop adjusted after T1: ${adjustedStop.toFixed(2)} (${preferEmaStop ? "EMA9" : "breakeven"})`);
+    }
+
+    const prevClose = closes5m.length >= 2 ? closes5m[closes5m.length - 2]! : undefined;
+    const prev2Close = closes5m.length >= 3 ? closes5m[closes5m.length - 3]! : undefined;
+    const consecutiveAgainst = prevClose !== undefined && prev2Close !== undefined
+      ? (play.direction === "LONG"
+          ? close < prevClose && prevClose < prev2Close
+          : close > prevClose && prevClose > prev2Close)
+      : false;
+
+    const vwapSlope5m = bars5m.length >= 40 ? computeRegime(bars5m, close).vwapSlopePct : undefined;
+    const vwapFlattening = vwapSlope5m !== undefined ? Math.abs(vwapSlope5m) <= 0.02 : false;
+    const momentumDrop = rsiPrev !== undefined && rsiNow !== undefined
+      ? (play.direction === "LONG" ? rsiNow < rsiPrev - 2 || rsiNow < 50 : rsiNow > rsiPrev + 2 || rsiNow > 50)
+      : false;
+
+    const bandReentry = bb && prevClose !== undefined
+      ? (play.direction === "LONG"
+          ? prevClose > bb.upper && close < bb.upper
+          : prevClose < bb.lower && close > bb.lower)
+      : false;
+
+    const recentHigh = bars5m.length >= 6 ? Math.max(...bars5m.slice(-6, -1).map((b) => b.high)) : undefined;
+    const recentLow = bars5m.length >= 6 ? Math.min(...bars5m.slice(-6, -1).map((b) => b.low)) : undefined;
+    const divergence = recentHigh !== undefined && recentLow !== undefined && rsiPrev !== undefined && rsiNow !== undefined
+      ? (play.direction === "LONG"
+          ? bars5m[bars5m.length - 1]!.high > recentHigh && rsiNow < rsiPrev && ema9_5m !== undefined && close < ema9_5m
+          : bars5m[bars5m.length - 1]!.low < recentLow && rsiNow > rsiPrev && ema9_5m !== undefined && close > ema9_5m)
+      : false;
+
+    const exhaustionSignals: string[] = [];
+    if (bandReentry) exhaustionSignals.push("bb_reentry");
+    if (consecutiveAgainst && vwapFlattening && momentumDrop) exhaustionSignals.push("stall_reversal");
+    if (divergence) exhaustionSignals.push("rsi_divergence");
+
+    if (play.t1Hit && exhaustionSignals.length > 0) {
+      play.stopHit = true;
+      play.status = "CLOSED";
+      const reason = `Exhaustion exit: ${exhaustionSignals.join(", ")}`;
+      events.push(this.ev("PLAY_CLOSED", ts, {
+        playId: play.id,
+        symbol: play.symbol,
+        direction: play.direction,
+        close,
+        stop: play.stop,
+        reason,
+        result: "WIN",
+        exitType: "EXHAUSTION",
+        llmAction: "RULES_EXIT"
+      }));
+      this.cooldownAfterPlayClosed = Date.now();
+      this.state.activePlay = null;
+      return events;
+    }
+
     // Hard-boundary checks (cooldowns etc.)
     // Check cache: llmCoachCacheKey = playId + "_" + snapshot.ts (5m close ts)
     const cacheKey = `${play.id}_${ts}`;
@@ -1199,7 +1411,10 @@ export class Orchestrator {
             rMultipleT1: rulesContext.rMultipleT1,
             rMultipleT2: rulesContext.rMultipleT2,
             rMultipleT3: rulesContext.rMultipleT3,
-            profitPercent: rulesContext.profitPercent
+            profitPercent: rulesContext.profitPercent,
+            t1Hit: play.t1Hit ?? false,
+            stopAdjusted: play.stopAdjusted ?? false,
+            exhaustionSignals
           }
         });
 

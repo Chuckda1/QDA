@@ -35,6 +35,7 @@ console.log("=================================");
 // STAGE 3: Structured pulse tracker
 let bars1mCount = 0;
 let bars5mCount = 0;
+let bars15mCount = 0;
 
 function getPlayState(play: Play | null | undefined): "NONE" | "ARMED" | "ENTERED" | "MANAGING" | "CLOSED" {
   if (!play) return "NONE";
@@ -57,8 +58,10 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
     symbol,
     last1mTs: s.last1mTs || null,
     last5mTs: s.last5mTs || null,
+    last15mTs: s.last15mTs || null,
     bars1mCount,
     bars5mCount,
+    bars15mCount,
     activePlayId: play?.id || null,
     entered: play?.status === "ENTERED",
     state: getPlayState(play),
@@ -72,6 +75,7 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
   // Reset counters for next interval
   bars1mCount = 0;
   bars5mCount = 0;
+  bars15mCount = 0;
 }
 
 // Initialize Telegram
@@ -216,7 +220,8 @@ if (alpacaKey && alpacaSecret) {
       });
       
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
-      const agg = new BarAggregator();
+      const agg5m = new BarAggregator(5);
+      const agg15m = new BarAggregator(15);
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
       
@@ -239,7 +244,7 @@ if (alpacaKey && alpacaSecret) {
             await publisher.publishOrdered(events1m);
 
             // 5m aggregation + processing (only fires when a 5m bar closes)
-            const bar5m = agg.push1m(bar);
+            const bar5m = agg5m.push1m(bar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({
@@ -252,6 +257,21 @@ if (alpacaKey && alpacaSecret) {
                 volume: bar5m.volume
               }, "5m");
               await publisher.publishOrdered(events5m);
+            }
+
+            const bar15m = agg15m.push1m(bar);
+            if (bar15m) {
+              bars15mCount++;
+              const events15m = await orch.processTick({
+                ts: bar15m.ts,
+                symbol: bar15m.symbol,
+                close: bar15m.close,
+                open: bar15m.open,
+                high: bar15m.high,
+                low: bar15m.low,
+                volume: bar15m.volume
+              }, "15m");
+              await publisher.publishOrdered(events15m);
             }
           } catch (processError: any) {
             // Log processing errors but continue the loop
@@ -279,7 +299,7 @@ if (alpacaKey && alpacaSecret) {
             }, "1m");
             await publisher.publishOrdered(events1m);
 
-            const bar5m = agg.push1m(bar);
+            const bar5m = agg5m.push1m(bar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({
@@ -292,6 +312,21 @@ if (alpacaKey && alpacaSecret) {
                 volume: bar5m.volume
               }, "5m");
               await publisher.publishOrdered(events5m);
+            }
+
+            const bar15m = agg15m.push1m(bar);
+            if (bar15m) {
+              bars15mCount++;
+              const events15m = await orch.processTick({
+                ts: bar15m.ts,
+                symbol: bar15m.symbol,
+                close: bar15m.close,
+                open: bar15m.open,
+                high: bar15m.high,
+                low: bar15m.low,
+                volume: bar15m.volume
+              }, "15m");
+              await publisher.publishOrdered(events15m);
             }
           } catch (processError: any) {
             // Log processing errors but continue the loop

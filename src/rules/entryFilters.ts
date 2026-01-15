@@ -5,7 +5,7 @@
  * They do NOT affect management/exits of existing plays.
  */
 
-import type { Direction, SetupPattern } from "../types.js";
+import type { Direction, EntryPermission, SetupPattern } from "../types.js";
 import { getETClock } from "../utils/timeUtils.js";
 
 export interface IndicatorData {
@@ -43,6 +43,7 @@ export interface EntryFilterResult {
   allowed: boolean;
   reason?: string;
   warnings?: string[]; // Warnings that don't block but should inform LLM
+  permission?: EntryPermission;
 }
 
 /**
@@ -55,8 +56,9 @@ export class EntryFilters {
   private readonly maxCutoffMinute = 45;
 
   // Extended-from-mean filter parameters
-  private readonly maxVwapDistanceATR = 1.5; // k * ATR
-  private readonly maxEmaDistanceATR = 1.5;
+  private readonly maxVwapDistanceATR = 1.0; // k * ATR
+  private readonly maxEmaDistanceATR = 1.0;
+  private readonly rearmVwapDistanceATR = 0.8;
 
   // Pullback requirement parameters
   private readonly minPullbackATR = 0.5; // Minimum 0.5 ATR pullback
@@ -99,8 +101,9 @@ export class EntryFilters {
       warnings.push(...rsiCheck.warnings);
     }
 
-    return { 
+    return {
       allowed: true,
+      permission: "ALLOWED",
       warnings: warnings.length > 0 ? warnings : undefined
     };
   }
@@ -119,11 +122,12 @@ export class EntryFilters {
     if (currentMinutes >= cutoffMinutes) {
       return {
         allowed: false,
-        reason: `Time-of-day cutoff: No new plays after ${this.cutoffHour}:${this.cutoffMinute.toString().padStart(2, '0')} ET (current: ${hour}:${minute.toString().padStart(2, '0')} ET)`
+        permission: "BLOCKED",
+        reason: `Time-of-day cutoff: No new plays after ${this.cutoffHour}:${this.cutoffMinute.toString().padStart(2, "0")} ET (current: ${hour}:${minute.toString().padStart(2, "0")} ET)`
       };
     }
 
-    return { allowed: true };
+    return { allowed: true, permission: "ALLOWED" };
   }
 
   /**
@@ -135,7 +139,7 @@ export class EntryFilters {
     
     // If no indicators available, allow (graceful degradation)
     if (!indicators || !indicators.atr || indicators.atr <= 0) {
-      return { allowed: true };
+      return { allowed: true, permission: "ALLOWED" };
     }
 
     const atr = indicators.atr;
@@ -184,13 +188,17 @@ export class EntryFilters {
     }
 
     if (issues.length > 0) {
+      const rearmHint = indicators.vwap !== undefined
+        ? `Re-arm when distance_to_VWAP <= ${this.rearmVwapDistanceATR} * ATR.`
+        : `Re-arm on pullback into VWAP/EMA20 zone.`;
       return {
         allowed: false,
-        reason: `Extended-from-mean filter: ${issues.join("; ")}`
+        permission: "WAIT_FOR_PULLBACK",
+        reason: `WAIT_FOR_PULLBACK: extended-from-mean (${issues.join("; ")}). ${rearmHint}`
       };
     }
 
-    return { allowed: true };
+    return { allowed: true, permission: "ALLOWED" };
   }
 
   /**
@@ -208,14 +216,14 @@ export class EntryFilters {
       setupPattern === "REVERSAL_ATTEMPT" ||
       setupFlags?.includes("CHOP_OVERRIDE")
     ) {
-      return { allowed: true };
+      return { allowed: true, permission: "ALLOWED" };
     }
 
     const { close, direction, indicators, recentBars } = context;
 
     // If no indicators or recent bars, allow (graceful degradation)
     if (!indicators || !indicators.atr || indicators.atr <= 0) {
-      return { allowed: true };
+      return { allowed: true, permission: "ALLOWED" };
     }
 
     if (!recentBars || recentBars.length < 5) {
@@ -234,6 +242,7 @@ export class EntryFilters {
       if (pullbackDepth < this.minPullbackATR * atr) {
         return {
           allowed: false,
+          permission: "BLOCKED",
           reason: `Impulse-then-pullback filter: Pullback depth ${pullbackDepth.toFixed(2)} is less than minimum ${(this.minPullbackATR * atr).toFixed(2)} (${this.minPullbackATR} * ATR). Local high: ${localHigh.toFixed(2)}`
         };
       }
@@ -245,6 +254,7 @@ export class EntryFilters {
         if (close <= ema) {
           return {
             allowed: false,
+            permission: "BLOCKED",
             reason: `Impulse-then-pullback filter: No reclaim signal - close ${close.toFixed(2)} is not above EMA (${ema.toFixed(2)})`
           };
         }
@@ -259,6 +269,7 @@ export class EntryFilters {
       if (pullbackDepth < this.minPullbackATR * atr) {
         return {
           allowed: false,
+          permission: "BLOCKED",
           reason: `Impulse-then-pullback filter: Pullback depth ${pullbackDepth.toFixed(2)} is less than minimum ${(this.minPullbackATR * atr).toFixed(2)} (${this.minPullbackATR} * ATR). Local low: ${localLow.toFixed(2)}`
         };
       }
@@ -269,13 +280,14 @@ export class EntryFilters {
         if (close >= ema) {
           return {
             allowed: false,
+            permission: "BLOCKED",
             reason: `Impulse-then-pullback filter: No reclaim signal - close ${close.toFixed(2)} is not below EMA (${ema.toFixed(2)})`
           };
         }
       }
     }
 
-    return { allowed: true };
+    return { allowed: true, permission: "ALLOWED" };
   }
 
   /**
@@ -289,7 +301,7 @@ export class EntryFilters {
 
     // If no indicators available, allow (graceful degradation)
     if (!indicators || !indicators.rsi14 || !indicators.vwap || !indicators.atr || indicators.atr <= 0) {
-      return { allowed: true };
+      return { allowed: true, permission: "ALLOWED" };
     }
 
     const rsi = indicators.rsi14;
@@ -304,6 +316,7 @@ export class EntryFilters {
       if (vwapDistance > maxAllowedDistance) {
         return {
           allowed: true, // Don't block, just warn
+          permission: "ALLOWED",
           warnings: [
             `RSI exhaustion warning (LONG): RSI(14)=${rsi.toFixed(1)} > ${this.rsiExhaustionLongThreshold} and price is ${vwapDistance.toFixed(2)} above VWAP (threshold: ${maxAllowedDistance.toFixed(2)} = ${this.rsiExhaustionVwapDistanceATR} * ATR). Consider reducing probability/legitimacy due to momentum exhaustion risk.`
           ]
@@ -318,6 +331,7 @@ export class EntryFilters {
       if (vwapDistance > maxAllowedDistance) {
         return {
           allowed: true, // Don't block, just warn
+          permission: "ALLOWED",
           warnings: [
             `RSI exhaustion warning (SHORT): RSI(14)=${rsi.toFixed(1)} < ${this.rsiExhaustionShortThreshold} and price is ${vwapDistance.toFixed(2)} below VWAP (threshold: ${maxAllowedDistance.toFixed(2)} = ${this.rsiExhaustionVwapDistanceATR} * ATR). Consider reducing probability/legitimacy due to capitulation / mean-reversion risk.`
           ]
@@ -325,7 +339,7 @@ export class EntryFilters {
       }
     }
 
-    return { allowed: true };
+    return { allowed: true, permission: "ALLOWED" };
   }
 
   /**

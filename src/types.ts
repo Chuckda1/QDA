@@ -1,8 +1,14 @@
 export type Direction = "LONG" | "SHORT";
-export type Regime = "BULL" | "BEAR" | "CHOP";
+export type Bias = "LONG" | "SHORT" | "NEUTRAL";
+export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
+export type EntryPermission = "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
 export type BotMode = "QUIET" | "ACTIVE";
 export type TradeAction = "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
-export type SetupPattern = "PULLBACK_CONTINUATION" | "BREAK_RETEST" | "REVERSAL_ATTEMPT";
+export type SetupPattern =
+  | "PULLBACK_CONTINUATION"
+  | "BREAK_RETEST"
+  | "REVERSAL_ATTEMPT"
+  | "VALUE_RECLAIM";
 
 export interface SetupCandidate {
   id: string;
@@ -76,6 +82,8 @@ export interface Play {
   entryTimestamp?: number; // timestamp when entered
   expiresAt?: number; // timestamp when arming expires
   triggerPrice?: number; // candidate trigger price
+  t1Hit?: boolean;
+  stopAdjusted?: boolean;
 }
 
 export interface BotState {
@@ -83,6 +91,7 @@ export interface BotState {
   lastTickAt?: number;
   last1mTs?: number;  // last 1m bar processed timestamp
   last5mTs?: number;   // last 5m bar processed timestamp
+  last15mTs?: number;  // last 15m bar processed timestamp
   session: string;
   price?: number;
   activePlay?: Play | null;

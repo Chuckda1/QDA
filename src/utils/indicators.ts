@@ -143,3 +143,27 @@ export function computeRSI(closes: number[], period: number): number | undefined
 
   return rsi;
 }
+
+/**
+ * Compute Bollinger Bands (SMA +/- stdDev * sigma)
+ */
+export function computeBollingerBands(
+  closes: number[],
+  period: number,
+  stdDev: number
+): { middle: number; upper: number; lower: number } | undefined {
+  if (closes.length < period) {
+    return undefined;
+  }
+
+  const window = closes.slice(-period);
+  const mean = window.reduce((sum, v) => sum + v, 0) / period;
+  const variance = window.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / period;
+  const sigma = Math.sqrt(variance);
+
+  return {
+    middle: mean,
+    upper: mean + stdDev * sigma,
+    lower: mean - stdDev * sigma,
+  };
+}

@@ -13,6 +13,7 @@ type PlanDiagnosticsSnapshot = {
     vwapSlope?: "UP" | "DOWN" | "FLAT";
     structure?: "BULLISH" | "BEARISH" | "MIXED";
   };
+  macroBias?: "LONG" | "SHORT" | "NEUTRAL";
   directionInference: {
     direction: Direction | undefined;
     confidence: number;
@@ -21,6 +22,7 @@ type PlanDiagnosticsSnapshot = {
   candidate?: SetupCandidate;
   setupReason?: string;
   entryFilterWarnings?: string[];
+  entryPermission?: "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
 };
 
 // STAGE 6: Helper to check if DST is in effect (simplified, matches timeUtils logic)
@@ -198,7 +200,7 @@ export class Scheduler {
     } else {
       planLines.push(`- Symbol: ${d.symbol}  Last: $${fmtNum(d.close)}  Age: ${fmtAge(d.ts)}`);
       planLines.push(`- Regime: ${d.regime.regime} (VWAP slope=${d.regime.vwapSlope ?? "n/a"} structure=${d.regime.structure ?? "n/a"})`);
-      planLines.push(`- Direction: ${d.directionInference.direction ?? "N/A"} (${Math.round(d.directionInference.confidence ?? 0)}%)`);
+      planLines.push(`- Bias: ${d.macroBias ?? "N/A"}  |  Direction: ${d.directionInference.direction ?? "N/A"} (${Math.round(d.directionInference.confidence ?? 0)}%)`);
 
       if (d.candidate) {
         const c = d.candidate;
@@ -210,6 +212,9 @@ export class Scheduler {
 
       if (d.entryFilterWarnings?.length) {
         planLines.push(`- Warnings: ${d.entryFilterWarnings.join(" | ")}`);
+      }
+      if (d.entryPermission) {
+        planLines.push(`- Entry permission: ${d.entryPermission}`);
       }
 
       planLines.push("");

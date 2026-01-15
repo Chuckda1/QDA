@@ -9,7 +9,16 @@ export interface IndicatorSnapshot {
 }
 
 export interface RuleScores {
-  regime?: "BULL" | "BEAR" | "CHOP";
+  regime?: "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
+  macroBias?: "LONG" | "SHORT" | "NEUTRAL";
+  entryPermission?: "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
+  indicatorMeta?: {
+    entryTF: string;
+    atrLen: number;
+    vwapLen: number;
+    emaLens: number[];
+    regimeTF: string;
+  };
   directionInference?: {
     direction?: "LONG" | "SHORT";
     confidence?: number;
@@ -66,6 +75,9 @@ export interface LLMCoachingContext {
     rMultipleT2: number; // R-multiple to T2
     rMultipleT3: number; // R-multiple to T3
     profitPercent: number;
+    t1Hit?: boolean;
+    stopAdjusted?: boolean;
+    exhaustionSignals?: string[];
   };
 }
 
@@ -647,7 +659,10 @@ Respond in EXACT JSON format:
       stopThreatened: rulesContext.stopThreatened, // within 0.25R of stop (warning only)
       targetHit: rulesContext.targetHit, // close-based target hit
       nearTarget: rulesContext.nearTarget, // within $0.03 of target
-      profitPercent: Number(rulesContext.profitPercent.toFixed(2)) // if entered
+      profitPercent: Number(rulesContext.profitPercent.toFixed(2)), // if entered
+      t1Hit: rulesContext.t1Hit ?? false,
+      stopAdjusted: rulesContext.stopAdjusted ?? false,
+      exhaustionSignals: rulesContext.exhaustionSignals ?? []
     }, null, 2);
 
     let prompt = `You are coaching a ${direction} trade on ${symbol}.
@@ -674,6 +689,7 @@ RULES (for your reasoning):
 4. All distances use close price as denominator for percentages
 5. Risk = |entry - stop|, Reward = T1 - entry (LONG) or entry - T1 (SHORT)
 6. R-multiple = Reward / Risk
+7. If exhaustionSignals are present, treat them as exit warnings
 
 COACHING REQUEST:
 Analyze this trade using the provided metrics for pattern analysis and probability calculations. Your decision is FINAL - if you say HOLD, we hold (unless hard stop on close).
