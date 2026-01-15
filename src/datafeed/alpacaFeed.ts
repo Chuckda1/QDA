@@ -378,7 +378,7 @@ export class AlpacaDataFeed {
           volume: bar.v
         }))
         .filter((bar: Bar) => Number.isFinite(bar.ts))
-        .sort((a, b) => a.ts - b.ts);
+        .sort((a: Bar, b: Bar) => a.ts - b.ts);
     } catch (error: any) {
       console.error("Alpaca API error:", error.message);
       return [];
