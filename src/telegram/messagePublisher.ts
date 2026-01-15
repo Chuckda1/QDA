@@ -32,7 +32,7 @@ export class MessagePublisher {
    * Publish multiple events in strict priority order
    * 
    * STAGE 4: All messages must go through this method to ensure serialization
-   * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → LLM_COACH_UPDATE → PLAY_CLOSED
+   * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → PLAY_ENTERED → LLM_COACH_UPDATE → PLAY_CLOSED
    * 
    * INVARIANT CHECKS:
    * - LLM_COACH_UPDATE only if play is entered
@@ -229,6 +229,13 @@ export class MessagePublisher {
           `Probability: ${event.data.probability || "N/A"}%`,
           ``,
           `${event.data.plan || ""}`
+        ].join("\n");
+
+      case "PLAY_ENTERED":
+        return [
+          `[${instanceId}] ✅ PLAY ENTERED`,
+          `${event.data.direction} ${event.data.symbol}`,
+          `Entry: $${event.data.entryPrice?.toFixed(2) || event.data.price?.toFixed(2) || "N/A"}`
         ].join("\n");
 
       case "LLM_COACH_UPDATE":

@@ -153,9 +153,25 @@ export class CommandHandler {
 
     // Mark as entered with current price
     const entryPrice = s.price || (s.activePlay.entryZone.low + s.activePlay.entryZone.high) / 2;
+    const enteredAt = Date.now();
     s.activePlay.entered = true;
     s.activePlay.entryPrice = entryPrice;
-    s.activePlay.entryTimestamp = Date.now();
+    s.activePlay.entryTimestamp = enteredAt;
+
+    const event: DomainEvent = {
+      type: "PLAY_ENTERED",
+      timestamp: enteredAt,
+      instanceId: this.instanceId,
+      data: {
+        playId: s.activePlay.id,
+        symbol: s.activePlay.symbol,
+        direction: s.activePlay.direction,
+        price: entryPrice,
+        entryPrice
+      }
+    };
+
+    await this.publisher.publishOrdered([event]);
 
     return `✅ Play ${s.activePlay.id} marked as ENTERED\nEntry Price: $${entryPrice.toFixed(2)}\nSymbol: ${s.activePlay.symbol} ${s.activePlay.direction}`;
   }

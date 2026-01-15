@@ -2,7 +2,7 @@ import type { DomainEvent, DomainEventType } from "../types.js";
 
 /**
  * Message priority order (lower number = higher priority, sent first)
- * Enforces strict ordering: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN
+ * Enforces strict ordering: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → PLAY_ENTERED
  * Then during trade: LLM_COACH_UPDATE (every 5m)
  * On exit: PLAY_CLOSED
  */
@@ -13,9 +13,10 @@ const PRIORITY: Record<DomainEventType, number> = {
   SCORECARD: 4,
   SETUP_SUMMARY: 5,
   TRADE_PLAN: 6,
-  ARMED_COACH: 7, // Pre-entry coaching (happens on 5m bars while waiting for entry)
-  LLM_COACH_UPDATE: 8, // Position management coaching (after entry)
-  PLAY_CLOSED: 9,
+  PLAY_ENTERED: 7,
+  ARMED_COACH: 8, // Pre-entry coaching (happens on 5m bars while waiting for entry)
+  LLM_COACH_UPDATE: 9, // Position management coaching (after entry)
+  PLAY_CLOSED: 10,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
 };
 

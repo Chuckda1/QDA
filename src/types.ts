@@ -33,6 +33,7 @@ export type DomainEventType =
   | "TRADE_PLAN"
   | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
+  | "PLAY_ENTERED"
   | "PLAY_CLOSED"
   | "PLAN_OF_DAY";
 
