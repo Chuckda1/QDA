@@ -66,10 +66,10 @@ export function buildDecision(inputs: DecisionGateInputs): AuthoritativeDecision
     candidate,
     rules,
     llm,
-    blockers = [],
-    blockerReasons = [],
     expiryMs
   } = inputs;
+  const blockers: DecisionBlocker[] = inputs.blockers ?? [];
+  const blockerReasons: string[] = inputs.blockerReasons ?? [];
 
   const decisionId = `${symbol}_${ts}_${candidate?.id ?? "none"}`;
   const decisionBase: Omit<AuthoritativeDecision, "status" | "blockers"> = {
@@ -83,7 +83,7 @@ export function buildDecision(inputs: DecisionGateInputs): AuthoritativeDecision
   };
 
   if (!candidate) {
-    const safeBlockers = blockers.length ? blockers : ["no_active_play"];
+    const safeBlockers: DecisionBlocker[] = blockers.length ? blockers : ["no_active_play"];
     return {
       ...decisionBase,
       status: "NO_SETUP",

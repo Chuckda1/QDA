@@ -532,7 +532,9 @@ export class Orchestrator {
       }
       if (!filterResult.allowed) {
         blockers.push("entry_filter");
-        blockerReasons.push(filterResult.reason);
+        if (filterResult.reason) {
+          blockerReasons.push(filterResult.reason);
+        }
         console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
       }
 
