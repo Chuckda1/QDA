@@ -10,7 +10,8 @@ export type DecisionBlocker =
   | "chop"
   | "datafeed"
   | "time_window"
-  | "entry_filter";
+  | "entry_filter"
+  | "low_probability";
 
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";

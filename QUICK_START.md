@@ -47,6 +47,17 @@ OPENAI_MODEL=gpt-4o-mini                    # Default if not set
 
 **Note:** If `OPENAI_API_KEY` is not set, the bot will run without LLM coaching (rules-only mode).
 
+### High-Probability Setup Filtering
+```bash
+ENFORCE_HIGH_PROBABILITY_SETUPS=true   # Default: true (filter low-prob setups)
+MIN_LLM_PROBABILITY=70                 # Default: 70
+MIN_LLM_AGREEMENT=70                   # Default: 70
+MIN_RULES_PROBABILITY=70               # Default: 70 (max of rules score vs dir confidence)
+AUTO_ALL_IN_ON_HIGH_PROB=true          # Default: true (upgrade SCALP to GO_ALL_IN)
+```
+
+**Note:** High-probability filtering requires an LLM scorecard. Rules-only setups will be blocked.
+
 ### Alpaca Market Data (Optional - for real-time data)
 ```bash
 ALPACA_API_KEY=your_alpaca_api_key_here
@@ -175,6 +186,11 @@ npm run test:llm
 | `OPENAI_API_KEY` | ❌ No | - | OpenAI API key (for LLM) |
 | `OPENAI_BASE_URL` | ❌ No | `https://api.openai.com/v1` | OpenAI API base URL |
 | `OPENAI_MODEL` | ❌ No | `gpt-4o-mini` | OpenAI model to use |
+| `ENFORCE_HIGH_PROBABILITY_SETUPS` | ❌ No | `true` | Filter out low-prob setups |
+| `MIN_LLM_PROBABILITY` | ❌ No | `70` | Minimum LLM probability to allow |
+| `MIN_LLM_AGREEMENT` | ❌ No | `70` | Minimum LLM agreement to allow |
+| `MIN_RULES_PROBABILITY` | ❌ No | `70` | Minimum rules confidence to allow |
+| `AUTO_ALL_IN_ON_HIGH_PROB` | ❌ No | `true` | Upgrade SCALP to GO_ALL_IN |
 | `ALPACA_API_KEY` | ❌ No | - | Alpaca API key (for market data) |
 | `ALPACA_API_SECRET` | ❌ No | - | Alpaca API secret (for market data) |
 | `ALPACA_BASE_URL` | ❌ No | `https://paper-api.alpaca.markets` | Alpaca base URL (paper/live) |
