@@ -768,7 +768,7 @@ export class Orchestrator {
 
       const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
-      const potdAlignment = !potdActive
+      const potdAlignment: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActive
         ? "OFF"
         : !potdConfirmed
         ? "UNCONFIRMED"
