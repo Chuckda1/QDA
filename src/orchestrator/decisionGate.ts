@@ -29,6 +29,7 @@ export type DecisionLlmSummary = {
 export type DecisionRulesSnapshot = {
   regime: Record<string, any>;
   macroBias?: Record<string, any>;
+  potd?: Record<string, any>;
   entryPermission?: string;
   indicatorMeta?: Record<string, any>;
   directionInference: Record<string, any>;

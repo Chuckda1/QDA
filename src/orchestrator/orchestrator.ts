@@ -1,4 +1,4 @@
-import type { Bias, BotState, DomainEvent, EntryPermission, Play, TradeAction } from "../types.js";
+import type { Bias, BotState, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
@@ -31,6 +31,12 @@ type SetupDiagnosticsSnapshot = {
   setupDebug?: any;
   entryFilterWarnings?: string[];
   entryPermission?: EntryPermission;
+  potd?: {
+    bias: PotdBias;
+    confidence: number;
+    mode: PotdMode;
+    alignment?: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF";
+  };
   guardrailBlock?: string; // Reason if blocked by guardrails
   regimeEvidence?: {
     bullScore: number;
@@ -96,6 +102,12 @@ export class Orchestrator {
   private readonly minRulesProbability: number;
   private readonly autoAllInOnHighProb: boolean;
 
+  // POTD config (soft prior by default)
+  private readonly potdBias: PotdBias;
+  private readonly potdConfidence: number;
+  private readonly potdMode: PotdMode;
+  private readonly potdPriorWeight: number;
+
   // Guardrail config (from env vars with defaults)
   private readonly maxPlaysPerETDay: number;
   private readonly cooldownAfterStopMin: number;
@@ -129,6 +141,16 @@ export class Orchestrator {
     this.minRulesProbability = parseInt(process.env.MIN_RULES_PROBABILITY || "70", 10);
     this.autoAllInOnHighProb = process.env.AUTO_ALL_IN_ON_HIGH_PROB !== "false";
 
+    // Load POTD config from env vars
+    const potdBiasRaw = (process.env.POTD_BIAS || "NONE").toUpperCase();
+    this.potdBias = potdBiasRaw === "LONG" || potdBiasRaw === "SHORT" ? potdBiasRaw : "NONE";
+    const potdModeRaw = (process.env.POTD_MODE || "PRIOR").toUpperCase();
+    this.potdMode = potdModeRaw === "HARD" || potdModeRaw === "OFF" ? potdModeRaw : "PRIOR";
+    const conf = parseFloat(process.env.POTD_CONFIDENCE || "0.6");
+    this.potdConfidence = Number.isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0.6;
+    const weight = parseInt(process.env.POTD_PRIOR_WEIGHT || "8", 10);
+    this.potdPriorWeight = Number.isFinite(weight) ? Math.max(0, Math.min(20, weight)) : 8;
+
     // Initialize ET day tracking
     this.currentETDay = getETDateString();
 
@@ -149,6 +171,10 @@ export class Orchestrator {
       activePlay,
       mode: "QUIET"
     };
+  }
+
+  private clampScore(value: number): number {
+    return Math.max(0, Math.min(100, value));
   }
 
   getState(): BotState {
@@ -740,6 +766,32 @@ export class Orchestrator {
       const blockers: DecisionBlocker[] = [];
       const blockerReasons: string[] = [];
 
+      const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
+      const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
+      const potdAlignment = !potdActive
+        ? "OFF"
+        : !potdConfirmed
+        ? "UNCONFIRMED"
+        : setupCandidate.direction === this.potdBias
+        ? "ALIGNED"
+        : "COUNTERTREND";
+      const potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
+
+      if (potdCountertrend) {
+        setupCandidate.flags = [...(setupCandidate.flags ?? []), "POTD_COUNTERTREND"];
+      }
+
+      if (potdActive && this.potdMode === "PRIOR") {
+        const delta = Math.round(this.potdPriorWeight * this.potdConfidence * (setupCandidate.direction === this.potdBias ? 1 : -1));
+        setupCandidate.score.total = this.clampScore(setupCandidate.score.total + delta);
+        setupCandidate.rationale.push(`potdPrior=${delta} (bias=${this.potdBias} conf=${this.potdConfidence})`);
+      }
+
+      if (potdActive && this.potdMode === "HARD" && setupCandidate.direction !== this.potdBias) {
+        blockers.push("guardrail");
+        blockerReasons.push(`POTD hard mode: ${this.potdBias} only (manual override required)`);
+      }
+
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
         const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
         const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
@@ -804,6 +856,12 @@ export class Orchestrator {
         candidate: setupCandidate,
         entryFilterWarnings: filterResult.warnings,
         entryPermission: filterResult.permission,
+        potd: {
+          bias: this.potdBias,
+          confidence: this.potdConfidence,
+          mode: this.potdMode,
+          alignment: potdAlignment,
+        },
         setupDebug: setupResult.debug,
         regimeEvidence: anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined ? {
           bullScore: anchorRegime.bullScore,
@@ -835,6 +893,9 @@ export class Orchestrator {
       const biasWarning = `Macro bias (15m): ${macroBiasInfo.bias}`;
       const entryPermission = filterResult.permission ?? "ALLOWED";
       const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
+      const potdWarning = potdActive
+        ? `POTD: ${this.potdBias} (conf=${this.potdConfidence.toFixed(2)} mode=${this.potdMode}) alignment=${potdAlignment}`
+        : "POTD: OFF";
       const indicatorMeta = {
         entryTF: "5m",
         atrLen: 14,
@@ -850,6 +911,7 @@ export class Orchestrator {
         regimeWarning,
         biasWarning,
         permissionWarning,
+        potdWarning,
         indicatorMetaLine
       ];
 
@@ -876,6 +938,13 @@ export class Orchestrator {
         regime: anchorRegime.regime,
         macroBias: macroBiasInfo.bias,
         entryPermission,
+        potd: {
+          bias: this.potdBias,
+          confidence: this.potdConfidence,
+          mode: this.potdMode,
+          alignment: potdAlignment,
+          confirmed: potdConfirmed,
+        },
         indicatorMeta,
         directionInference: {
           direction: dirInf.direction,
@@ -1013,6 +1082,16 @@ export class Orchestrator {
         }
       }
 
+      if (potdCountertrend && llmSummary) {
+        if (llmSummary.action === "GO_ALL_IN") {
+          llmSummary.action = "SCALP";
+          llmSummary.note = [llmSummary.note, "POTD countertrend: scalp-only"].filter(Boolean).join(" | ");
+        }
+        const flags = new Set([...(llmSummary.flags ?? [])]);
+        flags.add("POTD_COUNTERTREND");
+        llmSummary.flags = Array.from(flags);
+      }
+
       const highProbGate = (this.enforceHighProbabilitySetups || this.autoAllInOnHighProb)
         ? this.evaluateHighProbabilityGate({
             candidate: setupCandidate,
@@ -1044,7 +1123,7 @@ export class Orchestrator {
       const patternAllowsAllIn = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"].includes(setupCandidate.pattern);
       const chaseRisk = setupCandidate.flags?.includes("CHASE_RISK") ?? false;
       const goAllInAllowed = distanceToVwap !== undefined && atr
-        ? distanceToVwap <= 0.8 * atr && !atrSlopeRising && patternAllowsAllIn && !chaseRisk
+        ? distanceToVwap <= 0.8 * atr && !atrSlopeRising && patternAllowsAllIn && !chaseRisk && !potdCountertrend
         : false;
       if (llmSummary?.action === "GO_ALL_IN" && !goAllInAllowed) {
         llmSummary.action = "SCALP";
@@ -1064,6 +1143,13 @@ export class Orchestrator {
         macroBias: {
           bias: macroBiasInfo.bias,
           reasons: macroBiasInfo.reasons
+        },
+        potd: {
+          bias: this.potdBias,
+          confidence: this.potdConfidence,
+          mode: this.potdMode,
+          alignment: potdAlignment,
+          confirmed: potdConfirmed,
         },
         entryPermission,
         indicatorMeta,

@@ -12,6 +12,13 @@ export interface RuleScores {
   regime?: "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
   macroBias?: "LONG" | "SHORT" | "NEUTRAL";
   entryPermission?: "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
+  potd?: {
+    bias: "LONG" | "SHORT" | "NONE";
+    confidence: number;
+    mode: "OFF" | "PRIOR" | "HARD";
+    alignment: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF";
+    confirmed: boolean;
+  };
   indicatorMeta?: {
     entryTF: string;
     atrLen: number;

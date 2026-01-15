@@ -206,6 +206,7 @@ export class MessagePublisher {
         const bias = r.macroBias ?? {};
         const dir = r.directionInference ?? {};
         const entryPermission = r.entryPermission ?? "ALLOWED";
+        const potd = r.potd ?? {};
         const indicatorMeta = r.indicatorMeta ?? null;
         const setup = event.data.setup ?? {};
 
@@ -218,6 +219,7 @@ export class MessagePublisher {
           `Setup: ${setup.pattern ?? "N/A"}  |  Trigger: $${fmtNum(setup.triggerPrice)}  |  Stop: $${fmtNum(setup.stop)}`,
           `Regime: ${regime.regime ?? "N/A"}  |  Bias: ${bias.bias ?? "N/A"}  |  Entry: ${entryPermission}`,
           `Structure: ${regime.structure ?? "N/A"}  |  VWAP slope: ${regime.vwapSlope ?? "N/A"}`,
+          `POTD: ${potd.bias ?? "NONE"} (conf=${potd.confidence ?? "n/a"} mode=${potd.mode ?? "OFF"})  |  Alignment: ${potd.alignment ?? "OFF"}`,
           `Rules dir: ${dir.direction ?? "N/A"} (${fmtPct(dir.confidence)})`,
           `Ind: VWAP=${fmtNum(ind.vwap)} EMA9=${fmtNum(ind.ema9)} EMA20=${fmtNum(ind.ema20)} RSI=${fmtNum(ind.rsi14)} ATR=${fmtNum(ind.atr)}`,
           indicatorMeta ? `TF: entry=${indicatorMeta.entryTF} atr=${indicatorMeta.atrLen} vwap=${indicatorMeta.vwapLen} ema=${(indicatorMeta.emaLens ?? []).join("/") || "n/a"} regime=${indicatorMeta.regimeTF}` : "",
