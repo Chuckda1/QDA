@@ -103,9 +103,9 @@ export class Orchestrator {
   private readonly autoAllInOnHighProb: boolean;
 
   // POTD config (soft prior by default)
-  private readonly potdBias: PotdBias;
-  private readonly potdConfidence: number;
-  private readonly potdMode: PotdMode;
+  private potdBias: PotdBias;
+  private potdConfidence: number;
+  private potdMode: PotdMode;
   private readonly potdPriorWeight: number;
 
   // Guardrail config (from env vars with defaults)
@@ -114,7 +114,11 @@ export class Orchestrator {
   private readonly cooldownAfterLLMPassMin: number;
   private readonly cooldownAfterPlayClosedMin: number;
 
-  constructor(instanceId: string, llmService?: LLMService, initialState?: { activePlay?: Play | null }) {
+  constructor(
+    instanceId: string,
+    llmService?: LLMService,
+    initialState?: { activePlay?: Play | null; potd?: { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string } }
+  ) {
     this.instanceId = instanceId;
     this.llmService = llmService;
     this.stopProfitRules = new StopProfitRules();
@@ -165,11 +169,46 @@ export class Orchestrator {
       }
     }
 
+    const initialPotd = initialState?.potd;
+    if (initialPotd) {
+      this.potdBias = initialPotd.bias;
+      this.potdConfidence = initialPotd.confidence;
+      this.potdMode = initialPotd.mode;
+    }
+
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
       activePlay,
-      mode: "QUIET"
+      mode: "QUIET",
+      potd: initialPotd
+    };
+  }
+
+  getPotdState(): { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string } {
+    return {
+      bias: this.potdBias,
+      confidence: this.potdConfidence,
+      mode: this.potdMode,
+      updatedAt: this.state.potd?.updatedAt,
+      source: this.state.potd?.source,
+    };
+  }
+
+  setPotdState(params: { bias: PotdBias; confidence?: number; mode?: PotdMode; source?: string }): void {
+    this.potdBias = params.bias;
+    if (params.confidence !== undefined) {
+      this.potdConfidence = Math.max(0, Math.min(1, params.confidence));
+    }
+    if (params.mode) {
+      this.potdMode = params.mode;
+    }
+    this.state.potd = {
+      bias: this.potdBias,
+      confidence: this.potdConfidence,
+      mode: this.potdMode,
+      updatedAt: Date.now(),
+      source: params.source,
     };
   }
 
@@ -779,6 +818,8 @@ export class Orchestrator {
 
       if (potdCountertrend) {
         setupCandidate.flags = [...(setupCandidate.flags ?? []), "POTD_COUNTERTREND"];
+        blockers.push("guardrail");
+        blockerReasons.push(`POTD confirmed: countertrend ${setupCandidate.direction} disabled`);
       }
 
       if (potdActive && this.potdMode === "PRIOR") {

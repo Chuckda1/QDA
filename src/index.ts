@@ -108,7 +108,10 @@ try {
   console.warn("LLM service initialization error:", error.message);
 }
 
-const orch = new Orchestrator(instanceId, llmService, { activePlay: persisted?.activePlay ?? null });
+const orch = new Orchestrator(instanceId, llmService, {
+  activePlay: persisted?.activePlay ?? null,
+  potd: persisted?.potd,
+});
 const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
 
@@ -120,7 +123,7 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
     console.error("[STAGE 1] LLM DISABLED: OPENAI_API_KEY missing. LLM calls will return fallback responses.");
     llmErrorLogged = true;
   }
-}, () => orch.getLastDiagnostics());
+}, () => orch.getLastDiagnostics(), (potd) => orch.setPotdState(potd));
 
 // Start scheduler
 scheduler.start();
@@ -195,6 +198,7 @@ setInterval(() => {
     instanceId,
     savedAt: Date.now(),
     activePlay: orch.getState().activePlay ?? null,
+    potd: orch.getPotdState(),
     governor: governor.exportState(),
   };
   store.save(state).catch((err) => {

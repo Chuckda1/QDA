@@ -99,6 +99,13 @@ export interface BotState {
   activePlay?: Play | null;
   mode: BotMode;
   lastPlanSent?: number;
+  potd?: {
+    bias: PotdBias;
+    confidence: number;
+    mode: PotdMode;
+    updatedAt?: number;
+    source?: string;
+  };
   // STAGE 3: LLM tracking
   lastLLMCallAt?: number;
   lastLLMDecision?: string;

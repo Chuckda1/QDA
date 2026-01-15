@@ -71,7 +71,8 @@ export class Scheduler {
     private publisher: MessagePublisher,
     private instanceId: string,
     private onModeChange?: (mode: BotMode) => void,
-    private getLatestDiagnostics?: () => PlanDiagnosticsSnapshot | null
+    private getLatestDiagnostics?: () => PlanDiagnosticsSnapshot | null,
+    private setPotdState?: (potd: { bias: "LONG" | "SHORT" | "NONE"; confidence: number; mode: "OFF" | "PRIOR" | "HARD"; source?: string }) => void
   ) {}
 
   start(): void {
@@ -222,6 +223,12 @@ export class Scheduler {
       planLines.push("- At 09:30, trade ONLY when setup + filters + LLM agree.");
       planLines.push("- If regime flips early, follow regime (don't force longs in BEAR / shorts in BULL).");
       planLines.push("- Use /diag at open if no plays are arming to see the exact blocker.");
+
+      if (this.setPotdState) {
+        const bias = d.macroBias === "LONG" || d.macroBias === "SHORT" ? d.macroBias : "NONE";
+        const conf = Math.max(0, Math.min(1, (d.directionInference.confidence ?? 60) / 100));
+        this.setPotdState({ bias, confidence: conf, mode: "PRIOR", source: "plan-of-day" });
+      }
     }
 
     const event = {

@@ -8,6 +8,13 @@ export interface PersistedBotStateV1 {
   instanceId: string;
   savedAt: number;
   activePlay: Play | null;
+  potd?: {
+    bias: "LONG" | "SHORT" | "NONE";
+    confidence: number;
+    mode: "OFF" | "PRIOR" | "HARD";
+    updatedAt?: number;
+    source?: string;
+  };
   governor: {
     lastPlanDate: string; // ET date string "YYYY-MM-DD"
     dedupeKeys: Record<string, number>; // key -> timestamp when sent
