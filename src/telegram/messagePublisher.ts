@@ -154,6 +154,7 @@ export class MessagePublisher {
           `[${instanceId}] 🔎 ${p.mode} PLAY ARMED`,
           `Symbol: ${p.symbol}`,
           `Direction: ${p.direction}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           `Score: ${p.score.toFixed(1)} (${p.grade})`,
           `Entry: $${p.entryZone.low.toFixed(2)} - $${p.entryZone.high.toFixed(2)}`,
           `Stop: $${p.stop.toFixed(2)}`,
@@ -190,6 +191,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] 🤖 LLM VERIFY`,
           `${event.data.direction} ${event.data.symbol}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           `Legitimacy: ${event.data.legitimacy}%`,
           `Follow-through: ${event.data.followThroughProb}%`,
           `Action: ${event.data.action}`,
@@ -216,6 +218,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] 🧾 SCORECARD`,
           `${event.data.symbol}  Proposed: ${event.data.proposedDirection}  |  LLM Bias: ${l.biasDirection ?? "N/A"}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           `Setup: ${setup.pattern ?? "N/A"}  |  Trigger: $${fmtNum(setup.triggerPrice)}  |  Stop: $${fmtNum(setup.stop)}`,
           `Regime: ${regime.regime ?? "N/A"}  |  Bias: ${bias.bias ?? "N/A"}  |  Entry: ${entryPermission}`,
           `Structure: ${regime.structure ?? "N/A"}  |  VWAP slope: ${regime.vwapSlope ?? "N/A"}`,
@@ -243,6 +246,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] 🧩 SETUP SUMMARY (5m)`,
           `${c.direction} ${c.symbol}  |  ${c.pattern}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           `Score: ${c.score?.total ?? "n/a"}`,
           `Trigger: $${Number.isFinite(c.triggerPrice) ? c.triggerPrice.toFixed(2) : "n/a"}`,
           `Entry: $${c.entryZone?.low?.toFixed?.(2) ?? "n/a"} - $${c.entryZone?.high?.toFixed?.(2) ?? "n/a"}`,
@@ -256,6 +260,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] ⛔ NO ENTRY`,
           event.data?.direction && event.data?.symbol ? `${event.data.direction} ${event.data.symbol}` : "",
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           ...this.formatDecisionLines(event.data.decision)
         ].filter(Boolean).join("\n");
 
@@ -263,6 +268,7 @@ export class MessagePublisher {
         return [
           `[${instanceId}] 📋 TRADE PLAN`,
           `${event.data.direction} ${event.data.symbol}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
           `Action: ${event.data.action}`,
           `Size: ${event.data.size || "N/A"}`,
           `Probability: ${event.data.probability || "N/A"}%`,

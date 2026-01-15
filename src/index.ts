@@ -59,6 +59,7 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
     last1mTs: s.last1mTs || null,
     last5mTs: s.last5mTs || null,
     last15mTs: s.last15mTs || null,
+    price: s.price ?? null,
     bars1mCount,
     bars5mCount,
     bars15mCount,

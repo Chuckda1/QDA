@@ -1227,6 +1227,7 @@ export class Orchestrator {
           playId: setupCandidate.id,
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
+          price: close,
           legitimacy: decision.llm.legitimacy,
           followThroughProb: decision.llm.followThroughProb,
           action: decision.llm.action,
@@ -1239,6 +1240,7 @@ export class Orchestrator {
         playId: setupCandidate.id,
         symbol: setupCandidate.symbol,
         proposedDirection: setupCandidate.direction,
+        price: close,
         setup: {
           pattern: setupCandidate.pattern,
           triggerPrice: setupCandidate.triggerPrice,
@@ -1254,6 +1256,7 @@ export class Orchestrator {
           playId: decision.decisionId,
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
+          price: close,
           decision: decisionSummary
         }));
       }
@@ -1261,11 +1264,12 @@ export class Orchestrator {
       if (decision.status === "ARMED" && decision.play) {
         this.state.activePlay = decision.play;
         this.playsToday += 1;
-        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary }));
+        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary, price: close }));
         events.push(this.ev("TRADE_PLAN", ts, {
           playId: decision.play.id,
           symbol: decision.play.symbol,
           direction: decision.play.direction,
+          price: close,
           action: decision.llm?.action,
           size: decision.play.mode,
           probability: decision.llm?.probability,
@@ -1281,6 +1285,7 @@ export class Orchestrator {
           events.push(this.ev("SETUP_SUMMARY", ts, {
             symbol: c.symbol,
             candidate: c,
+            price: close,
             notes: this.lastDecision.rules
               ? `regime=${this.lastDecision.rules.regime.regime} bias=${this.lastDecision.rules.macroBias?.bias ?? "N/A"}`
               : undefined,
