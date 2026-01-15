@@ -52,6 +52,7 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
   const s = orch.getState();
   const mode = governor.getMode();
   const play = s.activePlay;
+  const d = orch.getLastDiagnostics();
   
   const pulse = {
     mode,
@@ -67,7 +68,18 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
     entered: play?.status === "ENTERED",
     state: getPlayState(play),
     lastLLMCallAt: s.lastLLMCallAt || null,
-    lastLLMDecision: s.lastLLMDecision || null
+    lastLLMDecision: s.lastLLMDecision || null,
+    diag: d ? {
+      regime: d.regime?.regime ?? null,
+      bias: d.macroBias ?? null,
+      potd: d.potd ? {
+        bias: d.potd.bias,
+        mode: d.potd.mode,
+        alignment: d.potd.alignment
+      } : null,
+      direction: d.directionInference?.direction ?? null,
+      entryPermission: d.entryPermission ?? null
+    } : null
   };
   
   // Log as single JSON line
