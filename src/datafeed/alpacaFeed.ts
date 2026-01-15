@@ -21,6 +21,7 @@ export interface AlpacaConfig {
   apiSecret: string;
   baseUrl?: string;     // Default: https://paper-api.alpaca.markets (paper) or https://api.alpaca.markets (live)
   feed?: "iex" | "sip"; // Default: "iex" (free), "sip" (paid)
+  dataBaseUrl?: string; // Default: https://data.alpaca.markets
 }
 
 export class AlpacaDataFeed {
@@ -37,6 +38,7 @@ export class AlpacaDataFeed {
     this.config = {
       baseUrl: config.baseUrl || "https://paper-api.alpaca.markets",
       feed: config.feed || "iex",
+      dataBaseUrl: config.dataBaseUrl || "https://data.alpaca.markets",
       ...config
     };
   }
@@ -335,6 +337,51 @@ export class AlpacaDataFeed {
     } catch (error: any) {
       console.error("Alpaca API error:", error.message);
       return null;
+    }
+  }
+
+  /**
+   * Fetch historical bars via REST API (used for warmup)
+   */
+  async fetchHistoricalBars(
+    symbol: string,
+    timeframe: "1Min" | "5Min",
+    limit: number
+  ): Promise<Bar[]> {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return [];
+    }
+    try {
+      const url = `${this.config.dataBaseUrl}/v2/stocks/${symbol}/bars?timeframe=${timeframe}&limit=${limit}`;
+      const response = await fetch(url, {
+        headers: {
+          "APCA-API-KEY-ID": this.config.apiKey,
+          "APCA-API-SECRET-KEY": this.config.apiSecret
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Alpaca API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const bars = Array.isArray(data.bars) ? data.bars : [];
+
+      return bars
+        .map((bar: any) => ({
+          ts: new Date(bar.t).getTime(),
+          symbol,
+          open: bar.o,
+          high: bar.h,
+          low: bar.l,
+          close: bar.c,
+          volume: bar.v
+        }))
+        .filter((bar: Bar) => Number.isFinite(bar.ts))
+        .sort((a, b) => a.ts - b.ts);
+    } catch (error: any) {
+      console.error("Alpaca API error:", error.message);
+      return [];
     }
   }
 

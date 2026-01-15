@@ -237,10 +237,61 @@ if (alpacaKey && alpacaSecret) {
       });
       
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
-      const agg5m = new BarAggregator(5);
-      const agg15m = new BarAggregator(15);
+      const agg5mFrom1m = new BarAggregator(5);
+      const agg15mFrom5m = new BarAggregator(15);
+      const warmup5mBars = Math.max(0, parseInt(process.env.WARMUP_5M_BARS || "50", 10));
+      const warmup1mBars = Math.max(0, parseInt(process.env.WARMUP_1M_BARS || "30", 10));
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
+
+      // Warmup: fetch 5m and 1m separately, then aggregate 15m from 5m
+      try {
+        if (warmup5mBars > 0) {
+          console.log(`[${instanceId}] Warmup: fetching ${warmup5mBars}x 5m bars for ${symbol}...`);
+          const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", warmup5mBars);
+          for (const bar of bars5m) {
+            await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close,
+              open: bar.open,
+              high: bar.high,
+              low: bar.low,
+              volume: bar.volume
+            }, "5m");
+            const bar15m = agg15mFrom5m.push1m(bar);
+            if (bar15m) {
+              await orch.processTick({
+                ts: bar15m.ts,
+                symbol: bar15m.symbol,
+                close: bar15m.close,
+                open: bar15m.open,
+                high: bar15m.high,
+                low: bar15m.low,
+                volume: bar15m.volume
+              }, "15m");
+            }
+          }
+        }
+
+        if (warmup1mBars > 0) {
+          console.log(`[${instanceId}] Warmup: fetching ${warmup1mBars}x 1m bars for ${symbol}...`);
+          const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", warmup1mBars);
+          for (const bar of bars1m) {
+            await orch.processTick({
+              ts: bar.ts,
+              symbol: bar.symbol,
+              close: bar.close,
+              open: bar.open,
+              high: bar.high,
+              low: bar.low,
+              volume: bar.volume
+            }, "1m");
+          }
+        }
+      } catch (warmupError: any) {
+        console.warn(`[${instanceId}] Warmup failed: ${warmupError?.message || String(warmupError)}`);
+      }
       
       // Use WebSocket for real-time bars (preferred)
       try {
@@ -261,7 +312,7 @@ if (alpacaKey && alpacaSecret) {
             await publisher.publishOrdered(events1m);
 
             // 5m aggregation + processing (only fires when a 5m bar closes)
-            const bar5m = agg5m.push1m(bar);
+            const bar5m = agg5mFrom1m.push1m(bar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({
@@ -274,21 +325,20 @@ if (alpacaKey && alpacaSecret) {
                 volume: bar5m.volume
               }, "5m");
               await publisher.publishOrdered(events5m);
-            }
-
-            const bar15m = agg15m.push1m(bar);
-            if (bar15m) {
-              bars15mCount++;
-              const events15m = await orch.processTick({
-                ts: bar15m.ts,
-                symbol: bar15m.symbol,
-                close: bar15m.close,
-                open: bar15m.open,
-                high: bar15m.high,
-                low: bar15m.low,
-                volume: bar15m.volume
-              }, "15m");
-              await publisher.publishOrdered(events15m);
+              const bar15m = agg15mFrom5m.push1m(bar5m);
+              if (bar15m) {
+                bars15mCount++;
+                const events15m = await orch.processTick({
+                  ts: bar15m.ts,
+                  symbol: bar15m.symbol,
+                  close: bar15m.close,
+                  open: bar15m.open,
+                  high: bar15m.high,
+                  low: bar15m.low,
+                  volume: bar15m.volume
+                }, "15m");
+                await publisher.publishOrdered(events15m);
+              }
             }
           } catch (processError: any) {
             // Log processing errors but continue the loop
@@ -316,7 +366,7 @@ if (alpacaKey && alpacaSecret) {
             }, "1m");
             await publisher.publishOrdered(events1m);
 
-            const bar5m = agg5m.push1m(bar);
+            const bar5m = agg5mFrom1m.push1m(bar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({
@@ -329,21 +379,20 @@ if (alpacaKey && alpacaSecret) {
                 volume: bar5m.volume
               }, "5m");
               await publisher.publishOrdered(events5m);
-            }
-
-            const bar15m = agg15m.push1m(bar);
-            if (bar15m) {
-              bars15mCount++;
-              const events15m = await orch.processTick({
-                ts: bar15m.ts,
-                symbol: bar15m.symbol,
-                close: bar15m.close,
-                open: bar15m.open,
-                high: bar15m.high,
-                low: bar15m.low,
-                volume: bar15m.volume
-              }, "15m");
-              await publisher.publishOrdered(events15m);
+              const bar15m = agg15mFrom5m.push1m(bar5m);
+              if (bar15m) {
+                bars15mCount++;
+                const events15m = await orch.processTick({
+                  ts: bar15m.ts,
+                  symbol: bar15m.symbol,
+                  close: bar15m.close,
+                  open: bar15m.open,
+                  high: bar15m.high,
+                  low: bar15m.low,
+                  volume: bar15m.volume
+                }, "15m");
+                await publisher.publishOrdered(events15m);
+              }
             }
           } catch (processError: any) {
             // Log processing errors but continue the loop
