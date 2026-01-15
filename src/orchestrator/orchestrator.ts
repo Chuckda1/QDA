@@ -1,4 +1,4 @@
-import type { Bias, BotState, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, TradeAction } from "../types.js";
+import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
@@ -59,6 +59,107 @@ type TickSnapshot = TickInput & {
   timeframe: "1m" | "5m" | "15m";
 };
 
+type ConfirmBar = {
+  ts: number;
+  close: number;
+  ema9?: number;
+  ema20?: number;
+};
+
+type DirectionGate =
+  | { allow: false; tier: "NONE"; reason: string; direction?: undefined }
+  | { allow: true; tier: "LOCKED" | "LEANING"; direction: Direction; reason: string };
+
+function computeEmaSlopePct(closes: number[], period: number, lookbackBars: number): number | undefined {
+  if (closes.length < period + lookbackBars) return undefined;
+  const emaNow = computeEMA(closes, period);
+  const pastCloses = closes.slice(0, Math.max(0, closes.length - lookbackBars));
+  const emaPast = computeEMA(pastCloses, period);
+  if (emaNow === undefined || emaPast === undefined || emaPast === 0) return undefined;
+  return ((emaNow - emaPast) / emaPast) * 100;
+}
+
+function directionGate15mMoreLeaning(input: {
+  close15m: number;
+  vwap15m?: number;
+  ema9_15m?: number;
+  ema20_15m?: number;
+  structure15m?: "BULLISH" | "BEARISH" | "MIXED" | "CHOP";
+  vwapSlope15m?: number;
+  ema20Slope15m?: number;
+}): DirectionGate {
+  const { close15m, vwap15m, ema9_15m, ema20_15m, structure15m, vwapSlope15m, ema20Slope15m } = input;
+
+  if (vwap15m === undefined || ema9_15m === undefined || ema20_15m === undefined) {
+    return { allow: false, tier: "NONE", reason: "Direction gate: missing VWAP/EMA inputs" };
+  }
+
+  const onVwapLong = close15m > vwap15m;
+  const onVwapShort = close15m < vwap15m;
+
+  const emaLong = ema9_15m > ema20_15m;
+  const emaShort = ema9_15m < ema20_15m;
+
+  const structureBull = structure15m === "BULLISH";
+  const structureBear = structure15m === "BEARISH";
+
+  const slopeBull =
+    (vwapSlope15m !== undefined && vwapSlope15m > 0) ||
+    (ema20Slope15m !== undefined && ema20Slope15m > 0);
+
+  const slopeBear =
+    (vwapSlope15m !== undefined && vwapSlope15m < 0) ||
+    (ema20Slope15m !== undefined && ema20Slope15m < 0);
+
+  const longCore2 = onVwapLong && emaLong;
+  const shortCore2 = onVwapShort && emaShort;
+
+  if (longCore2 && (structureBull || slopeBull)) {
+    return {
+      allow: true,
+      tier: "LOCKED",
+      direction: "LONG",
+      reason: `LOCKED LONG: VWAP side + EMA stack + ${(structureBull ? "structure" : "slope")} confirm`
+    };
+  }
+
+  if (shortCore2 && (structureBear || slopeBear)) {
+    return {
+      allow: true,
+      tier: "LOCKED",
+      direction: "SHORT",
+      reason: `LOCKED SHORT: VWAP side + EMA stack + ${(structureBear ? "structure" : "slope")} confirm`
+    };
+  }
+
+  const longOpposed = structureBear;
+  const shortOpposed = structureBull;
+
+  if (onVwapLong && !longOpposed && (emaLong || slopeBull || structureBull)) {
+    return {
+      allow: true,
+      tier: "LEANING",
+      direction: "LONG",
+      reason: "LEANING LONG: on correct VWAP side; not opposed; EMA/slope/structure supportive"
+    };
+  }
+
+  if (onVwapShort && !shortOpposed && (emaShort || slopeBear || structureBear)) {
+    return {
+      allow: true,
+      tier: "LEANING",
+      direction: "SHORT",
+      reason: "LEANING SHORT: on correct VWAP side; not opposed; EMA/slope/structure supportive"
+    };
+  }
+
+  return {
+    allow: false,
+    tier: "NONE",
+    reason: `Direction unclear/contested: close=${close15m.toFixed(2)} vwap=${vwap15m.toFixed(2)} ema9=${ema9_15m.toFixed(2)} ema20=${ema20_15m.toFixed(2)} structure=${structure15m ?? "?"}`
+  };
+}
+
 export class Orchestrator {
   private state: BotState;
   private instanceId: string;
@@ -77,6 +178,13 @@ export class Orchestrator {
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
+  private last15mClose?: number;
+  private last15mVwap?: number;
+  private last15mEma9?: number;
+  private last15mEma20?: number;
+  private last15mVwapSlopePct?: number;
+  private last15mEma20Slope?: number;
+  private last15mStructure?: "BULLISH" | "BEARISH" | "MIXED" | "CHOP";
 
   // Guardrail tracking
   private playsToday: number = 0;
@@ -518,21 +626,90 @@ export class Orchestrator {
       return events;
     }
 
-    // Entry eligible tracking (assume entry when price touches zone)
     const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
+
+    // 1) Zone touch arms an ENTRY_WINDOW (does NOT enter)
     if (inZone && play.status === "ARMED" && !play.inEntryZone) {
       play.inEntryZone = true;
-      // Assume entry when price is in zone (or you can require manual confirmation)
-      play.status = "ENTERED";
-      play.entryPrice = close;
-      play.entryTimestamp = ts;
-      events.push(this.ev("PLAY_ENTERED", ts, {
+      play.status = "ENTRY_WINDOW";
+      play.entryWindowOpenedTs = ts;
+      play.reclaim = { step: "WAIT_RECLAIM" };
+
+      events.push(this.ev("ENTRY_WINDOW_OPENED", ts, {
         playId: play.id,
         symbol: play.symbol,
         direction: play.direction,
         price: close,
-        entryPrice: play.entryPrice
+        entryZone: play.entryZone
       }));
+    }
+
+    // 2) While in ENTRY_WINDOW, wait for depth trigger inside zone
+    if (play.status === "ENTRY_WINDOW") {
+      const maxWindowMs = play.tier === "LEANING" ? 12 * 60_000 : 20 * 60_000;
+      if (play.entryWindowOpenedTs && ts - play.entryWindowOpenedTs > maxWindowMs) {
+        play.status = "CANCELLED";
+        events.push(this.ev("PLAY_CANCELLED", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          price: close,
+          reason: "Entry window expired"
+        }));
+        this.state.activePlay = null;
+        return events;
+      }
+
+      if (play.direction === "LONG" && close <= play.stop) {
+        play.status = "CANCELLED";
+        events.push(this.ev("PLAY_CANCELLED", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          price: close,
+          reason: "Pre-entry stop break"
+        }));
+        this.state.activePlay = null;
+        return events;
+      }
+      if (play.direction === "SHORT" && close >= play.stop) {
+        play.status = "CANCELLED";
+        events.push(this.ev("PLAY_CANCELLED", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          price: close,
+          reason: "Pre-entry stop break"
+        }));
+        this.state.activePlay = null;
+        return events;
+      }
+
+      const zoneWidth = play.entryZone.high - play.entryZone.low;
+      const entryTrigger = play.direction === "LONG"
+        ? play.entryZone.low + 0.35 * zoneWidth
+        : play.entryZone.high - 0.35 * zoneWidth;
+      const depthHit = play.direction === "LONG"
+        ? (low ?? close) <= entryTrigger
+        : (high ?? close) >= entryTrigger;
+
+      if (depthHit) {
+        play.status = "ENTERED";
+        play.entryPrice = close;
+        play.entryTimestamp = ts;
+        play.mode = "SCOUT";
+        play.reclaim = { step: "WAIT_RECLAIM", confirmations: 0 };
+
+        events.push(this.ev("PLAY_ENTERED", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          price: close,
+          entryPrice: play.entryPrice,
+          entryTrigger,
+          reason: "Pullback depth hit"
+        }));
+      }
     }
     if (!inZone) {
       play.inEntryZone = false;
@@ -566,6 +743,46 @@ export class Orchestrator {
       }));
       this.state.activePlay = null;
       return events;
+    }
+
+    if (play.status === "ENTERED" && play.mode === "SCOUT" && !play.stopHit) {
+      const closes1m = this.recentBars1m.map((b) => b.close);
+      const ema9_1m = computeEMA(closes1m.slice(-60), 9);
+      const ema20_1m = computeEMA(closes1m.slice(-80), 20);
+
+      const confirm = this.confirmEntryOnPullbackReclaim(play, {
+        ts,
+        close,
+        ema9: ema9_1m,
+        ema20: ema20_1m
+      });
+
+      if (confirm.ok) {
+        play.mode = "FULL";
+        events.push(this.ev("PLAY_SIZED_UP", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          mode: play.mode,
+          reason: confirm.reason
+        }));
+      } else if (confirm.shouldCancel) {
+        play.status = "CLOSED";
+        events.push(this.ev("PLAY_CLOSED", ts, {
+          playId: play.id,
+          symbol: play.symbol,
+          direction: play.direction,
+          close,
+          stop: play.stop,
+          reason: confirm.reason,
+          result: "LOSS",
+          exitType: "TIME_STOP",
+          llmAction: "RULES_EXIT"
+        }));
+        this.cooldownAfterPlayClosed = Date.now();
+        this.state.activePlay = null;
+        return events;
+      }
     }
 
     return events;
@@ -646,8 +863,10 @@ export class Orchestrator {
     const rawBias = computeMacroBias(this.recentBars15m, close);
 
     const closes = this.recentBars15m.map((b) => b.close);
+    const ema9 = computeEMA(closes.slice(-40), 9);
     const ema20 = computeEMA(closes.slice(-80), 20);
     const vwap = computeVWAP(this.recentBars15m, 30);
+    const ema20Slope = computeEmaSlopePct(closes, 20, 3);
 
     const lastTwo = this.recentBars15m.slice(-2);
     const hasTwo = lastTwo.length === 2;
@@ -691,6 +910,13 @@ export class Orchestrator {
     this.lastRegime15m = mergedRegime;
     this.lastMacroBias = finalBias;
     this.lastRegime15mTs = ts;
+    this.last15mClose = close;
+    this.last15mVwap = vwap;
+    this.last15mEma9 = ema9;
+    this.last15mEma20 = ema20;
+    this.last15mVwapSlopePct = mergedRegime.vwapSlopePct;
+    this.last15mEma20Slope = ema20Slope;
+    this.last15mStructure = mergedRegime.structure;
 
     return [];
   }
@@ -764,6 +990,16 @@ export class Orchestrator {
       const vwap = computeVWAP(this.recentBars5m, 30);
       const rsi14 = computeRSI(closes, 14);
 
+      const directionGate = directionGate15mMoreLeaning({
+        close15m: this.last15mClose ?? close,
+        vwap15m: this.last15mVwap ?? anchorRegime.vwap,
+        ema9_15m: this.last15mEma9,
+        ema20_15m: this.last15mEma20,
+        structure15m: this.last15mStructure ?? anchorRegime.structure,
+        vwapSlope15m: this.last15mVwapSlopePct ?? anchorRegime.vwapSlopePct,
+        ema20Slope15m: this.last15mEma20Slope,
+      });
+
       const setupResult = this.setupEngine.findSetup({
         ts,
         symbol,
@@ -804,6 +1040,34 @@ export class Orchestrator {
       const setupCandidate = setupResult.candidate;
       const blockers: DecisionBlocker[] = [];
       const blockerReasons: string[] = [];
+
+      if (!directionGate.allow) {
+        blockers.push("guardrail");
+        blockerReasons.push(directionGate.reason);
+      } else if (setupCandidate.direction !== directionGate.direction) {
+        blockers.push("guardrail");
+        blockerReasons.push(`Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
+      }
+
+      if (directionGate.allow) {
+        const scoreFloor = directionGate.tier === "LEANING" ? 78 : 70;
+        if (setupCandidate.score.total < scoreFloor) {
+          blockers.push("guardrail");
+          blockerReasons.push(`score floor ${scoreFloor} (${setupCandidate.score.total})`);
+        }
+        if (directionGate.tier === "LEANING" && setupCandidate.flags?.includes("CHASE_RISK")) {
+          blockers.push("guardrail");
+          blockerReasons.push("leaning: chase risk blocked");
+        }
+        if (directionGate.tier === "LEANING" && atr) {
+          const entryMid = (setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2;
+          const riskAtr = Math.abs(entryMid - setupCandidate.stop) / atr;
+          if (riskAtr > 1.0) {
+            blockers.push("guardrail");
+            blockerReasons.push(`leaning risk/ATR too large (${riskAtr.toFixed(2)})`);
+          }
+        }
+      }
 
       const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
@@ -1159,6 +1423,11 @@ export class Orchestrator {
         llmSummary.note = [llmSummary.note, "auto-all-in"].filter(Boolean).join(" | ");
       }
 
+      if (directionGate.allow && directionGate.tier === "LEANING" && llmSummary?.action === "GO_ALL_IN") {
+        llmSummary.action = "SCALP";
+        llmSummary.note = [llmSummary.note, "leaning: scout-only"].filter(Boolean).join(" | ");
+      }
+
       const distanceToVwap = vwap !== undefined && atr ? Math.abs(close - vwap) : undefined;
       const atrSlopeRising = anchorRegime.atrSlope !== undefined && anchorRegime.atrSlope > 0;
       const patternAllowsAllIn = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"].includes(setupCandidate.pattern);
@@ -1262,6 +1531,12 @@ export class Orchestrator {
       }
 
       if (decision.status === "ARMED" && decision.play) {
+        if (directionGate.allow) {
+          decision.play.tier = directionGate.tier;
+          if (directionGate.tier === "LEANING") {
+            decision.play.mode = "SCOUT";
+          }
+        }
         this.state.activePlay = decision.play;
         this.playsToday += 1;
         events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary, price: close }));
@@ -1638,5 +1913,60 @@ export class Orchestrator {
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {
     return { type, timestamp, instanceId: this.instanceId, data };
+  }
+
+  private confirmEntryOnPullbackReclaim(
+    play: Play,
+    bar: ConfirmBar
+  ): { ok: boolean; shouldCancel?: boolean; reason: string } {
+    const dir = play.direction;
+    const reclaimLine = play.tier === "LEANING" ? bar.ema20 : bar.ema9;
+
+    if (reclaimLine === undefined || !Number.isFinite(reclaimLine)) {
+      return { ok: false, shouldCancel: false, reason: "Missing reclaim line" };
+    }
+
+    const timeInTradeMin = play.entryTimestamp ? (bar.ts - play.entryTimestamp) / 60000 : 0;
+    const maxWaitMin = play.tier === "LEANING" ? 12 : 10;
+    if (timeInTradeMin >= maxWaitMin) {
+      return { ok: false, shouldCancel: true, reason: "Reclaim timeout" };
+    }
+
+    if (!play.reclaim) play.reclaim = { step: "WAIT_RECLAIM" } as ReclaimState;
+
+    const reclaimed =
+      dir === "LONG" ? bar.close > reclaimLine : bar.close < reclaimLine;
+    const held =
+      dir === "LONG" ? bar.close >= reclaimLine : bar.close <= reclaimLine;
+    const requiredHolds = play.tier === "LEANING" ? 2 : 1;
+
+    if (play.reclaim.step === "WAIT_RECLAIM") {
+      if (!reclaimed) {
+        return { ok: false, shouldCancel: false, reason: "Waiting for reclaim close" };
+      }
+      play.reclaim.step = "WAIT_CONFIRM";
+      play.reclaim.reclaimTs = bar.ts;
+      play.reclaim.reclaimClose = bar.close;
+      play.reclaim.confirmations = 0;
+      return { ok: false, shouldCancel: false, reason: "Reclaim detected; waiting confirm bar" };
+    }
+
+    if (play.reclaim.step === "WAIT_CONFIRM") {
+      if (held) {
+        const confirmations = (play.reclaim.confirmations ?? 0) + 1;
+        play.reclaim.confirmations = confirmations;
+        if (confirmations >= requiredHolds) {
+          return { ok: true, shouldCancel: false, reason: "Reclaim confirmed; size-up ok" };
+        }
+        return { ok: false, shouldCancel: false, reason: `Reclaim holding (${confirmations}/${requiredHolds})` };
+      }
+      play.reclaim.step = "WAIT_RECLAIM";
+      play.reclaim.reclaimTs = undefined;
+      play.reclaim.reclaimClose = undefined;
+      play.reclaim.confirmations = undefined;
+      return { ok: false, shouldCancel: false, reason: "Reclaim failed; reset" };
+    }
+
+    return { ok: false, shouldCancel: false, reason: "Unknown reclaim state" };
   }
 }

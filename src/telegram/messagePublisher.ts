@@ -280,8 +280,32 @@ export class MessagePublisher {
         return [
           `[${instanceId}] ✅ PLAY ENTERED`,
           `${event.data.direction} ${event.data.symbol}`,
-          `Entry: $${event.data.entryPrice?.toFixed(2) || event.data.price?.toFixed(2) || "N/A"}`
+          `Entry: $${event.data.entryPrice?.toFixed(2) || event.data.price?.toFixed(2) || "N/A"}`,
+          event.data.reason ? `Reason: ${event.data.reason}` : ""
         ].join("\n");
+
+      case "PLAY_SIZED_UP":
+        return [
+          `[${instanceId}] 📈 SIZE UP`,
+          `${event.data.direction} ${event.data.symbol}`,
+          `Mode: ${event.data.mode || "FULL"}`,
+          event.data.reason ? `Reason: ${event.data.reason}` : ""
+        ].filter(Boolean).join("\n");
+
+      case "ENTRY_WINDOW_OPENED":
+        return [
+          `[${instanceId}] 🟡 ENTRY WINDOW`,
+          `${event.data.direction} ${event.data.symbol}`,
+          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
+          event.data.entryZone ? `Zone: $${event.data.entryZone.low.toFixed(2)} - $${event.data.entryZone.high.toFixed(2)}` : ""
+        ].filter(Boolean).join("\n");
+
+      case "PLAY_CANCELLED":
+        return [
+          `[${instanceId}] 🚫 PLAY CANCELLED`,
+          `${event.data.direction} ${event.data.symbol}`,
+          event.data.reason ? `Reason: ${event.data.reason}` : ""
+        ].filter(Boolean).join("\n");
 
       case "LLM_COACH_UPDATE":
         return [

@@ -120,6 +120,8 @@ export function buildDecision(inputs: DecisionGateInputs): AuthoritativeDecision
       entryZone: candidate.entryZone,
       stop: candidate.stop,
       targets: candidate.targets,
+      valueBand: candidate.meta?.valueBand,
+      vwapRef: candidate.meta?.vwapRef ?? null,
       mode: playMode,
       confidence: llm?.probability ?? candidate.score.total,
       legitimacy: llm?.legitimacy,

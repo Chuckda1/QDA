@@ -400,14 +400,15 @@ export class SetupEngine {
       }
     }
 
-    // Select best candidate deterministically
-    if (candidates.length === 0) {
-      return { reason: "no qualifying setup patterns found" };
+    // Select best candidate deterministically (pullback-only)
+    const pullbackCandidates = candidates.filter((c) => c.pattern === "PULLBACK_CONTINUATION");
+    if (pullbackCandidates.length === 0) {
+      return { reason: "Only PULLBACK_CONTINUATION enabled" };
     }
 
     // Pick best candidate by deterministic score
-    candidates.sort((a, b) => b.score.total - a.score.total);
-    return { candidate: candidates[0]! };
+    pullbackCandidates.sort((a, b) => b.score.total - a.score.total);
+    return { candidate: pullbackCandidates[0]! };
   }
 
   /**
@@ -484,6 +485,10 @@ export class SetupEngine {
     const risk = Math.abs(entryMid - stop);
     if (risk <= 0) {
       return { reason: "Invalid risk calculation" };
+    }
+    const riskAtr = risk / atr;
+    if (riskAtr < 0.25 || riskAtr > 1.2) {
+      return { reason: `Risk/ATR out of bounds (${riskAtr.toFixed(2)})` };
     }
 
     // Build targets: 1R, 2R, 3R from entryMid
@@ -660,6 +665,10 @@ export class SetupEngine {
         entryZone,
         stop,
         targets,
+        meta: {
+          valueBand: { low: bandLow, high: bandHigh },
+          vwapRef: vwap ?? null
+        },
         rationale,
         score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
       }

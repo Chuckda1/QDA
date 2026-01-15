@@ -8,16 +8,19 @@ import type { DomainEvent, DomainEventType } from "../types.js";
  */
 const PRIORITY: Record<DomainEventType, number> = {
   PLAY_ARMED: 1,
-  TIMING_COACH: 2,
-  LLM_VERIFY: 3,
-  SCORECARD: 4,
-  SETUP_SUMMARY: 5,
-  NO_ENTRY: 6,
-  TRADE_PLAN: 7,
-  PLAY_ENTERED: 8,
-  ARMED_COACH: 9, // Pre-entry coaching (happens on 5m bars while waiting for entry)
-  LLM_COACH_UPDATE: 10, // Position management coaching (after entry)
-  PLAY_CLOSED: 11,
+  ENTRY_WINDOW_OPENED: 2,
+  TIMING_COACH: 3,
+  LLM_VERIFY: 4,
+  SCORECARD: 5,
+  SETUP_SUMMARY: 6,
+  NO_ENTRY: 7,
+  TRADE_PLAN: 8,
+  PLAY_ENTERED: 9,
+  PLAY_SIZED_UP: 10,
+  ARMED_COACH: 11, // Pre-entry coaching (happens on 5m bars while waiting for entry)
+  LLM_COACH_UPDATE: 12, // Position management coaching (after entry)
+  PLAY_CANCELLED: 13,
+  PLAY_CLOSED: 14,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
 };
 

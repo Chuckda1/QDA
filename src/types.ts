@@ -30,10 +30,15 @@ export interface SetupCandidate {
     total: number;
   };
   flags?: string[]; // e.g. ["CHOP_OVERRIDE"]
+  meta?: {
+    valueBand?: { low: number; high: number };
+    vwapRef?: number | null;
+  };
 }
 
 export type DomainEventType =
   | "PLAY_ARMED"
+  | "ENTRY_WINDOW_OPENED"
   | "TIMING_COACH"
   | "LLM_VERIFY"
   | "SCORECARD"
@@ -43,6 +48,8 @@ export type DomainEventType =
   | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
   | "PLAY_ENTERED"
+  | "PLAY_SIZED_UP"
+  | "PLAY_CANCELLED"
   | "PLAY_CLOSED"
   | "PLAN_OF_DAY";
 
@@ -69,6 +76,10 @@ export interface Play {
   inEntryZone?: boolean;
   stopThreatened?: boolean;
   stopHit?: boolean;
+  entryWindowOpenedTs?: number;
+  reclaim?: ReclaimState;
+  valueBand?: { low: number; high: number };
+  vwapRef?: number | null;
   
   // LLM fields
   legitimacy?: number;
@@ -76,7 +87,8 @@ export interface Play {
   action?: TradeAction;
   
   // tracking
-  status: "ARMED" | "ENTERED" | "CLOSED";
+  status: "ARMED" | "ENTRY_WINDOW" | "ENTERED" | "CANCELLED" | "CLOSED";
+  tier?: "LOCKED" | "LEANING";
   lastCoachUpdate?: number;
   armedTimestamp?: number; // timestamp when play was armed
   entered?: boolean;  // legacy flag (use status instead)
@@ -87,6 +99,15 @@ export interface Play {
   t1Hit?: boolean;
   stopAdjusted?: boolean;
 }
+
+export type ReclaimStep = "WAIT_RECLAIM" | "WAIT_CONFIRM";
+
+export type ReclaimState = {
+  step: ReclaimStep;
+  reclaimTs?: number;
+  reclaimClose?: number;
+  confirmations?: number;
+};
 
 export interface BotState {
   startedAt: number;
