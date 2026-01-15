@@ -901,7 +901,7 @@ export class Orchestrator {
           console.log(`[5m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
 
-          const llmVerifyPromise = this.llmService.verifyPlaySetup({
+          const llmVerifyPromise = this.llmService!.verifyPlaySetup({
             symbol: setupCandidate.symbol,
             direction: setupCandidate.direction,
             entryZone: setupCandidate.entryZone,

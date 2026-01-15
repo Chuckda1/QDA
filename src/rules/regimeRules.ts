@@ -37,6 +37,7 @@ export function vwapSlopeFromHistory(
     return {
       vwap: undefined,
       slope: "FLAT",
+      slopePct: 0,
       reasons: ["insufficient bars for VWAP slope"],
     };
   }
@@ -46,6 +47,7 @@ export function vwapSlopeFromHistory(
     return {
       vwap: undefined,
       slope: "FLAT",
+      slopePct: 0,
       reasons: ["VWAP computation failed"],
     };
   }
@@ -56,6 +58,7 @@ export function vwapSlopeFromHistory(
     return {
       vwap: currentVWAP,
       slope: "FLAT",
+      slopePct: 0,
       reasons: ["insufficient history for VWAP comparison"],
     };
   }
@@ -65,6 +68,7 @@ export function vwapSlopeFromHistory(
     return {
       vwap: currentVWAP,
       slope: "FLAT",
+      slopePct: 0,
       reasons: ["past VWAP computation failed"],
     };
   }

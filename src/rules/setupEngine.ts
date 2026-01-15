@@ -424,6 +424,8 @@ export class SetupEngine {
     const atr = indicators.atr!;
     const ema9 = indicators.ema9!;
     const ema20 = indicators.ema20!;
+    const vwap = indicators.vwap;
+    const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
 
     if (!atr || !ema9 || !ema20) {
       return { reason: "Missing required indicators for pullback continuation" };
@@ -569,6 +571,7 @@ export class SetupEngine {
     const ema9 = indicators.ema9!;
     const ema20 = indicators.ema20!;
     const vwap = indicators.vwap;
+    const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
 
     if (!atr || !ema9 || !ema20) {
       return { reason: "Missing required indicators for value reclaim" };
