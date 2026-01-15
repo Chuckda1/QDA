@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID=your_telegram_chat_id_here
 ### Bot Configuration
 ```bash
 INSTANCE_ID=qda-bot-001          # Bot instance identifier (default: "qda-bot-001")
-HEARTBEAT=1                      # Enable heartbeats: "1" or "0" (default: "1")
+HEARTBEAT=1                      # Enable status pulse logs: "1" or "0" (default: "1")
 ```
 
 ### LLM Service (Optional - bot works without it)
@@ -55,6 +55,15 @@ ALPACA_BASE_URL=https://paper-api.alpaca.markets  # Paper trading (default)
 # OR
 ALPACA_BASE_URL=https://api.alpaca.markets  # Live trading
 ALPACA_FEED=iex                              # "iex" (free) or "sip" (paid)
+```
+
+### High-Probability Gate (Optional)
+```bash
+ENFORCE_HIGH_PROBABILITY_SETUPS=true  # Block low-prob setups
+MIN_LLM_PROBABILITY=70                # Minimum LLM probability
+MIN_LLM_AGREEMENT=70                  # Minimum LLM agreement
+MIN_RULES_PROBABILITY=70              # Minimum rules probability (score or dir confidence)
+AUTO_ALL_IN_ON_HIGH_PROB=true         # Promote SCALP -> GO_ALL_IN on high-prob
 ```
 
 **How to get:**
@@ -171,7 +180,12 @@ npm run test:llm
 | `TELEGRAM_BOT_TOKEN` | ✅ Yes | - | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | ✅ Yes | - | Telegram chat ID (number) |
 | `INSTANCE_ID` | ❌ No | `qda-bot-001` | Bot instance identifier |
-| `HEARTBEAT` | ❌ No | `1` | Enable heartbeats (`1` or `0`) |
+| `HEARTBEAT` | ❌ No | `1` | Enable status pulses (`1` or `0`) |
+| `ENFORCE_HIGH_PROBABILITY_SETUPS` | ❌ No | `true` | Block low-prob setups |
+| `MIN_LLM_PROBABILITY` | ❌ No | `70` | Minimum LLM probability threshold |
+| `MIN_LLM_AGREEMENT` | ❌ No | `70` | Minimum LLM agreement threshold |
+| `MIN_RULES_PROBABILITY` | ❌ No | `70` | Minimum rules confidence threshold |
+| `AUTO_ALL_IN_ON_HIGH_PROB` | ❌ No | `true` | Promote SCALP -> GO_ALL_IN |
 | `OPENAI_API_KEY` | ❌ No | - | OpenAI API key (for LLM) |
 | `OPENAI_BASE_URL` | ❌ No | `https://api.openai.com/v1` | OpenAI API base URL |
 | `OPENAI_MODEL` | ❌ No | `gpt-4o-mini` | OpenAI model to use |

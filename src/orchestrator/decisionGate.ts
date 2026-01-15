@@ -8,6 +8,7 @@ export type DecisionBlocker =
   | "cooldown"
   | "guardrail"
   | "chop"
+  | "low_probability"
   | "datafeed"
   | "time_window"
   | "entry_filter";

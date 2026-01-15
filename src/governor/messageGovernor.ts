@@ -133,6 +133,11 @@ export class MessageGovernor {
       if (event.data?.type === pulseType) {
         return false;
       }
+
+      const decisionBlockers = event.data?.decision?.blockers;
+      if (Array.isArray(decisionBlockers) && decisionBlockers.includes("low_probability")) {
+        return false;
+      }
       
       // Check dedupe key
       const key = this.getDedupeKey(event);
