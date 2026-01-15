@@ -32,7 +32,7 @@ export class MessagePublisher {
    * Publish multiple events in strict priority order
    * 
    * STAGE 4: All messages must go through this method to ensure serialization
-   * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → TRADE_PLAN → PLAY_ENTERED → LLM_COACH_UPDATE → PLAY_CLOSED
+   * Order: PLAY_ARMED → TIMING_COACH → LLM_VERIFY → SCORECARD → NO_ENTRY → TRADE_PLAN → PLAY_ENTERED → LLM_COACH_UPDATE → PLAY_CLOSED
    * 
    * INVARIANT CHECKS:
    * - LLM_COACH_UPDATE only if play is entered
@@ -127,6 +127,23 @@ export class MessagePublisher {
     }
   }
 
+  private formatDecisionLines(decision?: {
+    status?: string;
+    blockers?: string[];
+    blockerReasons?: string[];
+  }): string[] {
+    if (!decision?.status) return [];
+    const lines = [`Decision: ${decision.status}`];
+    if (decision.status !== "ARMED") {
+      const blockers = decision.blockers?.length ? decision.blockers : ["arming_failed"];
+      lines.push(`Blocker: ${blockers.join(", ")}`);
+      if (decision.blockerReasons?.length) {
+        lines.push(`Reason: ${decision.blockerReasons.join(" | ")}`);
+      }
+    }
+    return lines;
+  }
+
   private formatEvent(event: DomainEvent): string {
     const instanceId = event.instanceId;
     
@@ -140,8 +157,9 @@ export class MessagePublisher {
           `Score: ${p.score.toFixed(1)} (${p.grade})`,
           `Entry: $${p.entryZone.low.toFixed(2)} - $${p.entryZone.high.toFixed(2)}`,
           `Stop: $${p.stop.toFixed(2)}`,
-          `Targets: $${p.targets.t1.toFixed(2)}, $${p.targets.t2.toFixed(2)}, $${p.targets.t3.toFixed(2)}`
-        ].join("\n");
+          `Targets: $${p.targets.t1.toFixed(2)}, $${p.targets.t2.toFixed(2)}, $${p.targets.t3.toFixed(2)}`,
+          ...this.formatDecisionLines(event.data.decision)
+        ].filter(Boolean).join("\n");
       }
       
       case "TIMING_COACH": {
@@ -176,8 +194,9 @@ export class MessagePublisher {
           `Follow-through: ${event.data.followThroughProb}%`,
           `Action: ${event.data.action}`,
           ``,
-          `${event.data.reasoning || ""}`
-        ].join("\n");
+          `${event.data.reasoning || ""}`,
+          ...this.formatDecisionLines(event.data.decision)
+        ].filter(Boolean).join("\n");
 
       case "SCORECARD": {
         const r = event.data.rules ?? {};
@@ -201,13 +220,18 @@ export class MessagePublisher {
           `Action: ${l.action ?? "N/A"}`,
           ``,
           `${l.reasoning ?? ""}`.trim(),
+          ...this.formatDecisionLines(event.data.decision)
         ].filter(Boolean).join("\n");
       }
 
       case "SETUP_SUMMARY": {
         const c = event.data?.candidate;
         if (!c) {
-          return `[${instanceId}] 🧩 SETUP SUMMARY\n${event.data?.summary ?? "No candidate"}`;
+          return [
+            `[${instanceId}] 🧩 SETUP SUMMARY`,
+            `${event.data?.summary ?? "No candidate"}`,
+            ...this.formatDecisionLines(event.data.decision)
+          ].filter(Boolean).join("\n");
         }
         return [
           `[${instanceId}] 🧩 SETUP SUMMARY (5m)`,
@@ -217,8 +241,16 @@ export class MessagePublisher {
           `Entry: $${c.entryZone?.low?.toFixed?.(2) ?? "n/a"} - $${c.entryZone?.high?.toFixed?.(2) ?? "n/a"}`,
           `Stop: $${Number.isFinite(c.stop) ? c.stop.toFixed(2) : "n/a"}`,
           event.data?.notes ? `Notes: ${event.data.notes}` : "",
+          ...this.formatDecisionLines(event.data.decision)
         ].filter(Boolean).join("\n");
       }
+
+      case "NO_ENTRY":
+        return [
+          `[${instanceId}] ⛔ NO ENTRY`,
+          event.data?.direction && event.data?.symbol ? `${event.data.direction} ${event.data.symbol}` : "",
+          ...this.formatDecisionLines(event.data.decision)
+        ].filter(Boolean).join("\n");
 
       case "TRADE_PLAN":
         return [

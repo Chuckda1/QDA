@@ -30,6 +30,7 @@ export type DomainEventType =
   | "LLM_VERIFY"
   | "SCORECARD"
   | "SETUP_SUMMARY"
+  | "NO_ENTRY"
   | "TRADE_PLAN"
   | "ARMED_COACH"
   | "LLM_COACH_UPDATE"
@@ -67,11 +68,14 @@ export interface Play {
   action?: TradeAction;
   
   // tracking
+  status: "ARMED" | "ENTERED" | "CLOSED";
   lastCoachUpdate?: number;
   armedTimestamp?: number; // timestamp when play was armed
-  entered?: boolean;  // true when position is actually entered
+  entered?: boolean;  // legacy flag (use status instead)
   entryPrice?: number; // actual entry price when entered
   entryTimestamp?: number; // timestamp when entered
+  expiresAt?: number; // timestamp when arming expires
+  triggerPrice?: number; // candidate trigger price
 }
 
 export interface BotState {

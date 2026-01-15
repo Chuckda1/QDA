@@ -11,6 +11,14 @@ import { detectStructureLLLH } from "../utils/structure.js";
 import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
+import {
+  buildDecision,
+  buildNoEntryDecision,
+  type AuthoritativeDecision,
+  type DecisionBlocker,
+  type DecisionLlmSummary,
+  type DecisionRulesSnapshot
+} from "./decisionGate.js";
 
 type SetupDiagnosticsSnapshot = {
   ts: number;
@@ -56,6 +64,7 @@ export class Orchestrator {
   private recentBars: OHLCVBar[] = []; // For pullback detection and direction inference
   private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
   private lastSetupSummary5mTs: number | null = null;
+  private lastDecision: AuthoritativeDecision | null = null;
 
   // Guardrail tracking
   private playsToday: number = 0;
@@ -107,10 +116,21 @@ export class Orchestrator {
     // Initialize ET day tracking
     this.currentETDay = getETDateString();
 
+    const activePlay = initialState?.activePlay ?? null;
+    if (activePlay && !activePlay.status) {
+      if (activePlay.stopHit) {
+        activePlay.status = "CLOSED";
+      } else if (activePlay.entered) {
+        activePlay.status = "ENTERED";
+      } else {
+        activePlay.status = "ARMED";
+      }
+    }
+
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
-      activePlay: initialState?.activePlay ?? null,
+      activePlay,
       mode: "QUIET"
     };
   }
@@ -294,6 +314,12 @@ export class Orchestrator {
             setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
             datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
           };
+          this.lastDecision = buildNoEntryDecision({
+            ts,
+            symbol,
+            reason: "datafeed",
+            reasonDetail: `time gap: ${gapMinutes} minutes`
+          });
         }
         return events; // Skip this bar
       }
@@ -330,6 +356,12 @@ export class Orchestrator {
             setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
             datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
           };
+          this.lastDecision = buildNoEntryDecision({
+            ts,
+            symbol,
+            reason: "datafeed",
+            reasonDetail: `missing OHLC: ${missing.join(", ")}`
+          });
         }
         return events; // Skip this bar
       }
@@ -357,6 +389,12 @@ export class Orchestrator {
           setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
           datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
         };
+        this.lastDecision = buildNoEntryDecision({
+          ts,
+          symbol,
+          reason: "datafeed",
+          reasonDetail: `data gap cooldown: ${this.dataGapCooldown} bars`
+        });
       }
       return events; // Skip processing during cooldown
     }
@@ -376,27 +414,13 @@ export class Orchestrator {
           directionInference: inferDirectionFromRecentBars(this.recentBars),
           setupReason: "insufficient bar history (< 6 bars)",
         };
-        return events;
-      }
-
-      // Check guardrails before proceeding
-      const guardrailCheck = this.checkGuardrails(ts);
-      if (!guardrailCheck.allowed) {
-        const regime = computeRegime(this.recentBars, close);
-        this.lastDiagnostics = {
+        this.lastDecision = buildDecision({
           ts,
           symbol,
-          close,
-          regime,
-          directionInference: inferDirectionFromRecentBars(this.recentBars),
-          guardrailBlock: guardrailCheck.reason,
-          setupReason: `guardrail: ${guardrailCheck.reason}`,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
-        console.log(`[1m] Guardrail block: ${guardrailCheck.reason}`);
+          blockers: ["no_active_play"],
+          blockerReasons: ["insufficient bar history (< 6 bars)"],
+          expiryMs: 30 * 60 * 1000
+        });
         return events;
       }
 
@@ -445,35 +469,29 @@ export class Orchestrator {
           } : undefined,
         };
         console.log(`[1m] No setup candidate: ${setupResult.reason || "unknown"}`);
+        this.lastDecision = buildDecision({
+          ts,
+          symbol,
+          blockers: ["no_active_play"],
+          blockerReasons: [setupResult.reason || "no setup pattern found"],
+          expiryMs: 30 * 60 * 1000
+        });
         return events;
       }
 
       const setupCandidate = setupResult.candidate;
 
+      const blockers: DecisionBlocker[] = [];
+      const blockerReasons: string[] = [];
+
       // Regime-direction enforcement happens AFTER setup selection.
       // Trend setups must align with regime; reversal attempts are explicitly countertrend.
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
         const regimeCheck = regimeAllowsDirection(regime.regime, setupCandidate.direction);
-
         const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
-
-        // Allow CHOP setups only when explicitly marked as override
         if (!regimeCheck.allowed && !(regime.regime === "CHOP" && hasChopOverride)) {
-          this.lastDiagnostics = {
-            ts,
-            symbol,
-            close,
-            regime,
-            directionInference: dirInf,
-            candidate: setupCandidate,
-            setupReason: `regime gate: ${regimeCheck.reason}`,
-            regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-              bullScore: regime.bullScore,
-              bearScore: regime.bearScore,
-            } : undefined,
-          };
-          console.log(`[1m] No setup: ${regimeCheck.reason} | ${regime.reasons.join(" | ")}`);
-          return events;
+          blockers.push(regime.regime === "CHOP" ? "chop" : "guardrail");
+          blockerReasons.push(regimeCheck.reason);
         }
       }
 
@@ -513,23 +531,9 @@ export class Orchestrator {
         console.log(`[1m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
       }
       if (!filterResult.allowed) {
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: dirInf,
-          candidate: setupCandidate,
-          setupReason: `entry filter: ${filterResult.reason}`,
-          entryFilterWarnings: filterResult.warnings,
-          setupDebug: setupResult.debug,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
+        blockers.push("entry_filter");
+        blockerReasons.push(filterResult.reason);
         console.log(`[1m] Entry blocked by filter: ${filterResult.reason}`);
-        return events;
       }
 
       // Update diagnostics with successful candidate
@@ -548,9 +552,23 @@ export class Orchestrator {
         } : undefined,
       };
 
-      // WATCH-ONLY mode: track setups/diagnostics but never arm a play or call the LLM.
+      const guardrailCheck = this.checkGuardrails(ts);
+      if (!guardrailCheck.allowed) {
+        const isCooldown = guardrailCheck.reason?.includes("cooldown");
+        blockers.push(isCooldown ? "cooldown" : "guardrail");
+        if (guardrailCheck.reason) blockerReasons.push(guardrailCheck.reason);
+        this.lastDiagnostics = {
+          ...this.lastDiagnostics,
+          guardrailBlock: guardrailCheck.reason,
+          setupReason: `guardrail: ${guardrailCheck.reason}`
+        };
+      }
+
       if (watchOnly) {
-        return events;
+        if (!blockers.includes("arming_failed")) {
+          blockers.push("arming_failed");
+        }
+        blockerReasons.push("mode QUIET");
       }
 
       // Prepare warnings for LLM
@@ -599,8 +617,9 @@ export class Orchestrator {
       let llmVerify: LLMVerifyType | undefined;
       let llmTimedOut = false;
       let llmRulesOnly = false;
+      let llmSummary: DecisionLlmSummary | undefined;
 
-      if (this.llmService) {
+      if (this.llmService && !watchOnly) {
         try {
           console.log(`[1m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
@@ -648,23 +667,8 @@ export class Orchestrator {
                   followThroughProb: 60,
                 };
               } else {
-                this.lastDiagnostics = {
-                  ts,
-                  symbol,
-                  close,
-                  regime,
-                  directionInference: dirInf,
-                  candidate: setupCandidate,
-                  setupReason: `LLM timeout: ${this.llmTimeoutMs}ms exceeded (treated as PASS)`,
-                  entryFilterWarnings: filterResult.warnings,
-                  setupDebug: setupResult.debug,
-                  regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-                    bullScore: regime.bullScore,
-                    bearScore: regime.bearScore,
-                  } : undefined,
-                };
-                this.cooldownAfterLLMPass = Date.now();
-                return events;
+                blockers.push("arming_failed");
+                blockerReasons.push(`LLM timeout: ${this.llmTimeoutMs}ms`);
               }
             } else {
               throw error;
@@ -687,9 +691,10 @@ export class Orchestrator {
             } : undefined,
           };
           console.error(`[1m] LLM verification failed:`, error.message);
-          return events;
+          blockers.push("arming_failed");
+          blockerReasons.push(`LLM error: ${error.message}`);
         }
-      } else if (this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore) {
+      } else if (!this.llmService && this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore && !watchOnly) {
         console.log(`[1m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
         llmRulesOnly = true;
         llmVerify = {
@@ -703,41 +708,79 @@ export class Orchestrator {
           flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
           followThroughProb: 60,
         };
-      } else {
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: dirInf,
-          candidate: setupCandidate,
-          setupReason: `no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`,
-          entryFilterWarnings: filterResult.warnings,
-          setupDebug: setupResult.debug,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
+      } else if (!this.llmService && !watchOnly) {
+        blockers.push("arming_failed");
+        blockerReasons.push(`no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`);
         console.log(`[1m] No LLM service - setup found but requires LLM approval`);
-        return events;
       }
 
-      if (!llmVerify) {
-        return events;
+      if (llmVerify) {
+        llmSummary = {
+          biasDirection: llmVerify.biasDirection,
+          agreement: llmVerify.agreement,
+          legitimacy: llmVerify.legitimacy,
+          probability: llmVerify.probability,
+          followThroughProb: llmVerify.followThroughProb,
+          action: llmVerify.action,
+          reasoning: llmVerify.reasoning,
+          plan: llmVerify.plan,
+          flags: llmVerify.flags ?? [],
+          note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
+        };
+        this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
+
+        if (llmVerify.action === "PASS") {
+          this.cooldownAfterLLMPass = Date.now();
+        }
       }
 
-      this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
+      const rulesSnapshot: DecisionRulesSnapshot = {
+        regime: {
+          regime: regime.regime,
+          structure: regime.structure,
+          vwapSlope: regime.vwapSlope,
+          reasons: regime.reasons
+        },
+        directionInference: {
+          direction: dirInf.direction,
+          confidence: dirInf.confidence,
+          reasons: dirInf.reasons
+        },
+        indicators: indicatorSnapshot,
+        ruleScores
+      };
 
-      events.push(this.ev("LLM_VERIFY", ts, {
-        playId: setupCandidate.id,
-        symbol: setupCandidate.symbol,
-        direction: setupCandidate.direction,
-        legitimacy: llmVerify.legitimacy,
-        followThroughProb: llmVerify.followThroughProb,
-        action: llmVerify.action,
-        reasoning: llmVerify.reasoning
-      }));
+      const decision = buildDecision({
+        ts,
+        symbol,
+        candidate: setupCandidate,
+        rules: rulesSnapshot,
+        llm: llmSummary,
+        blockers,
+        blockerReasons,
+        expiryMs: 30 * 60 * 1000
+      });
+      this.lastDecision = decision;
+
+      const decisionSummary = {
+        decisionId: decision.decisionId,
+        status: decision.status,
+        blockers: decision.blockers,
+        blockerReasons: decision.blockerReasons
+      };
+
+      if (decision.llm) {
+        events.push(this.ev("LLM_VERIFY", ts, {
+          playId: setupCandidate.id,
+          symbol: setupCandidate.symbol,
+          direction: setupCandidate.direction,
+          legitimacy: decision.llm.legitimacy,
+          followThroughProb: decision.llm.followThroughProb,
+          action: decision.llm.action,
+          reasoning: decision.llm.reasoning,
+          decision: decisionSummary
+        }));
+      }
 
       events.push(this.ev("SCORECARD", ts, {
         playId: setupCandidate.id,
@@ -748,99 +791,71 @@ export class Orchestrator {
           triggerPrice: setupCandidate.triggerPrice,
           stop: setupCandidate.stop
         },
-        rules: {
-          regime: {
-            regime: regime.regime,
-            structure: regime.structure,
-            vwapSlope: regime.vwapSlope,
-            reasons: regime.reasons
-          },
-          directionInference: {
-            direction: dirInf.direction,
-            confidence: dirInf.confidence,
-            reasons: dirInf.reasons
-          },
-          indicators: indicatorSnapshot,
-          ruleScores
-        },
-        llm: {
-          biasDirection: llmVerify.biasDirection,
-          agreement: llmVerify.agreement,
-          legitimacy: llmVerify.legitimacy,
-          probability: llmVerify.probability,
-          action: llmVerify.action,
-          reasoning: llmVerify.reasoning,
-          flags: llmVerify.flags ?? []
-        }
+        rules: rulesSnapshot,
+        llm: decision.llm,
+        decision: decisionSummary
       }));
 
-      if (llmVerify.action === "PASS") {
-        this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime,
-          directionInference: dirInf,
-          candidate: setupCandidate,
-          setupReason: `LLM PASS: ${llmVerify.reasoning}`,
-          entryFilterWarnings: filterResult.warnings,
-          setupDebug: setupResult.debug,
-          regimeEvidence: regime.bullScore !== undefined && regime.bearScore !== undefined ? {
-            bullScore: regime.bullScore,
-            bearScore: regime.bearScore,
-          } : undefined,
-        };
-        console.log(`[1m] LLM rejected setup: ${llmVerify.reasoning}`);
-        this.cooldownAfterLLMPass = Date.now();
-        return events;
+      if (decision.status !== "ARMED") {
+        events.push(this.ev("NO_ENTRY", ts, {
+          playId: decision.decisionId,
+          symbol: setupCandidate.symbol,
+          direction: setupCandidate.direction,
+          decision: decisionSummary
+        }));
       }
 
-      const playMode: Play["mode"] = llmVerify.action === "GO_ALL_IN" ? "FULL" : "SCOUT";
-      const play: Play = {
-        id: setupCandidate.id,
-        symbol: setupCandidate.symbol,
-        direction: setupCandidate.direction,
-        score: setupCandidate.score.total,
-        grade: setupCandidate.score.total >= 70 ? "A" : setupCandidate.score.total >= 60 ? "B" : setupCandidate.score.total >= 50 ? "C" : "D",
-        entryZone: setupCandidate.entryZone,
-        stop: setupCandidate.stop,
-        targets: setupCandidate.targets,
-        mode: playMode,
-        confidence: llmVerify.probability ?? setupCandidate.score.total,
-        legitimacy: llmVerify.legitimacy,
-        followThroughProb: llmVerify.followThroughProb,
-        action: llmVerify.action,
-        armedTimestamp: ts,
-        entered: false,
-        inEntryZone: false,
-        stopHit: false
-      };
-
-      this.state.activePlay = play;
-      this.playsToday += 1;
-
-      events.push(this.ev("PLAY_ARMED", ts, { play }));
-      events.push(this.ev("TRADE_PLAN", ts, {
-        playId: play.id,
-        symbol: play.symbol,
-        direction: play.direction,
-        action: llmVerify.action,
-        size: play.mode,
-        probability: llmVerify.probability,
-        plan: llmVerify.plan
-      }));
+      if (decision.status === "ARMED" && decision.play) {
+        this.state.activePlay = decision.play;
+        this.playsToday += 1;
+        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary }));
+        events.push(this.ev("TRADE_PLAN", ts, {
+          playId: decision.play.id,
+          symbol: decision.play.symbol,
+          direction: decision.play.direction,
+          action: decision.llm?.action,
+          size: decision.play.mode,
+          probability: decision.llm?.probability,
+          plan: decision.llm?.plan,
+          decision: decisionSummary
+        }));
+      }
 
       return events;
     }
 
     const play = this.state.activePlay!;
 
+    if (play.status === "ARMED" && play.expiresAt && ts >= play.expiresAt) {
+      const decision = buildNoEntryDecision({
+        ts,
+        symbol: play.symbol,
+        reason: "expired",
+        reasonDetail: `expired at ${new Date(play.expiresAt).toISOString()}`
+      });
+      this.lastDecision = decision;
+      events.push(this.ev("NO_ENTRY", ts, {
+        playId: decision.decisionId,
+        symbol: play.symbol,
+        direction: play.direction,
+        decision: {
+          decisionId: decision.decisionId,
+          status: decision.status,
+          blockers: decision.blockers,
+          blockerReasons: decision.blockerReasons
+        }
+      }));
+      play.status = "CLOSED";
+      this.state.activePlay = null;
+      return events;
+    }
+
     // Entry eligible tracking (assume entry when price touches zone)
     const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
-    if (inZone && !play.entered && !play.inEntryZone) {
+    if (inZone && play.status === "ARMED" && !play.inEntryZone) {
       play.inEntryZone = true;
       // Assume entry when price is in zone (or you can require manual confirmation)
-      play.entered = true;
+      play.status = "ENTERED";
       play.entryPrice = close;
       play.entryTimestamp = ts;
       events.push(this.ev("PLAY_ENTERED", ts, {
@@ -863,6 +878,7 @@ export class Orchestrator {
     // Check hard stop on CLOSE (only close price triggers stop, not wicks)
     if (rulesContext.stopHitOnClose && !play.stopHit) {
       play.stopHit = true;
+      play.status = "CLOSED";
       // Set cooldown after stop
       this.cooldownAfterStop = Date.now();
       console.log(`[Guardrails] Stop hit, cooldown set for ${this.cooldownAfterStopMin} minutes`);
@@ -898,19 +914,28 @@ export class Orchestrator {
 
     // Explicit log for 5m bar close with full bar data
     const playId = this.state.activePlay?.id || "none";
-    const entered = this.state.activePlay?.entered || false;
+    const entered = this.state.activePlay?.status === "ENTERED";
     console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
     // Gate 1 - If no active play → check for SETUP_SUMMARY
     if (!this.state.activePlay) {
       // Emit SETUP_SUMMARY on 5m close when there's no play (and candidate is strong)
-      if (this.state.mode === "ACTIVE" && this.lastDiagnostics?.candidate && this.lastSetupSummary5mTs !== ts) {
-        const c = this.lastDiagnostics.candidate;
+      if (this.state.mode === "ACTIVE" && this.lastDecision?.candidate && this.lastSetupSummary5mTs !== ts) {
+        const c = this.lastDecision.candidate;
         if ((c.score?.total ?? 0) >= 65) {
+          const decisionSummary = {
+            decisionId: this.lastDecision.decisionId,
+            status: this.lastDecision.status,
+            blockers: this.lastDecision.blockers,
+            blockerReasons: this.lastDecision.blockerReasons
+          };
           events.push(this.ev("SETUP_SUMMARY", ts, {
             symbol: c.symbol,
             candidate: c,
-            notes: `regime=${this.lastDiagnostics.regime.regime} dir=${this.lastDiagnostics.directionInference.direction ?? "N/A"}`,
+            notes: this.lastDecision.rules
+              ? `regime=${this.lastDecision.rules.regime.regime} dir=${this.lastDecision.rules.directionInference.direction ?? "N/A"}`
+              : undefined,
+            decision: decisionSummary
           }));
           this.lastSetupSummary5mTs = ts;
         }
@@ -922,7 +947,7 @@ export class Orchestrator {
     const play = this.state.activePlay;
 
     // Branch: ARMED (not entered) vs ENTERED
-    if (!play.entered) {
+    if (play.status !== "ENTERED") {
       // Path 1: ARMED_COACH - Pre-entry commentary
       return await this.handleArmedCoaching(snapshot, play, events);
     } else {
@@ -1124,6 +1149,7 @@ export class Orchestrator {
         // LLM decision is FINAL - if LLM says exit, we exit
         if (llmAction === "STOP_OUT" || llmAction === "TAKE_PROFIT") {
           play.stopHit = true;
+          play.status = "CLOSED";
           
           const result = llmAction === "TAKE_PROFIT" ? "WIN" : "LOSS";
           const exitType = llmAction === "TAKE_PROFIT" ? "TAKE_PROFIT" : "STOP_HIT";

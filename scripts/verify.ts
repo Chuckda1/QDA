@@ -35,20 +35,23 @@ function verify(): void {
   
   // Check for forbidden strings in source files
   const srcFiles = getAllTsFiles("src");
+  const normalizedFiles = srcFiles.map((file) => file.replace(/\\/g, "/"));
   
-  for (const file of srcFiles) {
+  for (let i = 0; i < srcFiles.length; i++) {
+    const file = srcFiles[i];
+    const normalized = normalizedFiles[i];
     const content = readFileSync(file, "utf-8");
     
     for (const pattern of FORBIDDEN_PATTERNS) {
       const regex = typeof pattern === "string" ? new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : pattern;
       if (regex.test(content)) {
-        errors.push(`Forbidden pattern found in ${file}: ${pattern}`);
+        errors.push(`Forbidden pattern found in ${normalized}: ${pattern}`);
       }
     }
   }
   
   // Check for duplicate entrypoints
-  const entrypoints = srcFiles.filter(f => f.includes("index") && f.endsWith(".ts"));
+  const entrypoints = normalizedFiles.filter(f => f.includes("index") && f.endsWith(".ts"));
   for (const forbidden of FORBIDDEN_ENTRYPOINTS) {
     if (entrypoints.some(e => e.includes(forbidden))) {
       errors.push(`Forbidden entrypoint found: ${forbidden}`);

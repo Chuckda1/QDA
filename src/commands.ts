@@ -55,8 +55,8 @@ export class CommandHandler {
       `Session: ${s.session}`,
       `Price: ${s.price ?? "n/a"}`,
       `ActivePlay: ${s.activePlay ? s.activePlay.id : "None"}`,
-      s.activePlay?.entered ? `Entry Price: $${s.activePlay.entryPrice?.toFixed(2) ?? "n/a"}` : "",
-      s.activePlay ? `Entered: ${s.activePlay.entered ? "Yes" : "No"}` : "",
+      s.activePlay?.status === "ENTERED" ? `Entry Price: $${s.activePlay.entryPrice?.toFixed(2) ?? "n/a"}` : "",
+      s.activePlay ? `Status: ${s.activePlay.status}` : "",
       "",
       "⚙️ SYSTEM:",
       uptimeInfo,
@@ -147,13 +147,14 @@ export class CommandHandler {
       return "❌ No active play to enter. Wait for a play to be armed first.";
     }
     
-    if (s.activePlay.entered) {
+    if (s.activePlay.status === "ENTERED") {
       return `✅ Play ${s.activePlay.id} already marked as entered at $${s.activePlay.entryPrice?.toFixed(2) ?? "unknown"}`;
     }
 
     // Mark as entered with current price
     const entryPrice = s.price || (s.activePlay.entryZone.low + s.activePlay.entryZone.high) / 2;
     const enteredAt = Date.now();
+    s.activePlay.status = "ENTERED";
     s.activePlay.entered = true;
     s.activePlay.entryPrice = entryPrice;
     s.activePlay.entryTimestamp = enteredAt;
@@ -195,6 +196,7 @@ export class CommandHandler {
       : entryPrice - currentPrice;
     const profitPct = entryPrice > 0 ? (profit / entryPrice) * 100 : 0;
     const result = profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN";
+    play.status = "CLOSED";
 
     // Create PLAY_CLOSED event
     const event: DomainEvent = {
