@@ -7,8 +7,9 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
-import { BarAggregator } from "./datafeed/barAggregator.js";
+import { BarAggregator, type Bar as AggregatedBar } from "./datafeed/barAggregator.js";
 import { announceStartupThrottled } from "./utils/startupAnnounce.js";
+import type { AlpacaDataFeed } from "./datafeed/alpacaFeed.js";
 import { StateStore } from "./persistence/stateStore.js";
 import type { Play } from "./types.js";
 
@@ -89,6 +90,81 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
   bars1mCount = 0;
   bars5mCount = 0;
   bars15mCount = 0;
+}
+
+function clampInt(value: string | undefined, fallback: number): number {
+  const parsed = parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+}
+
+function normalizeBackfillBars(bars: AggregatedBar[], bucketMinutes: number): AggregatedBar[] {
+  const bucketMs = bucketMinutes * 60 * 1000;
+  const now = Date.now();
+  const deduped = new Map<number, AggregatedBar>();
+  let droppedInProgress = 0;
+  let droppedInvalid = 0;
+
+  for (const bar of bars) {
+    if (!bar || !Number.isFinite(bar.ts)) {
+      droppedInvalid++;
+      continue;
+    }
+    const mod = ((bar.ts % bucketMs) + bucketMs) % bucketMs;
+    const closeTs = mod >= bucketMs - 2000 ? bar.ts : bar.ts + bucketMs - 1;
+    if (closeTs > now - 1000) {
+      droppedInProgress++;
+      continue;
+    }
+    deduped.set(closeTs, { ...bar, ts: closeTs });
+  }
+
+  if (droppedInvalid > 0 || droppedInProgress > 0) {
+    console.log(`[Warmup] Dropped bars: invalid=${droppedInvalid} in_progress=${droppedInProgress}`);
+  }
+
+  return Array.from(deduped.values()).sort((a, b) => a.ts - b.ts);
+}
+
+function aggregateTo15m(bars5m: AggregatedBar[]): AggregatedBar[] {
+  const agg15m = new BarAggregator(15);
+  const out: AggregatedBar[] = [];
+  for (const bar of bars5m) {
+    const bar15m = agg15m.push1m(bar);
+    if (bar15m) out.push(bar15m);
+  }
+  return out;
+}
+
+async function warmupFromAlpaca(alpacaFeed: AlpacaDataFeed, orch: Orchestrator, symbol: string): Promise<void> {
+  const warmup5m = clampInt(process.env.WARMUP_5M_BARS, 50);
+  const warmup1m = clampInt(process.env.WARMUP_1M_BARS, 0);
+  if (warmup5m <= 0 && warmup1m <= 0) {
+    return;
+  }
+
+  console.log(`[Warmup] Backfilling: 5m=${warmup5m} 1m=${warmup1m}`);
+
+  const [bars5mRaw, bars1mRaw] = await Promise.all([
+    warmup5m > 0 ? alpacaFeed.getBars(symbol, "5Min", warmup5m) : Promise.resolve([]),
+    warmup1m > 0 ? alpacaFeed.getBars(symbol, "1Min", warmup1m) : Promise.resolve([]),
+  ]);
+
+  const bars5m = normalizeBackfillBars(bars5mRaw, 5);
+  const bars1m = normalizeBackfillBars(bars1mRaw, 1);
+  const bars15m = aggregateTo15m(bars5m);
+
+  if (bars5m.length === 0 && bars1m.length === 0 && bars15m.length === 0) {
+    console.warn("[Warmup] No bars returned for backfill.");
+    return;
+  }
+
+  orch.warmupHistory({
+    symbol,
+    bars1m: bars1m.length ? bars1m : undefined,
+    bars5m: bars5m.length ? bars5m : undefined,
+    bars15m: bars15m.length ? bars15m : undefined,
+    source: "alpaca_backfill",
+  });
 }
 
 // Initialize Telegram
@@ -233,6 +309,7 @@ if (alpacaKey && alpacaSecret) {
         apiKey: alpacaKey,
         apiSecret: alpacaSecret,
         baseUrl: process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets",
+        dataUrl: process.env.ALPACA_DATA_URL,
         feed: feed
       });
       
@@ -241,6 +318,8 @@ if (alpacaKey && alpacaSecret) {
       const agg15m = new BarAggregator(15);
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
+
+      await warmupFromAlpaca(alpacaFeed, orch, symbol);
       
       // Use WebSocket for real-time bars (preferred)
       try {

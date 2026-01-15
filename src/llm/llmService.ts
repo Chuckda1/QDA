@@ -9,8 +9,8 @@ export interface IndicatorSnapshot {
 }
 
 export interface RuleScores {
-  regime?: "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
-  macroBias?: "LONG" | "SHORT" | "NEUTRAL";
+  regime?: "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION" | "UNKNOWN";
+  macroBias?: "LONG" | "SHORT" | "NEUTRAL" | "UNKNOWN";
   entryPermission?: "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
   potd?: {
     bias: "LONG" | "SHORT" | "NONE";

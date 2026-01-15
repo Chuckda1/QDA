@@ -20,6 +20,7 @@ export interface AlpacaConfig {
   apiKey: string;
   apiSecret: string;
   baseUrl?: string;     // Default: https://paper-api.alpaca.markets (paper) or https://api.alpaca.markets (live)
+  dataUrl?: string;     // Default: https://data.alpaca.markets (market data)
   feed?: "iex" | "sip"; // Default: "iex" (free), "sip" (paid)
 }
 
@@ -36,6 +37,7 @@ export class AlpacaDataFeed {
   constructor(config: AlpacaConfig) {
     this.config = {
       baseUrl: config.baseUrl || "https://paper-api.alpaca.markets",
+      dataUrl: config.dataUrl || "https://data.alpaca.markets",
       feed: config.feed || "iex",
       ...config
     };
@@ -306,7 +308,7 @@ export class AlpacaDataFeed {
    */
   async getLatestBar(symbol: string): Promise<Bar | null> {
     try {
-      const url = `${this.config.baseUrl}/v2/stocks/${symbol}/bars/latest`;
+      const url = `${this.config.dataUrl || this.config.baseUrl}/v2/stocks/${symbol}/bars/latest`;
       const response = await fetch(url, {
         headers: {
           "APCA-API-KEY-ID": this.config.apiKey,
@@ -335,6 +337,54 @@ export class AlpacaDataFeed {
     } catch (error: any) {
       console.error("Alpaca API error:", error.message);
       return null;
+    }
+  }
+
+  /**
+   * Fetch historical bars via REST API
+   */
+  async getBars(
+    symbol: string,
+    timeframe: "1Min" | "5Min" | "15Min",
+    limit: number = 50
+  ): Promise<Bar[]> {
+    try {
+      const base = this.config.dataUrl || this.config.baseUrl;
+      const url = new URL(`${base}/v2/stocks/${symbol}/bars`);
+      url.searchParams.set("timeframe", timeframe);
+      url.searchParams.set("limit", String(limit));
+      url.searchParams.set("adjustment", "raw");
+      url.searchParams.set("sort", "asc");
+      if (this.config.feed) {
+        url.searchParams.set("feed", this.config.feed);
+      }
+
+      const response = await fetch(url.toString(), {
+        headers: {
+          "APCA-API-KEY-ID": this.config.apiKey,
+          "APCA-API-SECRET-KEY": this.config.apiSecret
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Alpaca API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const bars = Array.isArray(data?.bars) ? data.bars : [];
+
+      return bars.map((bar: any) => ({
+        ts: new Date(bar.t).getTime(),
+        symbol,
+        open: bar.o,
+        high: bar.h,
+        low: bar.l,
+        close: bar.c,
+        volume: bar.v
+      }));
+    } catch (error: any) {
+      console.error("Alpaca API error:", error.message);
+      return [];
     }
   }
 

@@ -17,6 +17,8 @@ export interface RegimeResult {
   transitionFlags?: string[];
 }
 
+export const MIN_REGIME_BARS = 30;
+
 export interface VWAPSlopeResult {
   vwap: number | undefined;
   slope: "UP" | "DOWN" | "FLAT";
@@ -180,10 +182,10 @@ function detectImpulseFlip(
  * else CHOP
  */
 export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeResult {
-  if (bars.length < 30) {
+  if (bars.length < MIN_REGIME_BARS) {
     return {
-      regime: "CHOP",
-      reasons: ["insufficient bars for regime detection"],
+      regime: "UNKNOWN",
+      reasons: [`insufficient bars for regime detection (< ${MIN_REGIME_BARS})`],
     };
   }
 
@@ -313,6 +315,9 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
  * Hard veto: BEAR blocks LONG, BULL blocks SHORT, CHOP blocks everything
  */
 export function regimeAllowsDirection(regime: Regime, direction: "LONG" | "SHORT"): { allowed: boolean; reason: string } {
+  if (regime === "UNKNOWN") {
+    return { allowed: true, reason: "allowed: UNKNOWN regime (insufficient data)" };
+  }
   if (regime === "TREND_UP" && direction === "SHORT") {
     return { allowed: false, reason: "blocked: TREND_UP regime disallows SHORT setups" };
   }
@@ -329,6 +334,9 @@ export function regimeAllowsDirection(regime: Regime, direction: "LONG" | "SHORT
 }
 
 export function computeMacroBias(bars: OHLCVBar[], currentPrice: number): { bias: Bias; reasons: string[] } {
+  if (bars.length < MIN_REGIME_BARS) {
+    return { bias: "UNKNOWN", reasons: [`insufficient bars for macro bias detection (< ${MIN_REGIME_BARS})`] };
+  }
   const vwapInfo = vwapSlopeFromHistory(bars, 30, 10);
   const struct = detectStructureLLLH(bars, { lookback: 22, pivotWidth: 2 });
 

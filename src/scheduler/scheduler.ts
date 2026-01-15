@@ -13,7 +13,7 @@ type PlanDiagnosticsSnapshot = {
     vwapSlope?: "UP" | "DOWN" | "FLAT";
     structure?: "BULLISH" | "BEARISH" | "MIXED";
   };
-  macroBias?: "LONG" | "SHORT" | "NEUTRAL";
+  macroBias?: "LONG" | "SHORT" | "NEUTRAL" | "UNKNOWN";
   directionInference: {
     direction: Direction | undefined;
     confidence: number;

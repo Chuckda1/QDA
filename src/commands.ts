@@ -20,6 +20,7 @@ export class CommandHandler {
   async status(): Promise<string> {
     const s = this.orch.getState();
     const fmt = (ts?: number) => (ts ? new Date(ts).toISOString() : "n/a");
+    const counts = this.orch.getBarCounts();
 
     // Include basic uptime/mode info in status (but never as push message)
     const uptime = Math.floor((Date.now() - s.startedAt) / 1000);
@@ -37,10 +38,13 @@ export class CommandHandler {
           "🧩 DIAG (latest):",
           `At: ${new Date(d.ts).toISOString()}  Price: ${d.close.toFixed(2)}`,
           `Regime: ${d.regime.regime}  |  Bias: ${d.macroBias ?? "N/A"}  |  Dir: ${d.directionInference.direction ?? "N/A"} (${d.directionInference.confidence}%)`,
+          d.dataQuality?.status === "INSUFFICIENT_DATA"
+            ? `Data: ${d.dataQuality.status} (${d.dataQuality.reason ?? "n/a"})`
+            : null,
           d.candidate
             ? `Top candidate: ${d.candidate.direction} ${d.candidate.pattern} score=${d.candidate.score.total}`
             : `Top candidate: none (${d.setupReason ?? "n/a"})`,
-        ].join("\n")
+        ].filter(Boolean).join("\n")
       : null;
 
     return [
@@ -51,6 +55,7 @@ export class CommandHandler {
       `Last 5m: ${fmt(s.last5mTs)}`,
       `Last 15m: ${fmt(s.last15mTs)}`,
       `Last Tick: ${fmt(s.lastTickAt)}`,
+      `Bar cache: 1m=${counts.bars1m} 5m=${counts.bars5m} 15m=${counts.bars15m}`,
       "",
       "📈 DATA:",
       `Session: ${s.session}`,
@@ -71,12 +76,25 @@ export class CommandHandler {
     if (!d) return "No diagnostics yet (waiting for enough bars).";
 
     const guardrailStatus = this.orch.getGuardrailStatus();
+    const counts = d.barCounts ?? this.orch.getBarCounts();
 
     const lines: string[] = [];
     lines.push("=== Diagnostics (/diag) ===");
     lines.push(`Time: ${new Date(d.ts).toISOString()}`);
     lines.push(`Symbol: ${d.symbol}`);
     lines.push(`Price: ${d.close.toFixed(2)}`);
+    lines.push("");
+    lines.push("📦 BAR COUNTS:");
+    lines.push(`- 1m: ${counts.bars1m}`);
+    lines.push(`- 5m: ${counts.bars5m} (min=${counts.minBars5m})`);
+    lines.push(`- 15m: ${counts.bars15m} (min=${counts.minBars15m})`);
+    lines.push(`- Regime min bars: ${counts.minBarsRegime}`);
+    if (d.dataQuality) {
+      lines.push(`- Data quality: ${d.dataQuality.status}${d.dataQuality.reason ? ` (${d.dataQuality.reason})` : ""}`);
+      if (d.dataQuality.status === "INSUFFICIENT_DATA") {
+        lines.push(`- Sources: regime=${d.dataQuality.regimeSource ?? "UNKNOWN"} bias=${d.dataQuality.biasSource ?? "UNKNOWN"} dir=${d.dataQuality.directionSource ?? "UNKNOWN"}`);
+      }
+    }
     lines.push("");
     lines.push("🛡️ GUARDRAILS:");
     lines.push(`- Plays today: ${guardrailStatus.playsToday}/${guardrailStatus.maxPlaysPerETDay} (ET day: ${guardrailStatus.currentETDay})`);
@@ -284,7 +302,10 @@ export class CommandHandler {
       "ALPACA_API_KEY",
       "ALPACA_API_SECRET",
       "ALPACA_BASE_URL",
+      "ALPACA_DATA_URL",
       "ALPACA_FEED",
+      "WARMUP_5M_BARS",
+      "WARMUP_1M_BARS",
       "SYMBOLS",
       "NODE_ENV",
       "INSTANCE_ID"

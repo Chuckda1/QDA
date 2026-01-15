@@ -1,6 +1,6 @@
 export type Direction = "LONG" | "SHORT";
-export type Bias = "LONG" | "SHORT" | "NEUTRAL";
-export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
+export type Bias = "LONG" | "SHORT" | "NEUTRAL" | "UNKNOWN";
+export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION" | "UNKNOWN";
 export type EntryPermission = "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
 export type PotdBias = "LONG" | "SHORT" | "NONE";
 export type PotdMode = "OFF" | "PRIOR" | "HARD";
