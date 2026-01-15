@@ -11,7 +11,8 @@ export type DecisionBlocker =
   | "low_probability"
   | "datafeed"
   | "time_window"
-  | "entry_filter";
+  | "entry_filter"
+  | "low_probability";
 
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";

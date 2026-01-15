@@ -90,6 +90,13 @@ export class Orchestrator {
   private readonly minRulesProbability: number;
   private readonly autoAllInOnHighProb: boolean;
 
+  // High-probability setup filtering
+  private readonly enforceHighProbabilitySetups: boolean;
+  private readonly minLlmAgreement: number;
+  private readonly minLlmProbability: number;
+  private readonly minRulesProbability: number;
+  private readonly autoAllInOnHighProb: boolean;
+
   // Guardrail config (from env vars with defaults)
   private readonly maxPlaysPerETDay: number;
   private readonly cooldownAfterStopMin: number;
@@ -120,6 +127,13 @@ export class Orchestrator {
     this.enforceHighProbabilitySetups = process.env.ENFORCE_HIGH_PROBABILITY_SETUPS !== "false";
     this.minLlmProbability = parseInt(process.env.MIN_LLM_PROBABILITY || "70", 10);
     this.minLlmAgreement = parseInt(process.env.MIN_LLM_AGREEMENT || "70", 10);
+    this.minRulesProbability = parseInt(process.env.MIN_RULES_PROBABILITY || "70", 10);
+    this.autoAllInOnHighProb = process.env.AUTO_ALL_IN_ON_HIGH_PROB !== "false";
+
+    // Load high-probability setup filtering config from env vars
+    this.enforceHighProbabilitySetups = process.env.ENFORCE_HIGH_PROBABILITY_SETUPS !== "false";
+    this.minLlmAgreement = parseInt(process.env.MIN_LLM_AGREEMENT || "70", 10);
+    this.minLlmProbability = parseInt(process.env.MIN_LLM_PROBABILITY || "70", 10);
     this.minRulesProbability = parseInt(process.env.MIN_RULES_PROBABILITY || "70", 10);
     this.autoAllInOnHighProb = process.env.AUTO_ALL_IN_ON_HIGH_PROB !== "false";
 
@@ -253,6 +267,50 @@ export class Orchestrator {
     }
 
     return { allowed: true };
+  }
+
+  private evaluateHighProbabilityGate(params: {
+    candidate: SetupCandidate;
+    directionInference: DirectionInference;
+    llm?: DecisionLlmSummary;
+  }): { allowed: boolean; reason?: string; metrics: { llmProbability?: number; llmAgreement?: number; rulesScore: number; rulesConfidence: number; rulesProbability: number } } {
+    const { candidate, directionInference, llm } = params;
+    const llmProbability = Number.isFinite(llm?.probability) ? (llm?.probability as number) : undefined;
+    const llmAgreement = Number.isFinite(llm?.agreement) ? (llm?.agreement as number) : undefined;
+    const rulesScore = Number.isFinite(candidate?.score?.total) ? candidate.score.total : 0;
+    const rulesConfidence = Number.isFinite(directionInference?.confidence) ? directionInference.confidence : 0;
+    const rulesProbability = Math.max(rulesScore, rulesConfidence);
+
+    const failures: string[] = [];
+    if (!llm || llmProbability === undefined || llmAgreement === undefined) {
+      failures.push("LLM scorecard required");
+    } else {
+      if (llmProbability < this.minLlmProbability) {
+        failures.push(`LLM probability ${Math.round(llmProbability)} < ${this.minLlmProbability}`);
+      }
+      if (llmAgreement < this.minLlmAgreement) {
+        failures.push(`LLM agreement ${Math.round(llmAgreement)} < ${this.minLlmAgreement}`);
+      }
+      if (llm.action === "WAIT") {
+        failures.push("LLM action WAIT");
+      }
+    }
+
+    if (rulesProbability < this.minRulesProbability) {
+      failures.push(`Rules confidence ${Math.round(rulesProbability)} < ${this.minRulesProbability} (score=${Math.round(rulesScore)}, dir=${Math.round(rulesConfidence)})`);
+    }
+
+    return {
+      allowed: failures.length === 0,
+      reason: failures.length ? `high-prob filter: ${failures.join("; ")}` : undefined,
+      metrics: {
+        llmProbability,
+        llmAgreement,
+        rulesScore,
+        rulesConfidence,
+        rulesProbability
+      }
+    };
   }
 
   setMode(mode: BotState["mode"]): void {
