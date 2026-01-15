@@ -4,7 +4,7 @@ import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
-import { computeMacroBias, computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
+import { MIN_REGIME_BARS, computeMacroBias, computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
@@ -18,6 +18,23 @@ import {
   type DecisionLlmSummary,
   type DecisionRulesSnapshot
 } from "./decisionGate.js";
+
+type BarCounts = {
+  bars1m: number;
+  bars5m: number;
+  bars15m: number;
+  minBars5m: number;
+  minBars15m: number;
+  minBarsRegime: number;
+};
+
+type DiagnosticsDataQuality = {
+  status: "OK" | "INSUFFICIENT_DATA";
+  reason?: string;
+  regimeSource?: "1m" | "5m" | "15m" | "UNKNOWN";
+  biasSource?: "1m" | "5m" | "15m" | "UNKNOWN";
+  directionSource?: "1m" | "5m" | "15m" | "UNKNOWN";
+};
 
 type SetupDiagnosticsSnapshot = {
   ts: number;
@@ -43,6 +60,8 @@ type SetupDiagnosticsSnapshot = {
     bearScore: number;
   };
   datafeedIssue?: string; // Reason if blocked by datafeed issues
+  barCounts?: BarCounts;
+  dataQuality?: DiagnosticsDataQuality;
 };
 
 type TickInput = {
@@ -75,8 +94,10 @@ export class Orchestrator {
   private lastSetupSummary5mTs: number | null = null;
   private lastDecision: AuthoritativeDecision | null = null;
   private lastRegime15m: RegimeResult | null = null;
-  private lastMacroBias: Bias = "NEUTRAL";
+  private lastMacroBias: Bias = "UNKNOWN";
   private lastRegime15mTs: number | null = null;
+  private readonly minBars5mSetup = 6;
+  private readonly minBars15mAnchor = 6;
 
   // Guardrail tracking
   private playsToday: number = 0;
@@ -222,8 +243,173 @@ export class Orchestrator {
     return this.state;
   }
 
+  getBarCounts(): BarCounts {
+    return {
+      bars1m: this.recentBars1m.length,
+      bars5m: this.recentBars5m.length,
+      bars15m: this.recentBars15m.length,
+      minBars5m: this.minBars5mSetup,
+      minBars15m: this.minBars15mAnchor,
+      minBarsRegime: MIN_REGIME_BARS,
+    };
+  }
+
+  warmupHistory(params: {
+    symbol: string;
+    bars1m?: OHLCVBar[];
+    bars5m?: OHLCVBar[];
+    bars15m?: OHLCVBar[];
+    source?: string;
+  }): void {
+    const { bars1m, bars5m, bars15m, source, symbol } = params;
+
+    if (bars1m) {
+      this.recentBars1m = this.normalizeBars(bars1m, 80);
+    }
+    if (bars5m) {
+      this.recentBars5m = this.normalizeBars(bars5m, 120);
+    }
+    if (bars15m) {
+      this.recentBars15m = this.normalizeBars(bars15m, 120);
+    }
+
+    if (this.recentBars15m.length >= this.minBars15mAnchor) {
+      const last15m = this.recentBars15m[this.recentBars15m.length - 1]!;
+      this.lastRegime15m = computeRegime(this.recentBars15m, last15m.close);
+      this.lastMacroBias = computeMacroBias(this.recentBars15m, last15m.close).bias;
+      this.lastRegime15mTs = last15m.ts;
+    }
+
+    const counts = this.getBarCounts();
+    console.log(
+      `[Warmup] Seeded history${source ? ` (${source})` : ""}: 1m=${counts.bars1m} 5m=${counts.bars5m} 15m=${counts.bars15m}`
+    );
+
+    if (this.recentBars5m.length > 0) {
+      const last5m = this.recentBars5m[this.recentBars5m.length - 1]!;
+      const directionInference =
+        this.recentBars1m.length >= 6
+          ? inferDirectionFromRecentBars(this.recentBars1m)
+          : inferDirectionFromRecentBars(this.recentBars5m);
+      const warmRegime = this.lastRegime15m ?? computeRegime(this.recentBars5m, last5m.close);
+      const warmBias = this.lastRegime15m ? this.lastMacroBias : computeMacroBias(this.recentBars5m, last5m.close).bias;
+      this.lastDiagnostics = {
+        ts: last5m.ts,
+        symbol,
+        close: last5m.close,
+        regime: warmRegime,
+        macroBias: warmBias,
+        directionInference,
+        setupReason: "warmup backfill",
+        barCounts: counts,
+        dataQuality: { status: "OK", reason: "warmup backfill" },
+      };
+    }
+  }
+
   getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
     return this.lastDiagnostics;
+  }
+
+  private normalizeBars(bars: OHLCVBar[], maxLen: number): OHLCVBar[] {
+    const deduped = new Map<number, OHLCVBar>();
+    for (const bar of bars) {
+      if (!bar || !Number.isFinite(bar.ts)) continue;
+      if (!Number.isFinite(bar.high) || !Number.isFinite(bar.low) || !Number.isFinite(bar.close)) continue;
+      deduped.set(bar.ts, bar);
+    }
+    const sorted = Array.from(deduped.values()).sort((a, b) => a.ts - b.ts);
+    return sorted.slice(-maxLen);
+  }
+
+  private logBarCounts(timeframe: "1m" | "5m" | "15m", ts: number): void {
+    const counts = this.getBarCounts();
+    console.log(
+      `[${timeframe}] barCounts ts=${ts} 1m=${counts.bars1m} 5m=${counts.bars5m} 15m=${counts.bars15m}`
+    );
+  }
+
+  private logBarRejection(timeframe: "1m" | "5m" | "15m", ts: number, reason: string): void {
+    console.warn(`[${timeframe}] barRejected ts=${ts} reason=${reason}`);
+  }
+
+  private buildDiagnosticsBase(ts: number, symbol: string, close: number): Pick<SetupDiagnosticsSnapshot, "ts" | "symbol" | "close" | "barCounts" | "dataQuality"> {
+    return {
+      ts,
+      symbol,
+      close,
+      barCounts: this.getBarCounts(),
+      dataQuality: { status: "OK" },
+    };
+  }
+
+  private resolveFallbackDiagnostics(close: number): {
+    regime: RegimeResult;
+    macroBias: Bias;
+    directionInference: DirectionInference;
+    sources: Pick<DiagnosticsDataQuality, "regimeSource" | "biasSource" | "directionSource">;
+  } {
+    let regimeSource: DiagnosticsDataQuality["regimeSource"] = "UNKNOWN";
+    let biasSource: DiagnosticsDataQuality["biasSource"] = "UNKNOWN";
+    let directionSource: DiagnosticsDataQuality["directionSource"] = "UNKNOWN";
+
+    let regime: RegimeResult = { regime: "UNKNOWN", reasons: [`insufficient bars for regime detection (< ${MIN_REGIME_BARS})`] };
+    if (this.lastRegime15m && this.lastRegime15m.regime !== "UNKNOWN") {
+      regime = this.lastRegime15m;
+      regimeSource = "15m";
+    } else if (this.recentBars5m.length >= MIN_REGIME_BARS) {
+      regime = computeRegime(this.recentBars5m, close);
+      regimeSource = "5m";
+    } else if (this.recentBars15m.length >= MIN_REGIME_BARS) {
+      const lastClose = this.recentBars15m[this.recentBars15m.length - 1]?.close ?? close;
+      regime = computeRegime(this.recentBars15m, lastClose);
+      regimeSource = "15m";
+    } else if (this.recentBars1m.length >= MIN_REGIME_BARS) {
+      regime = computeRegime(this.recentBars1m, close);
+      regimeSource = "1m";
+    }
+
+    let macroBias: Bias = "UNKNOWN";
+    if (this.lastRegime15m && this.lastMacroBias !== "UNKNOWN") {
+      macroBias = this.lastMacroBias;
+      biasSource = "15m";
+    } else if (this.recentBars15m.length >= MIN_REGIME_BARS) {
+      const lastClose = this.recentBars15m[this.recentBars15m.length - 1]?.close ?? close;
+      macroBias = computeMacroBias(this.recentBars15m, lastClose).bias;
+      biasSource = "15m";
+    } else if (this.recentBars1m.length >= MIN_REGIME_BARS) {
+      const lastClose = this.recentBars1m[this.recentBars1m.length - 1]?.close ?? close;
+      macroBias = computeMacroBias(this.recentBars1m, lastClose).bias;
+      biasSource = "1m";
+    }
+
+    let directionBars = this.recentBars1m;
+    if (this.recentBars1m.length >= 6) {
+      directionSource = "1m";
+    } else if (this.recentBars5m.length >= 6) {
+      directionBars = this.recentBars5m;
+      directionSource = "5m";
+    } else if (this.recentBars15m.length >= 6) {
+      directionBars = this.recentBars15m;
+      directionSource = "15m";
+    } else if (this.recentBars5m.length > 0) {
+      directionBars = this.recentBars5m;
+    } else if (this.recentBars15m.length > 0) {
+      directionBars = this.recentBars15m;
+    }
+
+    const directionInference = inferDirectionFromRecentBars(directionBars);
+
+    return {
+      regime,
+      macroBias,
+      directionInference,
+      sources: {
+        regimeSource,
+        biasSource,
+        directionSource,
+      },
+    };
   }
 
   /**
@@ -378,6 +564,12 @@ export class Orchestrator {
     const events: DomainEvent[] = [];
     const { ts, symbol, close, high, low, open, volume } = snapshot;
 
+    const last1m = this.recentBars1m[this.recentBars1m.length - 1];
+    if (last1m && ts <= last1m.ts) {
+      this.logBarRejection("1m", ts, `stale_or_duplicate (last=${last1m.ts})`);
+      return events;
+    }
+
     // Datafeed resilience: Check for time gaps
     if (this.lastBarTs !== null) {
       const gapMs = ts - this.lastBarTs;
@@ -391,14 +583,13 @@ export class Orchestrator {
         // Set diagnostics for gap
         if (!this.state.activePlay) {
           this.lastDiagnostics = {
-            ts,
-            symbol,
-            close,
+            ...this.buildDiagnosticsBase(ts, symbol, close),
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
             directionInference: inferDirectionFromRecentBars(this.recentBars1m),
             setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
             datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
+            dataQuality: { status: "INSUFFICIENT_DATA", reason: `data gap: ${gapMinutes} min` },
           };
           this.lastDecision = buildNoEntryDecision({
             ts,
@@ -425,23 +616,24 @@ export class Orchestrator {
         if (this.dataGapCooldown > 0) this.dataGapCooldown--;
         // Keep enough history for ATR/RSI/EMA (direction + filters)
         if (this.recentBars1m.length > 80) this.recentBars1m.shift();
+        this.logBarCounts("1m", ts);
       } else {
         // Missing required OHLC data - log and set diagnostics
         const missing = [];
         if (high === undefined) missing.push("high");
         if (low === undefined) missing.push("low");
+        this.logBarRejection("1m", ts, `missing_ohlc (${missing.join(", ")})`);
         console.log(`[Datafeed] Insufficient OHLC data: missing ${missing.join(", ")}. Skipping bar.`);
         
         if (!this.state.activePlay) {
           this.lastDiagnostics = {
-            ts,
-            symbol,
-            close,
+            ...this.buildDiagnosticsBase(ts, symbol, close),
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
             directionInference: inferDirectionFromRecentBars(this.recentBars1m),
             setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
             datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
+            dataQuality: { status: "INSUFFICIENT_DATA", reason: `missing OHLC: ${missing.join(", ")}` },
           };
           this.lastDecision = buildNoEntryDecision({
             ts,
@@ -461,21 +653,22 @@ export class Orchestrator {
       if (this.dataGapCooldown > 0) this.dataGapCooldown--;
       // Keep enough history for ATR/RSI/EMA (direction + filters)
       if (this.recentBars1m.length > 80) this.recentBars1m.shift();
+      this.logBarCounts("1m", ts);
     }
 
     // Skip processing during data gap cooldown
     if (this.dataGapCooldown > 0) {
       console.log(`[Datafeed] Data gap cooldown active: ${this.dataGapCooldown} bars remaining`);
+      this.logBarRejection("1m", ts, `data_gap_cooldown (${this.dataGapCooldown} bars remaining)`);
       if (!this.state.activePlay) {
         this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
+          ...this.buildDiagnosticsBase(ts, symbol, close),
           regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
           macroBias: this.lastMacroBias,
           directionInference: inferDirectionFromRecentBars(this.recentBars1m),
           setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
           datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
+          dataQuality: { status: "INSUFFICIENT_DATA", reason: `data gap cooldown: ${this.dataGapCooldown}` },
         };
         this.lastDecision = buildNoEntryDecision({
           ts,
@@ -631,14 +824,23 @@ export class Orchestrator {
   private async handle15m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, close, open, high, low, volume } = snapshot;
 
-    if (high !== undefined && low !== undefined) {
-      const safeOpen = open ?? close;
-      const safeVol = volume ?? 0;
-      this.recentBars15m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
-      if (this.recentBars15m.length > 120) this.recentBars15m.shift();
+    const last15m = this.recentBars15m[this.recentBars15m.length - 1];
+    if (last15m && ts <= last15m.ts) {
+      this.logBarRejection("15m", ts, `stale_or_duplicate (last=${last15m.ts})`);
+      return [];
+    }
+    if (high === undefined || low === undefined) {
+      this.logBarRejection("15m", ts, "missing_ohlc");
+      return [];
     }
 
-    if (this.recentBars15m.length < 6) {
+    const safeOpen = open ?? close;
+    const safeVol = volume ?? 0;
+    this.recentBars15m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+    if (this.recentBars15m.length > 120) this.recentBars15m.shift();
+    this.logBarCounts("15m", ts);
+
+    if (this.recentBars15m.length < this.minBars15mAnchor) {
       return [];
     }
 
@@ -709,48 +911,68 @@ export class Orchestrator {
     const entered = this.state.activePlay?.status === "ENTERED";
     console.log(`[5m] barClose ts=${ts} o=${open?.toFixed(2) || "N/A"} h=${high?.toFixed(2) || "N/A"} l=${low?.toFixed(2) || "N/A"} c=${close.toFixed(2)} v=${volume || "N/A"} play=${playId} entered=${entered}`);
 
-    // Track 5m history for setup detection
-    if (high !== undefined && low !== undefined) {
-      const safeOpen = open ?? close;
-      const safeVol = volume ?? 0;
-      this.recentBars5m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
-      if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+    const last5m = this.recentBars5m[this.recentBars5m.length - 1];
+    if (last5m && ts <= last5m.ts) {
+      this.logBarRejection("5m", ts, `stale_or_duplicate (last=${last5m.ts})`);
+      return events;
     }
+    if (high === undefined || low === undefined) {
+      this.logBarRejection("5m", ts, "missing_ohlc");
+      return events;
+    }
+
+    // Track 5m history for setup detection
+    const safeOpen = open ?? close;
+    const safeVol = volume ?? 0;
+    this.recentBars5m.push({ ts, open: safeOpen, high, low, close, volume: safeVol });
+    if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+    this.logBarCounts("5m", ts);
 
     // Gate 1 - If no active play → evaluate new setups on 5m bars
     if (!this.state.activePlay) {
       const watchOnly = this.state.mode !== "ACTIVE";
 
-      if (this.recentBars5m.length < 6) {
-        const fallbackRegime = this.lastRegime15m ?? computeRegime(this.recentBars5m, close);
+      if (this.recentBars5m.length < this.minBars5mSetup) {
+        const fallback = this.resolveFallbackDiagnostics(close);
+        const barCounts = this.getBarCounts();
+        const reason = `INSUFFICIENT_DATA: 5m bars ${barCounts.bars5m}/${this.minBars5mSetup}`;
         this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
-          regime: fallbackRegime,
-          macroBias: this.lastMacroBias,
-          directionInference: inferDirectionFromRecentBars(this.recentBars5m),
-          setupReason: "insufficient 5m history (< 6 bars)",
+          ...this.buildDiagnosticsBase(ts, symbol, close),
+          regime: fallback.regime,
+          macroBias: fallback.macroBias,
+          directionInference: fallback.directionInference,
+          setupReason: reason,
+          dataQuality: {
+            status: "INSUFFICIENT_DATA",
+            reason,
+            regimeSource: fallback.sources.regimeSource,
+            biasSource: fallback.sources.biasSource,
+            directionSource: fallback.sources.directionSource,
+          },
         };
         this.lastDecision = buildDecision({
           ts,
           symbol,
           blockers: ["no_active_play"],
-          blockerReasons: ["insufficient 5m history (< 6 bars)"],
+          blockerReasons: [reason],
           expiryMs: 30 * 60 * 1000
         });
         return events;
       }
 
       const rawRegime5m = computeRegime(this.recentBars5m, close);
-      const anchorRegime = this.lastRegime15m ?? {
-        ...rawRegime5m,
-        regime: "TRANSITION",
-        reasons: [...rawRegime5m.reasons, "anchor pending: default TRANSITION until 15m confirms"]
-      };
+      const anchorRegime = this.lastRegime15m ?? (
+        rawRegime5m.regime === "UNKNOWN"
+          ? rawRegime5m
+          : {
+              ...rawRegime5m,
+              regime: "TRANSITION",
+              reasons: [...rawRegime5m.reasons, "anchor pending: default TRANSITION until 15m confirms"]
+            }
+      );
       const macroBiasInfo = this.lastRegime15m
         ? { bias: this.lastMacroBias, reasons: ["anchor=15m"] }
-        : { bias: "NEUTRAL" as Bias, reasons: ["anchor pending: bias neutral until 15m confirms"] };
+        : { bias: "UNKNOWN" as Bias, reasons: ["anchor pending: bias UNKNOWN until 15m confirms"] };
 
       const dirInf = inferDirectionFromRecentBars(this.recentBars5m);
       if (!dirInf.direction) {
@@ -777,9 +999,7 @@ export class Orchestrator {
 
       if (!setupResult.candidate) {
         this.lastDiagnostics = {
-          ts,
-          symbol,
-          close,
+          ...this.buildDiagnosticsBase(ts, symbol, close),
           regime: anchorRegime,
           macroBias: macroBiasInfo.bias,
           directionInference: dirInf,
@@ -888,9 +1108,7 @@ export class Orchestrator {
       }
 
       this.lastDiagnostics = {
-        ts,
-        symbol,
-        close,
+        ...this.buildDiagnosticsBase(ts, symbol, close),
         regime: anchorRegime,
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
@@ -1063,9 +1281,7 @@ export class Orchestrator {
           }
         } catch (error: any) {
           this.lastDiagnostics = {
-            ts,
-            symbol,
-            close,
+            ...this.buildDiagnosticsBase(ts, symbol, close),
             regime: anchorRegime,
             macroBias: macroBiasInfo.bias,
             directionInference: dirInf,
