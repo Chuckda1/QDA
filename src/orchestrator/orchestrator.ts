@@ -1,9 +1,11 @@
-import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, TradeAction } from "../types.js";
+import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
 import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
-import { inferDirectionFromRecentBars } from "../rules/directionRules.js";
+import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
+import { computeTimingSignal } from "../rules/timingRules.js";
+import type { TimingSignal } from "../rules/timingRules.js";
 import { computeMacroBias, computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
 import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
@@ -228,7 +230,11 @@ export class Orchestrator {
   constructor(
     instanceId: string,
     llmService?: LLMService,
-    initialState?: { activePlay?: Play | null; potd?: { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string } }
+    initialState?: {
+      activePlay?: Play | null;
+      potd?: { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string };
+      timingState?: TimingStateContext;
+    }
   ) {
     this.instanceId = instanceId;
     this.llmService = llmService;
@@ -292,7 +298,8 @@ export class Orchestrator {
       session: getMarketSessionLabel(),
       activePlay,
       mode: "QUIET",
-      potd: initialPotd
+      potd: initialPotd,
+      timingState: initialState?.timingState
     };
   }
 
@@ -325,6 +332,107 @@ export class Orchestrator {
 
   private clampScore(value: number): number {
     return Math.max(0, Math.min(100, value));
+  }
+
+  private updateTimingState(params: {
+    ts: number;
+    direction: Direction | "NONE";
+    timingSignal: TimingSignal;
+    bar: OHLCVBar;
+    inTrade: boolean;
+  }): TimingStateContext {
+    const { ts, direction, timingSignal, bar, inTrade } = params;
+    const current =
+      this.state.timingState ??
+      ({
+        phase: "IDLE",
+        dir: "NONE",
+        phaseSinceTs: ts,
+        anchor: {},
+        evidence: {},
+        locks: {},
+        lastUpdatedTs: ts,
+      } as TimingStateContext);
+
+    const next: TimingStateContext = { ...current, anchor: { ...current.anchor }, evidence: { ...current.evidence }, locks: { ...current.locks } };
+    const directionChanged = direction !== "NONE" && current.dir !== "NONE" && direction !== current.dir;
+
+    const setPhase = (phase: TimingStateContext["phase"]) => {
+      if (next.phase !== phase) {
+        next.phase = phase;
+        next.phaseSinceTs = ts;
+      }
+    };
+
+    if (inTrade) {
+      next.dir = direction !== "NONE" ? direction : next.dir;
+      setPhase("IN_TRADE");
+      next.lastUpdatedTs = ts;
+      this.state.timingState = next;
+      return next;
+    }
+
+    if (direction !== "NONE") {
+      next.dir = direction;
+    }
+
+    if (directionChanged && timingSignal.state === "IMPULSE_DETECTED") {
+      setPhase("IMPULSE");
+      next.anchor = { ...next.anchor, impulseStartPx: bar.close, impulseEndPx: bar.close };
+      next.lastUpdatedTs = ts;
+      this.state.timingState = next;
+      return next;
+    }
+
+    switch (next.phase) {
+      case "IDLE":
+      case "DONE":
+        if (timingSignal.state === "IMPULSE_DETECTED") {
+          setPhase("IMPULSE");
+          next.anchor = { ...next.anchor, impulseStartPx: bar.close, impulseEndPx: bar.close };
+        } else if (timingSignal.state === "PULLBACK_IN_PROGRESS") {
+          setPhase("PULLBACK");
+        } else if (timingSignal.state === "ENTRY_WINDOW_OPEN") {
+          setPhase("ENTRY_WINDOW");
+        }
+        break;
+      case "IMPULSE":
+        if (timingSignal.state === "PULLBACK_IN_PROGRESS") {
+          setPhase("PULLBACK");
+          next.anchor = {
+            ...next.anchor,
+            pullbackHighPx: bar.high ?? bar.close,
+            pullbackLowPx: bar.low ?? bar.close,
+          };
+        } else if (timingSignal.state === "ENTRY_WINDOW_OPEN") {
+          setPhase("ENTRY_WINDOW");
+        }
+        break;
+      case "PULLBACK":
+        if (timingSignal.state === "ENTRY_WINDOW_OPEN") {
+          setPhase("ENTRY_WINDOW");
+        } else if (timingSignal.state === "IMPULSE_DETECTED" && directionChanged) {
+          setPhase("IMPULSE");
+          next.anchor = { ...next.anchor, impulseStartPx: bar.close, impulseEndPx: bar.close };
+        }
+        break;
+      case "ENTRY_WINDOW": {
+        const maxHoldMs = 20 * 60_000;
+        if (timingSignal.state === "IMPULSE_DETECTED" && directionChanged) {
+          setPhase("IMPULSE");
+          next.anchor = { ...next.anchor, impulseStartPx: bar.close, impulseEndPx: bar.close };
+        } else if (ts - next.phaseSinceTs > maxHoldMs) {
+          setPhase("DONE");
+        }
+        break;
+      }
+      case "IN_TRADE":
+        break;
+    }
+
+    next.lastUpdatedTs = ts;
+    this.state.timingState = next;
+    return next;
   }
 
   getState(): BotState {
@@ -673,9 +781,44 @@ export class Orchestrator {
     }
 
     const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
+    const vwap1m = computeVWAP(this.recentBars1m, 30);
+    const atr1m = computeATR(this.recentBars1m, 14);
+    const timingSignal = computeTimingSignal({
+      bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
+      direction: play.direction,
+      entryZone: play.entryZone,
+      vwap: vwap1m,
+      atr: atr1m
+    });
+    const barRef: OHLCVBar = snapshot.bar1m ?? {
+      ts,
+      open,
+      high,
+      low,
+      close,
+      volume
+    };
+    const timingState = this.updateTimingState({
+      ts,
+      direction: play.direction,
+      timingSignal,
+      bar: barRef,
+      inTrade: play.status === "ENTERED"
+    });
+    const timingSnapshot = {
+      ...timingSignal,
+      phase: timingState.phase,
+      dir: timingState.dir,
+      phaseSinceTs: timingState.phaseSinceTs,
+      rawState: timingSignal.state
+    };
 
-    // 1) Zone touch arms an ENTRY_WINDOW (does NOT enter)
+    // 1) Zone touch + timing score arms an ENTRY_WINDOW (does NOT enter)
     if (inZone && play.status === "ARMED" && !play.inEntryZone) {
+      if (timingSignal.score < 70) {
+        // Keep waiting for timing to confirm
+        return events;
+      }
       play.inEntryZone = true;
       play.status = "ENTRY_WINDOW";
       play.entryWindowOpenedTs = ts;
@@ -687,11 +830,12 @@ export class Orchestrator {
         direction: play.direction,
         price: close,
         entryZone: play.entryZone,
+        timing: timingSnapshot,
         decision: buildDecisionPayload({
           kind: "EXECUTION",
           status: "ARMED",
           allowed: true,
-          rationale: ["price entered zone"]
+          rationale: ["price entered zone", `timing score=${timingSignal.score}`]
         }),
         playState: "ARMED",
         armReason: "armed; waiting for depth trigger"
@@ -709,6 +853,7 @@ export class Orchestrator {
           direction: play.direction,
           price: close,
           reason: "Entry window expired",
+          timing: timingSnapshot,
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
@@ -730,6 +875,7 @@ export class Orchestrator {
           direction: play.direction,
           price: close,
           reason: "Pre-entry stop break",
+          timing: timingSnapshot,
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
@@ -750,6 +896,7 @@ export class Orchestrator {
           direction: play.direction,
           price: close,
           reason: "Pre-entry stop break",
+          timing: timingSnapshot,
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
@@ -771,12 +918,26 @@ export class Orchestrator {
         ? (low ?? close) <= entryTrigger
         : (high ?? close) >= entryTrigger;
 
-      if (depthHit) {
+      const timingEnterScore = play.tier === "LEANING" ? 65 : 80;
+      if (depthHit && timingSignal.score >= timingEnterScore) {
         play.status = "ENTERED";
         play.entryPrice = close;
         play.entryTimestamp = ts;
         play.mode = "SCOUT";
         play.reclaim = { step: "WAIT_RECLAIM", confirmations: 0 };
+        const enteredTimingState = this.updateTimingState({
+          ts,
+          direction: play.direction,
+          timingSignal,
+          bar: barRef,
+          inTrade: true
+        });
+        const enteredTimingSnapshot = {
+          ...timingSnapshot,
+          phase: enteredTimingState.phase,
+          dir: enteredTimingState.dir,
+          phaseSinceTs: enteredTimingState.phaseSinceTs
+        };
 
         events.push(this.ev("PLAY_ENTERED", ts, {
           playId: play.id,
@@ -786,11 +947,12 @@ export class Orchestrator {
           entryPrice: play.entryPrice,
           entryTrigger,
           reason: "Pullback depth hit",
+          timing: enteredTimingSnapshot,
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "ENTERED",
             allowed: true,
-            rationale: ["pullback depth hit"]
+            rationale: ["pullback depth hit", `timing score=${timingSignal.score}`]
           }),
           playState: "ENTERED",
           armReason: "depth trigger hit"
@@ -1102,6 +1264,10 @@ export class Orchestrator {
         console.log(`[5m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
       }
 
+      const tacticalBars = this.recentBars1m.length >= 6 ? this.recentBars1m : this.recentBars5m;
+      const tacticalLookback = tacticalBars === this.recentBars1m ? 5 : 3;
+      const tacticalBiasInfo = inferTacticalBiasFromRecentBars(tacticalBars, { lookback: tacticalLookback });
+
       const atr = computeATR(this.recentBars5m, 14);
       const closes = this.recentBars5m.map((b) => b.close);
       const ema9 = computeEMA(closes.slice(-60), 9);
@@ -1109,7 +1275,7 @@ export class Orchestrator {
       const vwap = computeVWAP(this.recentBars5m, 30);
       const rsi14 = computeRSI(closes, 14);
 
-      const directionGate = directionGate15mMoreLeaning({
+      let directionGate = directionGate15mMoreLeaning({
         close15m: this.last15mClose ?? close,
         vwap15m: this.last15mVwap ?? anchorRegime.vwap,
         ema9_15m: this.last15mEma9,
@@ -1118,6 +1284,34 @@ export class Orchestrator {
         vwapSlope15m: this.last15mVwapSlopePct ?? anchorRegime.vwapSlopePct,
         ema20Slope15m: this.last15mEma20Slope,
       });
+
+      const tacticalBias = tacticalBiasInfo.bias;
+      const potdActiveForGate = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
+      if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
+        if (tacticalBias === "NONE" || tacticalBiasInfo.tier !== "CLEAR") {
+          if (potdActiveForGate) {
+            directionGate = {
+              allow: true,
+              tier: "LEANING",
+              direction: this.potdBias,
+              reason: `POTD bias ${this.potdBias} (tactical unclear; scalp-only)`,
+            };
+          } else {
+            directionGate = {
+              allow: false,
+              tier: "NONE",
+              reason: `tactical bias not clear (tier=${tacticalBiasInfo.tier})`,
+            };
+          }
+        } else {
+          directionGate = {
+            allow: true,
+            tier: "LEANING",
+            direction: tacticalBias,
+            reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`,
+          };
+        }
+      }
 
       const setupResult = this.setupEngine.findSetup({
         ts,
@@ -1157,6 +1351,28 @@ export class Orchestrator {
       }
 
       const setupCandidate = setupResult.candidate;
+      const timingSignal = computeTimingSignal({
+        bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
+        direction: setupCandidate.direction,
+        entryZone: setupCandidate.entryZone,
+        vwap: computeVWAP(this.recentBars1m, 30),
+        atr: computeATR(this.recentBars1m, 14)
+      });
+      const timingBarRef = this.recentBars1m[this.recentBars1m.length - 1] ?? this.recentBars5m[this.recentBars5m.length - 1]!;
+      const timingState = this.updateTimingState({
+        ts,
+        direction: setupCandidate.direction,
+        timingSignal,
+        bar: timingBarRef,
+        inTrade: false
+      });
+      const timingSnapshot = {
+        ...timingSignal,
+        phase: timingState.phase,
+        dir: timingState.dir,
+        phaseSinceTs: timingState.phaseSinceTs,
+        rawState: timingSignal.state
+      };
       const blockers: DecisionBlocker[] = [];
       const blockerReasons: string[] = [];
       const transitionLockActive = this.transitionLockRemaining > 0;
@@ -1190,6 +1406,14 @@ export class Orchestrator {
             blockerReasons.push(`leaning risk/ATR too large (${riskAtr.toFixed(2)})`);
           }
         }
+        if ((anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") && atr) {
+          const entryMid = (setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2;
+          const riskAtr = Math.abs(entryMid - setupCandidate.stop) / atr;
+          if (riskAtr > 0.9) {
+            blockers.push("guardrail");
+            blockerReasons.push(`chop/transition risk/ATR too large (${riskAtr.toFixed(2)})`);
+          }
+        }
       }
 
       const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
@@ -1221,11 +1445,23 @@ export class Orchestrator {
       }
 
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
-        const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
-        const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
-        if (!regimeCheck.allowed && !(anchorRegime.regime === "CHOP" && hasChopOverride)) {
-          blockers.push(anchorRegime.regime === "CHOP" ? "chop" : "guardrail");
-          blockerReasons.push(regimeCheck.reason);
+        if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
+          if (tacticalBias === "NONE" || tacticalBiasInfo.tier !== "CLEAR") {
+            if (!(potdActive && setupCandidate.direction === this.potdBias)) {
+              blockers.push("chop");
+              blockerReasons.push(`blocked: CHOP/TRANSITION requires CLEAR tactical bias (tier=${tacticalBiasInfo.tier})`);
+            }
+          } else if (setupCandidate.direction !== tacticalBias) {
+            blockers.push("guardrail");
+            blockerReasons.push(`blocked: tactical bias ${tacticalBias} only`);
+          }
+        } else {
+          const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
+          const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
+          if (!regimeCheck.allowed && !(anchorRegime.regime === "CHOP" && hasChopOverride)) {
+            blockers.push(anchorRegime.regime === "CHOP" ? "chop" : "guardrail");
+            blockerReasons.push(regimeCheck.reason);
+          }
         }
       }
 
@@ -1241,18 +1477,40 @@ export class Orchestrator {
       const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
         ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
         : undefined;
-      const permission = directionGate.allow
+      const shockMode = tacticalBiasInfo.shock;
+      const permissionMode =
+        anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION" || transitionLockActive || shockMode
+          ? "SCALP_ONLY"
+          : "SWING_ALLOWED";
+      const chopTransition = anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION";
+      const permission = chopTransition
+        ? { long: true, short: true, mode: "SCALP_ONLY" }
+        : directionGate.allow
         ? {
             long: directionGate.direction === "LONG",
             short: directionGate.direction === "SHORT",
-            mode: anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION" || transitionLockActive ? "SCALP_ONLY" : "SWING_ALLOWED"
+            mode: permissionMode,
           }
         : { long: false, short: false, mode: "BLOCKED" };
       const marketState = {
         regime: anchorRegime.regime,
         confidence: regimeConfidence,
         permission,
-        reason: [anchorRegime.reasons?.[0], transitionLockActive ? `transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})` : undefined, directionGate.reason]
+        tacticalBias: {
+          bias: tacticalBias,
+          tier: tacticalBiasInfo.tier,
+          score: tacticalBiasInfo.score,
+          confidence: tacticalBiasInfo.confidence,
+          shock: shockMode,
+          shockReason: tacticalBiasInfo.shockReason,
+        },
+        reason: [
+          anchorRegime.reasons?.[0],
+          `tactical=${tacticalBias}${tacticalBias !== "NONE" ? `(${tacticalBiasInfo.confidence}%, score=${tacticalBiasInfo.score})` : ""}`,
+          shockMode ? `shock mode: ${tacticalBiasInfo.shockReason ?? "range expansion"}` : undefined,
+          transitionLockActive ? `transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})` : undefined,
+          directionGate.reason
+        ]
           .filter(Boolean)
           .join(" | "),
         potd: {
@@ -1306,6 +1564,7 @@ export class Orchestrator {
         regime: anchorRegime,
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
+        tacticalBias: tacticalBiasInfo,
         candidate: setupCandidate,
         entryFilterWarnings: filterResult.warnings,
         entryPermission: filterResult.permission,
@@ -1677,6 +1936,7 @@ export class Orchestrator {
           blockerTags: blockers,
           blockerReasons,
           marketState,
+          timing: timingSnapshot,
           playState: "CANDIDATE",
           notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
         }));
@@ -1696,6 +1956,7 @@ export class Orchestrator {
         llm: decision.llm,
         decision: decisionSummary,
         marketState,
+        timing: timingSnapshot,
         topPlay,
         blockerTags: blockers,
         blockerReasons,
@@ -1711,6 +1972,7 @@ export class Orchestrator {
           price: close,
           decision: decisionSummary,
           marketState,
+          timing: timingSnapshot,
           topPlay,
           blockerTags: blockers,
           blockerReasons,
@@ -1733,6 +1995,7 @@ export class Orchestrator {
           decision: decisionSummary,
           price: close,
           marketState,
+          timing: timingSnapshot,
           topPlay,
           blockerTags: blockers,
           blockerReasons,
@@ -1750,6 +2013,7 @@ export class Orchestrator {
           plan: decision.llm?.plan,
           decision: decisionSummary,
           marketState,
+          timing: timingSnapshot,
           topPlay,
           blockerTags: blockers,
           blockerReasons,
@@ -1771,6 +2035,7 @@ export class Orchestrator {
               : undefined,
             decision: decisionSummary,
             marketState,
+            timing: timingSnapshot,
             topPlay,
             blockerTags: blockers,
             blockerReasons,

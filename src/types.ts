@@ -100,6 +100,37 @@ export interface Play {
   stopAdjusted?: boolean;
 }
 
+export type TimingPhase =
+  | "IDLE"
+  | "IMPULSE"
+  | "PULLBACK"
+  | "ENTRY_WINDOW"
+  | "IN_TRADE"
+  | "DONE";
+
+export interface TimingStateContext {
+  phase: TimingPhase;
+  dir: Direction | "NONE";
+  phaseSinceTs: number;
+  anchor?: {
+    impulseStartPx?: number;
+    impulseEndPx?: number;
+    pullbackHighPx?: number;
+    pullbackLowPx?: number;
+    vwapCrossTs?: number;
+  };
+  evidence?: {
+    impulseAtr?: number;
+    retracePct?: number;
+    slopeAtr?: number;
+  };
+  locks?: {
+    minBarsInPhase?: number;
+    cooldownUntilTs?: number;
+  };
+  lastUpdatedTs?: number;
+}
+
 export type ReclaimStep = "WAIT_RECLAIM" | "WAIT_CONFIRM";
 
 export type ReclaimState = {
@@ -130,4 +161,5 @@ export interface BotState {
   // STAGE 3: LLM tracking
   lastLLMCallAt?: number;
   lastLLMDecision?: string;
+  timingState?: TimingStateContext;
 }

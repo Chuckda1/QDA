@@ -8,6 +8,16 @@ export interface DirectionInference {
   reasons: string[];
 }
 
+export interface TacticalBias {
+  bias: Direction | "NONE";
+  tier: "CLEAR" | "LEAN" | "NONE";
+  score: number;
+  confidence: number; // 0-100
+  reasons: string[];
+  shock: boolean;
+  shockReason?: string;
+}
+
 /**
  * Calculate percentage move
  */
@@ -234,4 +244,150 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   }
 
   return { direction, confidence, reasons };
+}
+
+/**
+ * Infer fast tactical bias from recent bars (short lookback).
+ * Intended for CHOP/TRANSITION permission gating.
+ */
+export function inferTacticalBiasFromRecentBars(
+  bars: OHLCVBar[],
+  opts?: { lookback?: number }
+): TacticalBias {
+  if (!bars || bars.length < 6) {
+    return {
+      bias: "NONE",
+      tier: "NONE",
+      score: 0,
+      confidence: 0,
+      reasons: ["insufficient bars (< 6) for tactical bias"],
+      shock: false,
+    };
+  }
+
+  const lookback = Math.min(opts?.lookback ?? 5, bars.length);
+  const window = bars.slice(bars.length - lookback);
+  const closes = window.map((b) => b.close);
+  const last = window[window.length - 1]!;
+  const first = window[0]!;
+
+  const atr14 = computeATR(bars, 14);
+  const ema9 = computeEMA(bars.slice(-30).map((b) => b.close), 9);
+  const ema20 = computeEMA(bars.slice(-60).map((b) => b.close), 20);
+  const vwap30 = computeVWAP(bars, 30);
+
+  const slope = last.close - first.close;
+  const slopeAtr = atr14 && atr14 > 0 ? slope / atr14 : undefined;
+
+  // Shock detection: 1-bar or 2-bar range expansion
+  const lastRange = (last.high ?? last.close) - (last.low ?? last.close);
+  const prev = window.length >= 2 ? window[window.length - 2] : undefined;
+  const prevRange = prev ? (prev.high ?? prev.close) - (prev.low ?? prev.close) : 0;
+  const shock1 = atr14 ? lastRange >= 0.6 * atr14 : false;
+  const shock2 = atr14 ? (lastRange + prevRange) >= 0.9 * atr14 : false;
+  const shock = shock1 || shock2;
+  const shockBias = last.close >= (last.open ?? last.close) ? "LONG" : "SHORT";
+
+  let score = 0;
+  const reasons: string[] = [];
+
+  if (vwap30 !== undefined) {
+    if (last.close > vwap30) {
+      score += 1;
+      reasons.push("price>VWAP");
+    } else if (last.close < vwap30) {
+      score -= 1;
+      reasons.push("price<VWAP");
+    }
+  }
+
+  if (ema9 !== undefined && ema20 !== undefined) {
+    if (ema9 > ema20) {
+      score += 1;
+      reasons.push("EMA9>EMA20");
+    } else if (ema9 < ema20) {
+      score -= 1;
+      reasons.push("EMA9<EMA20");
+    }
+  }
+
+  // Candle ratio (directional)
+  let greenCount = 0;
+  let redCount = 0;
+  for (const bar of window) {
+    const barOpen = bar.open ?? bar.close;
+    if (bar.close > barOpen) greenCount += 1;
+    else if (bar.close < barOpen) redCount += 1;
+  }
+  const greenRatio = window.length > 0 ? greenCount / window.length : 0;
+  const redRatio = window.length > 0 ? redCount / window.length : 0;
+
+  const alignedUp = (vwap30 !== undefined ? last.close > vwap30 : true) && (ema9 !== undefined && ema20 !== undefined ? ema9 > ema20 : true);
+  const alignedDown = (vwap30 !== undefined ? last.close < vwap30 : true) && (ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : true);
+
+  const baseCandleRatio = 0.58;
+  const relaxedCandleRatio = 0.52;
+
+  if (alignedUp && slopeAtr !== undefined && slopeAtr >= 0.5 && greenRatio >= relaxedCandleRatio) {
+    score += 1;
+    reasons.push(`greenRatio=${(greenRatio * 100).toFixed(0)}%`);
+  } else if (alignedDown && slopeAtr !== undefined && slopeAtr <= -0.5 && redRatio >= relaxedCandleRatio) {
+    score -= 1;
+    reasons.push(`redRatio=${(redRatio * 100).toFixed(0)}%`);
+  } else if (greenRatio >= baseCandleRatio) {
+    score += 1;
+    reasons.push(`greenRatio=${(greenRatio * 100).toFixed(0)}%`);
+  } else if (redRatio >= baseCandleRatio) {
+    score -= 1;
+    reasons.push(`redRatio=${(redRatio * 100).toFixed(0)}%`);
+  }
+
+  if (slopeAtr !== undefined) {
+    if (slopeAtr >= 0.5) {
+      score += 1;
+      reasons.push(`slope=${slopeAtr.toFixed(2)} ATR up`);
+    } else if (slopeAtr <= -0.5) {
+      score -= 1;
+      reasons.push(`slope=${slopeAtr.toFixed(2)} ATR down`);
+    }
+  }
+
+  let bias: Direction | "NONE" = "NONE";
+  let tier: "CLEAR" | "LEAN" | "NONE" = "NONE";
+  if (score >= 3) {
+    bias = "LONG";
+    tier = "CLEAR";
+  } else if (score === 2) {
+    bias = "LONG";
+    tier = "LEAN";
+  } else if (score <= -3) {
+    bias = "SHORT";
+    tier = "CLEAR";
+  } else if (score === -2) {
+    bias = "SHORT";
+    tier = "LEAN";
+  }
+
+  let confidence = Math.min(100, Math.round((Math.abs(score) / 4) * 100));
+  let shockReason: string | undefined;
+  if (shock) {
+    confidence = Math.min(100, Math.max(confidence, 80));
+    shockReason = atr14 ? `range=${lastRange.toFixed(2)}; 2-bar=${(lastRange + prevRange).toFixed(2)}` : "range expansion";
+    bias = shockBias;
+    tier = "CLEAR";
+  }
+
+  if (bias === "NONE") {
+    reasons.push("tactical bias unclear");
+  }
+
+  return {
+    bias,
+    tier,
+    score: Math.abs(score),
+    confidence,
+    reasons,
+    shock,
+    shockReason
+  };
 }

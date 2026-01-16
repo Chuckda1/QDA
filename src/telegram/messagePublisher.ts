@@ -2,6 +2,7 @@ import type { DomainEvent } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
+import { getETParts } from "../utils/timeUtils.js";
 import { orderEvents } from "./messageOrder.js";
 
 export class MessagePublisher {
@@ -150,6 +151,13 @@ export class MessagePublisher {
     const longAllowed = state.permission?.long ? "✅ LONG" : "❌ LONG";
     const shortAllowed = state.permission?.short ? "✅ SHORT" : "❌ SHORT";
     const mode = state.permission?.mode ?? "N/A";
+    const tactical = state.tacticalBias;
+    const tacticalLine = tactical
+      ? `Tactical Bias: ${tactical.bias ?? "NONE"}${Number.isFinite(tactical.confidence) ? ` (${Math.round(tactical.confidence)}%)` : ""}${tactical.tier ? ` tier=${tactical.tier}` : ""}${Number.isFinite(tactical.score) ? ` score=${tactical.score}` : ""}`
+      : undefined;
+    const shockLine = tactical?.shock
+      ? `Shock Mode: ON${tactical.shockReason ? ` (${tactical.shockReason})` : ""}`
+      : undefined;
     const planBias = state.potd ? `Plan Bias: ${state.potd.bias}` : undefined;
     const planStatus = state.potd
       ? `Plan Status: ${state.potd.overridden ? "INVALIDATED by live regime" : "VALID"}${state.potd.alignment ? ` alignment=${state.potd.alignment}` : ""}`
@@ -159,6 +167,8 @@ export class MessagePublisher {
       `Regime: ${state.regime ?? "N/A"}${confidence}`,
       `Live Permission: ${longAllowed} / ${shortAllowed}`,
       `Mode: ${mode}`,
+      tacticalLine || "",
+      shockLine || "",
       state.reason ? `Reason: ${state.reason}` : "",
       planBias || "",
       planStatus || ""
@@ -227,8 +237,35 @@ export class MessagePublisher {
     return ["RATIONALE", ...trimmed.map((line) => `- ${line}`)];
   }
 
+  private formatTimingBlock(event: DomainEvent): string[] {
+    const timing = event.data.timing;
+    if (!timing) return [];
+    const reasons = timing.reasons?.length ? `Trigger: ${timing.reasons.join(" | ")}` : undefined;
+    const phase = timing.phase ?? timing.state ?? "N/A";
+    const dir = timing.dir ? `Dir: ${timing.dir}` : undefined;
+    const raw = timing.rawState && timing.rawState !== phase ? `Raw: ${timing.rawState}` : undefined;
+    const since = Number.isFinite(timing.phaseSinceTs)
+      ? (() => {
+          const { hour, minute } = getETParts(new Date(timing.phaseSinceTs));
+          const hh = String(hour).padStart(2, "0");
+          const mm = String(minute).padStart(2, "0");
+          return `Since: ${hh}:${mm} ET`;
+        })()
+      : undefined;
+    return [
+      "TIMING",
+      `Phase: ${phase}`,
+      dir || "",
+      raw || "",
+      since || "",
+      Number.isFinite(timing.score) ? `TimingScore: ${Math.round(timing.score)}` : "",
+      reasons || ""
+    ].filter(Boolean);
+  }
+
   private formatBanner(event: DomainEvent, title: string): string {
     const marketState = this.formatMarketStateBlock(event.data.marketState);
+    const timing = this.formatTimingBlock(event);
     const playState = this.formatPlayStateBlock(event);
     const topPlay = this.formatTopPlayBlock(event);
     const rationale = this.formatRationaleBlock(event);
@@ -242,6 +279,7 @@ export class MessagePublisher {
     const sections = [
       `[${event.instanceId}] ${title}`,
       ...marketState,
+      ...(timing.length ? ["", ...timing] : []),
       ...(playState.length ? ["", ...playState] : []),
       "",
       ...topPlay,
@@ -401,6 +439,9 @@ export class MessagePublisher {
         ].join("\n");
 
       case "PLAY_ENTERED":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "PLAY ENTERED");
+        }
         return [
           `[${instanceId}] ✅ PLAY ENTERED`,
           `${event.data.direction} ${event.data.symbol}`,
@@ -409,6 +450,9 @@ export class MessagePublisher {
         ].join("\n");
 
       case "PLAY_SIZED_UP":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "PLAY SIZED UP");
+        }
         return [
           `[${instanceId}] 📈 SIZE UP`,
           `${event.data.direction} ${event.data.symbol}`,
@@ -417,6 +461,9 @@ export class MessagePublisher {
         ].filter(Boolean).join("\n");
 
       case "ENTRY_WINDOW_OPENED":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "ENTRY WINDOW OPENED");
+        }
         return [
           `[${instanceId}] 🟡 ENTRY WINDOW`,
           `${event.data.direction} ${event.data.symbol}`,
@@ -425,6 +472,9 @@ export class MessagePublisher {
         ].filter(Boolean).join("\n");
 
       case "PLAY_CANCELLED":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "PLAY CANCELLED");
+        }
         return [
           `[${instanceId}] 🚫 PLAY CANCELLED`,
           `${event.data.direction} ${event.data.symbol}`,
@@ -441,6 +491,9 @@ export class MessagePublisher {
         ].join("\n");
 
       case "PLAY_CLOSED":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "PLAY CLOSED");
+        }
         return [
           `[${instanceId}] 🏁 PLAY CLOSED`,
           `${event.data.direction} ${event.data.symbol}`,

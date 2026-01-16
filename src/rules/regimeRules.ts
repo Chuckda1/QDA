@@ -205,10 +205,10 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   const atrSlope = atrInfo.atrSlope;
   const transitionFlags: string[] = [];
 
-  const impulseCheck = atr ? detectImpulseFlip(bars, atr, 3, 0.8) : { impulseFlip: false, reasons: ["ATR unavailable for impulse flip"] };
+  const impulseCheck = atr ? detectImpulseFlip(bars, atr, 3, 0.6) : { impulseFlip: false, reasons: ["ATR unavailable for impulse flip"] };
   reasons.push(...impulseCheck.reasons);
 
-  const atrSlopeRising = atrSlope !== undefined && atrSlope >= 0.08;
+  const atrSlopeRising = atrSlope !== undefined && atrSlope >= 0.05;
   const mildDirectional =
     vwapSlopePct !== undefined && Math.abs(vwapSlopePct) >= 0.02 && Math.abs(vwapSlopePct) <= 0.08;
   const transitionGate =
@@ -245,10 +245,67 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   const bullGate = bullScore >= 2 && bullScore > bearScore;
   const bearGate = bearScore >= 2 && bearScore > bullScore;
 
+  const closeNow = bars[bars.length - 1]?.close ?? currentPrice;
+  const closePast = bars.length >= 6 ? bars[bars.length - 6]!.close : bars[0]!.close;
+  const slopeAtrFast = atr && atr > 0 ? (closeNow - closePast) / atr : undefined;
+  const closeLast = bars[bars.length - 1]!.close;
+  const closePrev = bars[bars.length - 2]!.close;
+  const closePrev2 = bars[bars.length - 3]!.close;
+  const bullCloseConfirm = vwap !== undefined
+    ? closePrev > vwap && closeLast > vwap
+    : closeLast > closePrev && closePrev > closePrev2;
+  const bearCloseConfirm = vwap !== undefined
+    ? closePrev < vwap && closeLast < vwap
+    : closeLast < closePrev && closePrev < closePrev2;
+
   if (transitionGate) {
     return {
       regime: "TRANSITION",
       reasons: [...reasons, `TRANSITION regime: ${transitionFlags.join("+") || "volatility expansion"}`],
+      vwap,
+      vwapSlope,
+      vwapSlopePct,
+      structure,
+      bullScore,
+      bearScore,
+      atr,
+      atrSlope,
+      transitionFlags,
+    };
+  }
+
+  const fastDegradeVwapCross =
+    vwap !== undefined &&
+    atr !== undefined &&
+    ((bullGate && currentPrice < vwap - 0.35 * atr) || (bearGate && currentPrice > vwap + 0.35 * atr));
+  const fastDegradeOppSlope =
+    slopeAtrFast !== undefined &&
+    ((bullGate && slopeAtrFast <= -0.9) || (bearGate && slopeAtrFast >= 0.9));
+
+  if (fastDegradeVwapCross) transitionFlags.push("fastDegrade_vwapCross");
+  if (fastDegradeOppSlope) transitionFlags.push("fastDegrade_oppositeSlope");
+
+  if (fastDegradeVwapCross || fastDegradeOppSlope) {
+    return {
+      regime: "TRANSITION",
+      reasons: [...reasons, `TRANSITION regime: ${transitionFlags.join("+") || "fast degrade"}`],
+      vwap,
+      vwapSlope,
+      vwapSlopePct,
+      structure,
+      bullScore,
+      bearScore,
+      atr,
+      atrSlope,
+      transitionFlags,
+    };
+  }
+
+  if (bearGate && !bearCloseConfirm) {
+    transitionFlags.push("waiting_confirm_closes");
+    return {
+      regime: "TRANSITION",
+      reasons: [...reasons, "TRANSITION regime: waiting 2 closes to confirm TREND_DOWN"],
       vwap,
       vwapSlope,
       vwapSlopePct,
@@ -274,6 +331,23 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
       bearScore,
       atr,
       atrSlope,
+    };
+  }
+
+  if (bullGate && !bullCloseConfirm) {
+    transitionFlags.push("waiting_confirm_closes");
+    return {
+      regime: "TRANSITION",
+      reasons: [...reasons, "TRANSITION regime: waiting 2 closes to confirm TREND_UP"],
+      vwap,
+      vwapSlope,
+      vwapSlopePct,
+      structure,
+      bullScore,
+      bearScore,
+      atr,
+      atrSlope,
+      transitionFlags,
     };
   }
 

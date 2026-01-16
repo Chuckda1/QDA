@@ -124,6 +124,7 @@ try {
 const orch = new Orchestrator(instanceId, llmService, {
   activePlay: persisted?.activePlay ?? null,
   potd: persisted?.potd,
+  timingState: persisted?.timingState,
 });
 const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
@@ -211,6 +212,7 @@ setInterval(() => {
     instanceId,
     savedAt: Date.now(),
     activePlay: orch.getState().activePlay ?? null,
+    timingState: orch.getState().timingState,
     potd: orch.getPotdState(),
     governor: governor.exportState(),
   };
