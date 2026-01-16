@@ -1349,12 +1349,20 @@ export class Orchestrator {
             };
           }
         } else {
+          if (tacticalBias === "NONE") {
+            directionGate = {
+              allow: false,
+              tier: "NONE",
+              reason: "tactical bias not clear (bias=NONE)",
+            };
+          } else {
           directionGate = {
             allow: true,
             tier: "LEANING",
             direction: tacticalBias,
             reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`,
           };
+          }
         }
       }
 
