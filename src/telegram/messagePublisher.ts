@@ -144,11 +144,123 @@ export class MessagePublisher {
     return lines;
   }
 
+  private formatMarketStateBlock(state?: any): string[] {
+    if (!state) return [];
+    const confidence = Number.isFinite(state.confidence) ? ` (Confidence: ${Math.round(state.confidence)}%)` : "";
+    const longAllowed = state.permission?.long ? "✅ LONG" : "❌ LONG";
+    const shortAllowed = state.permission?.short ? "✅ SHORT" : "❌ SHORT";
+    const mode = state.permission?.mode ?? "N/A";
+    const planBias = state.potd ? `Plan Bias: ${state.potd.bias}` : undefined;
+    const planStatus = state.potd
+      ? `Plan Status: ${state.potd.overridden ? "INVALIDATED by live regime" : "VALID"}${state.potd.alignment ? ` alignment=${state.potd.alignment}` : ""}`
+      : undefined;
+    return [
+      "MARKET STATE",
+      `Regime: ${state.regime ?? "N/A"}${confidence}`,
+      `Live Permission: ${longAllowed} / ${shortAllowed}`,
+      `Mode: ${mode}`,
+      state.reason ? `Reason: ${state.reason}` : "",
+      planBias || "",
+      planStatus || ""
+    ].filter(Boolean);
+  }
+
+  private formatPlayStateBlock(event: DomainEvent): string[] {
+    const state = event.data.playState;
+    const decisionKind = event.data.decision?.kind ? `Decision: ${event.data.decision.kind}` : "";
+    if (!state) return [];
+    const armReason = event.data.armReason ? `Arm Reason: ${event.data.armReason}` : "";
+    const notArmed = event.data.notArmedReason ? `Not Armed Because: ${event.data.notArmedReason}` : "";
+    return ["PLAY STATE", `Play State: ${state}`, decisionKind, armReason, notArmed].filter(Boolean);
+  }
+
+  private formatTopPlayBlock(event: DomainEvent): string[] {
+    const top = event.data.topPlay ?? {};
+    const setup = top.setup ?? event.data.setup?.pattern ?? event.data.candidate?.pattern ?? "N/A";
+    const direction = top.direction ?? event.data.direction ?? event.data.candidate?.direction ?? event.data.play?.direction;
+    const entryZone = top.entryZone ?? event.data.play?.entryZone ?? event.data.setup?.entryZone ?? event.data.candidate?.entryZone;
+    const stop = top.stop ?? event.data.play?.stop ?? event.data.setup?.stop ?? event.data.candidate?.stop;
+    const probability = top.probability ?? event.data.probability ?? event.data.llm?.probability;
+    const action = top.action ?? event.data.action ?? event.data.llm?.action ?? event.data.play?.action;
+
+    const entryLine = entryZone
+      ? `Entry: $${entryZone.low.toFixed(2)} - $${entryZone.high.toFixed(2)}`
+      : "Entry: N/A";
+    const stopLine = Number.isFinite(stop) ? `Stop: $${stop.toFixed(2)}` : "Stop: N/A";
+    const probLine = Number.isFinite(probability) ? `Prob(T1): ${Math.round(probability)}%` : "Prob(T1): N/A";
+
+    return [
+      "TOP PLAY",
+      `Setup: ${setup}${direction ? ` ${direction}` : ""}`,
+      entryLine,
+      stopLine,
+      probLine,
+      `Action: ${action ?? "N/A"}`
+    ];
+  }
+
+  private formatBlockersBlock(params: {
+    reasons?: string[];
+    tags?: string[];
+    decisionReasons?: string[];
+    decisionTags?: string[];
+  }): string[] {
+    const reasons = params.decisionReasons?.length ? params.decisionReasons : params.reasons ?? [];
+    const tags = params.tags?.length ? params.tags : params.decisionTags ?? [];
+    if (!reasons.length && !tags.length) return [];
+    const lines = ["BLOCKERS"];
+    if (reasons.length) {
+      lines.push(...reasons.map((b) => `- ${b}`));
+    }
+    if (tags.length) {
+      lines.push(`Tags: ${tags.join(", ")}`);
+    }
+    return lines;
+  }
+
+  private formatRationaleBlock(event: DomainEvent): string[] {
+    const rationale: string[] | undefined = event.data.decision?.rationale;
+    if (!rationale?.length) return [];
+    const kind = event.data.decision?.kind;
+    const maxLines = kind === "GATE" ? 2 : 3;
+    const trimmed = rationale.slice(0, maxLines);
+    return ["RATIONALE", ...trimmed.map((line) => `- ${line}`)];
+  }
+
+  private formatBanner(event: DomainEvent, title: string): string {
+    const marketState = this.formatMarketStateBlock(event.data.marketState);
+    const playState = this.formatPlayStateBlock(event);
+    const topPlay = this.formatTopPlayBlock(event);
+    const rationale = this.formatRationaleBlock(event);
+    const blockers = this.formatBlockersBlock({
+      reasons: event.data.blockerReasons,
+      tags: event.data.blockerTags,
+      decisionReasons: event.data.decision?.blockerReasons,
+      decisionTags: event.data.decision?.blockers
+    });
+    const decisionKind = event.data.decision?.kind;
+    const sections = [
+      `[${event.instanceId}] ${title}`,
+      ...marketState,
+      ...(playState.length ? ["", ...playState] : []),
+      "",
+      ...topPlay,
+      ...(decisionKind === "GATE" ? (blockers.length ? ["", ...blockers] : []) : []),
+      ...(decisionKind === "GATE" ? (rationale.length ? ["", ...rationale] : []) : []),
+      ...(decisionKind !== "GATE" ? (rationale.length ? ["", ...rationale] : []) : []),
+      ...(decisionKind !== "GATE" ? (blockers.length ? ["", ...blockers] : []) : [])
+    ];
+    return sections.join("\n");
+  }
+
   private formatEvent(event: DomainEvent): string {
     const instanceId = event.instanceId;
     
     switch (event.type) {
       case "PLAY_ARMED": {
+        if (event.data.marketState) {
+          return this.formatBanner(event, "PLAY ARMED");
+        }
         const p = event.data.play;
         return [
           `[${instanceId}] 🔎 ${p.mode} PLAY ARMED`,
@@ -201,6 +313,9 @@ export class MessagePublisher {
         ].filter(Boolean).join("\n");
 
       case "SCORECARD": {
+        if (event.data.marketState) {
+          return this.formatBanner(event, "SCORECARD");
+        }
         const r = event.data.rules ?? {};
         const l = event.data.llm ?? {};
         const ind = r.indicators ?? {};
@@ -235,6 +350,9 @@ export class MessagePublisher {
       }
 
       case "SETUP_SUMMARY": {
+        if (event.data.marketState) {
+          return this.formatBanner(event, "SETUP SUMMARY");
+        }
         const c = event.data?.candidate;
         if (!c) {
           return [
@@ -257,6 +375,9 @@ export class MessagePublisher {
       }
 
       case "NO_ENTRY":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "NO ENTRY");
+        }
         return [
           `[${instanceId}] ⛔ NO ENTRY`,
           event.data?.direction && event.data?.symbol ? `${event.data.direction} ${event.data.symbol}` : "",
@@ -265,6 +386,9 @@ export class MessagePublisher {
         ].filter(Boolean).join("\n");
 
       case "TRADE_PLAN":
+        if (event.data.marketState) {
+          return this.formatBanner(event, "TRADE PLAN");
+        }
         return [
           `[${instanceId}] 📋 TRADE PLAN`,
           `${event.data.direction} ${event.data.symbol}`,

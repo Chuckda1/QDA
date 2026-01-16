@@ -236,7 +236,15 @@ export class Scheduler {
       timestamp: Date.now(),
       instanceId: this.instanceId,
       data: {
-        plan: planLines.join("\n")
+        plan: planLines.join("\n"),
+        decision: {
+          decisionId: `PLAN_${Date.now()}`,
+          status: "PLAN",
+          kind: "EXECUTION",
+          permission: { long: false, short: false, mode: "N/A" },
+          direction: "NONE",
+          rationale: ["daily plan generated"]
+        }
       }
     };
     // STAGE 4: All messages must go through publishOrdered for serialization

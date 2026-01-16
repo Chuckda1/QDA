@@ -185,6 +185,9 @@ export class Orchestrator {
   private last15mVwapSlopePct?: number;
   private last15mEma20Slope?: number;
   private last15mStructure?: "BULLISH" | "BEARISH" | "MIXED" | "CHOP";
+  private lastRegimeLabel?: RegimeResult["regime"];
+  private transitionLockRemaining: number = 0;
+  private readonly transitionLockBars: number = 3;
 
   // Guardrail tracking
   private playsToday: number = 0;
@@ -601,6 +604,35 @@ export class Orchestrator {
     }
 
     const play = this.state.activePlay!;
+    const buildDecisionPayload = (params: {
+      kind: "GATE" | "EXECUTION" | "MANAGEMENT";
+      status: string;
+      allowed?: boolean;
+      direction?: "LONG" | "SHORT" | "NONE";
+      gateTier?: "LEANING" | "STRICT" | "OPEN";
+      blockers?: string[];
+      blockerReasons?: string[];
+      rationale?: string[];
+      permissionMode?: "SCALP_ONLY" | "SWING_ALLOWED" | "BLOCKED";
+    }) => {
+      const permission = {
+        long: play.direction === "LONG",
+        short: play.direction === "SHORT",
+        mode: params.permissionMode ?? (play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED")
+      };
+      return {
+        decisionId: `${play.symbol}_${ts}_${play.id}`,
+        status: params.status,
+        kind: params.kind,
+        ...(params.allowed !== undefined ? { allowed: params.allowed } : {}),
+        permission,
+        direction: params.direction ?? play.direction,
+        ...(params.kind === "GATE" ? { gateTier: params.gateTier ?? (play.tier === "LEANING" ? "LEANING" : "OPEN") } : {}),
+        blockers: params.blockers,
+        blockerReasons: params.blockerReasons,
+        rationale: params.rationale
+      };
+    };
 
     if (play.status === "ARMED" && play.expiresAt && ts >= play.expiresAt) {
       const decision = buildNoEntryDecision({
@@ -618,8 +650,22 @@ export class Orchestrator {
           decisionId: decision.decisionId,
           status: decision.status,
           blockers: decision.blockers,
-          blockerReasons: decision.blockerReasons
-        }
+          blockerReasons: decision.blockerReasons,
+          kind: "GATE",
+          allowed: false,
+          permission: {
+            long: play.direction === "LONG",
+            short: play.direction === "SHORT",
+            mode: play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED"
+          },
+          direction: play.direction,
+          gateTier: "STRICT",
+          rationale: decision.blockerReasons
+        },
+        blockerTags: decision.blockers,
+        blockerReasons: decision.blockerReasons,
+        playState: "CANDIDATE",
+        notArmedReason: decision.blockerReasons?.join(" | ")
       }));
       play.status = "CLOSED";
       this.state.activePlay = null;
@@ -640,7 +686,15 @@ export class Orchestrator {
         symbol: play.symbol,
         direction: play.direction,
         price: close,
-        entryZone: play.entryZone
+        entryZone: play.entryZone,
+        decision: buildDecisionPayload({
+          kind: "EXECUTION",
+          status: "ARMED",
+          allowed: true,
+          rationale: ["price entered zone"]
+        }),
+        playState: "ARMED",
+        armReason: "armed; waiting for depth trigger"
       }));
     }
 
@@ -654,7 +708,15 @@ export class Orchestrator {
           symbol: play.symbol,
           direction: play.direction,
           price: close,
-          reason: "Entry window expired"
+          reason: "Entry window expired",
+          decision: buildDecisionPayload({
+            kind: "EXECUTION",
+            status: "CANCELLED",
+            allowed: false,
+            rationale: ["Entry window expired"]
+          }),
+          playState: "CANDIDATE",
+          notArmedReason: "Entry window expired"
         }));
         this.state.activePlay = null;
         return events;
@@ -667,7 +729,15 @@ export class Orchestrator {
           symbol: play.symbol,
           direction: play.direction,
           price: close,
-          reason: "Pre-entry stop break"
+          reason: "Pre-entry stop break",
+          decision: buildDecisionPayload({
+            kind: "EXECUTION",
+            status: "CANCELLED",
+            allowed: false,
+            rationale: ["Pre-entry stop break"]
+          }),
+          playState: "CANDIDATE",
+          notArmedReason: "Pre-entry stop break"
         }));
         this.state.activePlay = null;
         return events;
@@ -679,7 +749,15 @@ export class Orchestrator {
           symbol: play.symbol,
           direction: play.direction,
           price: close,
-          reason: "Pre-entry stop break"
+          reason: "Pre-entry stop break",
+          decision: buildDecisionPayload({
+            kind: "EXECUTION",
+            status: "CANCELLED",
+            allowed: false,
+            rationale: ["Pre-entry stop break"]
+          }),
+          playState: "CANDIDATE",
+          notArmedReason: "Pre-entry stop break"
         }));
         this.state.activePlay = null;
         return events;
@@ -707,7 +785,15 @@ export class Orchestrator {
           price: close,
           entryPrice: play.entryPrice,
           entryTrigger,
-          reason: "Pullback depth hit"
+          reason: "Pullback depth hit",
+          decision: buildDecisionPayload({
+            kind: "EXECUTION",
+            status: "ENTERED",
+            allowed: true,
+            rationale: ["pullback depth hit"]
+          }),
+          playState: "ENTERED",
+          armReason: "depth trigger hit"
         }));
       }
     }
@@ -739,7 +825,15 @@ export class Orchestrator {
         reason: "Stop loss hit on close (hard rule)",
         result: "LOSS",
         exitType: "STOP_HIT",
-        llmAction: "N/A" // Hard stop, LLM not consulted
+        llmAction: "N/A", // Hard stop, LLM not consulted
+        decision: buildDecisionPayload({
+          kind: "MANAGEMENT",
+          status: "CLOSED",
+          allowed: true,
+          permissionMode: play.mode,
+          rationale: ["stop loss hit on close"]
+        }),
+        playState: "ENTERED"
       }));
       this.state.activePlay = null;
       return events;
@@ -764,7 +858,15 @@ export class Orchestrator {
           symbol: play.symbol,
           direction: play.direction,
           mode: play.mode,
-          reason: confirm.reason
+          reason: confirm.reason,
+          decision: buildDecisionPayload({
+            kind: "MANAGEMENT",
+            status: "ENTERED",
+            allowed: true,
+            permissionMode: play.mode,
+            rationale: [confirm.reason]
+          }),
+          playState: "ENTERED"
         }));
       } else if (confirm.shouldCancel) {
         play.status = "CLOSED";
@@ -777,7 +879,15 @@ export class Orchestrator {
           reason: confirm.reason,
           result: "LOSS",
           exitType: "TIME_STOP",
-          llmAction: "RULES_EXIT"
+          llmAction: "RULES_EXIT",
+          decision: buildDecisionPayload({
+            kind: "MANAGEMENT",
+            status: "CLOSED",
+            allowed: true,
+            permissionMode: play.mode,
+            rationale: [confirm.reason]
+          }),
+          playState: "ENTERED"
         }));
         this.cooldownAfterPlayClosed = Date.now();
         this.state.activePlay = null;
@@ -906,6 +1016,13 @@ export class Orchestrator {
       regime: finalRegime,
       reasons: hysteresisNotes.length ? [...rawRegime.reasons, ...hysteresisNotes] : rawRegime.reasons
     };
+
+    if (this.lastRegimeLabel && mergedRegime.regime !== this.lastRegimeLabel) {
+      this.transitionLockRemaining = this.transitionLockBars;
+    } else if (this.transitionLockRemaining > 0) {
+      this.transitionLockRemaining -= 1;
+    }
+    this.lastRegimeLabel = mergedRegime.regime;
 
     this.lastRegime15m = mergedRegime;
     this.lastMacroBias = finalBias;
@@ -1055,6 +1172,9 @@ export class Orchestrator {
           blockers.push("guardrail");
           blockerReasons.push(`score floor ${scoreFloor} (${setupCandidate.score.total})`);
         }
+        if (transitionLockActive) {
+          blockerReasons.push(`transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})`);
+        }
         if (directionGate.tier === "LEANING" && setupCandidate.flags?.includes("CHASE_RISK")) {
           blockers.push("guardrail");
           blockerReasons.push("leaning: chase risk blocked");
@@ -1114,6 +1234,32 @@ export class Orchestrator {
         blockers.push("guardrail");
         blockerReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
       }
+
+      const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
+        ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
+        : undefined;
+      const transitionLockActive = this.transitionLockRemaining > 0;
+      const permission = directionGate.allow
+        ? {
+            long: directionGate.direction === "LONG",
+            short: directionGate.direction === "SHORT",
+            mode: anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION" || transitionLockActive ? "SCALP_ONLY" : "SWING_ALLOWED"
+          }
+        : { long: false, short: false, mode: "BLOCKED" };
+      const marketState = {
+        regime: anchorRegime.regime,
+        confidence: regimeConfidence,
+        permission,
+        reason: [anchorRegime.reasons?.[0], transitionLockActive ? `transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})` : undefined, directionGate.reason]
+          .filter(Boolean)
+          .join(" | "),
+        potd: {
+          bias: this.potdBias,
+          mode: this.potdMode,
+          alignment: potdAlignment,
+          overridden: potdCountertrend
+        }
+      };
 
       const filterContext: EntryFilterContext = {
         timestamp: ts,
@@ -1484,11 +1630,35 @@ export class Orchestrator {
       });
       this.lastDecision = decision;
 
+      const topPlay = {
+        setup: setupCandidate.pattern,
+        direction: setupCandidate.direction,
+        entryZone: setupCandidate.entryZone,
+        stop: setupCandidate.stop,
+        probability: decision.llm?.probability ?? llmSummary?.probability,
+        action: decision.llm?.action ?? llmSummary?.action
+      };
+
+      const riskAtr = atr
+        ? Math.abs(((setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2) - setupCandidate.stop) / atr
+        : undefined;
       const decisionSummary = {
         decisionId: decision.decisionId,
         status: decision.status,
+        kind: "GATE" as const,
+        allowed: decision.status === "ARMED",
+        permission,
+        direction: directionGate.allow ? directionGate.direction : "NONE",
+        gateTier: directionGate.allow ? (directionGate.tier === "LEANING" ? "LEANING" : "OPEN") : "STRICT",
         blockers: decision.blockers,
-        blockerReasons: decision.blockerReasons
+        blockerReasons: decision.blockerReasons,
+        rationale: [directionGate.reason].filter(Boolean),
+        metrics: {
+          score: setupCandidate.score.total,
+          legitimacy: decision.llm?.legitimacy,
+          followThrough: decision.llm?.followThroughProb,
+          riskAtr
+        }
       };
 
       if (decision.llm) {
@@ -1501,7 +1671,12 @@ export class Orchestrator {
           followThroughProb: decision.llm.followThroughProb,
           action: decision.llm.action,
           reasoning: decision.llm.reasoning,
-          decision: decisionSummary
+          decision: decisionSummary,
+          blockerTags: blockers,
+          blockerReasons,
+          marketState,
+          playState: "CANDIDATE",
+          notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
         }));
       }
 
@@ -1517,7 +1692,13 @@ export class Orchestrator {
         },
         rules: rulesSnapshot,
         llm: decision.llm,
-        decision: decisionSummary
+        decision: decisionSummary,
+        marketState,
+        topPlay,
+        blockerTags: blockers,
+        blockerReasons,
+        playState: "CANDIDATE",
+        notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
       }));
 
       if (decision.status !== "ARMED") {
@@ -1526,7 +1707,13 @@ export class Orchestrator {
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
           price: close,
-          decision: decisionSummary
+          decision: decisionSummary,
+          marketState,
+          topPlay,
+          blockerTags: blockers,
+          blockerReasons,
+          playState: "CANDIDATE",
+          notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
         }));
       }
 
@@ -1539,7 +1726,17 @@ export class Orchestrator {
         }
         this.state.activePlay = decision.play;
         this.playsToday += 1;
-        events.push(this.ev("PLAY_ARMED", ts, { play: decision.play, decision: decisionSummary, price: close }));
+        events.push(this.ev("PLAY_ARMED", ts, {
+          play: decision.play,
+          decision: decisionSummary,
+          price: close,
+          marketState,
+          topPlay,
+          blockerTags: blockers,
+          blockerReasons,
+          playState: "ARMED",
+          armReason: "regime + score + LLM approved"
+        }));
         events.push(this.ev("TRADE_PLAN", ts, {
           playId: decision.play.id,
           symbol: decision.play.symbol,
@@ -1549,7 +1746,13 @@ export class Orchestrator {
           size: decision.play.mode,
           probability: decision.llm?.probability,
           plan: decision.llm?.plan,
-          decision: decisionSummary
+          decision: decisionSummary,
+          marketState,
+          topPlay,
+          blockerTags: blockers,
+          blockerReasons,
+          playState: "ARMED",
+          armReason: "regime + score + LLM approved"
         }));
       }
 
@@ -1564,7 +1767,12 @@ export class Orchestrator {
             notes: this.lastDecision.rules
               ? `regime=${this.lastDecision.rules.regime.regime} bias=${this.lastDecision.rules.macroBias?.bias ?? "N/A"}`
               : undefined,
-            decision: decisionSummary
+            decision: decisionSummary,
+            marketState,
+            topPlay,
+            blockerTags: blockers,
+            blockerReasons,
+            playState: decision.status === "ARMED" ? "ARMED" : "CANDIDATE"
           }));
           this.lastSetupSummary5mTs = ts;
         }
@@ -1648,7 +1856,20 @@ export class Orchestrator {
           commentary: armedResponse.commentary,
           entryReadiness: armedResponse.entryReadiness,
           reasoning: armedResponse.reasoning,
-          urgency: armedResponse.urgency
+          urgency: armedResponse.urgency,
+          decision: {
+            decisionId: `${play.symbol}_${ts}_${play.id}`,
+            status: play.status,
+            kind: "EXECUTION",
+            permission: {
+              long: play.direction === "LONG",
+              short: play.direction === "SHORT",
+              mode: play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED"
+            },
+            direction: play.direction,
+            rationale: ["armed coaching update"]
+          },
+          playState: play.status
         }));
         
       } catch (error: any) {
@@ -1752,7 +1973,20 @@ export class Orchestrator {
         reason,
         result: "WIN",
         exitType: "EXHAUSTION",
-        llmAction: "RULES_EXIT"
+        llmAction: "RULES_EXIT",
+        decision: {
+          decisionId: `${play.symbol}_${ts}_${play.id}`,
+          status: "CLOSED",
+          kind: "MANAGEMENT",
+          permission: {
+            long: play.direction === "LONG",
+            short: play.direction === "SHORT",
+            mode: play.mode
+          },
+          direction: play.direction,
+          rationale: [reason]
+        },
+        playState: "ENTERED"
       }));
       this.cooldownAfterPlayClosed = Date.now();
       this.state.activePlay = null;
@@ -1857,7 +2091,20 @@ export class Orchestrator {
           reasoning: llmReasoning,
           urgency: llmUrgency,
           update: llmReasoning,
-          rulesContext // Include rules context in event
+          rulesContext, // Include rules context in event
+          decision: {
+            decisionId: `${play.symbol}_${ts}_${play.id}`,
+            status: play.status,
+            kind: "MANAGEMENT",
+            permission: {
+              long: play.direction === "LONG",
+              short: play.direction === "SHORT",
+              mode: play.mode
+            },
+            direction: play.direction,
+            rationale: [llmReasoning || llmAction]
+          },
+          playState: "ENTERED"
         }));
         
         // LLM decision is FINAL - if LLM says exit, we exit
@@ -1880,7 +2127,20 @@ export class Orchestrator {
             exitType,
             targetHit: rulesContext.targetHit,
             llmAction,
-            llmReasoning
+            llmReasoning,
+            decision: {
+              decisionId: `${play.symbol}_${ts}_${play.id}`,
+              status: "CLOSED",
+              kind: "MANAGEMENT",
+              permission: {
+                long: play.direction === "LONG",
+                short: play.direction === "SHORT",
+                mode: play.mode
+              },
+              direction: play.direction,
+              rationale: [llmReasoning || llmAction]
+            },
+            playState: "ENTERED"
           }));
           
           // Set cooldown after play closed
