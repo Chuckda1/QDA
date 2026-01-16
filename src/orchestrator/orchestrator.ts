@@ -816,6 +816,7 @@ export class Orchestrator {
       // Set cooldown after play closed
       this.cooldownAfterPlayClosed = Date.now();
       // INVARIANT: PLAY_CLOSED must have matching active play (verified - we have play)
+      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
       events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
         symbol: play.symbol,
@@ -830,7 +831,7 @@ export class Orchestrator {
           kind: "MANAGEMENT",
           status: "CLOSED",
           allowed: true,
-          permissionMode: play.mode,
+          permissionMode: playPermissionMode,
           rationale: ["stop loss hit on close"]
         }),
         playState: "ENTERED"
@@ -853,6 +854,7 @@ export class Orchestrator {
 
       if (confirm.ok) {
         play.mode = "FULL";
+        const sizedPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
         events.push(this.ev("PLAY_SIZED_UP", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -863,7 +865,7 @@ export class Orchestrator {
             kind: "MANAGEMENT",
             status: "ENTERED",
             allowed: true,
-            permissionMode: play.mode,
+            permissionMode: sizedPermissionMode,
             rationale: [confirm.reason]
           }),
           playState: "ENTERED"
@@ -884,7 +886,7 @@ export class Orchestrator {
             kind: "MANAGEMENT",
             status: "CLOSED",
             allowed: true,
-            permissionMode: play.mode,
+            permissionMode: playPermissionMode,
             rationale: [confirm.reason]
           }),
           playState: "ENTERED"
@@ -1157,6 +1159,7 @@ export class Orchestrator {
       const setupCandidate = setupResult.candidate;
       const blockers: DecisionBlocker[] = [];
       const blockerReasons: string[] = [];
+      const transitionLockActive = this.transitionLockRemaining > 0;
 
       if (!directionGate.allow) {
         blockers.push("guardrail");
@@ -1238,7 +1241,6 @@ export class Orchestrator {
       const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
         ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
         : undefined;
-      const transitionLockActive = this.transitionLockRemaining > 0;
       const permission = directionGate.allow
         ? {
             long: directionGate.direction === "LONG",
@@ -1964,6 +1966,7 @@ export class Orchestrator {
       play.stopHit = true;
       play.status = "CLOSED";
       const reason = `Exhaustion exit: ${exhaustionSignals.join(", ")}`;
+      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
       events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
         symbol: play.symbol,
@@ -1981,7 +1984,7 @@ export class Orchestrator {
           permission: {
             long: play.direction === "LONG",
             short: play.direction === "SHORT",
-            mode: play.mode
+            mode: playPermissionMode
           },
           direction: play.direction,
           rationale: [reason]
@@ -2082,6 +2085,7 @@ export class Orchestrator {
 
         // Emit LLM_COACH_UPDATE only if materially changed OR cooldown expired
         // (For now, emit every 5m bar - you can add material change detection later)
+        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
         events.push(this.ev("LLM_COACH_UPDATE", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -2099,7 +2103,7 @@ export class Orchestrator {
             permission: {
               long: play.direction === "LONG",
               short: play.direction === "SHORT",
-              mode: play.mode
+              mode: playPermissionMode
             },
             direction: play.direction,
             rationale: [llmReasoning || llmAction]
@@ -2135,7 +2139,7 @@ export class Orchestrator {
               permission: {
                 long: play.direction === "LONG",
                 short: play.direction === "SHORT",
-                mode: play.mode
+                mode: playPermissionMode
               },
               direction: play.direction,
               rationale: [llmReasoning || llmAction]
