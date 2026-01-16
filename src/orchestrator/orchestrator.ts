@@ -6,7 +6,7 @@ import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
-import { computeMacroBias, computeRegime, regimeAllowsDirection } from "../rules/regimeRules.js";
+import { computeMacroBias, computeRegime, regimeAllowsDirection, type RegimeOptions } from "../rules/regimeRules.js";
 import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
@@ -163,6 +163,22 @@ function directionGate15mMoreLeaning(input: {
   };
 }
 
+const REGIME_15M_FAST_OPTIONS: Partial<RegimeOptions> = {
+  minBars: 16,
+  vwapPeriod: 12,
+  vwapLookbackBars: 4,
+  atrPeriod: 10,
+  atrLookbackBars: 4,
+  structureLookback: 16,
+};
+
+const REGIME_5M_PROVISIONAL_OPTIONS: Partial<RegimeOptions> = {
+  ...REGIME_15M_FAST_OPTIONS,
+  minBars: 12,
+};
+
+const REGIME_15M_MIN_BARS = REGIME_15M_FAST_OPTIONS.minBars ?? 30;
+
 export class Orchestrator {
   private state: BotState;
   private instanceId: string;
@@ -181,6 +197,7 @@ export class Orchestrator {
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
+  private lastRegime15mReady: boolean = false;
   private last15mClose?: number;
   private last15mVwap?: number;
   private last15mEma9?: number;
@@ -1135,8 +1152,8 @@ export class Orchestrator {
       return [];
     }
 
-    const rawRegime = computeRegime(this.recentBars15m, close);
-    const rawBias = computeMacroBias(this.recentBars15m, close);
+    const rawRegime = computeRegime(this.recentBars15m, close, REGIME_15M_FAST_OPTIONS);
+    const rawBias = computeMacroBias(this.recentBars15m, close, REGIME_15M_FAST_OPTIONS);
 
     const closes = this.recentBars15m.map((b) => b.close);
     const ema9 = computeEMA(closes.slice(-40), 9);
@@ -1177,10 +1194,14 @@ export class Orchestrator {
       hysteresisNotes.push("bias hold: SHORT bias until confirmed upshift");
     }
 
+    const anchorReady = this.recentBars15m.length >= REGIME_15M_MIN_BARS;
+    const readinessNote = anchorReady
+      ? []
+      : [`15m anchor warming: ${this.recentBars15m.length}/${REGIME_15M_MIN_BARS} bars`];
     const mergedRegime: RegimeResult = {
       ...rawRegime,
       regime: finalRegime,
-      reasons: hysteresisNotes.length ? [...rawRegime.reasons, ...hysteresisNotes] : rawRegime.reasons
+      reasons: [...rawRegime.reasons, ...hysteresisNotes, ...readinessNote]
     };
 
     if (this.lastRegimeLabel && mergedRegime.regime !== this.lastRegimeLabel) {
@@ -1193,6 +1214,7 @@ export class Orchestrator {
     this.lastRegime15m = mergedRegime;
     this.lastMacroBias = finalBias;
     this.lastRegime15mTs = ts;
+    this.lastRegime15mReady = anchorReady;
     this.last15mClose = close;
     this.last15mVwap = vwap;
     this.last15mEma9 = ema9;
@@ -1231,13 +1253,15 @@ export class Orchestrator {
       const watchOnly = this.state.mode !== "ACTIVE";
 
       if (this.recentBars5m.length < 6) {
-        const fallbackRegime = this.lastRegime15m ?? computeRegime(this.recentBars5m, close);
+        const fallbackRegime = this.lastRegime15mReady && this.lastRegime15m
+          ? this.lastRegime15m
+          : computeRegime(this.recentBars5m, close, REGIME_5M_PROVISIONAL_OPTIONS);
         this.lastDiagnostics = {
           ts,
           symbol,
           close,
           regime: fallbackRegime,
-          macroBias: this.lastMacroBias,
+          macroBias: this.lastRegime15mReady ? this.lastMacroBias : "NEUTRAL",
           directionInference: inferDirectionFromRecentBars(this.recentBars5m),
           setupReason: "insufficient 5m history (< 6 bars)",
         };
@@ -1251,15 +1275,18 @@ export class Orchestrator {
         return events;
       }
 
-      const rawRegime5m = computeRegime(this.recentBars5m, close);
-      const anchorRegime = this.lastRegime15m ?? {
-        ...rawRegime5m,
-        regime: "TRANSITION",
-        reasons: [...rawRegime5m.reasons, "anchor pending: default TRANSITION until 15m confirms"]
-      };
-      const macroBiasInfo = this.lastRegime15m
+      const rawRegime5m = computeRegime(this.recentBars5m, close, REGIME_5M_PROVISIONAL_OPTIONS);
+      const anchorReady = this.lastRegime15mReady && !!this.lastRegime15m;
+      const anchorRegime = anchorReady
+        ? this.lastRegime15m!
+        : {
+            ...rawRegime5m,
+            reasons: [...rawRegime5m.reasons, "anchor=5m provisional until 15m mature"]
+          };
+      const anchorLabel = anchorReady ? "15m" : "5m provisional";
+      const macroBiasInfo = anchorReady
         ? { bias: this.lastMacroBias, reasons: ["anchor=15m"] }
-        : { bias: "NEUTRAL" as Bias, reasons: ["anchor pending: bias neutral until 15m confirms"] };
+        : { bias: "NEUTRAL" as Bias, reasons: ["anchor=5m provisional: bias neutral"] };
 
       const dirInf = inferDirectionFromRecentBars(this.recentBars5m);
       if (!dirInf.direction) {
@@ -1276,23 +1303,37 @@ export class Orchestrator {
       const ema20 = computeEMA(closes.slice(-80), 20);
       const vwap = computeVWAP(this.recentBars5m, 30);
       const rsi14 = computeRSI(closes, 14);
+      const ema20Slope5m = computeEmaSlopePct(closes, 20, 3);
 
-      let directionGate = directionGate15mMoreLeaning({
-        close15m: this.last15mClose ?? close,
-        vwap15m: this.last15mVwap ?? anchorRegime.vwap,
-        ema9_15m: this.last15mEma9,
-        ema20_15m: this.last15mEma20,
-        structure15m: this.last15mStructure ?? anchorRegime.structure,
-        vwapSlope15m: this.last15mVwapSlopePct ?? anchorRegime.vwapSlopePct,
-        ema20Slope15m: this.last15mEma20Slope,
-      });
+      let directionGate = directionGate15mMoreLeaning(
+        anchorReady
+          ? {
+              close15m: this.last15mClose ?? close,
+              vwap15m: this.last15mVwap ?? anchorRegime.vwap,
+              ema9_15m: this.last15mEma9,
+              ema20_15m: this.last15mEma20,
+              structure15m: this.last15mStructure ?? anchorRegime.structure,
+              vwapSlope15m: this.last15mVwapSlopePct ?? anchorRegime.vwapSlopePct,
+              ema20Slope15m: this.last15mEma20Slope,
+            }
+          : {
+              close15m: close,
+              vwap15m: vwap ?? anchorRegime.vwap,
+              ema9_15m: ema9,
+              ema20_15m: ema20,
+              structure15m: anchorRegime.structure,
+              vwapSlope15m: anchorRegime.vwapSlopePct,
+              ema20Slope15m: ema20Slope5m,
+            }
+      );
 
       const tacticalBias = tacticalBiasInfo.bias;
       const potdDirection: Direction | undefined =
         this.potdBias === "LONG" || this.potdBias === "SHORT" ? this.potdBias : undefined;
       const potdActiveForGate = this.potdMode !== "OFF" && !!potdDirection && this.potdConfidence > 0;
       if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
-        if (tacticalBias === "NONE" || tacticalBiasInfo.tier !== "CLEAR") {
+        const tacticalTierOk = tacticalBiasInfo.tier !== "NONE";
+        if (!tacticalTierOk) {
           if (potdActiveForGate) {
             directionGate = {
               allow: true,
@@ -1312,7 +1353,7 @@ export class Orchestrator {
             allow: true,
             tier: "LEANING",
             direction: tacticalBias,
-            reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`,
+            reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`,
           };
         }
       }
@@ -1450,10 +1491,10 @@ export class Orchestrator {
 
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
         if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
-          if (tacticalBias === "NONE" || tacticalBiasInfo.tier !== "CLEAR") {
+          if (tacticalBiasInfo.tier === "NONE") {
             if (!(potdActive && setupCandidate.direction === this.potdBias)) {
               blockers.push("chop");
-              blockerReasons.push(`blocked: CHOP/TRANSITION requires CLEAR tactical bias (tier=${tacticalBiasInfo.tier})`);
+              blockerReasons.push(`blocked: CHOP/TRANSITION requires tactical bias (tier=${tacticalBiasInfo.tier})`);
             }
           } else if (setupCandidate.direction !== tacticalBias) {
             blockers.push("guardrail");
@@ -1481,8 +1522,13 @@ export class Orchestrator {
         ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
         : undefined;
       const shockMode = tacticalBiasInfo.shock;
+      const anchorProvisional = !anchorReady;
       const permissionMode =
-        anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION" || transitionLockActive || shockMode
+        anchorRegime.regime === "CHOP" ||
+        anchorRegime.regime === "TRANSITION" ||
+        transitionLockActive ||
+        shockMode ||
+        anchorProvisional
           ? "SCALP_ONLY"
           : "SWING_ALLOWED";
       const chopTransition = anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION";
@@ -1606,8 +1652,8 @@ export class Orchestrator {
       }
 
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
-      const regimeWarning = `Regime gate (15m): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
-      const biasWarning = `Macro bias (15m): ${macroBiasInfo.bias}`;
+      const regimeWarning = `Regime gate (${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
+      const biasWarning = `Macro bias (${anchorLabel}): ${macroBiasInfo.bias}`;
       const entryPermission = filterResult.permission ?? "ALLOWED";
       const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
       const potdWarning = potdActive
@@ -1618,9 +1664,9 @@ export class Orchestrator {
         atrLen: 14,
         vwapLen: 30,
         emaLens: [9, 20],
-        regimeTF: "15m"
+        regimeTF: anchorLabel
       };
-      const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=15m`;
+      const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=${anchorLabel}`;
 
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
@@ -2189,7 +2235,9 @@ export class Orchestrator {
     const rsiPrev = closes5m.length > 15 ? computeRSI(closes5m.slice(0, -1), 14) : undefined;
     const bb = computeBollingerBands(closes5m, 20, 2);
 
-    const regimeForStops = this.lastRegime15m ?? computeRegime(bars5m, close);
+    const regimeForStops = this.lastRegime15mReady && this.lastRegime15m
+      ? this.lastRegime15m
+      : computeRegime(bars5m, close);
 
     const t1HitNow = rulesContext.targetHit === "T1" || rulesContext.targetHit === "T2" || rulesContext.targetHit === "T3";
     if (t1HitNow && !play.t1Hit) {
