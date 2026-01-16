@@ -24,6 +24,40 @@ export interface VWAPSlopeResult {
   reasons: string[];
 }
 
+export interface RegimeOptions {
+  minBars: number;
+  vwapPeriod: number;
+  vwapLookbackBars: number;
+  atrPeriod: number;
+  atrLookbackBars: number;
+  structureLookback: number;
+  structurePivotWidth: number;
+  impulseLookbackBars: number;
+  impulseAtr: number;
+  atrSlopeRise: number;
+  mildDirectionalMin: number;
+  mildDirectionalMax: number;
+}
+
+const DEFAULT_REGIME_OPTIONS: RegimeOptions = {
+  minBars: 30,
+  vwapPeriod: 30,
+  vwapLookbackBars: 10,
+  atrPeriod: 14,
+  atrLookbackBars: 10,
+  structureLookback: 22,
+  structurePivotWidth: 2,
+  impulseLookbackBars: 3,
+  impulseAtr: 0.6,
+  atrSlopeRise: 0.05,
+  mildDirectionalMin: 0.02,
+  mildDirectionalMax: 0.08,
+};
+
+function resolveRegimeOptions(opts?: Partial<RegimeOptions>): RegimeOptions {
+  return { ...DEFAULT_REGIME_OPTIONS, ...opts };
+}
+
 /**
  * Compute VWAP slope from recent history
  * Compares current VWAP to VWAP N bars ago
@@ -179,17 +213,22 @@ function detectImpulseFlip(
  * TRANSITION iff: ATR slope rising AND (impulse + counter-impulse within N bars OR structure=MIXED with mildly directional VWAP slope)
  * else CHOP
  */
-export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeResult {
-  if (bars.length < 30) {
+export function computeRegime(
+  bars: OHLCVBar[],
+  currentPrice: number,
+  opts?: Partial<RegimeOptions>
+): RegimeResult {
+  const cfg = resolveRegimeOptions(opts);
+  if (bars.length < cfg.minBars) {
     return {
       regime: "CHOP",
-      reasons: ["insufficient bars for regime detection"],
+      reasons: [`insufficient bars for regime detection (< ${cfg.minBars})`],
     };
   }
 
-  const vwapInfo = vwapSlopeFromHistory(bars, 30, 10);
-  const atrInfo = atrSlopeFromHistory(bars, 14, 10);
-  const struct = detectStructureLLLH(bars, { lookback: 22, pivotWidth: 2 });
+  const vwapInfo = vwapSlopeFromHistory(bars, cfg.vwapPeriod, cfg.vwapLookbackBars);
+  const atrInfo = atrSlopeFromHistory(bars, cfg.atrPeriod, cfg.atrLookbackBars);
+  const struct = detectStructureLLLH(bars, { lookback: cfg.structureLookback, pivotWidth: cfg.structurePivotWidth });
 
   const vwap = vwapInfo.vwap;
   const vwapSlope = vwapInfo.slope;
@@ -205,12 +244,16 @@ export function computeRegime(bars: OHLCVBar[], currentPrice: number): RegimeRes
   const atrSlope = atrInfo.atrSlope;
   const transitionFlags: string[] = [];
 
-  const impulseCheck = atr ? detectImpulseFlip(bars, atr, 3, 0.6) : { impulseFlip: false, reasons: ["ATR unavailable for impulse flip"] };
+  const impulseCheck = atr
+    ? detectImpulseFlip(bars, atr, cfg.impulseLookbackBars, cfg.impulseAtr)
+    : { impulseFlip: false, reasons: ["ATR unavailable for impulse flip"] };
   reasons.push(...impulseCheck.reasons);
 
-  const atrSlopeRising = atrSlope !== undefined && atrSlope >= 0.05;
+  const atrSlopeRising = atrSlope !== undefined && atrSlope >= cfg.atrSlopeRise;
   const mildDirectional =
-    vwapSlopePct !== undefined && Math.abs(vwapSlopePct) >= 0.02 && Math.abs(vwapSlopePct) <= 0.08;
+    vwapSlopePct !== undefined &&
+    Math.abs(vwapSlopePct) >= cfg.mildDirectionalMin &&
+    Math.abs(vwapSlopePct) <= cfg.mildDirectionalMax;
   const transitionGate =
     atrSlopeRising &&
     (impulseCheck.impulseFlip || (structure === "MIXED" && mildDirectional));
@@ -402,9 +445,14 @@ export function regimeAllowsDirection(regime: Regime, direction: "LONG" | "SHORT
   return { allowed: true, reason: "allowed by regime" };
 }
 
-export function computeMacroBias(bars: OHLCVBar[], currentPrice: number): { bias: Bias; reasons: string[] } {
-  const vwapInfo = vwapSlopeFromHistory(bars, 30, 10);
-  const struct = detectStructureLLLH(bars, { lookback: 22, pivotWidth: 2 });
+export function computeMacroBias(
+  bars: OHLCVBar[],
+  currentPrice: number,
+  opts?: Partial<RegimeOptions>
+): { bias: Bias; reasons: string[] } {
+  const cfg = resolveRegimeOptions(opts);
+  const vwapInfo = vwapSlopeFromHistory(bars, cfg.vwapPeriod, cfg.vwapLookbackBars);
+  const struct = detectStructureLLLH(bars, { lookback: cfg.structureLookback, pivotWidth: cfg.structurePivotWidth });
 
   const vwap = vwapInfo.vwap;
   const vwapSlope = vwapInfo.slope;
