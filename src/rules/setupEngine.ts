@@ -158,7 +158,6 @@ export class SetupEngine {
       }
 
     }
-    }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
     if (ctx.macroBias) {
