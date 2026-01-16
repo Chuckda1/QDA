@@ -28,6 +28,7 @@ type SetupDiagnosticsSnapshot = {
   regime: RegimeResult;
   macroBias?: Bias;
   directionInference: DirectionInference;
+  tacticalBias?: ReturnType<typeof inferTacticalBiasFromRecentBars>;
   candidate?: SetupCandidate;
   setupReason?: string;
   setupDebug?: any;
@@ -790,7 +791,7 @@ export class Orchestrator {
       vwap: vwap1m,
       atr: atr1m
     });
-    const barRef: OHLCVBar = snapshot.bar1m ?? {
+    const barRef: OHLCVBar = {
       ts,
       open,
       high,
@@ -1016,7 +1017,7 @@ export class Orchestrator {
 
       if (confirm.ok) {
         play.mode = "FULL";
-        const sizedPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
+        const sizedPermissionMode = "SWING_ALLOWED";
         events.push(this.ev("PLAY_SIZED_UP", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -1034,6 +1035,7 @@ export class Orchestrator {
         }));
       } else if (confirm.shouldCancel) {
         play.status = "CLOSED";
+        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
         events.push(this.ev("PLAY_CLOSED", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -1286,14 +1288,16 @@ export class Orchestrator {
       });
 
       const tacticalBias = tacticalBiasInfo.bias;
-      const potdActiveForGate = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
+      const potdDirection: Direction | undefined =
+        this.potdBias === "LONG" || this.potdBias === "SHORT" ? this.potdBias : undefined;
+      const potdActiveForGate = this.potdMode !== "OFF" && !!potdDirection && this.potdConfidence > 0;
       if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
         if (tacticalBias === "NONE" || tacticalBiasInfo.tier !== "CLEAR") {
           if (potdActiveForGate) {
             directionGate = {
               allow: true,
               tier: "LEANING",
-              direction: this.potdBias,
+              direction: potdDirection,
               reason: `POTD bias ${this.potdBias} (tactical unclear; scalp-only)`,
             };
           } else {
@@ -1457,9 +1461,8 @@ export class Orchestrator {
           }
         } else {
           const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
-          const hasChopOverride = setupCandidate.flags?.includes("CHOP_OVERRIDE") ?? false;
-          if (!regimeCheck.allowed && !(anchorRegime.regime === "CHOP" && hasChopOverride)) {
-            blockers.push(anchorRegime.regime === "CHOP" ? "chop" : "guardrail");
+          if (!regimeCheck.allowed) {
+            blockers.push("guardrail");
             blockerReasons.push(regimeCheck.reason);
           }
         }
@@ -1586,11 +1589,13 @@ export class Orchestrator {
         const isCooldown = guardrailCheck.reason?.includes("cooldown");
         blockers.push(isCooldown ? "cooldown" : "guardrail");
         if (guardrailCheck.reason) blockerReasons.push(guardrailCheck.reason);
-        this.lastDiagnostics = {
-          ...this.lastDiagnostics,
-          guardrailBlock: guardrailCheck.reason,
-          setupReason: `guardrail: ${guardrailCheck.reason}`
-        };
+        if (this.lastDiagnostics) {
+          this.lastDiagnostics = {
+            ...this.lastDiagnostics,
+            guardrailBlock: guardrailCheck.reason,
+            setupReason: `guardrail: ${guardrailCheck.reason}`
+          };
+        }
       }
 
       if (watchOnly) {
