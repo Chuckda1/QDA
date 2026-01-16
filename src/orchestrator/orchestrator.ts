@@ -793,11 +793,11 @@ export class Orchestrator {
     });
     const barRef: OHLCVBar = {
       ts,
-      open,
-      high,
-      low,
+      open: open ?? close,
+      high: high ?? close,
+      low: low ?? close,
       close,
-      volume
+      volume: volume ?? 0
     };
     const timingState = this.updateTimingState({
       ts,
