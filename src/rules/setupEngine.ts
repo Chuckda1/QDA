@@ -3,7 +3,7 @@ import type { OHLCVBar } from "../utils/indicators.js";
 import { computeATR, computeEMA, computeVWAP, computeRSI } from "../utils/indicators.js";
 import type { RegimeResult } from "./regimeRules.js";
 import type { StructureResult } from "../utils/structure.js";
-import type { DirectionInference } from "./directionRules.js";
+import type { DirectionInference, TacticalBias } from "./directionRules.js";
 
 export interface SetupEngineContext {
   ts: number;
@@ -13,6 +13,7 @@ export interface SetupEngineContext {
   regime: RegimeResult;
   macroBias?: Bias;
   directionInference: DirectionInference;
+  tacticalBias?: Pick<TacticalBias, "bias" | "tier">;
   indicators: {
     atr?: number;
     ema9?: number;
@@ -149,14 +150,14 @@ export class SetupEngine {
         (currentPrice < ema9 && ema9 < ema20);
 
       if (!bullAligned && !bearAligned) {
-        return {
-          reason: `chop regime blocks setups (override needs |slope|>=1.2 ATR + VWAP/EMA alignment; got slope=${slopeAtr.toFixed(2)} ATR bullAligned=${bullAligned} bearAligned=${bearAligned})`
-        };
+        baseReasons.push(`chopNoOverride slope=${slopeAtr.toFixed(2)} ATR bullAligned=${bullAligned} bearAligned=${bearAligned}`);
+      } else {
+        chopOverride = true;
+        chopOverrideDirection = bullAligned ? "LONG" : "SHORT";
+        baseReasons.push(`chopOverride=true dir=${chopOverrideDirection} slope=${slopeAtr.toFixed(2)} ATR`);
       }
 
-      chopOverride = true;
-      chopOverrideDirection = bullAligned ? "LONG" : "SHORT";
-      baseReasons.push(`chopOverride=true dir=${chopOverrideDirection} slope=${slopeAtr.toFixed(2)} ATR`);
+    }
     }
 
     baseReasons.push(`regime=${regime.regime} structure=${regime.structure ?? "N/A"}`);
@@ -215,20 +216,21 @@ export class SetupEngine {
     // -------------------------
     for (const direction of ["LONG", "SHORT"] as const) {
       // Require regime OR structure alignment for trend patterns.
-      // In CHOP, allow only if we explicitly have chopOverride for that direction.
+      // In CHOP/TRANSITION, allow for candidate visibility.
       const regimeAligned =
         (regime.regime === "TREND_UP" && direction === "LONG") ||
         (regime.regime === "TREND_DOWN" && direction === "SHORT");
       const structureAligned = (regime.structure === "BULLISH" && direction === "LONG") || (regime.structure === "BEARISH" && direction === "SHORT");
       const chopAligned = chopOverride && chopOverrideDirection === direction;
+      const neutralAligned = regime.regime === "CHOP" || regime.regime === "TRANSITION";
 
-      if (!(regimeAligned || structureAligned || chopAligned)) continue;
+      if (!(regimeAligned || structureAligned || chopAligned || neutralAligned)) continue;
 
       const pattern: SetupPattern = "BREAK_RETEST";
       const reasons = [
         ...baseReasons,
         `pattern=${pattern}`,
-        `aligned: regimeAligned=${regimeAligned} structureAligned=${structureAligned} chopAligned=${chopAligned}`,
+        `aligned: regimeAligned=${regimeAligned} structureAligned=${structureAligned} chopAligned=${chopAligned} neutralAligned=${neutralAligned}`,
       ];
 
       const breakoutLookback = 20;
@@ -400,15 +402,29 @@ export class SetupEngine {
       }
     }
 
-    // Select best candidate deterministically (pullback-only)
-    const pullbackCandidates = candidates.filter((c) => c.pattern === "PULLBACK_CONTINUATION");
-    if (pullbackCandidates.length === 0) {
-      return { reason: "Only PULLBACK_CONTINUATION enabled" };
+    if (candidates.length === 0) {
+      return { reason: "no setup patterns matched" };
     }
 
-    // Pick best candidate by deterministic score
-    pullbackCandidates.sort((a, b) => b.score.total - a.score.total);
-    return { candidate: pullbackCandidates[0]! };
+    const byScore = [...candidates].sort((a, b) => b.score.total - a.score.total);
+    const pickByPreference = (patterns: SetupPattern[]) => {
+      for (const pattern of patterns) {
+        const best = byScore.find((c) => c.pattern === pattern);
+        if (best) return best;
+      }
+      return undefined;
+    };
+
+    let preferred: SetupCandidate | undefined;
+    if (regime.regime === "TREND_UP" || regime.regime === "TREND_DOWN") {
+      preferred = pickByPreference(["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM", "REVERSAL_ATTEMPT"]);
+    } else if (regime.regime === "TRANSITION") {
+      preferred = pickByPreference(["BREAK_RETEST", "VALUE_RECLAIM", "PULLBACK_CONTINUATION", "REVERSAL_ATTEMPT"]);
+    } else {
+      preferred = pickByPreference(["BREAK_RETEST", "VALUE_RECLAIM", "REVERSAL_ATTEMPT", "PULLBACK_CONTINUATION"]);
+    }
+
+    return { candidate: preferred ?? byScore[0]! };
   }
 
   /**
@@ -420,7 +436,7 @@ export class SetupEngine {
    * - Recent swing point for stop placement
    */
   private findPullbackContinuation(ctx: SetupEngineContext): SetupEngineResult {
-    const { ts, symbol, currentPrice, bars, regime, directionInference, indicators } = ctx;
+    const { ts, symbol, currentPrice, bars, regime, directionInference, indicators, tacticalBias } = ctx;
     const structure = { structure: regime.structure ?? "MIXED" as const };
     const atr = indicators.atr!;
     const ema9 = indicators.ema9!;
@@ -432,12 +448,23 @@ export class SetupEngine {
       return { reason: "Missing required indicators for pullback continuation" };
     }
 
-    // Determine direction from regime
+    // Determine direction from regime (TREND) or tactical bias (TRANSITION)
     let direction: Direction | undefined;
     if (regime.regime === "TREND_UP" && structure.structure === "BULLISH") {
       direction = "LONG";
     } else if (regime.regime === "TREND_DOWN" && structure.structure === "BEARISH") {
       direction = "SHORT";
+    } else if (regime.regime === "TRANSITION") {
+      const tacticalDir = tacticalBias?.bias;
+      const tacticalOk = tacticalDir && tacticalDir !== "NONE" && tacticalBias?.tier !== "NONE";
+      const structureOpposed =
+        (tacticalDir === "LONG" && structure.structure === "BEARISH") ||
+        (tacticalDir === "SHORT" && structure.structure === "BULLISH");
+      if (tacticalOk && !structureOpposed) {
+        direction = tacticalDir as Direction;
+      } else {
+        return { reason: "Transition requires tactical bias + non-opposite structure" };
+      }
     } else {
       return { reason: "Regime/structure misalignment" };
     }

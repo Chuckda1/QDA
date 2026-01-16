@@ -1366,6 +1366,7 @@ export class Orchestrator {
         regime: anchorRegime,
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
+        tacticalBias: { bias: tacticalBiasInfo.bias, tier: tacticalBiasInfo.tier },
         indicators: { vwap, ema9, ema20, atr, rsi14 }
       });
 
