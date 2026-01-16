@@ -1896,9 +1896,21 @@ export class Orchestrator {
       });
       this.lastDecision = decision;
 
+      const qualityLabel = (score: number): { grade: string; tag: string } => {
+        if (score >= 90) return { grade: "A+", tag: "High conviction" };
+        if (score >= 82) return { grade: "A", tag: "Tradeable" };
+        if (score >= 75) return { grade: "B", tag: "OK / needs help" };
+        if (score >= 70) return { grade: "C", tag: "Low quality (watchlist)" };
+        return { grade: "D", tag: "Ignore" };
+      };
+      const quality = qualityLabel(setupCandidate.score.total);
       const topPlay = {
         setup: setupCandidate.pattern,
         direction: setupCandidate.direction,
+        score: setupCandidate.score.total,
+        quality: quality.grade,
+        qualityTag: quality.tag,
+        armStatus: decision.status === "ARMED" ? "ARMED" : "NOT ARMED",
         entryZone: setupCandidate.entryZone,
         stop: setupCandidate.stop,
         probability: decision.llm?.probability ?? llmSummary?.probability,

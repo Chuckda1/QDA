@@ -192,16 +192,26 @@ export class MessagePublisher {
     const stop = top.stop ?? event.data.play?.stop ?? event.data.setup?.stop ?? event.data.candidate?.stop;
     const probability = top.probability ?? event.data.probability ?? event.data.llm?.probability;
     const action = top.action ?? event.data.action ?? event.data.llm?.action ?? event.data.play?.action;
+    const score = top.score ?? event.data.candidate?.score?.total;
+    const quality = top.quality;
+    const qualityTag = top.qualityTag;
+    const armStatus = top.armStatus;
 
     const entryLine = entryZone
       ? `Entry: $${entryZone.low.toFixed(2)} - $${entryZone.high.toFixed(2)}`
       : "Entry: N/A";
     const stopLine = Number.isFinite(stop) ? `Stop: $${stop.toFixed(2)}` : "Stop: N/A";
     const probLine = Number.isFinite(probability) ? `Prob(T1): ${Math.round(probability)}%` : "Prob(T1): N/A";
+    const scoreLine = Number.isFinite(score)
+      ? `Score: ${Math.round(score)}${quality ? ` (${quality}${qualityTag ? ` • ${qualityTag}` : ""})` : ""}`
+      : "Score: N/A";
+    const armLine = armStatus ? `Arm: ${armStatus}` : "";
 
     return [
       "TOP PLAY",
       `Setup: ${setup}${direction ? ` ${direction}` : ""}`,
+      scoreLine,
+      armLine,
       entryLine,
       stopLine,
       probLine,
