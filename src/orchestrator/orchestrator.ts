@@ -1532,7 +1532,11 @@ export class Orchestrator {
         }
       };
 
-      let filterResult: EntryFilterResult | null = null;
+      let filterResult: EntryFilterResult = {
+        allowed: true,
+        warnings: [],
+        permission: "ALLOWED",
+      };
 
       this.lastDiagnostics = {
         ts,
@@ -1543,8 +1547,8 @@ export class Orchestrator {
         directionInference: dirInf,
         tacticalBias: tacticalBiasInfo,
         candidate: setupCandidate,
-        entryFilterWarnings: filterResult?.warnings,
-        entryPermission: filterResult?.permission,
+        entryFilterWarnings: filterResult.warnings,
+        entryPermission: filterResult.permission,
         potd: {
           bias: this.potdBias,
           confidence: this.potdConfidence,
@@ -1575,7 +1579,7 @@ export class Orchestrator {
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate (${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
       const biasWarning = `Macro bias (${anchorLabel}): ${macroBiasInfo.bias}`;
-      const entryPermission = filterResult?.permission ?? "ALLOWED";
+      const entryPermission = filterResult.permission ?? "ALLOWED";
       const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
       const potdWarning = potdActive
         ? `POTD: ${this.potdBias} (conf=${this.potdConfidence.toFixed(2)} mode=${this.potdMode}) alignment=${potdAlignment}`
@@ -1590,7 +1594,7 @@ export class Orchestrator {
       const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=${anchorLabel}`;
 
       const llmWarnings = [
-        ...(filterResult?.warnings ?? []),
+        ...(filterResult.warnings ?? []),
         dirWarning,
         regimeWarning,
         biasWarning,
@@ -1637,7 +1641,7 @@ export class Orchestrator {
           reasons: dirInf.reasons
         },
         entryFilters: {
-          warnings: filterResult?.warnings ?? []
+          warnings: filterResult.warnings ?? []
         },
         warnings: llmWarnings
       };
