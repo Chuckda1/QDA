@@ -29,6 +29,48 @@ export interface SetupCandidate {
     quality: number;
     total: number;
   };
+  scoreComponents?: {
+    structure?: number;
+    momentum?: number;
+    location?: number;
+    volatility?: number;
+    pattern?: number;
+    risk?: number;
+  };
+  featureBundle?: {
+    location?: {
+      priceVsVWAP?: { atR?: number };
+      priceVsEMA20?: { atR?: number };
+      inValueZone?: boolean;
+      extendedFromMean?: { atR?: number; extended?: boolean };
+    };
+    trend?: {
+      structure?: "BULLISH" | "BEARISH" | "MIXED";
+      vwapSlopeAtr?: number;
+      ema9SlopeAtr?: number;
+      ema20SlopeAtr?: number;
+      emaAlignment?: "BULL" | "BEAR" | "NEUTRAL";
+    };
+    timing?: {
+      impulseAtr?: number;
+      pullbackDepthAtr?: number;
+      reclaimSignal?: "NONE" | "EMA_RECLAIM" | "VWAP_RECLAIM" | "BOTH";
+      barsSinceImpulse?: number;
+      barsInPullback?: number;
+    };
+    volatility?: {
+      atr?: number;
+      atrSlope?: number;
+      regime15m?: Regime;
+      regime5mProvisional?: Regime;
+      confidence?: number;
+      tacticalBias?: "LONG" | "SHORT" | "NONE";
+    };
+    volume?: {
+      relVolume?: number;
+      impulseVolVsPullbackVol?: number;
+    };
+  };
   flags?: string[]; // e.g. ["CHOP_OVERRIDE"]
   meta?: {
     valueBand?: { low: number; high: number };
@@ -41,7 +83,9 @@ export type DomainEventType =
   | "ENTRY_WINDOW_OPENED"
   | "TIMING_COACH"
   | "LLM_VERIFY"
+  | "LLM_PICK"
   | "SCORECARD"
+  | "SETUP_CANDIDATES"
   | "SETUP_SUMMARY"
   | "NO_ENTRY"
   | "TRADE_PLAN"
@@ -58,6 +102,28 @@ export interface DomainEvent {
   timestamp: number;
   instanceId: string;
   data: Record<string, any>;
+}
+
+export interface SnapshotContract {
+  timestamp: number;
+  symbol: string;
+  timeframe: "1m" | "5m" | "15m";
+  marketState?: Record<string, any>;
+  timing?: Record<string, any>;
+  candidates?: SetupCandidate[];
+  llmSelection?: {
+    selectedCandidateId?: string;
+    rankedCandidateIds?: string[];
+    action?: TradeAction;
+    agreement?: number;
+    legitimacy?: number;
+    probability?: number;
+    note?: string;
+  };
+  lowContext?: {
+    active: boolean;
+    reasons: string[];
+  };
 }
 
 export interface Play {
@@ -98,6 +164,17 @@ export interface Play {
   triggerPrice?: number; // candidate trigger price
   t1Hit?: boolean;
   stopAdjusted?: boolean;
+  armedSnapshot?: SnapshotContract;
+  entrySnapshot?: SnapshotContract;
+  coachingState?: {
+    lastCoachTs?: number;
+    lastRecommendation?: string;
+    intent?: "PROTECT" | "HARVEST" | "PRESS";
+    lockUntilTs?: number;
+    lastTriggerTs?: Record<string, number>;
+    maxFavorableR?: number;
+    maxAdverseR?: number;
+  };
 }
 
 export type TimingPhase =

@@ -1,7 +1,7 @@
-import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, SnapshotContract, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
-import { EntryFilters, type EntryFilterContext } from "../rules/entryFilters.js";
+import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
 import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
@@ -956,6 +956,19 @@ export class Orchestrator {
           dir: enteredTimingState.dir,
           phaseSinceTs: enteredTimingState.phaseSinceTs
         };
+        const baseSnapshot = play.armedSnapshot ?? {
+          timestamp: ts,
+          symbol: play.symbol,
+          timeframe: "1m",
+          candidates: [],
+          lowContext: { active: false, reasons: [] }
+        };
+        play.entrySnapshot = {
+          ...baseSnapshot,
+          timestamp: ts,
+          timeframe: "1m",
+          timing: enteredTimingSnapshot
+        };
 
         events.push(this.ev("PLAY_ENTERED", ts, {
           playId: play.id,
@@ -1378,6 +1391,14 @@ export class Orchestrator {
         indicators: { vwap, ema9, ema20, atr, rsi14 }
       });
 
+      const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
+      const candidatePatterns = new Set(setupCandidates.map((candidate) => candidate.pattern));
+      const candidateDirections = new Set(setupCandidates.map((candidate) => candidate.direction));
+      const lowContextReasons: string[] = [];
+      if (setupCandidates.length < 3) lowContextReasons.push(`candidateCount=${setupCandidates.length}`);
+      if (candidatePatterns.size < 2) lowContextReasons.push(`patternDiversity=${candidatePatterns.size}`);
+      if (candidateDirections.size < 2) lowContextReasons.push(`directionDiversity=${candidateDirections.size}`);
+      const lowContext = lowContextReasons.length > 0;
       if (!setupResult.candidate) {
         this.lastDiagnostics = {
           ts,
@@ -1404,99 +1425,31 @@ export class Orchestrator {
         return events;
       }
 
-      const setupCandidate = setupResult.candidate;
-      const timingSignal = computeTimingSignal({
-        bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
-        direction: setupCandidate.direction,
-        entryZone: setupCandidate.entryZone,
-        vwap: computeVWAP(this.recentBars1m, 30),
-        atr: computeATR(this.recentBars1m, 14)
-      });
-      const timingBarRef = this.recentBars1m[this.recentBars1m.length - 1] ?? this.recentBars5m[this.recentBars5m.length - 1]!;
-      const timingState = this.updateTimingState({
-        ts,
-        direction: setupCandidate.direction,
-        timingSignal,
-        bar: timingBarRef,
-        inTrade: false
-      });
-      const timingSnapshot = {
-        ...timingSignal,
-        phase: timingState.phase,
-        dir: timingState.dir,
-        phaseSinceTs: timingState.phaseSinceTs,
-        rawState: timingSignal.state
-      };
-      const blockers: DecisionBlocker[] = [];
-      const blockerReasons: string[] = [];
+      let setupCandidate = setupResult.candidate;
+      let timingSnapshot: TimingSignal & { phase: TimingPhase; dir: Direction | "NONE"; phaseSinceTs: number; rawState: TimingSignal["state"] } | undefined;
+      let blockers: DecisionBlocker[] = [];
+      let blockerReasons: string[] = [];
+      let guardrailBlockReason: string | undefined;
+      let guardrailBlockTag: DecisionBlocker | undefined;
       const transitionLockActive = this.transitionLockRemaining > 0;
-
-      if (!directionGate.allow) {
-        blockers.push("guardrail");
-        blockerReasons.push(directionGate.reason);
-      } else if (setupCandidate.direction !== directionGate.direction) {
-        blockers.push("guardrail");
-        blockerReasons.push(`Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
-      }
-
-      if (directionGate.allow) {
-        const scoreFloor = directionGate.tier === "LEANING" ? 78 : 70;
-        if (setupCandidate.score.total < scoreFloor) {
-          blockers.push("guardrail");
-          blockerReasons.push(`score floor ${scoreFloor} (${setupCandidate.score.total})`);
-        }
-        if (transitionLockActive) {
-          blockerReasons.push(`transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})`);
-        }
-        if (directionGate.tier === "LEANING" && setupCandidate.flags?.includes("CHASE_RISK")) {
-          blockers.push("guardrail");
-          blockerReasons.push("leaning: chase risk blocked");
-        }
-        if (directionGate.tier === "LEANING" && atr) {
-          const entryMid = (setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2;
-          const riskAtr = Math.abs(entryMid - setupCandidate.stop) / atr;
-          if (riskAtr > 1.0) {
-            blockers.push("guardrail");
-            blockerReasons.push(`leaning risk/ATR too large (${riskAtr.toFixed(2)})`);
-          }
-        }
-        if ((anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") && atr) {
-          const entryMid = (setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2;
-          const riskAtr = Math.abs(entryMid - setupCandidate.stop) / atr;
-          if (riskAtr > 0.9) {
-            blockers.push("guardrail");
-            blockerReasons.push(`chop/transition risk/ATR too large (${riskAtr.toFixed(2)})`);
-          }
-        }
-      }
 
       const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
-      const potdAlignment: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActive
+      if (potdActive && this.potdMode === "PRIOR") {
+        for (const candidate of setupCandidates) {
+          const delta = Math.round(this.potdPriorWeight * this.potdConfidence * (candidate.direction === this.potdBias ? 1 : -1));
+          candidate.score.total = this.clampScore(candidate.score.total + delta);
+          candidate.rationale.push(`potdPrior=${delta} (bias=${this.potdBias} conf=${this.potdConfidence})`);
+        }
+      }
+      let potdAlignment: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActive
         ? "OFF"
         : !potdConfirmed
         ? "UNCONFIRMED"
         : setupCandidate.direction === this.potdBias
         ? "ALIGNED"
         : "COUNTERTREND";
-      const potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
-
-      if (potdCountertrend) {
-        setupCandidate.flags = [...(setupCandidate.flags ?? []), "POTD_COUNTERTREND"];
-        blockers.push("guardrail");
-        blockerReasons.push(`POTD confirmed: countertrend ${setupCandidate.direction} disabled`);
-      }
-
-      if (potdActive && this.potdMode === "PRIOR") {
-        const delta = Math.round(this.potdPriorWeight * this.potdConfidence * (setupCandidate.direction === this.potdBias ? 1 : -1));
-        setupCandidate.score.total = this.clampScore(setupCandidate.score.total + delta);
-        setupCandidate.rationale.push(`potdPrior=${delta} (bias=${this.potdBias} conf=${this.potdConfidence})`);
-      }
-
-      if (potdActive && this.potdMode === "HARD" && setupCandidate.direction !== this.potdBias) {
-        blockers.push("guardrail");
-        blockerReasons.push(`POTD hard mode: ${this.potdBias} only (manual override required)`);
-      }
+      let potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
 
       if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
         if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
@@ -1579,41 +1532,7 @@ export class Orchestrator {
         }
       };
 
-      const filterContext: EntryFilterContext = {
-        timestamp: ts,
-        symbol,
-        direction: setupCandidate.direction,
-        close,
-        high,
-        low,
-        open,
-        volume,
-        indicators: { vwap, ema20, ema9, atr, rsi14 },
-        recentBars: this.recentBars5m.length >= 5
-          ? this.recentBars5m.slice(-20).map((b) => ({
-              ts: b.ts,
-              open: b.open ?? b.close,
-              high: b.high,
-              low: b.low,
-              close: b.close,
-              volume: b.volume ?? 0
-            }))
-          : undefined,
-        setupPattern: setupCandidate.pattern,
-        setupFlags: setupCandidate.flags
-      };
-
-      const filterResult = this.entryFilters.canCreateNewPlay(filterContext);
-      if (filterResult.warnings?.length) {
-        console.log(`[5m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
-      }
-      if (!filterResult.allowed) {
-        blockers.push("entry_filter");
-        if (filterResult.reason) {
-          blockerReasons.push(filterResult.reason);
-        }
-        console.log(`[5m] Entry blocked by filter: ${filterResult.reason}`);
-      }
+      let filterResult: EntryFilterResult | null = null;
 
       this.lastDiagnostics = {
         ts,
@@ -1624,8 +1543,8 @@ export class Orchestrator {
         directionInference: dirInf,
         tacticalBias: tacticalBiasInfo,
         candidate: setupCandidate,
-        entryFilterWarnings: filterResult.warnings,
-        entryPermission: filterResult.permission,
+        entryFilterWarnings: filterResult?.warnings,
+        entryPermission: filterResult?.permission,
         potd: {
           bias: this.potdBias,
           confidence: this.potdConfidence,
@@ -1642,8 +1561,8 @@ export class Orchestrator {
       const guardrailCheck = this.checkGuardrails(ts);
       if (!guardrailCheck.allowed) {
         const isCooldown = guardrailCheck.reason?.includes("cooldown");
-        blockers.push(isCooldown ? "cooldown" : "guardrail");
-        if (guardrailCheck.reason) blockerReasons.push(guardrailCheck.reason);
+        guardrailBlockTag = isCooldown ? "cooldown" : "guardrail";
+        guardrailBlockReason = guardrailCheck.reason;
         if (this.lastDiagnostics) {
           this.lastDiagnostics = {
             ...this.lastDiagnostics,
@@ -1653,17 +1572,10 @@ export class Orchestrator {
         }
       }
 
-      if (watchOnly) {
-        if (!blockers.includes("arming_failed")) {
-          blockers.push("arming_failed");
-        }
-        blockerReasons.push("mode QUIET");
-      }
-
       const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate (${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
       const biasWarning = `Macro bias (${anchorLabel}): ${macroBiasInfo.bias}`;
-      const entryPermission = filterResult.permission ?? "ALLOWED";
+      const entryPermission = filterResult?.permission ?? "ALLOWED";
       const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
       const potdWarning = potdActive
         ? `POTD: ${this.potdBias} (conf=${this.potdConfidence.toFixed(2)} mode=${this.potdMode}) alignment=${potdAlignment}`
@@ -1678,13 +1590,14 @@ export class Orchestrator {
       const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=${anchorLabel}`;
 
       const llmWarnings = [
-        ...(filterResult.warnings ?? []),
+        ...(filterResult?.warnings ?? []),
         dirWarning,
         regimeWarning,
         biasWarning,
         permissionWarning,
         potdWarning,
-        indicatorMetaLine
+        indicatorMetaLine,
+        ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
       ];
 
       const recentBarsForLLM = this.recentBars5m.slice(-20).map((b) => ({
@@ -1724,7 +1637,7 @@ export class Orchestrator {
           reasons: dirInf.reasons
         },
         entryFilters: {
-          warnings: filterResult.warnings ?? []
+          warnings: filterResult?.warnings ?? []
         },
         warnings: llmWarnings
       };
@@ -1734,14 +1647,23 @@ export class Orchestrator {
       let llmTimedOut = false;
       let llmRulesOnly = false;
       let llmSummary: DecisionLlmSummary | undefined;
+      let llmErrorReason: string | undefined;
 
-      const shouldRunLlm = !!this.llmService && !watchOnly && blockers.length === 0;
+      const shouldRunLlm = !!this.llmService && !watchOnly && setupCandidates.length > 0;
 
       if (shouldRunLlm) {
         try {
           console.log(`[5m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
 
+          const sortedCandidates = setupCandidates
+            .slice()
+            .sort((a, b) => b.score.total - a.score.total);
+          const llmTopN = 8;
+          const llmTailN = anchorRegime.regime === "CHOP" ? 20 : 12;
+          const llmTop = sortedCandidates.slice(0, llmTopN);
+          const llmTail = sortedCandidates.slice(llmTopN, llmTopN + llmTailN);
+          const llmCandidates = [...llmTop, ...llmTail];
           const llmVerifyPromise = this.llmService!.verifyPlaySetup({
             symbol: setupCandidate.symbol,
             direction: setupCandidate.direction,
@@ -1756,7 +1678,8 @@ export class Orchestrator {
             indicatorSnapshot,
             recentBars: recentBarsForLLM,
             ruleScores,
-            setupCandidate
+            setupCandidate,
+            candidates: llmCandidates
           });
 
           const timeoutPromise = new Promise<Awaited<typeof llmVerifyPromise>>((_, reject) => {
@@ -1785,8 +1708,7 @@ export class Orchestrator {
                   followThroughProb: 60,
                 };
               } else {
-                blockers.push("arming_failed");
-                blockerReasons.push(`LLM timeout: ${this.llmTimeoutMs}ms`);
+                llmErrorReason = `LLM timeout: ${this.llmTimeoutMs}ms`;
               }
             } else {
               throw error;
@@ -1811,10 +1733,9 @@ export class Orchestrator {
             } : undefined,
           };
           console.error(`[5m] LLM verification failed:`, error.message);
-          blockers.push("arming_failed");
-          blockerReasons.push(`LLM error: ${error.message}`);
+          llmErrorReason = `LLM error: ${error.message}`;
         }
-      } else if (!this.llmService && this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore && !watchOnly && blockers.length === 0) {
+      } else if (!this.llmService && this.allowRulesOnlyWhenLLMDown && setupCandidate.score.total >= this.rulesOnlyMinScore && !watchOnly) {
         console.log(`[5m] No LLM service but setup is A-grade (score=${setupCandidate.score.total} >= ${this.rulesOnlyMinScore}) - allowing rules-only`);
         llmRulesOnly = true;
         llmVerify = {
@@ -1828,10 +1749,18 @@ export class Orchestrator {
           flags: ["NO_LLM_SERVICE", "RULES_ONLY"],
           followThroughProb: 60,
         };
-      } else if (!this.llmService && !watchOnly && blockers.length === 0) {
-        blockers.push("arming_failed");
-        blockerReasons.push(`no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`);
+      } else if (!this.llmService && !watchOnly) {
+        llmErrorReason = `no LLM service - setup requires LLM approval${this.allowRulesOnlyWhenLLMDown ? ` (or A-grade score >= ${this.rulesOnlyMinScore})` : ""}`;
         console.log(`[5m] No LLM service - setup found but requires LLM approval`);
+      }
+
+      if (llmVerify?.selectedCandidateId) {
+        const picked = setupCandidates.find((candidate) => candidate.id === llmVerify!.selectedCandidateId);
+        if (picked) {
+          setupCandidate = picked;
+        } else {
+          llmErrorReason = llmErrorReason ?? `LLM selected unknown candidate id: ${llmVerify.selectedCandidateId}`;
+        }
       }
 
       if (llmVerify) {
@@ -1845,6 +1774,8 @@ export class Orchestrator {
           reasoning: llmVerify.reasoning,
           plan: llmVerify.plan,
           flags: llmVerify.flags ?? [],
+          selectedCandidateId: llmVerify.selectedCandidateId,
+          rankedCandidateIds: llmVerify.rankedCandidateIds,
           note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
         };
         this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
@@ -1854,6 +1785,229 @@ export class Orchestrator {
         }
       }
 
+      const snapshotContract: SnapshotContract = {
+        timestamp: ts,
+        symbol,
+        timeframe: "5m",
+        marketState,
+        timing: timingSnapshot,
+        candidates: setupCandidates,
+        llmSelection: llmSummary
+          ? {
+              selectedCandidateId: llmSummary.selectedCandidateId,
+              rankedCandidateIds: llmSummary.rankedCandidateIds,
+              action: llmSummary.action,
+              agreement: llmSummary.agreement,
+              legitimacy: llmSummary.legitimacy,
+              probability: llmSummary.probability,
+              note: llmSummary.note,
+            }
+          : undefined,
+        lowContext: {
+          active: lowContext,
+          reasons: lowContextReasons,
+        },
+      };
+
+      const timingSignal = computeTimingSignal({
+        bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
+        direction: setupCandidate.direction,
+        entryZone: setupCandidate.entryZone,
+        vwap: computeVWAP(this.recentBars1m, 30),
+        atr: computeATR(this.recentBars1m, 14)
+      });
+      const timingBarRef = this.recentBars1m[this.recentBars1m.length - 1] ?? this.recentBars5m[this.recentBars5m.length - 1]!;
+      const timingState = this.updateTimingState({
+        ts,
+        direction: setupCandidate.direction,
+        timingSignal,
+        bar: timingBarRef,
+        inTrade: false
+      });
+      timingSnapshot = {
+        ...timingSignal,
+        phase: timingState.phase,
+        dir: timingState.dir,
+        phaseSinceTs: timingState.phaseSinceTs,
+        rawState: timingSignal.state
+      };
+      if (lowContext) {
+        const minTimingScore = 75;
+        if (timingSignal.score < minTimingScore) {
+          blockers.push("guardrail");
+          blockerReasons.push(`LOW_CONTEXT: timing score >= ${minTimingScore} required (${Math.round(timingSignal.score)})`);
+        }
+      }
+
+      potdAlignment = !potdActive
+        ? "OFF"
+        : !potdConfirmed
+        ? "UNCONFIRMED"
+        : setupCandidate.direction === this.potdBias
+        ? "ALIGNED"
+        : "COUNTERTREND";
+      potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
+      marketState.potd.alignment = potdAlignment;
+      marketState.potd.overridden = potdCountertrend;
+      ruleScores.potd.alignment = potdAlignment;
+
+      const buildBlockers = (candidate: SetupCandidate) => {
+        const nextBlockers: DecisionBlocker[] = [];
+        const nextReasons: string[] = [];
+
+        if (!directionGate.allow) {
+          nextBlockers.push("guardrail");
+          nextReasons.push(directionGate.reason);
+        } else if (candidate.direction !== directionGate.direction) {
+          nextBlockers.push("guardrail");
+          nextReasons.push(`Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
+        }
+
+        if (directionGate.allow) {
+          const scoreFloorBase = directionGate.tier === "LEANING" ? 78 : 70;
+          const scoreFloor = lowContext ? scoreFloorBase + 5 : scoreFloorBase;
+          if (candidate.score.total < scoreFloor) {
+            nextBlockers.push("guardrail");
+            nextReasons.push(`score floor ${scoreFloor} (${candidate.score.total})`);
+          }
+          if (transitionLockActive) {
+            nextReasons.push(`transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})`);
+          }
+          if (directionGate.tier === "LEANING" && candidate.flags?.includes("CHASE_RISK")) {
+            nextBlockers.push("guardrail");
+            nextReasons.push("leaning: chase risk blocked");
+          }
+          if (directionGate.tier === "LEANING" && atr) {
+            const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
+            const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
+            if (riskAtr > 1.0) {
+              nextBlockers.push("guardrail");
+              nextReasons.push(`leaning risk/ATR too large (${riskAtr.toFixed(2)})`);
+            }
+          }
+          if ((anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") && atr) {
+            const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
+            const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
+            if (riskAtr > 0.9) {
+              nextBlockers.push("guardrail");
+              nextReasons.push(`chop/transition risk/ATR too large (${riskAtr.toFixed(2)})`);
+            }
+          }
+        }
+
+        if (potdCountertrend) {
+          candidate.flags = [...(candidate.flags ?? []), "POTD_COUNTERTREND"];
+          nextBlockers.push("guardrail");
+          nextReasons.push(`POTD confirmed: countertrend ${candidate.direction} disabled`);
+        }
+
+        if (potdActive && this.potdMode === "HARD" && candidate.direction !== this.potdBias) {
+          nextBlockers.push("guardrail");
+          nextReasons.push(`POTD hard mode: ${this.potdBias} only (manual override required)`);
+        }
+
+        if (candidate.pattern !== "REVERSAL_ATTEMPT") {
+          if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
+            if (tacticalBiasInfo.tier === "NONE") {
+              if (!(potdActive && candidate.direction === this.potdBias)) {
+                nextBlockers.push("chop");
+                nextReasons.push(`blocked: CHOP/TRANSITION requires tactical bias (tier=${tacticalBiasInfo.tier})`);
+              }
+            } else if (candidate.direction !== tacticalBias) {
+              nextBlockers.push("guardrail");
+              nextReasons.push(`blocked: tactical bias ${tacticalBias} only`);
+            }
+          } else {
+            const regimeCheck = regimeAllowsDirection(anchorRegime.regime, candidate.direction);
+            if (!regimeCheck.allowed) {
+              nextBlockers.push("guardrail");
+              nextReasons.push(regimeCheck.reason);
+            }
+          }
+        }
+
+        if (macroBiasInfo.bias === "LONG" && candidate.direction === "SHORT" && anchorRegime.regime !== "TREND_DOWN") {
+          nextBlockers.push("guardrail");
+          nextReasons.push("bias gate: 15m bias LONG blocks SHORT setups until 15m turns");
+        }
+        if (macroBiasInfo.bias === "SHORT" && candidate.direction === "LONG" && anchorRegime.regime !== "TREND_UP") {
+          nextBlockers.push("guardrail");
+          nextReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
+        }
+
+        if (llmErrorReason) {
+          nextBlockers.push("arming_failed");
+          nextReasons.push(llmErrorReason);
+        }
+
+        return { blockers: nextBlockers, blockerReasons: nextReasons };
+      };
+
+      ({ blockers, blockerReasons } = buildBlockers(setupCandidate));
+
+      const filterContext: EntryFilterContext = {
+        timestamp: ts,
+        symbol,
+        direction: setupCandidate.direction,
+        close,
+        high,
+        low,
+        open,
+        volume,
+        indicators: { vwap, ema20, ema9, atr, rsi14 },
+        recentBars: this.recentBars5m.length >= 5
+          ? this.recentBars5m.slice(-20).map((b) => ({
+              ts: b.ts,
+              open: b.open ?? b.close,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+              volume: b.volume ?? 0
+            }))
+          : undefined,
+        setupPattern: setupCandidate.pattern,
+        setupFlags: setupCandidate.flags
+      };
+
+      filterResult = this.entryFilters.canCreateNewPlay(filterContext);
+      if (filterResult.warnings?.length) {
+        console.log(`[5m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
+      }
+      if (!filterResult.allowed) {
+        blockers.push("entry_filter");
+        if (filterResult.reason) {
+          blockerReasons.push(filterResult.reason);
+        }
+        console.log(`[5m] Entry blocked by filter: ${filterResult.reason}`);
+      }
+      ruleScores.entryPermission = filterResult.permission ?? "ALLOWED";
+      ruleScores.entryFilters = { warnings: filterResult.warnings ?? [] };
+
+      if (guardrailBlockReason) {
+        blockers.push(guardrailBlockTag ?? "guardrail");
+        blockerReasons.push(guardrailBlockReason);
+      }
+      if (watchOnly) {
+        if (!blockers.includes("arming_failed")) {
+          blockers.push("arming_failed");
+        }
+        blockerReasons.push("mode QUIET");
+      }
+      if (this.lastDiagnostics) {
+        this.lastDiagnostics = {
+          ...this.lastDiagnostics,
+          candidate: setupCandidate,
+          entryFilterWarnings: filterResult.warnings,
+          entryPermission: filterResult.permission,
+          potd: {
+            bias: this.potdBias,
+            confidence: this.potdConfidence,
+            mode: this.potdMode,
+            alignment: potdAlignment,
+          }
+        };
+      }
+
       if (potdCountertrend && llmSummary) {
         if (llmSummary.action === "GO_ALL_IN") {
           llmSummary.action = "SCALP";
@@ -1861,6 +2015,13 @@ export class Orchestrator {
         }
         const flags = new Set([...(llmSummary.flags ?? [])]);
         flags.add("POTD_COUNTERTREND");
+        llmSummary.flags = Array.from(flags);
+      }
+      if (lowContext && llmSummary?.action === "GO_ALL_IN") {
+        llmSummary.action = "SCALP";
+        llmSummary.note = [llmSummary.note, "low_context: scalp-only"].filter(Boolean).join(" | ");
+        const flags = new Set([...(llmSummary.flags ?? [])]);
+        flags.add("LOW_CONTEXT");
         llmSummary.flags = Array.from(flags);
       }
 
@@ -1985,7 +2146,10 @@ export class Orchestrator {
         gateTier: directionGate.allow ? (directionGate.tier === "LEANING" ? "LEANING" : "OPEN") : "STRICT",
         blockers: decision.blockers,
         blockerReasons: decision.blockerReasons,
-        rationale: [directionGate.reason].filter(Boolean),
+        rationale: [
+          directionGate.reason,
+          ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
+        ].filter(Boolean),
         metrics: {
           score: setupCandidate.score.total,
           legitimacy: decision.llm?.legitimacy,
@@ -1993,6 +2157,45 @@ export class Orchestrator {
           riskAtr
         }
       };
+      const rankedCandidates = setupCandidates
+        .slice()
+        .sort((a, b) => b.score.total - a.score.total)
+        .slice(0, 5)
+        .map((candidate) => {
+          const candidateQuality = qualityLabel(candidate.score.total);
+          return {
+            id: candidate.id,
+            setup: candidate.pattern,
+            direction: candidate.direction,
+            score: candidate.score.total,
+            quality: candidateQuality.grade,
+            qualityTag: candidateQuality.tag,
+            entryZone: candidate.entryZone,
+            stop: candidate.stop,
+            flags: candidate.flags ?? [],
+          };
+        });
+      events.push(this.ev("SETUP_CANDIDATES", ts, {
+        symbol,
+        price: close,
+        topPlay,
+        candidates: rankedCandidates,
+        marketState,
+        timing: timingSnapshot,
+        decision: decisionSummary,
+      }));
+      if (llmSummary?.selectedCandidateId || llmSummary?.rankedCandidateIds?.length) {
+        events.push(this.ev("LLM_PICK", ts, {
+          symbol,
+          price: close,
+          selectedCandidateId: llmSummary?.selectedCandidateId,
+          rankedCandidateIds: llmSummary?.rankedCandidateIds,
+          candidates: rankedCandidates,
+          marketState,
+          timing: timingSnapshot,
+          decision: decisionSummary,
+        }));
+      }
 
       if (decision.llm) {
         events.push(this.ev("LLM_VERIFY", ts, {
@@ -2060,6 +2263,7 @@ export class Orchestrator {
             decision.play.mode = "SCOUT";
           }
         }
+        decision.play.armedSnapshot = snapshotContract;
         this.state.activePlay = decision.play;
         this.playsToday += 1;
         events.push(this.ev("PLAY_ARMED", ts, {
@@ -2122,14 +2326,13 @@ export class Orchestrator {
 
     const play = this.state.activePlay;
 
-    // Branch: ARMED (not entered) vs ENTERED
+    // Coaching only after ENTERED
     if (play.status !== "ENTERED") {
-      // Path 1: ARMED_COACH - Pre-entry commentary
-      return await this.handleArmedCoaching(snapshot, play, events);
-    } else {
-      // Path 2: LLM_COACH_UPDATE - Position management
-      return await this.handleManageCoaching(snapshot, play, events);
+      return events;
     }
+
+    // Path: LLM_COACH_UPDATE - Position management
+    return await this.handleManageCoaching(snapshot, play, events);
   }
 
   /**
@@ -2335,6 +2538,70 @@ export class Orchestrator {
       return events;
     }
 
+    const risk = rulesContext.risk;
+    const unrealizedR = risk > 0
+      ? (play.direction === "LONG" ? (close - entryPrice) / risk : (entryPrice - close) / risk)
+      : 0;
+    play.coachingState = play.coachingState ?? {};
+    play.coachingState.lastTriggerTs = play.coachingState.lastTriggerTs ?? {};
+    play.coachingState.maxFavorableR = play.coachingState.maxFavorableR !== undefined
+      ? Math.max(play.coachingState.maxFavorableR, unrealizedR)
+      : unrealizedR;
+    play.coachingState.maxAdverseR = play.coachingState.maxAdverseR !== undefined
+      ? Math.min(play.coachingState.maxAdverseR, unrealizedR)
+      : unrealizedR;
+
+    const triggers: string[] = [];
+    const nextTargetDistanceR = risk > 0
+      ? rulesContext.targetHit === "T1"
+        ? rulesContext.distanceToT2Dollars / risk
+        : rulesContext.targetHit === "T2"
+        ? rulesContext.distanceToT3Dollars / risk
+        : rulesContext.distanceToT1Dollars / risk
+      : undefined;
+    if (rulesContext.targetHit) triggers.push("TARGET_HIT");
+    if (nextTargetDistanceR !== undefined && Math.abs(nextTargetDistanceR) <= 0.15) triggers.push("NEAR_TARGET");
+    if ((rulesContext.distanceToStopDollars / (risk || 1)) <= 0.2 || unrealizedR <= -0.7) triggers.push("STOP_THREATENED");
+    if (unrealizedR >= 0.8) triggers.push("BREAKEVEN_THRESHOLD");
+    if (play.coachingState.maxAdverseR !== undefined && play.coachingState.maxAdverseR <= -0.6) triggers.push("ADVERSE_EXCURSION");
+    if (play.coachingState.maxFavorableR !== undefined && unrealizedR <= play.coachingState.maxFavorableR - 0.5) {
+      triggers.push("ADVERSE_EXCURSION");
+    }
+    const vwapNow = computeVWAP(bars5m, 30);
+    const entrySnapshot = play.entrySnapshot ?? play.armedSnapshot;
+    const selectedCandidate = entrySnapshot?.candidates?.find((candidate) => candidate.id === entrySnapshot?.llmSelection?.selectedCandidateId)
+      ?? entrySnapshot?.candidates?.[0];
+    const usesVwap = !!selectedCandidate?.featureBundle?.location?.priceVsVWAP;
+    if (vwapNow !== undefined && usesVwap) {
+      const vwapLoss = play.direction === "LONG" ? close < vwapNow : close > vwapNow;
+      if (vwapLoss) triggers.push("VWAP_LOSS");
+    }
+    const regimeNow = computeRegime(bars5m, close);
+    const regimePermission = regimeAllowsDirection(regimeNow.regime, play.direction);
+    if (!regimePermission.allowed) triggers.push("PERMISSION_FLIP_AGAINST_TRADE");
+
+    const triggerCooldownMs = 10 * 60_000;
+    const tierA = new Set(["STOP_THREATENED", "TARGET_HIT", "PLAY_SIZED_UP", "PERMISSION_FLIP_AGAINST_TRADE"]);
+    const eligibleTriggers: string[] = [];
+    const blockedTriggers: string[] = [];
+    for (const trigger of triggers) {
+      if (tierA.has(trigger)) {
+        eligibleTriggers.push(trigger);
+        continue;
+      }
+      const lastTs = play.coachingState?.lastTriggerTs?.[trigger];
+      if (!lastTs || ts - lastTs >= triggerCooldownMs) {
+        eligibleTriggers.push(trigger);
+      } else {
+        blockedTriggers.push(trigger);
+      }
+    }
+    const fallbackCadenceMs = 15 * 60_000;
+    const shouldCoach = eligibleTriggers.length > 0 || !play.coachingState.lastCoachTs || (ts - play.coachingState.lastCoachTs) >= fallbackCadenceMs;
+    if (!shouldCoach) {
+      return events;
+    }
+
     // Hard-boundary checks (cooldowns etc.)
     // Check cache: llmCoachCacheKey = playId + "_" + snapshot.ts (5m close ts)
     const cacheKey = `${play.id}_${ts}`;
@@ -2365,6 +2632,7 @@ export class Orchestrator {
           ? `${rulesContext.targetHit} target hit`
           : "Monitoring price action";
         
+        const entrySnapshot = play.entrySnapshot ?? play.armedSnapshot;
         const llmResponse = await this.llmService.getCoachingUpdate({
           symbol: play.symbol,
           direction: play.direction,
@@ -2374,6 +2642,13 @@ export class Orchestrator {
           targets: play.targets,
           timeInTrade,
           priceAction,
+          snapshot: entrySnapshot,
+          entrySnapshot,
+          playContext: {
+            playId: play.id,
+            entryTime: play.entryTimestamp,
+            lastAction: play.action
+          },
           // Add rules context for LLM probability calculations (exact formulas)
           rulesContext: {
             distanceToStop: rulesContext.distanceToStop,
@@ -2395,15 +2670,38 @@ export class Orchestrator {
             rMultipleT2: rulesContext.rMultipleT2,
             rMultipleT3: rulesContext.rMultipleT3,
             profitPercent: rulesContext.profitPercent,
+            unrealizedR,
+            maxFavorableR: play.coachingState.maxFavorableR,
+            maxAdverseR: play.coachingState.maxAdverseR,
             t1Hit: play.t1Hit ?? false,
             stopAdjusted: play.stopAdjusted ?? false,
             exhaustionSignals
           }
         });
 
-        const llmAction = llmResponse.action;
+        let llmAction = llmResponse.action;
+        const stopTightenAllowed = llmResponse.proposedStop !== undefined
+          ? (play.direction === "LONG" ? llmResponse.proposedStop >= play.stop : llmResponse.proposedStop <= play.stop)
+          : true;
+        if (!stopTightenAllowed) {
+          llmAction = "HOLD";
+        }
+        if (llmResponse.proposedPartialPct !== undefined && llmResponse.proposedPartialPct > 0.5) {
+          llmResponse.proposedPartialPct = 0.5;
+        }
+        if (llmAction === "ADD") {
+          const timingScore = entrySnapshot?.timing?.score;
+          if (!(timingScore !== undefined && timingScore >= 80 && unrealizedR > 0.5)) {
+            llmAction = "HOLD";
+          }
+        }
         const llmReasoning = llmResponse.reasoning;
         const llmUrgency = llmResponse.urgency;
+        play.coachingState.lastCoachTs = ts;
+        play.coachingState.lastRecommendation = llmAction;
+        for (const trigger of eligibleTriggers) {
+          play.coachingState.lastTriggerTs[trigger] = ts;
+        }
         
         // STAGE 3: Track LLM decision
         this.state.lastLLMDecision = `COACH:${llmAction}`;
@@ -2433,6 +2731,13 @@ export class Orchestrator {
           action: llmAction,
           reasoning: llmReasoning,
           urgency: llmUrgency,
+          confidence: llmResponse.confidence,
+          reasonCodes: llmResponse.reasonCodes,
+          proposedStop: llmResponse.proposedStop,
+          proposedPartialPct: llmResponse.proposedPartialPct,
+          nextCheck: llmResponse.nextCheck,
+          triggers: eligibleTriggers,
+          blockedTriggers,
           update: llmReasoning,
           rulesContext, // Include rules context in event
           decision: {

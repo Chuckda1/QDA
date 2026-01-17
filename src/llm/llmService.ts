@@ -1,3 +1,5 @@
+import type { SnapshotContract } from "../types.js";
+
 export interface IndicatorSnapshot {
   vwap?: number;
   ema9?: number;
@@ -46,6 +48,8 @@ export interface LLMScorecardResponse {
   reasoning: string;
   plan: string;
   flags?: string[]; // Optional flags/warnings
+  selectedCandidateId?: string;
+  rankedCandidateIds?: string[];
 }
 
 export interface LLMCoachingContext {
@@ -62,6 +66,15 @@ export interface LLMCoachingContext {
   indicatorSnapshot?: IndicatorSnapshot;
   recentBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
   ruleScores?: RuleScores;
+  snapshot?: SnapshotContract;
+  entrySnapshot?: SnapshotContract;
+  playContext?: {
+    playId: string;
+    entryTime?: number;
+    remainingSize?: number;
+    realizedPnL?: number;
+    lastAction?: string;
+  };
   rulesContext?: {
     distanceToStop: number;
     distanceToStopDollars: number;
@@ -82,6 +95,9 @@ export interface LLMCoachingContext {
     rMultipleT2: number; // R-multiple to T2
     rMultipleT3: number; // R-multiple to T3
     profitPercent: number;
+    unrealizedR?: number;
+    maxFavorableR?: number;
+    maxAdverseR?: number;
     t1Hit?: boolean;
     stopAdjusted?: boolean;
     exhaustionSignals?: string[];
@@ -89,10 +105,16 @@ export interface LLMCoachingContext {
 }
 
 export interface LLMCoachingResponse {
-  action: "HOLD" | "TAKE_PROFIT" | "TIGHTEN_STOP" | "STOP_OUT" | "SCALE_OUT";
+  action: "HOLD" | "TAKE_PROFIT" | "TIGHTEN_STOP" | "STOP_OUT" | "SCALE_OUT" | "REDUCE" | "MOVE_TO_BE" | "ADD";
   reasoning: string;
   urgency: "LOW" | "MEDIUM" | "HIGH";
   specificPrice?: number; // if action requires a price
+  confidence?: number;
+  reasonCodes?: string[];
+  riskNotes?: string[];
+  proposedStop?: number;
+  proposedPartialPct?: number;
+  nextCheck?: string;
 }
 
 export interface ArmedCoachingContext {
@@ -172,6 +194,7 @@ export class LLMService {
     recentBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
     ruleScores?: RuleScores;
     setupCandidate?: import("../types.js").SetupCandidate;
+    candidates?: Array<import("../types.js").SetupCandidate>;
   }): Promise<LLMScorecardResponse & { followThroughProb: number }> {
     // STAGE 1: Return fallback if LLM not enabled
     if (!this.enabled) {
@@ -187,7 +210,7 @@ export class LLMService {
         flags: []
       };
     }
-    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores, setupCandidate } = context;
+    const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores, setupCandidate, candidates } = context;
     
     // Calculate risk/reward for LLM
     const entryMid = (entryZone.low + entryZone.high) / 2;
@@ -212,7 +235,8 @@ export class LLMService {
       })),
       indicators: indicatorSnapshot ?? null,
       ruleScores: ruleScores ?? null,
-      setupCandidate: setupCandidate ?? null
+      setupCandidate: setupCandidate ?? null,
+      candidates: candidates ?? null
     }, null, 2);
     
     const prompt = `You are creating a SCORECARD for a new ${direction} trading setup on ${symbol}.
@@ -255,6 +279,10 @@ Step 8) Create a trade plan (entry strategy, position sizing, exit strategy)
 
 Step 9) Optional flags: List any warnings or concerns (e.g., ["high RSI", "regime mismatch"])
 
+If multiple candidates are provided in the snapshot, rank them and select the best. Use:
+- selectedCandidateId: the chosen candidate id
+- rankedCandidateIds: ordered list best → worst
+
 Respond in EXACT JSON format:
 {
   "biasDirection": "LONG|SHORT|NEUTRAL",
@@ -264,7 +292,9 @@ Respond in EXACT JSON format:
   "action": "GO_ALL_IN|SCALP|WAIT|PASS",
   "reasoning": "Brief explanation",
   "plan": "Entry strategy, position size, exit strategy",
-  "flags": ["flag1", "flag2"] or []
+  "flags": ["flag1", "flag2"] or [],
+  "selectedCandidateId": "candidate_id_or_null",
+  "rankedCandidateIds": ["id1","id2", "..."] or []
 }`;
 
     try {
@@ -322,7 +352,9 @@ Respond in EXACT JSON format:
             action: parsed.action || "SCALP",
             reasoning: parsed.reasoning || "Setup analyzed",
             plan: parsed.plan || "Enter on pullback to entry zone. Tight stop. Target T1.",
-            flags: Array.isArray(parsed.flags) ? parsed.flags : []
+            flags: Array.isArray(parsed.flags) ? parsed.flags : [],
+            selectedCandidateId: typeof parsed.selectedCandidateId === "string" ? parsed.selectedCandidateId : undefined,
+            rankedCandidateIds: Array.isArray(parsed.rankedCandidateIds) ? parsed.rankedCandidateIds.filter((id: any) => typeof id === "string") : []
           };
         } catch (e) {
           console.error("[LLM] Failed to parse JSON response:", e);
@@ -625,7 +657,7 @@ Respond in EXACT JSON format:
   }
 
   private buildCoachingPrompt(context: LLMCoachingContext): string {
-    const { symbol, direction, entryPrice, currentPrice, stop, targets, timeInTrade, priceAction, rulesContext } = context;
+    const { symbol, direction, entryPrice, currentPrice, stop, targets, timeInTrade, priceAction, rulesContext, snapshot, entrySnapshot, playContext } = context;
     
     // All numbers MUST be computed in code - LLM never calculates
     if (!rulesContext) {
@@ -667,10 +699,17 @@ Respond in EXACT JSON format:
       targetHit: rulesContext.targetHit, // close-based target hit
       nearTarget: rulesContext.nearTarget, // within $0.03 of target
       profitPercent: Number(rulesContext.profitPercent.toFixed(2)), // if entered
+      unrealizedR: rulesContext.unrealizedR !== undefined ? Number(rulesContext.unrealizedR.toFixed(2)) : undefined,
+      maxFavorableR: rulesContext.maxFavorableR !== undefined ? Number(rulesContext.maxFavorableR.toFixed(2)) : undefined,
+      maxAdverseR: rulesContext.maxAdverseR !== undefined ? Number(rulesContext.maxAdverseR.toFixed(2)) : undefined,
       t1Hit: rulesContext.t1Hit ?? false,
       stopAdjusted: rulesContext.stopAdjusted ?? false,
       exhaustionSignals: rulesContext.exhaustionSignals ?? []
     }, null, 2);
+
+    const entrySnapshotJson = entrySnapshot ? JSON.stringify(entrySnapshot, null, 2) : undefined;
+    const snapshotJson = snapshot ? JSON.stringify(snapshot, null, 2) : undefined;
+    const playContextJson = playContext ? JSON.stringify(playContext, null, 2) : undefined;
 
     let prompt = `You are coaching a ${direction} trade on ${symbol}.
 
@@ -681,6 +720,9 @@ TRADE CONTEXT:
 - Direction: ${direction}
 - Time in trade: ${timeInTrade || 0} minutes
 - Price action: ${priceAction || "Monitoring"}
+${playContextJson ? `\nPLAY CONTEXT:\n\`\`\`json\n${playContextJson}\n\`\`\`` : ""}
+${entrySnapshotJson ? `\nENTRY SNAPSHOT (selector contract at entry):\n\`\`\`json\n${entrySnapshotJson}\n\`\`\`` : ""}
+${snapshotJson ? `\nCURRENT SNAPSHOT (latest contract):\n\`\`\`json\n${snapshotJson}\n\`\`\`` : ""}
 
 COMPUTED METRICS (use these exact values - do not recalculate):
 \`\`\`json
@@ -698,8 +740,13 @@ RULES (for your reasoning):
 6. R-multiple = Reward / Risk
 7. If exhaustionSignals are present, treat them as exit warnings
 
+CONSTRAINTS:
+- You manage ONLY the active play. Do not select a different candidate.
+- Do NOT flip direction.
+- Do NOT override hard risk rules or hard stop on close.
+
 COACHING REQUEST:
-Analyze this trade using the provided metrics for pattern analysis and probability calculations. Your decision is FINAL - if you say HOLD, we hold (unless hard stop on close).
+Analyze this trade using the provided metrics and snapshots. Your decision is FINAL - if you say HOLD, we hold (unless hard stop on close).
 If the tape is clearly moving against the trade direction (e.g., repeated lower closes for LONG), you should say so explicitly and consider STOP_OUT or TIGHTEN_STOP with HIGH urgency.
 Should the trader:
 1. HOLD - continue holding (your decision is final)
@@ -707,11 +754,20 @@ Should the trader:
 3. TIGHTEN_STOP - move stop to breakeven or better
 4. STOP_OUT - exit immediately (you see risk)
 5. SCALE_OUT - take partial profit
+6. REDUCE - reduce size
+7. MOVE_TO_BE - move stop to breakeven
+8. ADD - add only if already in profit and risk allows (rare)
 
 Respond in this EXACT JSON format:
 {
-  "action": "HOLD|TAKE_PROFIT|TIGHTEN_STOP|STOP_OUT|SCALE_OUT",
-  "reasoning": "Brief explanation using the provided metrics for pattern analysis and probability reasoning (2-3 sentences max)",
+  "action": "HOLD|TAKE_PROFIT|TIGHTEN_STOP|STOP_OUT|SCALE_OUT|REDUCE|MOVE_TO_BE|ADD",
+  "confidence": 0-100,
+  "reasonCodes": ["VWAP_RECLAIM","TIMING_WEAKEN","TARGET_TAG","REGIME_FLIP"],
+  "riskNotes": ["..."],
+  "proposedStop": null or number,
+  "proposedPartialPct": null or number,
+  "nextCheck": "ON_T1|ON_VWAP_LOSS|IN_10M",
+  "reasoning": "Brief explanation using the provided metrics (2-3 sentences max)",
   "urgency": "LOW|MEDIUM|HIGH",
   "specificPrice": null or number (if action requires a price)
 }`;
@@ -729,7 +785,13 @@ Respond in this EXACT JSON format:
           action: parsed.action || "HOLD",
           reasoning: parsed.reasoning || "No reasoning provided",
           urgency: parsed.urgency || "LOW",
-          specificPrice: parsed.specificPrice || undefined
+          specificPrice: parsed.specificPrice || undefined,
+          confidence: typeof parsed.confidence === "number" ? parsed.confidence : undefined,
+          reasonCodes: Array.isArray(parsed.reasonCodes) ? parsed.reasonCodes : undefined,
+          riskNotes: Array.isArray(parsed.riskNotes) ? parsed.riskNotes : undefined,
+          proposedStop: typeof parsed.proposedStop === "number" ? parsed.proposedStop : undefined,
+          proposedPartialPct: typeof parsed.proposedPartialPct === "number" ? parsed.proposedPartialPct : undefined,
+          nextCheck: typeof parsed.nextCheck === "string" ? parsed.nextCheck : undefined
         };
       } catch (e) {
         // Fall through to text parsing

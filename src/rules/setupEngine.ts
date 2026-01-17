@@ -25,6 +25,7 @@ export interface SetupEngineContext {
 
 export interface SetupEngineResult {
   candidate?: SetupCandidate;
+  candidates?: SetupCandidate[];
   reason?: string;
   debug?: {
     breakRetest?: Array<{
@@ -94,6 +95,43 @@ function recentSwingLow(bars: OHLCVBar[], lookback: number): number {
   return Math.min(...window.map(b => b.low));
 }
 
+function computeRelVolume(bars: OHLCVBar[], lookback: number): number | undefined {
+  if (bars.length < lookback) return undefined;
+  const window = bars.slice(-lookback);
+  const avg = window.reduce((sum, b) => sum + (b.volume ?? 0), 0) / window.length;
+  const last = window[window.length - 1]!;
+  if (avg <= 0) return undefined;
+  return (last.volume ?? 0) / avg;
+}
+
+function computeImpulseVolRatio(bars: OHLCVBar[]): number | undefined {
+  if (bars.length < 8) return undefined;
+  const tail = bars.slice(-8);
+  const impulse = tail.slice(0, 4);
+  const pullback = tail.slice(4);
+  const impulseAvg = impulse.reduce((sum, b) => sum + (b.volume ?? 0), 0) / impulse.length;
+  const pullbackAvg = pullback.reduce((sum, b) => sum + (b.volume ?? 0), 0) / pullback.length;
+  if (pullbackAvg <= 0) return undefined;
+  return impulseAvg / pullbackAvg;
+}
+
+function computeEmaSlopeAtr(closes: number[], period: number, lookbackBars: number, atr?: number): number | undefined {
+  if (!atr || atr <= 0 || closes.length < period + lookbackBars) return undefined;
+  const now = computeEMA(closes, period);
+  const past = computeEMA(closes.slice(0, Math.max(0, closes.length - lookbackBars)), period);
+  if (now === undefined || past === undefined) return undefined;
+  return (now - past) / atr;
+}
+
+function computeVwapSlopeAtr(bars: OHLCVBar[], vwapPeriod: number, lookbackBars: number, atr?: number): number | undefined {
+  if (!atr || atr <= 0 || bars.length < vwapPeriod + lookbackBars) return undefined;
+  const now = computeVWAP(bars, vwapPeriod);
+  const pastWindow = bars.slice(0, bars.length - lookbackBars);
+  const past = computeVWAP(pastWindow, vwapPeriod);
+  if (now === undefined || past === undefined) return undefined;
+  return (now - past) / atr;
+}
+
 /**
  * SetupEngine: Deterministic pattern detection for trading setups
  * 
@@ -125,6 +163,20 @@ export class SetupEngine {
     if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
 
     const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
+    const relVolume = computeRelVolume(bars, 20);
+    const impulseVolVsPullbackVol = computeImpulseVolRatio(bars);
+    const vwapSlopeAtr = computeVwapSlopeAtr(bars, 30, 6, atr);
+    const ema9SlopeAtr = computeEmaSlopeAtr(closes, 9, 6, atr);
+    const ema20SlopeAtr = computeEmaSlopeAtr(closes, 20, 6, atr);
+    const priceVsVwapAtr = vwap !== undefined ? (currentPrice - vwap) / atr : undefined;
+    const priceVsEma20Atr = ema20 !== undefined ? (currentPrice - ema20) / atr : undefined;
+    const inValueZone = vwap !== undefined ? Math.abs(currentPrice - vwap) <= 0.5 * atr : undefined;
+    const extendedFromMean = priceVsVwapAtr !== undefined ? Math.abs(priceVsVwapAtr) : undefined;
+    const emaAlignment: "BULL" | "BEAR" | "NEUTRAL" =
+      ema9 > ema20 && currentPrice > ema20 ? "BULL" : ema9 < ema20 && currentPrice < ema20 ? "BEAR" : "NEUTRAL";
+    const recentHigh = recentSwingHigh(bars, 12);
+    const recentLow = recentSwingLow(bars, 12);
+    const impulseAtr = (recentHigh - recentLow) / atr;
 
     // CHOP default is to block new setups, but allow a "momentum + alignment" override.
     // This is intended to catch range breakdowns / repeated rejections (e.g., tap 693 and fail,
@@ -170,15 +222,95 @@ export class SetupEngine {
     );
 
     const candidates: SetupCandidate[] = [];
+    const enrichCandidate = (candidate: SetupCandidate): SetupCandidate => {
+      const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
+      const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
+      const pullbackDepthAtr =
+        candidate.direction === "LONG" ? (recentHigh - currentPrice) / atr : (currentPrice - recentLow) / atr;
+      const reclaimSignal =
+        candidate.direction === "LONG"
+          ? currentPrice > ema9 && (vwap === undefined || currentPrice > vwap)
+            ? "BOTH"
+            : currentPrice > ema9
+            ? "EMA_RECLAIM"
+            : vwap !== undefined && currentPrice > vwap
+            ? "VWAP_RECLAIM"
+            : "NONE"
+          : currentPrice < ema9 && (vwap === undefined || currentPrice < vwap)
+          ? "BOTH"
+          : currentPrice < ema9
+          ? "EMA_RECLAIM"
+          : vwap !== undefined && currentPrice < vwap
+          ? "VWAP_RECLAIM"
+          : "NONE";
+
+      candidate.scoreComponents = {
+        structure: candidate.score.structure,
+        momentum: directionInference.confidence,
+        location: candidate.score.alignment,
+        volatility: clamp(impulseAtr * 25, 0, 25),
+        pattern: candidate.score.quality,
+        risk: clamp(25 - riskAtr * 10, 0, 25),
+      };
+      candidate.featureBundle = {
+        location: {
+          priceVsVWAP: priceVsVwapAtr !== undefined ? { atR: Number(priceVsVwapAtr.toFixed(2)) } : undefined,
+          priceVsEMA20: priceVsEma20Atr !== undefined ? { atR: Number(priceVsEma20Atr.toFixed(2)) } : undefined,
+          inValueZone,
+          extendedFromMean:
+            extendedFromMean !== undefined
+              ? { atR: Number(extendedFromMean.toFixed(2)), extended: extendedFromMean >= 1 }
+              : undefined,
+        },
+        trend: {
+          structure: regime.structure,
+          vwapSlopeAtr,
+          ema9SlopeAtr,
+          ema20SlopeAtr,
+          emaAlignment,
+        },
+        timing: {
+          impulseAtr: Number(impulseAtr.toFixed(2)),
+          pullbackDepthAtr: Number(pullbackDepthAtr.toFixed(2)),
+          reclaimSignal,
+          barsSinceImpulse: bars.length >= 6 ? 6 : bars.length,
+          barsInPullback: bars.length >= 3 ? 3 : bars.length,
+        },
+        volatility: {
+          atr: Number(atr.toFixed(2)),
+          atrSlope: regime.atrSlope,
+          regime15m: regime.regime,
+          regime5mProvisional: regime.regime,
+          confidence: directionInference.confidence,
+          tacticalBias: ctx.tacticalBias?.bias ?? "NONE",
+        },
+        volume: {
+          relVolume: relVolume !== undefined ? Number(relVolume.toFixed(2)) : undefined,
+          impulseVolVsPullbackVol: impulseVolVsPullbackVol !== undefined ? Number(impulseVolVsPullbackVol.toFixed(2)) : undefined,
+        },
+      };
+      const flags = new Set(candidate.flags ?? []);
+      if (extendedFromMean !== undefined && extendedFromMean >= 1) flags.add("EXTENDED");
+      if (reclaimSignal === "NONE") flags.add("WEAK_RECLAIM");
+      if (relVolume !== undefined && relVolume < 0.7) flags.add("LOW_RVOL");
+      if (candidate.featureBundle.timing?.barsSinceImpulse && candidate.featureBundle.timing.barsSinceImpulse > 6) {
+        flags.add("LATE_ENTRY");
+      }
+      if (regime.regime === "CHOP" || regime.regime === "TRANSITION") flags.add("CHOP_RISK");
+      if (ctx.macroBias && candidate.direction !== ctx.macroBias && ctx.macroBias !== "NEUTRAL") flags.add("COUNTER_ANCHOR");
+      candidate.flags = Array.from(flags);
+      return candidate;
+    };
     const pushCandidate = (candidate: SetupCandidate) => {
+      const enriched = enrichCandidate(candidate);
       // Add CHOP_OVERRIDE flag if applicable
       if (chopOverride) {
-        candidate.flags = [...(candidate.flags ?? []), "CHOP_OVERRIDE"];
+        enriched.flags = [...(enriched.flags ?? []), "CHOP_OVERRIDE"];
       }
       if (chaseRisk) {
-        candidate.flags = [...(candidate.flags ?? []), "CHASE_RISK"];
+        enriched.flags = [...(enriched.flags ?? []), "CHASE_RISK"];
       }
-      candidates.push(candidate);
+      candidates.push(enriched);
     };
 
     // Try PULLBACK_CONTINUATION pattern
@@ -402,7 +534,7 @@ export class SetupEngine {
     }
 
     if (candidates.length === 0) {
-      return { reason: "no setup patterns matched" };
+      return { reason: "no setup patterns matched", candidates: [] };
     }
 
     const byScore = [...candidates].sort((a, b) => b.score.total - a.score.total);
@@ -423,7 +555,7 @@ export class SetupEngine {
       preferred = pickByPreference(["BREAK_RETEST", "VALUE_RECLAIM", "REVERSAL_ATTEMPT", "PULLBACK_CONTINUATION"]);
     }
 
-    return { candidate: preferred ?? byScore[0]! };
+    return { candidate: preferred ?? byScore[0]!, candidates: byScore };
   }
 
   /**

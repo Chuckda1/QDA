@@ -23,6 +23,8 @@ export type DecisionLlmSummary = {
   reasoning?: string;
   plan?: string;
   flags?: string[];
+  selectedCandidateId?: string;
+  rankedCandidateIds?: string[];
   note?: string;
 };
 

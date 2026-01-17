@@ -219,6 +219,18 @@ export class MessagePublisher {
     ];
   }
 
+  private formatCandidatesBlock(event: DomainEvent): string[] {
+    const candidates = event.data.candidates;
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+    const title = event.data.candidatesTitle ?? "CANDIDATES";
+    const lines = candidates.slice(0, 5).map((candidate: any) => {
+      const flags = candidate.flags?.length ? ` | ${candidate.flags.join(", ")}` : "";
+      const quality = candidate.quality ? ` ${candidate.quality}${candidate.qualityTag ? ` (${candidate.qualityTag})` : ""}` : "";
+      return `${candidate.setup ?? "SETUP"} ${candidate.direction ?? "DIR"} score=${candidate.score ?? "?"}${quality}${flags}`;
+    });
+    return [title, ...lines].filter(Boolean);
+  }
+
   private formatBlockersBlock(params: {
     reasons?: string[];
     tags?: string[];
@@ -278,6 +290,7 @@ export class MessagePublisher {
     const timing = this.formatTimingBlock(event);
     const playState = this.formatPlayStateBlock(event);
     const topPlay = this.formatTopPlayBlock(event);
+    const candidates = this.formatCandidatesBlock(event);
     const rationale = this.formatRationaleBlock(event);
     const blockers = this.formatBlockersBlock({
       reasons: event.data.blockerReasons,
@@ -293,6 +306,7 @@ export class MessagePublisher {
       ...(playState.length ? ["", ...playState] : []),
       "",
       ...topPlay,
+      ...(candidates.length ? ["", ...candidates] : []),
       ...(decisionKind === "GATE" ? (blockers.length ? ["", ...blockers] : []) : []),
       ...(decisionKind === "GATE" ? (rationale.length ? ["", ...rationale] : []) : []),
       ...(decisionKind !== "GATE" ? (rationale.length ? ["", ...rationale] : []) : []),
@@ -359,6 +373,12 @@ export class MessagePublisher {
           `${event.data.reasoning || ""}`,
           ...this.formatDecisionLines(event.data.decision)
         ].filter(Boolean).join("\n");
+
+      case "SETUP_CANDIDATES":
+        return this.formatBanner(event, "SETUP CANDIDATES");
+
+      case "LLM_PICK":
+        return this.formatBanner(event, "LLM PICK");
 
       case "SCORECARD": {
         if (event.data.marketState) {
@@ -496,6 +516,18 @@ export class MessagePublisher {
           `[${instanceId}] 💬 LLM COACH UPDATE`,
           `${event.data.direction} ${event.data.symbol}`,
           `Price: $${event.data.price?.toFixed(2) || "N/A"}`,
+          event.data.action ? `Action: ${event.data.action}` : "",
+          Number.isFinite(event.data.confidence) ? `Confidence: ${Math.round(event.data.confidence)}%` : "",
+          Array.isArray(event.data.reasonCodes) && event.data.reasonCodes.length
+            ? `Reasons: ${event.data.reasonCodes.join(", ")}`
+            : "",
+          Array.isArray(event.data.triggers) && event.data.triggers.length
+            ? `Trigger: ${event.data.triggers.join(", ")} (cooldown ok)`
+            : "",
+          Array.isArray(event.data.blockedTriggers) && event.data.blockedTriggers.length
+            ? `Trigger Blocked: ${event.data.blockedTriggers.join(", ")}`
+            : "",
+          event.data.nextCheck ? `Next: ${event.data.nextCheck}` : "",
           ``,
           `${event.data.update || ""}`
         ].join("\n");

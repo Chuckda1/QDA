@@ -10,17 +10,19 @@ const PRIORITY: Record<DomainEventType, number> = {
   PLAY_ARMED: 1,
   ENTRY_WINDOW_OPENED: 2,
   TIMING_COACH: 3,
-  LLM_VERIFY: 4,
-  SCORECARD: 5,
-  SETUP_SUMMARY: 6,
-  NO_ENTRY: 7,
-  TRADE_PLAN: 8,
-  PLAY_ENTERED: 9,
-  PLAY_SIZED_UP: 10,
-  ARMED_COACH: 11, // Pre-entry coaching (happens on 5m bars while waiting for entry)
-  LLM_COACH_UPDATE: 12, // Position management coaching (after entry)
-  PLAY_CANCELLED: 13,
-  PLAY_CLOSED: 14,
+  SETUP_CANDIDATES: 4,
+  LLM_PICK: 5,
+  LLM_VERIFY: 6,
+  SCORECARD: 7,
+  SETUP_SUMMARY: 8,
+  NO_ENTRY: 9,
+  TRADE_PLAN: 10,
+  PLAY_ENTERED: 11,
+  PLAY_SIZED_UP: 12,
+  ARMED_COACH: 13, // Pre-entry coaching (happens on 5m bars while waiting for entry)
+  LLM_COACH_UPDATE: 14, // Position management coaching (after entry)
+  PLAY_CANCELLED: 15,
+  PLAY_CLOSED: 16,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
 };
 

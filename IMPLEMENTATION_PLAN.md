@@ -137,6 +137,53 @@ npm run test:telemetry
 
 ---
 
+## Addendum: Candidates-First LLM Visibility (Chart-Equivalent Features)
+
+### Goal
+Ensure the LLM sees the same chart context a human uses by sending a rich candidates list,
+while keeping execution gates strict and separate from candidate discovery.
+
+### Architecture Rule
+**Tier A (hard safety only) → Tier B (candidate generation) → Tier C (execution gates after LLM)**
+
+### Candidate Payload Requirements
+Send **3–12 candidates** per evaluation, each including:
+1. **Identity + Levels**
+   - `setupType`, `direction`, `timeframe`, `anchorTimeframe`
+   - `trigger`, `entryZone`, `stop`, `targets`
+2. **Score + Components**
+   - `score.total`
+   - `score.components` (structure, momentum, location, volatility, pattern quality, risk)
+3. **Feature Bundle (chart representation)**
+   - Location: `priceVsVWAP.atR`, `priceVsEMA20.atR`, `inValueZone`, `extendedFromMean`
+   - Trend/structure: `structure`, `vwapSlopeAtr`, `ema9SlopeAtr`, `ema20SlopeAtr`, `emaAlignment`
+   - Impulse/pullback: `impulseAtr`, `pullbackDepthAtr`, `reclaimSignal`, `barsSinceImpulse`, `barsInPullback`
+   - Volatility/regime: `atr`, `atrSlope`, `regime15m`, `regime5mProvisional`, `confidence`, `tacticalBias`
+   - Volume: `relVolume`, `impulseVolVsPullbackVol`
+4. **Flags (warnings, not blockers)**
+   - `EXTENDED`, `WEAK_RECLAIM`, `LOW_RVOL`, `LATE_ENTRY`, `CHOP_RISK`, `WICKY`, `COUNTER_ANCHOR`
+
+### LLM Flow
+1. **Always build candidates** (no pruning for score below floor).
+2. **Run LLM** on the candidates list even if some are low quality.
+3. **Apply execution gates after LLM**:
+   - permissions/regime
+   - entry filters
+   - sizing rules
+   - timing confirmation
+
+### Messaging Expectations
+- **SETUP_CANDIDATES** (quiet, frequent): top 3–5 candidates with score + flags.
+- **LLM_PICK**: ranked picks with short rationale.
+- **EXECUTION_DECISION**: ARM/PASS with explicit blockers after LLM selection.
+
+### Acceptance Criteria
+- ✅ LLM receives multi-candidate payload with chart-equivalent features
+- ✅ Hard blockers only applied after LLM selection
+- ✅ Telegram shows candidate visibility even when no trade is armed
+
+---
+
 ## Phase 4: Message Pipeline + Idempotency
 
 ### Goal

@@ -11,6 +11,57 @@ A **Telegram trading bot** for SPY ETF that:
 
 ---
 
+## 🧠 Conceptual Flow (Candidates-First)
+
+### Market State (slow context)
+Computes regime, macro bias, and permissions (long/short + mode). Adds tactical bias + shock for faster directional context. This is the permission layer, not the entry trigger.
+
+### Candidate Discovery (wide net)
+`setupEngine` generates multiple candidates (not just one). Each candidate carries chart‑equivalent features (location, trend, timing, volatility, volume), structured score components, and **flags** (warnings only). **No hard blocking here**—candidates are surfaced for visibility.
+
+> **Flags = descriptive warnings (never block).**
+
+### LLM Evaluation (candidates-first)
+LLM receives a candidate batch (rank set + optional “contrast” set of near‑misses). It ranks and selects the best candidate (`selectedCandidateId`, `rankedCandidateIds`) and returns confidence, risk notes, and preferred action.
+
+### Execution Gate (strict, post-LLM)
+Only after LLM selection, the bot applies **blockers** (execution-only hard stops):
+- Direction gates (LOCKED/LEANING)
+- Regime permission + CHOP/TRANSITION rules
+- Risk/ATR caps, chase risk, timing thresholds
+- Entry filters + guardrails  
+This preserves strict execution while still surfacing ideas.
+
+> **Blockers = execution-only (can block ARM/ENTER).**
+
+### Timing Engine (microstructure)
+Independent timing signals score entries (break/accept, retest quality, VWAP reaction, ATR normalization). Entry window opens only when timing is good; actual entry is gated by timing score. Timing is persisted as a state machine (IMPULSE → PULLBACK → ENTRY_WINDOW → IN_TRADE) to prevent “late flips.”
+
+### Context Quality (LOW_CONTEXT / diversity)
+When candidate count or diversity is low, mark **LOW_CONTEXT**. LLM still ranks; execution is tightened (scalp/pass caps, stricter thresholds) and messaging surfaces the limitation.
+
+### Messaging (explainability first)
+Every key event prints:
+MARKET STATE (regime, permissions, tactical bias, plan status)
+TIMING
+TOP PLAY
+CANDIDATES (when available)
+BLOCKERS (if not armed)
+This makes “why didn’t it enter?” unambiguous.
+
+### Design Principles
+- Separate what’s allowed vs. what’s seen.
+- Permissions stay strict; candidate visibility is wide.
+- LLM is a selector, not a gate.
+- The LLM chooses; rules decide if execution is allowed.
+- Timing is its own layer: regime says what; timing says when.
+- Explainability is mandatory: every no‑entry ties to explicit blockers.
+
+### In short
+Your bot behaves like a pro trading assistant: it sees more setups, chooses deliberately, executes only when strictly permitted, and always explains why.
+
+---
+
 ## 🏗️ Architecture Overview
 
 ```
