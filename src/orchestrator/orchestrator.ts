@@ -1473,11 +1473,11 @@ export class Orchestrator {
 
       if (macroBiasInfo.bias === "LONG" && setupCandidate.direction === "SHORT" && anchorRegime.regime !== "TREND_DOWN") {
         blockers.push("guardrail");
-        blockerReasons.push("bias gate: 15m bias LONG blocks SHORT setups until 15m turns");
+        blockerReasons.push(`bias gate: ${anchorLabel} bias LONG blocks SHORT setups until ${anchorLabel} turns`);
       }
       if (macroBiasInfo.bias === "SHORT" && setupCandidate.direction === "LONG" && anchorRegime.regime !== "TREND_UP") {
         blockers.push("guardrail");
-        blockerReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
+        blockerReasons.push(`bias gate: ${anchorLabel} bias SHORT blocks LONG setups until ${anchorLabel} turns`);
       }
 
       const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
