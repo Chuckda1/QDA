@@ -11,12 +11,30 @@ export type SetupPattern =
   | "RECLAIM"
   | "FADE";
 
+export interface TacticalSnapshot {
+  activeDirection: Direction | "NEUTRAL";
+  confidence: number; // 0-100
+  reasons: string[];
+  tier: "CLEAR" | "LEAN" | "NONE";
+  score: number;
+  shock: boolean;
+  shockReason?: string;
+  indicatorTf: "1m" | "5m";
+  confirm?: {
+    tf: "5m";
+    bias: Direction | "NONE";
+    confidence: number;
+    reasons: string[];
+  };
+}
+
 export interface SetupCandidate {
   id: string;
   ts: number;
   symbol: string;
   direction: Direction;
   pattern: SetupPattern;
+  intentBucket?: SetupPattern;
   stage?: "EARLY" | "READY" | "LATE";
   holdReason?: string;
   qualityTag?: "LOW" | "OK" | "HIGH";
@@ -82,6 +100,7 @@ export interface SetupCandidate {
     };
   };
   flags?: string[]; // e.g. ["CHOP_OVERRIDE"]
+  warningFlags?: string[];
   meta?: {
     valueBand?: { low: number; high: number };
     vwapRef?: number | null;
@@ -118,6 +137,7 @@ export interface SnapshotContract {
   timestamp: number;
   symbol: string;
   timeframe: "1m" | "5m" | "15m";
+  tacticalSnapshot?: TacticalSnapshot;
   marketState?: Record<string, any>;
   timing?: Record<string, any>;
   candidates?: SetupCandidate[];
@@ -236,6 +256,8 @@ export interface BotState {
   session: string;
   price?: number;
   activePlay?: Play | null;
+  pendingCandidate?: SetupCandidate | null;
+  pendingCandidateExpiresAt?: number;
   mode: BotMode;
   lastPlanSent?: number;
   potd?: {

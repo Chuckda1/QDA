@@ -1,9 +1,9 @@
-import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, SnapshotContract, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
 import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
-import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
+import { inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
 import { computeMacroBias, computeRegime, type RegimeOptions } from "../rules/regimeRules.js";
@@ -28,6 +28,7 @@ type SetupDiagnosticsSnapshot = {
   regime: RegimeResult;
   macroBias?: Bias;
   directionInference: DirectionInference;
+  tacticalSnapshot?: TacticalSnapshot;
   tacticalBias?: ReturnType<typeof inferTacticalBiasFromRecentBars>;
   candidate?: SetupCandidate;
   setupReason?: string;
@@ -116,6 +117,46 @@ function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
     ema20: closes.length >= 20 ? computeEMA(closes.slice(-80), 20) : undefined,
     atr: bars.length >= 15 ? computeATR(bars, 14) : undefined,
     rsi14: closes.length >= 15 ? computeRSI(closes, 14) : undefined,
+  };
+}
+
+function buildTacticalSnapshot(params: {
+  bars: OHLCVBar[];
+  indicators: ReturnType<typeof buildIndicatorSet>;
+  tf: "1m" | "5m";
+  confirmBars?: OHLCVBar[];
+  confirmIndicators?: ReturnType<typeof buildIndicatorSet>;
+}): TacticalSnapshot {
+  const lookback = params.tf === "1m" ? 5 : 3;
+  const primary = inferTacticalBiasFromRecentBars(params.bars, {
+    lookback,
+    indicators: { ...params.indicators, tf: params.tf },
+  });
+  const confirm =
+    params.confirmBars && params.confirmIndicators
+      ? inferTacticalBiasFromRecentBars(params.confirmBars, {
+          lookback: 3,
+          indicators: { ...params.confirmIndicators, tf: "5m" },
+        })
+      : undefined;
+
+  return {
+    activeDirection: primary.bias === "NONE" ? "NEUTRAL" : primary.bias,
+    confidence: primary.confidence,
+    reasons: primary.reasons,
+    tier: primary.tier,
+    score: primary.score,
+    shock: primary.shock,
+    shockReason: primary.shockReason,
+    indicatorTf: params.tf,
+    confirm: confirm
+      ? {
+          tf: "5m",
+          bias: confirm.bias,
+          confidence: confirm.confidence,
+          reasons: confirm.reasons,
+        }
+      : undefined,
   };
 }
 
@@ -214,6 +255,8 @@ export class Orchestrator {
     llmService?: LLMService,
     initialState?: {
       activePlay?: Play | null;
+      pendingCandidate?: SetupCandidate | null;
+      pendingCandidateExpiresAt?: number;
       potd?: { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string };
       timingState?: TimingStateContext;
     }
@@ -279,6 +322,8 @@ export class Orchestrator {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
       activePlay,
+      pendingCandidate: initialState?.pendingCandidate ?? null,
+      pendingCandidateExpiresAt: initialState?.pendingCandidateExpiresAt,
       mode: "QUIET",
       potd: initialPotd,
       timingState: initialState?.timingState
@@ -578,6 +623,26 @@ export class Orchestrator {
   private async handle1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const events: DomainEvent[] = [];
     const { ts, symbol, close, high, low, open, volume } = snapshot;
+    const buildTacticalInference = () => {
+      const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
+      const confirmIndicators = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
+      const tacticalSnapshot = buildTacticalSnapshot({
+        bars: this.recentBars1m,
+        indicators: indicators1m,
+        tf: "1m",
+        confirmBars: this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
+        confirmIndicators,
+      });
+      return {
+        tacticalSnapshot,
+        directionInference: {
+          direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? undefined : tacticalSnapshot.activeDirection,
+          confidence: tacticalSnapshot.confidence,
+          reasons: tacticalSnapshot.reasons,
+          indicatorTf: tacticalSnapshot.indicatorTf,
+        },
+      };
+    };
 
     // Datafeed resilience: Check for time gaps
     if (this.lastBarTs !== null) {
@@ -591,13 +656,15 @@ export class Orchestrator {
         
         // Set diagnostics for gap
         if (!this.state.activePlay) {
+          const tactical = buildTacticalInference();
           this.lastDiagnostics = {
             ts,
             symbol,
             close,
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
-            directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
+            directionInference: tactical.directionInference,
+            tacticalSnapshot: tactical.tacticalSnapshot,
             setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
             datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
           };
@@ -634,13 +701,15 @@ export class Orchestrator {
         console.log(`[Datafeed] Insufficient OHLC data: missing ${missing.join(", ")}. Skipping bar.`);
         
         if (!this.state.activePlay) {
+          const tactical = buildTacticalInference();
           this.lastDiagnostics = {
             ts,
             symbol,
             close,
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
-            directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
+            directionInference: tactical.directionInference,
+            tacticalSnapshot: tactical.tacticalSnapshot,
             setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
             datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
           };
@@ -668,13 +737,15 @@ export class Orchestrator {
     if (this.dataGapCooldown > 0) {
       console.log(`[Datafeed] Data gap cooldown active: ${this.dataGapCooldown} bars remaining`);
       if (!this.state.activePlay) {
+        const tactical = buildTacticalInference();
         this.lastDiagnostics = {
           ts,
           symbol,
           close,
           regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
           macroBias: this.lastMacroBias,
-          directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
+          directionInference: tactical.directionInference,
+          tacticalSnapshot: tactical.tacticalSnapshot,
           setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
           datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
         };
@@ -1233,13 +1304,27 @@ export class Orchestrator {
         const fallbackRegime = this.lastRegime15mReady && this.lastRegime15m
           ? this.lastRegime15m
           : computeRegime(this.recentBars5m, close, REGIME_5M_PROVISIONAL_OPTIONS);
+        const fallbackIndicators = buildIndicatorSet(this.recentBars1m, "1m");
+        const fallbackTactical = buildTacticalSnapshot({
+          bars: this.recentBars1m,
+          indicators: fallbackIndicators,
+          tf: "1m",
+          confirmBars: this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
+          confirmIndicators: this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined,
+        });
         this.lastDiagnostics = {
           ts,
           symbol,
           close,
           regime: fallbackRegime,
           macroBias: this.lastRegime15mReady ? this.lastMacroBias : "NEUTRAL",
-          directionInference: inferDirectionFromRecentBars(this.recentBars5m, { indicators: buildIndicatorSet(this.recentBars5m, "5m") }),
+          directionInference: {
+            direction: fallbackTactical.activeDirection === "NEUTRAL" ? undefined : fallbackTactical.activeDirection,
+            confidence: fallbackTactical.confidence,
+            reasons: fallbackTactical.reasons,
+            indicatorTf: fallbackTactical.indicatorTf,
+          },
+          tacticalSnapshot: fallbackTactical,
           setupReason: "insufficient 5m history (< 6 bars)",
         };
         this.lastDecision = buildDecision({
@@ -1268,17 +1353,35 @@ export class Orchestrator {
       const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
       const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
 
-      const dirBars = this.recentBars1m.length >= 12 ? this.recentBars1m : this.recentBars5m;
-      const dirIndicators = dirBars === this.recentBars1m ? indicators1m : indicators5m;
-      const dirInf = inferDirectionFromRecentBars(dirBars, { indicators: dirIndicators });
+      const tacticalPrimaryBars = this.recentBars1m.length >= 6 ? this.recentBars1m : this.recentBars5m;
+      const tacticalPrimaryIndicators = tacticalPrimaryBars === this.recentBars1m ? indicators1m : indicators5m;
+      const tacticalPrimaryTf = tacticalPrimaryBars === this.recentBars1m ? "1m" : "5m";
+      const tacticalSnapshot = buildTacticalSnapshot({
+        bars: tacticalPrimaryBars,
+        indicators: tacticalPrimaryIndicators,
+        tf: tacticalPrimaryTf,
+        confirmBars: tacticalPrimaryTf === "1m" && this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
+        confirmIndicators: tacticalPrimaryTf === "1m" ? indicators5m : undefined,
+      });
+      const dirInf = {
+        direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? undefined : tacticalSnapshot.activeDirection,
+        confidence: tacticalSnapshot.confidence,
+        reasons: tacticalSnapshot.reasons,
+        indicatorTf: tacticalSnapshot.indicatorTf,
+      };
       if (!dirInf.direction) {
-        console.log(`[5m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
+        console.log(`[5m] Tactical direction unclear (continuing): ${dirInf.reasons.join(" | ")}`);
       }
-
-      const tacticalBars = this.recentBars1m.length >= 6 ? this.recentBars1m : this.recentBars5m;
-      const tacticalLookback = tacticalBars === this.recentBars1m ? 5 : 3;
-      const tacticalIndicators = tacticalBars === this.recentBars1m ? indicators1m : indicators5m;
-      const tacticalBiasInfo = inferTacticalBiasFromRecentBars(tacticalBars, { lookback: tacticalLookback, indicators: tacticalIndicators });
+      const tacticalBiasInfo = {
+        bias: tacticalSnapshot.activeDirection === "NEUTRAL" ? "NONE" : tacticalSnapshot.activeDirection,
+        tier: tacticalSnapshot.tier,
+        score: tacticalSnapshot.score,
+        confidence: tacticalSnapshot.confidence,
+        reasons: tacticalSnapshot.reasons,
+        shock: tacticalSnapshot.shock,
+        shockReason: tacticalSnapshot.shockReason,
+        indicatorTf: tacticalSnapshot.indicatorTf,
+      };
 
       const atr = indicators5m.atr;
       const ema9 = indicators5m.ema9;
@@ -1306,7 +1409,7 @@ export class Orchestrator {
           return {
             allow: false,
             tier: "NONE" as const,
-            reason: `tactical bias unclear (${tacticalBiasInfo.tier})`
+            reason: `tactical direction NEUTRAL (${tacticalBiasInfo.tier})`
           };
         }
         const tier = tacticalBiasInfo.tier === "CLEAR" ? "LOCKED" : "LEANING";
@@ -1314,7 +1417,7 @@ export class Orchestrator {
           allow: true,
           tier,
           direction: tacticalBias,
-          reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`
+          reason: `tactical direction ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`
         };
       })();
 
@@ -1348,6 +1451,27 @@ export class Orchestrator {
       });
 
       const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
+      const pending = this.state.pendingCandidate;
+      if (pending) {
+        const expired = this.state.pendingCandidateExpiresAt !== undefined && ts >= this.state.pendingCandidateExpiresAt;
+        const directionMismatch = directionGate.allow && pending.direction !== directionGate.direction;
+        const stopInvalid =
+          pending.direction === "LONG" ? close <= pending.stop : close >= pending.stop;
+        if (expired || directionMismatch || stopInvalid) {
+          this.state.pendingCandidate = null;
+          this.state.pendingCandidateExpiresAt = undefined;
+        } else {
+          const existing = setupCandidates.find((candidate) => candidate.id === pending.id);
+          if (!existing) {
+            setupCandidates.push({
+              ...pending,
+              stage: pending.stage ?? "EARLY",
+              holdReason: pending.holdReason ?? "WAIT_FOR_PULLBACK",
+              warningFlags: pending.warningFlags ?? pending.flags,
+            });
+          }
+        }
+      }
       const potdActivePre = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmedPre = potdActivePre && macroBiasInfo.bias === this.potdBias;
       const potdAlignmentNoCandidate: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActivePre
@@ -1413,6 +1537,8 @@ export class Orchestrator {
           regime: anchorRegime,
           macroBias: macroBiasInfo.bias,
           directionInference: dirInf,
+          tacticalSnapshot,
+          tacticalBias: tacticalBiasInfo,
           setupReason: setupResult.reason || "no setup pattern found",
           setupDebug: setupResult.debug,
           candidateStats: {
@@ -1431,7 +1557,7 @@ export class Orchestrator {
         console.log(`[5m] No setup candidates: ${setupResult.reason || "unknown"}`);
         const topPlay = {
           setup: "N/A",
-          direction: directionGate.allow ? directionGate.direction : "N/A",
+          direction: tacticalSnapshot.activeDirection,
           score: 0,
           quality: "D",
           qualityTag: "No candidates",
@@ -1445,6 +1571,7 @@ export class Orchestrator {
           regime: anchorRegime.regime,
           confidence: regimeConfidence,
           permission,
+          tacticalSnapshot,
           tacticalBias: {
             bias: tacticalBias,
             tier: tacticalBiasInfo.tier,
@@ -1452,6 +1579,7 @@ export class Orchestrator {
             confidence: tacticalBiasInfo.confidence,
             shock: shockMode,
             shockReason: tacticalBiasInfo.shockReason,
+            reasons: tacticalBiasInfo.reasons,
           },
           dataReadiness: {
             ready: readinessOk,
@@ -1501,6 +1629,13 @@ export class Orchestrator {
       }
 
       let setupCandidate = setupResult.candidate ?? setupCandidates[0]!;
+      const pendingCandidate = this.state.pendingCandidate;
+      if (pendingCandidate) {
+        const pendingMatch = setupCandidates.find((candidate) => candidate.id === pendingCandidate.id);
+        if (pendingMatch) {
+          setupCandidate = pendingMatch;
+        }
+      }
       let timingSnapshot: TimingSignal & { phase: TimingPhase; dir: Direction | "NONE"; phaseSinceTs: number; rawState: TimingSignal["state"] } | undefined;
       let blockers: DecisionBlocker[] = [];
       let blockerReasons: string[] = [];
@@ -1524,12 +1659,20 @@ export class Orchestrator {
         : "COUNTERTREND";
       let potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
 
+      if (potdCountertrend) {
+        const nextFlags = new Set([...(setupCandidate.flags ?? [])]);
+        nextFlags.add("POTD_COUNTERTREND");
+        setupCandidate.flags = Array.from(nextFlags);
+        setupCandidate.warningFlags = setupCandidate.warningFlags ?? setupCandidate.flags;
+      }
+
       // Direction gating is handled by tactical bias; regime/macro is risk-mode only.
 
       const marketState = {
         regime: anchorRegime.regime,
         confidence: regimeConfidence,
         permission,
+        tacticalSnapshot,
         tacticalBias: {
           bias: tacticalBias,
           tier: tacticalBiasInfo.tier,
@@ -1537,6 +1680,7 @@ export class Orchestrator {
           confidence: tacticalBiasInfo.confidence,
           shock: shockMode,
           shockReason: tacticalBiasInfo.shockReason,
+          reasons: tacticalBiasInfo.reasons,
         },
         dataReadiness: {
           ready: readinessOk,
@@ -1573,6 +1717,7 @@ export class Orchestrator {
         regime: anchorRegime,
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
+        tacticalSnapshot,
         tacticalBias: tacticalBiasInfo,
         candidate: setupCandidate,
         entryFilterWarnings: filterResult.warnings,
@@ -1612,9 +1757,12 @@ export class Orchestrator {
         }
       }
 
-      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}, tf=${dirInf.indicatorTf ?? "unknown"}) | ${dirInf.reasons.join(" | ")}`;
-      const regimeWarning = `Regime gate (${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
-      const biasWarning = `Macro bias (${anchorLabel}): ${macroBiasInfo.bias}`;
+      const dirWarning = `Tactical direction: ${tacticalSnapshot.activeDirection} (confidence=${tacticalSnapshot.confidence}%, tf=${tacticalSnapshot.indicatorTf}) | ${tacticalSnapshot.reasons.join(" | ")}`;
+      const confirmWarning = tacticalSnapshot.confirm
+        ? `Tactical confirm (5m): ${tacticalSnapshot.confirm.bias} (${tacticalSnapshot.confirm.confidence}%) | ${tacticalSnapshot.confirm.reasons.join(" | ")}`
+        : undefined;
+      const regimeWarning = `Context (regime ${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
+      const biasWarning = `Context (macro ${anchorLabel}): ${macroBiasInfo.bias}`;
       const entryPermission = filterResult.permission ?? "ALLOWED";
       const permissionWarning = `Entry permission: ${entryPermission}${filterResult.reason ? ` (${filterResult.reason})` : ""}`;
       const potdWarning = potdActive
@@ -1622,15 +1770,15 @@ export class Orchestrator {
         : "POTD: OFF";
       const indicatorMeta = {
         entryTF: "5m",
-        directionTF: dirIndicators.tf,
-        tacticalTF: tacticalIndicators.tf,
+        directionTF: tacticalSnapshot.indicatorTf,
+        tacticalTF: tacticalSnapshot.indicatorTf,
         atrLen: 14,
         vwapLen: 30,
         vwapType: "RTH",
         emaLens: [9, 20],
         regimeTF: anchorLabel
       };
-      const indicatorMetaLine = `TF: entry=5m dir=${dirIndicators.tf} tactical=${tacticalIndicators.tf} atr=14 vwap=RTH ema=9/20 regime=${anchorLabel}`;
+      const indicatorMetaLine = `TF: entry=5m tactical=${tacticalSnapshot.indicatorTf} atr=14 vwap=RTH ema=9/20 regime=${anchorLabel}`;
       const last1mClose = this.recentBars1m.length ? this.recentBars1m[this.recentBars1m.length - 1]!.close : close;
       const emaStack1m = indicators1m.ema9 !== undefined && indicators1m.ema20 !== undefined
         ? (indicators1m.ema9 > indicators1m.ema20 ? "BULL" : "BEAR")
@@ -1641,21 +1789,18 @@ export class Orchestrator {
       const vwapSide1m = indicators1m.vwap !== undefined ? (last1mClose > indicators1m.vwap ? "ABOVE" : "BELOW") : "N/A";
       const vwapSide5m = indicators5m.vwap !== undefined ? (close > indicators5m.vwap ? "ABOVE" : "BELOW") : "N/A";
       const indicatorTfSummary = `INDICATORS: emaStack(1m=${emaStack1m},5m=${emaStack5m}) vwapSide(1m=${vwapSide1m},5m=${vwapSide5m})`;
-      const vetoSourceLine = dirInf.veto
-        ? `VETO source: ${dirInf.veto.reason} tf=${dirInf.veto.tf} vwap=${dirInf.veto.vwap?.toFixed(2) ?? "N/A"} ema9=${dirInf.veto.ema9?.toFixed(2) ?? "N/A"} ema20=${dirInf.veto.ema20?.toFixed(2) ?? "N/A"}`
-        : undefined;
-      console.log(`[5m] ${indicatorTfSummary}${vetoSourceLine ? ` | ${vetoSourceLine}` : ""}`);
+      console.log(`[5m] ${indicatorTfSummary}`);
 
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
         dirWarning,
+        confirmWarning,
         regimeWarning,
         biasWarning,
         permissionWarning,
         potdWarning,
         indicatorMetaLine,
         indicatorTfSummary,
-        vetoSourceLine,
         ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
       ];
 
@@ -1682,6 +1827,7 @@ export class Orchestrator {
       };
 
       const ruleScores = {
+        tacticalSnapshot,
         regime: anchorRegime.regime,
         macroBias: macroBiasInfo.bias,
         entryPermission,
@@ -1854,6 +2000,7 @@ export class Orchestrator {
         timestamp: ts,
         symbol,
         timeframe: "5m",
+        tacticalSnapshot,
         marketState,
         timing: timingSnapshot,
         candidates: setupCandidates,
@@ -1931,7 +2078,7 @@ export class Orchestrator {
         }
         if (!readinessOk) {
           nextBlockers.push("guardrail");
-          nextReasons.push(`DATA_WARMUP: missing ${readinessMissing.join(", ")}`);
+          nextReasons.push(`DATA_READY: missing ${readinessMissing.join(", ")}`);
         }
 
         if (!directionGate.allow) {
@@ -1942,47 +2089,21 @@ export class Orchestrator {
           nextReasons.push(`Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
         }
 
-        if (directionGate.allow) {
-          const scoreFloorBase = directionGate.tier === "LEANING" ? 78 : 70;
-          const scoreFloor = lowContext ? scoreFloorBase + 5 : scoreFloorBase;
-          if (candidate.score.total < scoreFloor) {
+        if (atr) {
+          const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
+          const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
+          if (riskAtr > 1.5) {
             nextBlockers.push("guardrail");
-            nextReasons.push(`score floor ${scoreFloor} (${candidate.score.total})`);
-          }
-          if (transitionLockActive) {
-            nextReasons.push(`transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})`);
-          }
-          if (directionGate.tier === "LEANING" && candidate.flags?.includes("CHASE_RISK")) {
-            nextBlockers.push("guardrail");
-            nextReasons.push("leaning: chase risk blocked");
-          }
-          if (directionGate.tier === "LEANING" && atr) {
-            const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
-            const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
-            if (riskAtr > 1.0) {
-              nextBlockers.push("guardrail");
-              nextReasons.push(`leaning risk/ATR too large (${riskAtr.toFixed(2)})`);
-            }
-          }
-          if ((anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") && atr) {
-            const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
-            const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
-            if (riskAtr > 0.9) {
-              nextBlockers.push("guardrail");
-              nextReasons.push(`chop/transition risk/ATR too large (${riskAtr.toFixed(2)})`);
-            }
+            nextReasons.push(`RISK_CAP: risk/ATR ${riskAtr.toFixed(2)} > 1.50`);
           }
         }
 
-        if (potdCountertrend) {
-          candidate.flags = [...(candidate.flags ?? []), "POTD_COUNTERTREND"];
-          nextBlockers.push("guardrail");
-          nextReasons.push(`POTD confirmed: countertrend ${candidate.direction} disabled`);
-        }
-
-        if (potdActive && this.potdMode === "HARD" && candidate.direction !== this.potdBias) {
-          nextBlockers.push("guardrail");
-          nextReasons.push(`POTD hard mode: ${this.potdBias} only (manual override required)`);
+        const timingReady =
+          timingSnapshot?.phase === "ENTRY_WINDOW" ||
+          timingSnapshot?.state === "ENTRY_WINDOW_OPEN";
+        if (llmSummary?.action && ["GO_ALL_IN", "SCALP"].includes(llmSummary.action) && !timingReady) {
+          nextBlockers.push("time_window");
+          nextReasons.push(`TIMING_THRESHOLD: ${timingSnapshot?.phase ?? timingSnapshot?.state ?? "N/A"}`);
         }
 
         if (llmErrorReason) {
@@ -2032,6 +2153,17 @@ export class Orchestrator {
       }
       ruleScores.entryPermission = filterResult.permission ?? "ALLOWED";
       ruleScores.entryFilters = { warnings: filterResult.warnings ?? [] };
+
+      if (filterResult.permission === "WAIT_FOR_PULLBACK") {
+        setupCandidate.stage = "EARLY";
+        setupCandidate.holdReason = filterResult.reason ?? "WAIT_FOR_PULLBACK";
+        setupCandidate.warningFlags = setupCandidate.warningFlags ?? setupCandidate.flags;
+        this.state.pendingCandidate = { ...setupCandidate };
+        this.state.pendingCandidateExpiresAt = ts + 30 * 60 * 1000;
+      } else if (this.state.pendingCandidate?.id === setupCandidate.id) {
+        this.state.pendingCandidate = null;
+        this.state.pendingCandidateExpiresAt = undefined;
+      }
 
       if (guardrailBlockReason) {
         blockers.push(guardrailBlockTag ?? "guardrail");
@@ -2083,14 +2215,12 @@ export class Orchestrator {
           })
         : null;
 
-      if (this.enforceHighProbabilitySetups && highProbGate && !highProbGate.allowed) {
-        if (!blockers.includes("low_probability")) {
-          blockers.push("low_probability");
-        }
-        if (highProbGate.reason) {
-          blockerReasons.push(highProbGate.reason);
-          console.log(`[5m] High-probability gate blocked: ${highProbGate.reason}`);
-        }
+      if (this.enforceHighProbabilitySetups && highProbGate && !highProbGate.allowed && llmSummary) {
+        const flags = new Set([...(llmSummary.flags ?? [])]);
+        flags.add("LOW_PROBABILITY");
+        llmSummary.flags = Array.from(flags);
+        llmSummary.note = [llmSummary.note, highProbGate.reason ?? "low probability"].filter(Boolean).join(" | ");
+        console.log(`[5m] High-probability gate warning: ${highProbGate.reason}`);
       }
 
       if (this.autoAllInOnHighProb && highProbGate?.allowed && llmSummary?.action === "SCALP") {
@@ -2132,6 +2262,7 @@ export class Orchestrator {
           bias: macroBiasInfo.bias,
           reasons: macroBiasInfo.reasons
         },
+        tacticalSnapshot,
         potd: {
           bias: this.potdBias,
           confidence: this.potdConfidence,
@@ -2192,7 +2323,7 @@ export class Orchestrator {
         kind: "GATE" as const,
         allowed: decision.status === "ARMED",
         permission,
-        direction: directionGate.allow ? directionGate.direction : "NONE",
+        direction: tacticalSnapshot.activeDirection,
         gateTier: directionGate.allow ? (directionGate.tier === "LEANING" ? "LEANING" : "OPEN") : "STRICT",
         blockers: decision.blockers,
         blockerReasons: decision.blockerReasons,
@@ -2216,6 +2347,7 @@ export class Orchestrator {
           return {
             id: candidate.id,
             setup: candidate.pattern,
+            intentBucket: candidate.intentBucket ?? candidate.pattern,
             direction: candidate.direction,
             score: candidate.score.total,
             quality: candidateQuality.grade,
@@ -2225,6 +2357,7 @@ export class Orchestrator {
             entryZone: candidate.entryZone,
             stop: candidate.stop,
             flags: candidate.flags ?? [],
+            warningFlags: candidate.warningFlags ?? candidate.flags ?? [],
           };
         });
       events.push(this.ev("SETUP_CANDIDATES", ts, {
@@ -2232,6 +2365,7 @@ export class Orchestrator {
         price: close,
         topPlay,
         candidates: rankedCandidates,
+        candidatesTitle: "IDEAS / CANDIDATES",
         marketState,
         timing: timingSnapshot,
         decision: decisionSummary,
@@ -2243,6 +2377,7 @@ export class Orchestrator {
           selectedCandidateId: llmSummary?.selectedCandidateId,
           rankedCandidateIds: llmSummary?.rankedCandidateIds,
           candidates: rankedCandidates,
+          candidatesTitle: "IDEAS / CANDIDATES",
           marketState,
           timing: timingSnapshot,
           decision: decisionSummary,
@@ -2274,7 +2409,7 @@ export class Orchestrator {
         entryPermission: ruleScores.entryPermission,
         timingPhase: timingSnapshot?.phase ?? timingSnapshot?.state,
         directionBand: getDirectionConfidenceBand(dirInf.confidence),
-        direction: dirInf.direction ?? "NONE",
+        direction: tacticalSnapshot.activeDirection,
         llmAction: decision.llm?.action,
         decisionStatus: decision.status
       };
@@ -2320,6 +2455,8 @@ export class Orchestrator {
       }
 
       if (decision.status === "ARMED" && decision.play) {
+        this.state.pendingCandidate = null;
+        this.state.pendingCandidateExpiresAt = undefined;
         if (directionGate.allow) {
           decision.play.tier = directionGate.tier;
           if (directionGate.tier === "LEANING") {

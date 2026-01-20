@@ -123,6 +123,12 @@ export class MessagePublisher {
     const mode = event.data.marketState?.permission?.mode ?? "N/A";
     const blockers = (event.data.decision?.blockers ?? event.data.blockerTags ?? []).slice(0, 2).sort().join(",");
     const action = event.data.llm?.action ?? event.data.action ?? event.data.decision?.llm?.action ?? "N/A";
+    const tacticalDirection =
+      event.data.marketState?.tacticalSnapshot?.activeDirection ??
+      event.data.marketState?.tacticalBias?.bias ??
+      "N/A";
+    const decisionStatus = event.data.decision?.status ?? "N/A";
+    const topPlayKey = event.data.topPlay?.setup ?? event.data.candidate?.pattern ?? "N/A";
     const signature = [
       symbol,
       candidateId,
@@ -135,6 +141,9 @@ export class MessagePublisher {
       blockers,
       action,
       llmBucket,
+      tacticalDirection,
+      decisionStatus,
+      topPlayKey,
     ].join("|");
 
     const candidateCount = Array.isArray(event.data.candidates) ? event.data.candidates.length : undefined;
@@ -311,15 +320,9 @@ export class MessagePublisher {
   private formatMarketStateBlock(state?: any): string[] {
     if (!state) return [];
     const confidence = Number.isFinite(state.confidence) ? ` (Confidence: ${Math.round(state.confidence)}%)` : "";
-    const longAllowed = state.permission?.long ? "✅ LONG" : "❌ LONG";
-    const shortAllowed = state.permission?.short ? "✅ SHORT" : "❌ SHORT";
     const mode = state.permission?.mode ?? "N/A";
-    const tactical = state.tacticalBias;
-    const tacticalLine = tactical
-      ? `Tactical Bias: ${tactical.bias ?? "NONE"}${Number.isFinite(tactical.confidence) ? ` (${Math.round(tactical.confidence)}%)` : ""}${tactical.tier ? ` tier=${tactical.tier}` : ""}${Number.isFinite(tactical.score) ? ` score=${tactical.score}` : ""}`
-      : undefined;
-    const shockLine = tactical?.shock
-      ? `Shock Mode: ON${tactical.shockReason ? ` (${tactical.shockReason})` : ""}`
+    const shockLine = state.tacticalBias?.shock
+      ? `Shock Mode: ON${state.tacticalBias?.shockReason ? ` (${state.tacticalBias.shockReason})` : ""}`
       : undefined;
     const planBias = state.potd ? `Plan Bias: ${state.potd.bias}` : undefined;
     const planStatus = state.potd
@@ -331,17 +334,27 @@ export class MessagePublisher {
         : `DATA: WARMUP (missing: ${(state.dataReadiness.missing ?? []).join(", ") || "unknown"})`
       : undefined;
     return [
-      "MARKET STATE",
-      `Regime: ${state.regime ?? "N/A"}${confidence}`,
-      `Live Permission: ${longAllowed} / ${shortAllowed}`,
-      `Mode: ${mode}`,
+      "CONTEXT / RISK MODE",
+      `Context Regime: ${state.regime ?? "N/A"}${confidence}`,
+      `Risk Mode: ${mode}`,
       dataLine || "",
-      tacticalLine || "",
       shockLine || "",
       state.reason ? `Reason: ${state.reason}` : "",
       planBias || "",
       planStatus || ""
     ].filter(Boolean);
+  }
+
+  private formatTacticalHeadline(state?: any): string | undefined {
+    if (!state) return undefined;
+    const tactical = state.tacticalSnapshot ?? state.tacticalBias;
+    if (!tactical) return undefined;
+    const direction = tactical.activeDirection ?? tactical.bias ?? "NEUTRAL";
+    const confidence = Number.isFinite(tactical.confidence) ? `${Math.round(tactical.confidence)}%` : "N/A";
+    const reasons = Array.isArray(tactical.reasons) ? tactical.reasons.slice(0, 2).join(" | ") : undefined;
+    const tier = tactical.tier ? ` ${tactical.tier}` : "";
+    const reasonSuffix = reasons ? ` [${reasons}]` : "";
+    return `ACTIVE: ${direction}${tier} (${confidence})${reasonSuffix}`;
   }
 
   private formatPlayStateBlock(event: DomainEvent): string[] {
@@ -393,11 +406,15 @@ export class MessagePublisher {
     if (!Array.isArray(candidates) || candidates.length === 0) return [];
     const title = event.data.candidatesTitle ?? "CANDIDATES";
     const lines = candidates.slice(0, 5).map((candidate: any) => {
-      const flags = candidate.flags?.length ? ` | ${candidate.flags.join(", ")}` : "";
+      const warningFlags = candidate.warningFlags?.length
+        ? candidate.warningFlags
+        : candidate.flags;
+      const flags = warningFlags?.length ? ` | ${warningFlags.join(", ")}` : "";
       const quality = candidate.quality ? ` ${candidate.quality}${candidate.qualityTag ? ` (${candidate.qualityTag})` : ""}` : "";
       const stage = candidate.stage ? ` [${candidate.stage}]` : "";
       const hold = candidate.holdReason ? ` | hold=${candidate.holdReason}` : "";
-      return `${candidate.setup ?? "SETUP"} ${candidate.direction ?? "DIR"}${stage} score=${candidate.score ?? "?"}${quality}${flags}${hold}`;
+      const intent = candidate.intentBucket ?? candidate.setup ?? "SETUP";
+      return `${intent} ${candidate.direction ?? "DIR"}${stage} score=${candidate.score ?? "?"}${quality}${flags}${hold}`;
     });
     return [title, ...lines].filter(Boolean);
   }
@@ -458,6 +475,7 @@ export class MessagePublisher {
 
   private formatBanner(event: DomainEvent, title: string): string {
     const marketState = this.formatMarketStateBlock(event.data.marketState);
+    const tacticalHeadline = this.formatTacticalHeadline(event.data.marketState);
     const timing = this.formatTimingBlock(event);
     const playState = this.formatPlayStateBlock(event);
     const topPlay = this.formatTopPlayBlock(event);
@@ -472,6 +490,7 @@ export class MessagePublisher {
     const decisionKind = event.data.decision?.kind;
     const sections = [
       `[${event.instanceId}] ${title}`,
+      ...(tacticalHeadline ? [tacticalHeadline] : []),
       ...marketState,
       ...(timing.length ? ["", ...timing] : []),
       ...(playState.length ? ["", ...playState] : []),

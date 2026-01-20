@@ -162,13 +162,12 @@ export function inferDirectionFromRecentBars(
     direction = undefined;
   }
 
-  // VWAP + EMA alignment veto (fast safety filter)
+  // VWAP + EMA alignment warning (context only, never veto direction)
   const last = window[window.length - 1]!;
   let veto: DirectionInference["veto"] | undefined;
   if (direction === "LONG" && vwap30 !== undefined) {
     const emaBearStack = ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : false;
     if (last.close < vwap30 && emaBearStack) {
-      direction = undefined;
       if (indicatorTf) {
         veto = { reason: "bear alignment veto (price<VWAP and EMA9<EMA20)", tf: indicatorTf, vwap: vwap30, ema9, ema20 };
       }
@@ -179,7 +178,6 @@ export function inferDirectionFromRecentBars(
     const strongDown = slopeAtr !== undefined ? slopeAtr <= -0.8 : slopePct <= -0.30;
     const downMomentumOk = strongDown && redRatio >= strongCandleRatio;
     if (last.close > vwap30 && emaBullStack && !downMomentumOk) {
-      direction = undefined;
       if (indicatorTf) {
         veto = { reason: "bull alignment veto (price>VWAP and EMA9>EMA20)", tf: indicatorTf, vwap: vwap30, ema9, ema20 };
       }
@@ -191,16 +189,6 @@ export function inferDirectionFromRecentBars(
   
   if (direction === undefined) {
     reasons.push("direction unclear");
-    // Check if veto was applied
-    if (vwap30 !== undefined && last.close !== undefined) {
-      const emaBearStack = ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : false;
-      const emaBullStack = ema9 !== undefined && ema20 !== undefined ? ema9 > ema20 : false;
-      if (last.close < vwap30 && emaBearStack) {
-        reasons.unshift(`veto: price<VWAP and EMA9<EMA20 (bear alignment) — block LONG tf=${indicatorTf ?? "unknown"}`);
-      } else if (last.close > vwap30 && emaBullStack) {
-        reasons.unshift(`veto: price>VWAP and EMA9>EMA20 (bull alignment) — block SHORT tf=${indicatorTf ?? "unknown"}`);
-      }
-    }
     if (slopeAtr !== undefined) {
       reasons.push(`slope=${slopeAtr.toFixed(2)} ATR (need |slope| >= 0.6)`);
     } else {

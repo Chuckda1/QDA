@@ -11,6 +11,19 @@ export interface IndicatorSnapshot {
 }
 
 export interface RuleScores {
+  tacticalSnapshot?: {
+    activeDirection?: "LONG" | "SHORT" | "NEUTRAL";
+    confidence?: number;
+    reasons?: string[];
+    tier?: string;
+    indicatorTf?: string;
+    confirm?: {
+      tf?: string;
+      bias?: "LONG" | "SHORT" | "NONE";
+      confidence?: number;
+      reasons?: string[];
+    };
+  };
   regime?: "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
   macroBias?: "LONG" | "SHORT" | "NEUTRAL";
   entryPermission?: "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
@@ -258,28 +271,29 @@ ${snapshotJson}
 \`\`\`
 
 YOUR TASK:
-Step 1) Determine biasDirection: Look at the market snapshot (recent bars, indicators, rule scores) and determine what direction the market actually favors (LONG, SHORT, or NEUTRAL). This is your independent assessment, not necessarily matching the proposed ${direction} direction.
+Step 1) Determine biasDirection from the Tactical Snapshot (ruleScores.tacticalSnapshot). This is the authoritative direction signal for the system. If it is NEUTRAL, you may keep biasDirection=NEUTRAL.
 
-Step 2) Determine what the RULES are implying: Look at ruleScores.regime, ruleScores.directionInference, and ruleScores.entryFilters. What direction do the rules suggest? What is their confidence?
+Step 2) Use ruleScores.regime and ruleScores.macroBias as CONTEXT ONLY. They must not veto direction or suppress candidates.
 
-Step 3) Compute agreement (0-100): how aligned your bias is with the rules.
+Step 3) Compute agreement (0-100): how aligned your bias is with the Tactical Snapshot.
 
-Step 3b) Validate the RULES setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
+Step 3b) Validate the setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
   - If intent is FADE (countertrend), be STRICT: default to WAIT or PASS unless the snapshot clearly shows a reversal trigger.
 
-Step 4) Assess legitimacy (0-100): How valid is this setup overall? Consider all factors: indicators, structure, regime, warnings.
+Step 4) Assess legitimacy (0-100): How valid is this setup overall? Consider all factors: indicators, structure, context, warnings.
 
 Step 5) Assess probability (0-100): Likelihood price reaches T1? Use the indicators and recent price action to inform this.
 
 Step 6) Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
+  - If the best candidate is counter to the Tactical Snapshot, prefer WAIT/PASS and call it out explicitly.
 
 Step 7) Provide reasoning (2-3 sentences): Explain your biasDirection, agreement level, and action choice. If you disagree with the proposed direction, say so explicitly.
 
 Step 8) Create a trade plan (entry strategy, position sizing, exit strategy)
 
-Step 9) Optional flags: List any warnings or concerns (e.g., ["high RSI", "regime mismatch"])
+Step 9) Optional flags: List any warnings or concerns (e.g., ["high RSI", "countertrend risk"])
 
-If multiple candidates are provided in the snapshot, rank them and select the best. Use:
+If multiple candidates are provided in the snapshot, rank them and select the best. Prefer candidates aligned with the Tactical Snapshot. Use:
 - selectedCandidateId: the chosen candidate id
 - rankedCandidateIds: ordered list best → worst
 

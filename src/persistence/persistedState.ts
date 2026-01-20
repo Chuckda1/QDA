@@ -1,4 +1,4 @@
-import type { Play, TimingStateContext } from "../types.js";
+import type { Play, SetupCandidate, TimingStateContext } from "../types.js";
 
 /**
  * Persisted state schema (versioned)
@@ -8,6 +8,8 @@ export interface PersistedBotStateV1 {
   instanceId: string;
   savedAt: number;
   activePlay: Play | null;
+  pendingCandidate?: SetupCandidate | null;
+  pendingCandidateExpiresAt?: number;
   timingState?: TimingStateContext;
   potd?: {
     bias: "LONG" | "SHORT" | "NONE";

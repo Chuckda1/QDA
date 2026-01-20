@@ -231,6 +231,7 @@ export class SetupEngine {
 
     const candidates: SetupCandidate[] = [];
     const enrichCandidate = (candidate: SetupCandidate): SetupCandidate => {
+      candidate.intentBucket = candidate.intentBucket ?? candidate.pattern;
       candidate.stage = candidate.stage ?? "READY";
       candidate.qualityTag = candidate.qualityTag ?? "OK";
       const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
@@ -310,6 +311,7 @@ export class SetupEngine {
       if (ctx.macroBias && candidate.direction !== ctx.macroBias && ctx.macroBias !== "NEUTRAL") flags.add("COUNTER_MACRO");
       if (!ctx.directionInference.direction) flags.add("LOW_CONFIDENCE");
       candidate.flags = Array.from(flags);
+      candidate.warningFlags = candidate.warningFlags ?? candidate.flags;
       return candidate;
     };
     const pushCandidate = (candidate: SetupCandidate) => {
@@ -321,6 +323,7 @@ export class SetupEngine {
       if (chaseRisk) {
         enriched.flags = [...(enriched.flags ?? []), "CHASE_RISK"];
       }
+      enriched.warningFlags = enriched.warningFlags ?? enriched.flags;
       candidates.push(enriched);
     };
 
@@ -545,6 +548,16 @@ export class SetupEngine {
       }
     }
 
+    if (candidates.length > 0 && candidates.length < 3) {
+      const early = this.buildEarlyCandidates(ctx, "low candidate density (visibility-first)");
+      const existingIds = new Set(candidates.map((c) => c.id));
+      for (const candidate of early) {
+        if (!existingIds.has(candidate.id)) {
+          pushCandidate(candidate);
+        }
+      }
+    }
+
     if (candidates.length === 0) {
       const early = this.buildEarlyCandidates(ctx, "no setup patterns matched");
       return { candidate: early[0], candidates: early, reason: "no setup patterns matched" };
@@ -599,6 +612,7 @@ export class SetupEngine {
           symbol,
           direction,
           pattern,
+          intentBucket: pattern,
           stage: "EARLY",
           holdReason,
           qualityTag: "LOW",
@@ -608,7 +622,8 @@ export class SetupEngine {
           targets,
           rationale: [`EARLY idea (${pattern})`, holdReason],
           score: { alignment: 20, structure: 20, quality: 25, total: 20 },
-          flags: ["EARLY_IDEA"]
+          flags: ["EARLY_IDEA"],
+          warningFlags: ["EARLY_IDEA"]
         });
         if (candidates.length >= 6) return candidates;
       }
@@ -806,6 +821,7 @@ export class SetupEngine {
       symbol,
       direction,
       pattern,
+      intentBucket: pattern,
       stage: "EARLY",
       holdReason,
       qualityTag: "LOW",
@@ -815,7 +831,8 @@ export class SetupEngine {
       targets,
       rationale: [`EARLY idea (${pattern})`, holdReason],
       score: { alignment: 20, structure: 20, quality: 25, total: 20 },
-      flags: ["EARLY_IDEA"]
+      flags: ["EARLY_IDEA"],
+      warningFlags: ["EARLY_IDEA"]
     };
   }
 

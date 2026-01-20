@@ -124,6 +124,8 @@ try {
 
 const orch = new Orchestrator(instanceId, llmService, {
   activePlay: persisted?.activePlay ?? null,
+  pendingCandidate: persisted?.pendingCandidate ?? null,
+  pendingCandidateExpiresAt: persisted?.pendingCandidateExpiresAt,
   potd: persisted?.potd,
   timingState: persisted?.timingState,
 });
@@ -213,6 +215,8 @@ setInterval(() => {
     instanceId,
     savedAt: Date.now(),
     activePlay: orch.getState().activePlay ?? null,
+    pendingCandidate: orch.getState().pendingCandidate ?? null,
+    pendingCandidateExpiresAt: orch.getState().pendingCandidateExpiresAt,
     timingState: orch.getState().timingState,
     potd: orch.getPotdState(),
     governor: governor.exportState(),
