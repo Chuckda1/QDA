@@ -78,7 +78,8 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
         alignment: d.potd.alignment
       } : null,
       direction: d.directionInference?.direction ?? null,
-      entryPermission: d.entryPermission ?? null
+      entryPermission: d.entryPermission ?? null,
+      candidateStats: d.candidateStats ?? null
     } : null
   };
   

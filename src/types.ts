@@ -18,6 +18,9 @@ export interface SetupCandidate {
   symbol: string;
   direction: Direction;
   pattern: SetupPattern;
+  stage?: "EARLY" | "READY" | "LATE";
+  holdReason?: string;
+  qualityTag?: "LOW" | "OK" | "HIGH";
   triggerPrice: number;
   entryZone: { low: number; high: number };
   stop: number;

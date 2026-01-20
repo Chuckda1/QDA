@@ -150,7 +150,8 @@ export class SetupEngine {
     const baseReasons: string[] = [];
 
     if (!bars || bars.length < 30) {
-      return { reason: "insufficient bars for setup detection (< 30)" };
+      const early = this.buildEarlyCandidates(ctx, "insufficient bars for setup detection (< 30)");
+      return { candidate: early[0], candidates: early, reason: "insufficient bars for setup detection (< 30)" };
     }
 
     const atr = indicators.atr ?? computeATR(bars, 14);
@@ -159,8 +160,14 @@ export class SetupEngine {
     const ema20 = indicators.ema20 ?? computeEMA(closes.slice(-80), 20);
     const vwap = indicators.vwap ?? computeVWAP(bars, 30);
 
-    if (!atr || atr <= 0) return { reason: "ATR unavailable; cannot size setup" };
-    if (ema9 === undefined || ema20 === undefined) return { reason: "EMA unavailable; cannot detect reclaim" };
+    if (!atr || atr <= 0) {
+      const early = this.buildEarlyCandidates(ctx, "ATR unavailable; cannot size setup");
+      return { candidate: early[0], candidates: early, reason: "ATR unavailable; cannot size setup" };
+    }
+    if (ema9 === undefined || ema20 === undefined) {
+      const early = this.buildEarlyCandidates(ctx, "EMA unavailable; cannot detect reclaim");
+      return { candidate: early[0], candidates: early, reason: "EMA unavailable; cannot detect reclaim" };
+    }
 
     const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
     const relVolume = computeRelVolume(bars, 20);
@@ -223,6 +230,8 @@ export class SetupEngine {
 
     const candidates: SetupCandidate[] = [];
     const enrichCandidate = (candidate: SetupCandidate): SetupCandidate => {
+      candidate.stage = candidate.stage ?? "READY";
+      candidate.qualityTag = candidate.qualityTag ?? "OK";
       const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
       const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
       const pullbackDepthAtr =
@@ -534,7 +543,8 @@ export class SetupEngine {
     }
 
     if (candidates.length === 0) {
-      return { reason: "no setup patterns matched", candidates: [] };
+      const early = this.buildEarlyCandidates(ctx, "no setup patterns matched");
+      return { candidate: early[0], candidates: early, reason: "no setup patterns matched" };
     }
 
     const byScore = [...candidates].sort((a, b) => b.score.total - a.score.total);
@@ -558,6 +568,51 @@ export class SetupEngine {
     return { candidate: preferred ?? byScore[0]!, candidates: byScore };
   }
 
+  private buildEarlyCandidates(ctx: SetupEngineContext, holdReason: string): SetupCandidate[] {
+    const { ts, symbol, currentPrice, directionInference, tacticalBias, indicators } = ctx;
+    const fallbackRisk = indicators.atr && indicators.atr > 0 ? indicators.atr * 0.5 : Math.max(0.1, currentPrice * 0.001);
+    const directions: Direction[] = [];
+    if (directionInference.direction) {
+      directions.push(directionInference.direction);
+    } else if (tacticalBias?.bias && tacticalBias.bias !== "NONE") {
+      directions.push(tacticalBias.bias);
+    } else {
+      directions.push("LONG", "SHORT");
+    }
+
+    const patterns: SetupPattern[] = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"];
+    const candidates: SetupCandidate[] = [];
+    for (const direction of directions) {
+      for (const pattern of patterns) {
+        const stop = direction === "LONG" ? currentPrice - fallbackRisk : currentPrice + fallbackRisk;
+        const entryZone = direction === "LONG"
+          ? { low: currentPrice - fallbackRisk * 0.25, high: currentPrice + fallbackRisk * 0.15 }
+          : { low: currentPrice - fallbackRisk * 0.15, high: currentPrice + fallbackRisk * 0.25 };
+        const entryMid = (entryZone.low + entryZone.high) / 2;
+        const targets = makeTargetsFromR(direction, entryMid, stop);
+        candidates.push({
+          id: `setup_${ts}_${pattern.toLowerCase()}_${direction.toLowerCase()}_early`,
+          ts,
+          symbol,
+          direction,
+          pattern,
+          stage: "EARLY",
+          holdReason,
+          qualityTag: "LOW",
+          triggerPrice: currentPrice,
+          entryZone,
+          stop,
+          targets,
+          rationale: [`EARLY idea (${pattern})`, holdReason],
+          score: { alignment: 20, structure: 20, quality: 25, total: 20 },
+          flags: ["EARLY_IDEA"]
+        });
+        if (candidates.length >= 6) return candidates;
+      }
+    }
+    return candidates;
+  }
+
   /**
    * Find PULLBACK_CONTINUATION pattern
    * Requirements:
@@ -576,7 +631,11 @@ export class SetupEngine {
     const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
 
     if (!atr || !ema9 || !ema20) {
-      return { reason: "Missing required indicators for pullback continuation" };
+      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+      const early = fallbackDir
+        ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Missing required indicators for pullback continuation")
+        : undefined;
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Missing required indicators for pullback continuation" };
     }
 
     // Determine direction from regime (TREND) or tactical bias (TRANSITION)
@@ -594,10 +653,18 @@ export class SetupEngine {
       if (tacticalOk && !structureOpposed) {
         direction = tacticalDir as Direction;
       } else {
-        return { reason: "Transition requires tactical bias + non-opposite structure" };
+        const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+        const early = fallbackDir
+          ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Transition requires tactical bias + non-opposite structure")
+          : undefined;
+        return { candidate: early, candidates: early ? [early] : undefined, reason: "Transition requires tactical bias + non-opposite structure" };
       }
     } else {
-      return { reason: "Regime/structure misalignment" };
+      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+      const early = fallbackDir
+        ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Regime/structure misalignment")
+        : undefined;
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Regime/structure misalignment" };
     }
 
     // Check EMA9 reclaim signal
@@ -606,7 +673,8 @@ export class SetupEngine {
       : currentPrice < ema9;
 
     if (!reclaimSignal) {
-      return { reason: `No EMA9 reclaim signal for ${direction}` };
+      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, `No EMA9 reclaim signal for ${direction}`);
+      return { candidate: early, candidates: early ? [early] : undefined, reason: `No EMA9 reclaim signal for ${direction}` };
     }
 
     // Find recent swing point for stop placement
@@ -623,7 +691,8 @@ export class SetupEngine {
     }
 
     if (swingPoint === undefined) {
-      return { reason: "Could not find swing point" };
+      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, "Could not find swing point");
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Could not find swing point" };
     }
 
     // Build entry zone (around current price, slightly wider for pullback)
@@ -642,11 +711,13 @@ export class SetupEngine {
     // Calculate risk (entryMid to stop)
     const risk = Math.abs(entryMid - stop);
     if (risk <= 0) {
-      return { reason: "Invalid risk calculation" };
+      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, "Invalid risk calculation");
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Invalid risk calculation" };
     }
     const riskAtr = risk / atr;
     if (riskAtr < 0.25 || riskAtr > 1.2) {
-      return { reason: `Risk/ATR out of bounds (${riskAtr.toFixed(2)})` };
+      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, `Risk/ATR out of bounds (${riskAtr.toFixed(2)})`);
+      return { candidate: early, candidates: early ? [early] : undefined, reason: `Risk/ATR out of bounds (${riskAtr.toFixed(2)})` };
     }
 
     // Build targets: 1R, 2R, 3R from entryMid
@@ -720,6 +791,41 @@ export class SetupEngine {
     return Math.min(100, score);
   }
 
+  private buildEarlyCandidateFromContext(
+    ctx: SetupEngineContext,
+    pattern: SetupPattern,
+    direction: Direction,
+    holdReason: string
+  ): SetupCandidate | undefined {
+    const { ts, symbol, currentPrice, indicators } = ctx;
+    const atr = indicators.atr ?? computeATR(ctx.bars, 14);
+    if (!atr || atr <= 0) return undefined;
+    const fallbackRisk = atr * 0.5;
+    const stop = direction === "LONG" ? currentPrice - fallbackRisk : currentPrice + fallbackRisk;
+    const entryZone = direction === "LONG"
+      ? { low: currentPrice - fallbackRisk * 0.25, high: currentPrice + fallbackRisk * 0.15 }
+      : { low: currentPrice - fallbackRisk * 0.15, high: currentPrice + fallbackRisk * 0.25 };
+    const entryMid = (entryZone.low + entryZone.high) / 2;
+    const targets = makeTargetsFromR(direction, entryMid, stop);
+    return {
+      id: `setup_${ts}_${pattern.toLowerCase()}_${direction.toLowerCase()}_early`,
+      ts,
+      symbol,
+      direction,
+      pattern,
+      stage: "EARLY",
+      holdReason,
+      qualityTag: "LOW",
+      triggerPrice: currentPrice,
+      entryZone,
+      stop,
+      targets,
+      rationale: [`EARLY idea (${pattern})`, holdReason],
+      score: { alignment: 20, structure: 20, quality: 25, total: 20 },
+      flags: ["EARLY_IDEA"]
+    };
+  }
+
   /**
    * Find VALUE_RECLAIM pattern
    * Requirements:
@@ -729,7 +835,7 @@ export class SetupEngine {
    * - Close back above/below EMA9 and hold 1-2 bars
    */
   private findValueReclaim(ctx: SetupEngineContext): SetupEngineResult {
-    const { ts, symbol, currentPrice, bars, regime, macroBias, indicators } = ctx;
+    const { ts, symbol, currentPrice, bars, regime, macroBias, indicators, directionInference, tacticalBias } = ctx;
     const atr = indicators.atr!;
     const ema9 = indicators.ema9!;
     const ema20 = indicators.ema20!;
@@ -737,17 +843,29 @@ export class SetupEngine {
     const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
 
     if (!atr || !ema9 || !ema20) {
-      return { reason: "Missing required indicators for value reclaim" };
+      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+      const early = fallbackDir
+        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Missing required indicators for value reclaim")
+        : undefined;
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Missing required indicators for value reclaim" };
     }
 
     if (bars.length < 6) {
-      return { reason: "Insufficient bars for value reclaim" };
+      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+      const early = fallbackDir
+        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Insufficient bars for value reclaim")
+        : undefined;
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Insufficient bars for value reclaim" };
     }
 
     const direction: Direction | undefined =
       macroBias === "LONG" ? "LONG" : macroBias === "SHORT" ? "SHORT" : undefined;
     if (!direction) {
-      return { reason: "Macro bias neutral - value reclaim skipped" };
+      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
+      const early = fallbackDir
+        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Macro bias neutral - value reclaim skipped")
+        : undefined;
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Macro bias neutral - value reclaim skipped" };
     }
 
     const bandLow = vwap !== undefined ? Math.min(vwap, ema20) : ema20;
@@ -767,7 +885,8 @@ export class SetupEngine {
       : last.close < ema9 && prev.close < ema9;
 
     if (!pulledIntoValue || !rejectionSignal || !emaHold) {
-      return { reason: "Value reclaim conditions not met" };
+      const early = this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", direction, "Value reclaim conditions not met");
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Value reclaim conditions not met" };
     }
 
     const triggerPrice = last.close;
@@ -778,7 +897,10 @@ export class SetupEngine {
       : recentSwingHigh(bars, swingLookback) + buffer;
 
     const risk = Math.abs(triggerPrice - stop);
-    if (risk <= 0) return { reason: "Invalid risk for value reclaim" };
+    if (risk <= 0) {
+      const early = this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", direction, "Invalid risk for value reclaim");
+      return { candidate: early, candidates: early ? [early] : undefined, reason: "Invalid risk for value reclaim" };
+    }
 
     const entryZone = direction === "LONG"
       ? { low: triggerPrice - 0.15 * risk, high: triggerPrice + 0.05 * risk }

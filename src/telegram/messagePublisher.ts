@@ -1,4 +1,4 @@
-import type { DomainEvent } from "../types.js";
+import type { DomainEvent, DomainEventType } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
@@ -8,6 +8,12 @@ import { orderEvents } from "./messageOrder.js";
 export class MessagePublisher {
   // STAGE 4: Single publish queue to serialize all messages
   private publishQueue: Promise<void> = Promise.resolve();
+  private publishState = new Map<string, { lastSentAt: number; lastSignature?: string; lastEntryPermission?: string; lastLlmBucket?: string; lastCandidateCount?: number }>();
+  private suppressCounters = {
+    suppressedByDedupe: 0,
+    suppressedByThrottle: 0,
+    publishedByException: 0,
+  };
 
   constructor(
     private governor: MessageGovernor,
@@ -27,6 +33,162 @@ export class MessagePublisher {
     const text = this.formatEvent(event);
     await sendTelegramMessageSafe(this.bot, this.chatId, text);
     return true;
+  }
+
+  private async publishWithControls(event: DomainEvent): Promise<boolean> {
+    const decision = this.shouldSuppressEvent(event);
+    if (decision.suppress) {
+      return false;
+    }
+    const sent = await this.publish(event);
+    if (sent) {
+      this.updatePublishState(event, decision.signature, decision.entryPermission, decision.llmBucket, decision.candidateCount);
+    }
+    return sent;
+  }
+
+  private reduceByPriority(events: DomainEvent[]): DomainEvent[] {
+    const priorityOrder: DomainEventType[] = [
+      "PLAY_ENTERED",
+      "PLAY_CLOSED",
+      "PLAY_ARMED",
+      "ENTRY_WINDOW_OPENED",
+      "LLM_PICK",
+      "SCORECARD",
+      "SETUP_CANDIDATES",
+      "NO_ENTRY",
+    ];
+    const byTs = new Map<number, DomainEvent[]>();
+    for (const event of events) {
+      const list = byTs.get(event.timestamp) ?? [];
+      list.push(event);
+      byTs.set(event.timestamp, list);
+    }
+    const reduced: DomainEvent[] = [];
+    for (const [_, group] of byTs.entries()) {
+      const sorted = orderEvents(group);
+      const highest = sorted.find((event) => priorityOrder.includes(event.type));
+      if (highest) {
+        reduced.push(highest);
+        for (const event of sorted) {
+          if (!priorityOrder.includes(event.type)) {
+            reduced.push(event);
+          }
+        }
+      } else {
+        reduced.push(...sorted);
+      }
+    }
+    return reduced;
+  }
+
+  private shouldSuppressEvent(event: DomainEvent): {
+    suppress: boolean;
+    signature?: string;
+    entryPermission?: string;
+    llmBucket?: string;
+    candidateCount?: number;
+  } {
+    const typesToControl: DomainEventType[] = ["SCORECARD", "NO_ENTRY", "LLM_PICK", "SETUP_CANDIDATES"];
+    if (!typesToControl.includes(event.type)) {
+      return { suppress: false };
+    }
+
+    const symbol = event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
+    const key = `${event.type}_${symbol}`;
+    const now = Date.now();
+    const state = this.publishState.get(key);
+
+    const entryPermission = event.data.rules?.entryPermission ?? event.data.entryPermission ?? "N/A";
+    const permissionBucket = entryPermission === "WAIT_FOR_PULLBACK" ? "WAIT_FOR_PULLBACK" : "CLEAR";
+    const llmProb = event.data.llm?.probability ?? event.data.probability ?? event.data.decision?.llm?.probability;
+    const llmBucket = Number.isFinite(llmProb)
+      ? llmProb >= 80
+        ? "80+"
+        : llmProb >= 60
+        ? "60-79"
+        : "<60"
+      : "N/A";
+    const candidateId =
+      event.data.topPlay?.id ??
+      event.data.selectedCandidateId ??
+      event.data.candidate?.id ??
+      event.data.playId ??
+      event.data.play?.id ??
+      "none";
+    const stage = event.data.topPlay?.stage ?? event.data.candidate?.stage ?? "READY";
+    const timingPhase = event.data.timing?.phase ?? event.data.timing?.state ?? "N/A";
+    const entryReady = timingPhase === "ENTRY_WINDOW";
+    const regime = event.data.marketState?.regime ?? "N/A";
+    const mode = event.data.marketState?.permission?.mode ?? "N/A";
+    const blockers = (event.data.decision?.blockers ?? event.data.blockerTags ?? []).slice(0, 2).sort().join(",");
+    const action = event.data.llm?.action ?? event.data.action ?? event.data.decision?.llm?.action ?? "N/A";
+    const signature = [
+      symbol,
+      candidateId,
+      stage,
+      permissionBucket,
+      timingPhase,
+      entryReady ? "READY" : "NOT_READY",
+      regime,
+      mode,
+      blockers,
+      action,
+      llmBucket,
+    ].join("|");
+
+    const candidateCount = Array.isArray(event.data.candidates) ? event.data.candidates.length : undefined;
+
+    const throttleMs =
+      event.type === "SCORECARD"
+        ? 4 * 60_000
+        : event.type === "NO_ENTRY"
+        ? 5 * 60_000
+        : event.type === "SETUP_CANDIDATES"
+        ? 3 * 60_000
+        : 3 * 60_000;
+
+    const exception =
+      (state?.lastEntryPermission && state.lastEntryPermission !== permissionBucket) ||
+      (state?.lastLlmBucket && state.lastLlmBucket !== llmBucket) ||
+      (typeof candidateCount === "number" && typeof state?.lastCandidateCount === "number" && candidateCount > state.lastCandidateCount);
+
+    if (exception) {
+      this.suppressCounters.publishedByException += 1;
+      return { suppress: false, signature, entryPermission: permissionBucket, llmBucket, candidateCount };
+    }
+
+    if (state?.lastSignature && state.lastSignature === signature) {
+      this.suppressCounters.suppressedByDedupe += 1;
+      console.log(`[PUB] suppressed ${event.type} (dedupe)`);
+      return { suppress: true };
+    }
+
+    if (state?.lastSentAt && now - state.lastSentAt < throttleMs) {
+      this.suppressCounters.suppressedByThrottle += 1;
+      console.log(`[PUB] suppressed ${event.type} (throttle)`);
+      return { suppress: true };
+    }
+
+    return { suppress: false, signature, entryPermission: permissionBucket, llmBucket, candidateCount };
+  }
+
+  private updatePublishState(
+    event: DomainEvent,
+    signature?: string,
+    entryPermission?: string,
+    llmBucket?: string,
+    candidateCount?: number
+  ): void {
+    const symbol = event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
+    const key = `${event.type}_${symbol}`;
+    this.publishState.set(key, {
+      lastSentAt: Date.now(),
+      lastSignature: signature,
+      lastEntryPermission: entryPermission,
+      lastLlmBucket: llmBucket,
+      lastCandidateCount: candidateCount,
+    });
   }
 
   /**
@@ -103,8 +265,9 @@ export class MessagePublisher {
       }
     }
 
+    const reducedEvents = this.reduceByPriority(events);
     // Sort events by priority (strict ordering)
-    const orderedEvents = orderEvents(events);
+    const orderedEvents = orderEvents(reducedEvents);
 
     // STAGE 4: Publish in strict order with logging
     const total = orderedEvents.length;
@@ -115,7 +278,7 @@ export class MessagePublisher {
       const startTime = Date.now();
       console.log(`[PUB] sending ${event.type} playId=${playId} idx=${idx + 1}/${total}`);
       
-      const sent = await this.publish(event);
+      const sent = await this.publishWithControls(event);
       const duration = Date.now() - startTime;
       
       if (sent) {
@@ -162,11 +325,17 @@ export class MessagePublisher {
     const planStatus = state.potd
       ? `Plan Status: ${state.potd.overridden ? "INVALIDATED by live regime" : "VALID"}${state.potd.alignment ? ` alignment=${state.potd.alignment}` : ""}`
       : undefined;
+    const dataLine = state.dataReadiness
+      ? state.dataReadiness.ready
+        ? `DATA: OK (bars=${state.dataReadiness.bars ?? "?"})`
+        : `DATA: WARMUP (missing: ${(state.dataReadiness.missing ?? []).join(", ") || "unknown"})`
+      : undefined;
     return [
       "MARKET STATE",
       `Regime: ${state.regime ?? "N/A"}${confidence}`,
       `Live Permission: ${longAllowed} / ${shortAllowed}`,
       `Mode: ${mode}`,
+      dataLine || "",
       tacticalLine || "",
       shockLine || "",
       state.reason ? `Reason: ${state.reason}` : "",
@@ -226,7 +395,9 @@ export class MessagePublisher {
     const lines = candidates.slice(0, 5).map((candidate: any) => {
       const flags = candidate.flags?.length ? ` | ${candidate.flags.join(", ")}` : "";
       const quality = candidate.quality ? ` ${candidate.quality}${candidate.qualityTag ? ` (${candidate.qualityTag})` : ""}` : "";
-      return `${candidate.setup ?? "SETUP"} ${candidate.direction ?? "DIR"} score=${candidate.score ?? "?"}${quality}${flags}`;
+      const stage = candidate.stage ? ` [${candidate.stage}]` : "";
+      const hold = candidate.holdReason ? ` | hold=${candidate.holdReason}` : "";
+      return `${candidate.setup ?? "SETUP"} ${candidate.direction ?? "DIR"}${stage} score=${candidate.score ?? "?"}${quality}${flags}${hold}`;
     });
     return [title, ...lines].filter(Boolean);
   }

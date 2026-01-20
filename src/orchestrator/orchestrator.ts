@@ -34,6 +34,14 @@ type SetupDiagnosticsSnapshot = {
   setupDebug?: any;
   entryFilterWarnings?: string[];
   entryPermission?: EntryPermission;
+  candidateStats?: {
+    candidateCount: number;
+    stageCounts?: Record<string, number>;
+    patternCounts?: Record<string, number>;
+    directionCounts?: Record<string, number>;
+    llmInvoked?: boolean;
+    lowContext?: boolean;
+  };
   potd?: {
     bias: PotdBias;
     confidence: number;
@@ -1317,6 +1325,18 @@ export class Orchestrator {
       const vwap = computeVWAP(this.recentBars5m, 30);
       const rsi14 = computeRSI(closes, 14);
       const ema20Slope5m = computeEmaSlopePct(closes, 20, 3);
+      const indicatorReadiness = {
+        hasBars: this.recentBars5m.length >= 30,
+        hasATR: !!atr && atr > 0,
+        hasEMA9: ema9 !== undefined,
+        hasEMA20: ema20 !== undefined,
+        hasVWAP: vwap !== undefined,
+        hasTimingInputs: (this.recentBars1m.length >= 6) || (this.recentBars5m.length >= 6),
+      };
+      const readinessMissing = Object.entries(indicatorReadiness)
+        .filter(([_, ok]) => !ok)
+        .map(([key]) => key.replace(/^has/, ""));
+      const readinessOk = readinessMissing.length === 0;
 
       let directionGate = directionGate15mMoreLeaning(
         anchorReady
@@ -1392,6 +1412,28 @@ export class Orchestrator {
       });
 
       const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
+      if (!readinessOk) {
+        const missingList = readinessMissing.join(", ");
+        for (const candidate of setupCandidates) {
+          candidate.stage = "EARLY";
+          candidate.qualityTag = "LOW";
+          candidate.holdReason = `WARMUP: missing ${missingList}`;
+          candidate.flags = [...(candidate.flags ?? []), "MISSING_INDICATORS"];
+        }
+      }
+      const stageCounts = setupCandidates.reduce<Record<string, number>>((acc, candidate) => {
+        const stage = candidate.stage ?? "READY";
+        acc[stage] = (acc[stage] ?? 0) + 1;
+        return acc;
+      }, {});
+      const patternCounts = setupCandidates.reduce<Record<string, number>>((acc, candidate) => {
+        acc[candidate.pattern] = (acc[candidate.pattern] ?? 0) + 1;
+        return acc;
+      }, {});
+      const directionCounts = setupCandidates.reduce<Record<string, number>>((acc, candidate) => {
+        acc[candidate.direction] = (acc[candidate.direction] ?? 0) + 1;
+        return acc;
+      }, {});
       const candidatePatterns = new Set(setupCandidates.map((candidate) => candidate.pattern));
       const candidateDirections = new Set(setupCandidates.map((candidate) => candidate.direction));
       const lowContextReasons: string[] = [];
@@ -1399,7 +1441,7 @@ export class Orchestrator {
       if (candidatePatterns.size < 2) lowContextReasons.push(`patternDiversity=${candidatePatterns.size}`);
       if (candidateDirections.size < 2) lowContextReasons.push(`directionDiversity=${candidateDirections.size}`);
       const lowContext = lowContextReasons.length > 0;
-      if (!setupResult.candidate) {
+      if (setupCandidates.length === 0) {
         this.lastDiagnostics = {
           ts,
           symbol,
@@ -1409,12 +1451,48 @@ export class Orchestrator {
           directionInference: dirInf,
           setupReason: setupResult.reason || "no setup pattern found",
           setupDebug: setupResult.debug,
+          candidateStats: {
+            candidateCount: 0,
+            stageCounts,
+            patternCounts,
+            directionCounts,
+            llmInvoked: false,
+            lowContext: lowContext,
+          },
           regimeEvidence: anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined ? {
             bullScore: anchorRegime.bullScore,
             bearScore: anchorRegime.bearScore,
           } : undefined,
         };
-        console.log(`[5m] No setup candidate: ${setupResult.reason || "unknown"}`);
+        console.log(`[5m] No setup candidates: ${setupResult.reason || "unknown"}`);
+        const topPlay = {
+          setup: "N/A",
+          direction: directionGate.allow ? directionGate.direction : "N/A",
+          score: 0,
+          quality: "D",
+          qualityTag: "No candidates",
+          armStatus: "NOT ARMED",
+          entryZone: undefined,
+          stop: undefined,
+          probability: undefined,
+          action: undefined
+        };
+        events.push(this.ev("SETUP_CANDIDATES", ts, {
+          symbol,
+          price: close,
+          topPlay,
+          candidates: [],
+          marketState,
+          timing: undefined,
+          decision: buildDecisionPayload({
+            kind: "GATE",
+            status: "NO_SETUP",
+            allowed: false,
+            rationale: [setupResult.reason || "no setup pattern found"]
+          }),
+          playState: "CANDIDATE",
+          notArmedReason: setupResult.reason || "no setup pattern found"
+        }));
         this.lastDecision = buildDecision({
           ts,
           symbol,
@@ -1515,6 +1593,11 @@ export class Orchestrator {
           shock: shockMode,
           shockReason: tacticalBiasInfo.shockReason,
         },
+        dataReadiness: {
+          ready: readinessOk,
+          missing: readinessMissing,
+          bars: this.recentBars5m.length,
+        },
         reason: [
           anchorRegime.reasons?.[0],
           `tactical=${tacticalBias}${tacticalBias !== "NONE" ? `(${tacticalBiasInfo.confidence}%, score=${tacticalBiasInfo.score})` : ""}`,
@@ -1549,6 +1632,14 @@ export class Orchestrator {
         candidate: setupCandidate,
         entryFilterWarnings: filterResult.warnings,
         entryPermission: filterResult.permission,
+        candidateStats: {
+          candidateCount: setupCandidates.length,
+          stageCounts,
+          patternCounts,
+          directionCounts,
+          llmInvoked: false,
+          lowContext: lowContext,
+        },
         potd: {
           bias: this.potdBias,
           confidence: this.potdConfidence,
@@ -1659,6 +1750,9 @@ export class Orchestrator {
         try {
           console.log(`[5m] Calling LLM for setup validation: ${setupCandidate.id}`);
           this.state.lastLLMCallAt = Date.now();
+          if (this.lastDiagnostics?.candidateStats) {
+            this.lastDiagnostics.candidateStats.llmInvoked = true;
+          }
 
           const sortedCandidates = setupCandidates
             .slice()
@@ -1842,6 +1936,11 @@ export class Orchestrator {
           blockerReasons.push(`LOW_CONTEXT: timing score >= ${minTimingScore} required (${Math.round(timingSignal.score)})`);
         }
       }
+      if (setupCandidate.stage === "EARLY" && timingSnapshot.phase === "ENTRY_WINDOW" && readinessOk) {
+        setupCandidate.stage = "READY";
+        setupCandidate.holdReason = undefined;
+        setupCandidate.qualityTag = setupCandidate.qualityTag ?? "OK";
+      }
 
       potdAlignment = !potdActive
         ? "OFF"
@@ -1858,6 +1957,15 @@ export class Orchestrator {
       const buildBlockers = (candidate: SetupCandidate) => {
         const nextBlockers: DecisionBlocker[] = [];
         const nextReasons: string[] = [];
+
+        if (candidate.stage === "EARLY") {
+          nextBlockers.push("guardrail");
+          nextReasons.push(`EARLY idea: ${candidate.holdReason ?? "waiting for timing"}`);
+        }
+        if (!readinessOk) {
+          nextBlockers.push("guardrail");
+          nextReasons.push(`DATA_WARMUP: missing ${readinessMissing.join(", ")}`);
+        }
 
         if (!directionGate.allow) {
           nextBlockers.push("guardrail");
@@ -2173,7 +2281,9 @@ export class Orchestrator {
             direction: candidate.direction,
             score: candidate.score.total,
             quality: candidateQuality.grade,
-            qualityTag: candidateQuality.tag,
+            qualityTag: candidate.qualityTag ?? candidateQuality.tag,
+            stage: candidate.stage,
+            holdReason: candidate.holdReason,
             entryZone: candidate.entryZone,
             stop: candidate.stop,
             flags: candidate.flags ?? [],
