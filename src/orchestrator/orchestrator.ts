@@ -1399,6 +1399,31 @@ export class Orchestrator {
         }
       }
 
+      const transitionLockActive = this.transitionLockRemaining > 0;
+      const shockMode = tacticalBiasInfo.shock;
+      const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
+        ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
+        : undefined;
+      const anchorProvisional = !anchorReady;
+      const permissionMode =
+        anchorRegime.regime === "CHOP" ||
+        anchorRegime.regime === "TRANSITION" ||
+        transitionLockActive ||
+        shockMode ||
+        anchorProvisional
+          ? "SCALP_ONLY"
+          : "SWING_ALLOWED";
+      const chopTransition = anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION";
+      const permission = chopTransition
+        ? { long: true, short: true, mode: "SCALP_ONLY" }
+        : directionGate.allow
+        ? {
+            long: directionGate.direction === "LONG",
+            short: directionGate.direction === "SHORT",
+            mode: permissionMode,
+          }
+        : { long: false, short: false, mode: "BLOCKED" };
+
       const setupResult = this.setupEngine.findSetup({
         ts,
         symbol,
@@ -1412,9 +1437,9 @@ export class Orchestrator {
       });
 
       const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
-      const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
-      const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
-      const potdAlignmentNoCandidate: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActive
+      const potdActivePre = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
+      const potdConfirmedPre = potdActivePre && macroBiasInfo.bias === this.potdBias;
+      const potdAlignmentNoCandidate: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActivePre
         ? "OFF"
         : "UNCONFIRMED";
       if (!readinessOk) {
@@ -1547,8 +1572,6 @@ export class Orchestrator {
       let blockerReasons: string[] = [];
       let guardrailBlockReason: string | undefined;
       let guardrailBlockTag: DecisionBlocker | undefined;
-      const transitionLockActive = this.transitionLockRemaining > 0;
-
       const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
       if (potdActive && this.potdMode === "PRIOR") {
@@ -1596,29 +1619,6 @@ export class Orchestrator {
         blockerReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
       }
 
-      const regimeConfidence = anchorRegime.bullScore !== undefined && anchorRegime.bearScore !== undefined
-        ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
-        : undefined;
-      const shockMode = tacticalBiasInfo.shock;
-      const anchorProvisional = !anchorReady;
-      const permissionMode =
-        anchorRegime.regime === "CHOP" ||
-        anchorRegime.regime === "TRANSITION" ||
-        transitionLockActive ||
-        shockMode ||
-        anchorProvisional
-          ? "SCALP_ONLY"
-          : "SWING_ALLOWED";
-      const chopTransition = anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION";
-      const permission = chopTransition
-        ? { long: true, short: true, mode: "SCALP_ONLY" }
-        : directionGate.allow
-        ? {
-            long: directionGate.direction === "LONG",
-            short: directionGate.direction === "SHORT",
-            mode: permissionMode,
-          }
-        : { long: false, short: false, mode: "BLOCKED" };
       const marketState = {
         regime: anchorRegime.regime,
         confidence: regimeConfidence,
