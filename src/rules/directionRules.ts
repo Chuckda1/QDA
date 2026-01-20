@@ -165,7 +165,9 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   }
   if (direction === "SHORT" && vwap30 !== undefined) {
     const emaBullStack = ema9 !== undefined && ema20 !== undefined ? ema9 > ema20 : false;
-    if (last.close > vwap30 && emaBullStack) {
+    const strongDown = slopeAtr !== undefined ? slopeAtr <= -0.8 : slopePct <= -0.30;
+    const downMomentumOk = strongDown && redRatio >= strongCandleRatio;
+    if (last.close > vwap30 && emaBullStack && !downMomentumOk) {
       direction = undefined;
     }
   }
