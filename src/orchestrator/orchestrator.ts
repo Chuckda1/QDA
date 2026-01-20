@@ -1412,6 +1412,11 @@ export class Orchestrator {
       });
 
       const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
+      const potdActive = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
+      const potdConfirmed = potdActive && macroBiasInfo.bias === this.potdBias;
+      const potdAlignmentNoCandidate: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActive
+        ? "OFF"
+        : "UNCONFIRMED";
       if (!readinessOk) {
         const missingList = readinessMissing.join(", ");
         for (const candidate of setupCandidates) {
@@ -1477,19 +1482,52 @@ export class Orchestrator {
           probability: undefined,
           action: undefined
         };
+        const marketStateForNoCandidates = {
+          regime: anchorRegime.regime,
+          confidence: regimeConfidence,
+          permission,
+          tacticalBias: {
+            bias: tacticalBias,
+            tier: tacticalBiasInfo.tier,
+            score: tacticalBiasInfo.score,
+            confidence: tacticalBiasInfo.confidence,
+            shock: shockMode,
+            shockReason: tacticalBiasInfo.shockReason,
+          },
+          dataReadiness: {
+            ready: readinessOk,
+            missing: readinessMissing,
+            bars: this.recentBars5m.length,
+          },
+          reason: [
+            anchorRegime.reasons?.[0],
+            `tactical=${tacticalBias}${tacticalBias !== "NONE" ? `(${tacticalBiasInfo.confidence}%, score=${tacticalBiasInfo.score})` : ""}`,
+            shockMode ? `shock mode: ${tacticalBiasInfo.shockReason ?? "range expansion"}` : undefined,
+            transitionLockActive ? `transition lock (${this.transitionLockRemaining}/${this.transitionLockBars})` : undefined,
+            directionGate.reason
+          ]
+            .filter(Boolean)
+            .join(" | "),
+          potd: {
+            bias: this.potdBias,
+            mode: this.potdMode,
+            alignment: potdAlignmentNoCandidate,
+            overridden: false,
+          }
+        };
         events.push(this.ev("SETUP_CANDIDATES", ts, {
           symbol,
           price: close,
           topPlay,
           candidates: [],
-          marketState,
+          marketState: marketStateForNoCandidates,
           timing: undefined,
-          decision: buildDecisionPayload({
+          decision: {
             kind: "GATE",
             status: "NO_SETUP",
             allowed: false,
             rationale: [setupResult.reason || "no setup pattern found"]
-          }),
+          },
           playState: "CANDIDATE",
           notArmedReason: setupResult.reason || "no setup pattern found"
         }));
@@ -1503,7 +1541,7 @@ export class Orchestrator {
         return events;
       }
 
-      let setupCandidate = setupResult.candidate;
+      let setupCandidate = setupResult.candidate ?? setupCandidates[0]!;
       let timingSnapshot: TimingSignal & { phase: TimingPhase; dir: Direction | "NONE"; phaseSinceTs: number; rawState: TimingSignal["state"] } | undefined;
       let blockers: DecisionBlocker[] = [];
       let blockerReasons: string[] = [];
