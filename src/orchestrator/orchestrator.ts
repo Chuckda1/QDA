@@ -1372,7 +1372,7 @@ export class Orchestrator {
       if (!dirInf.direction) {
         console.log(`[5m] Tactical direction unclear (continuing): ${dirInf.reasons.join(" | ")}`);
       }
-      const tacticalBiasInfo = {
+      const tacticalBiasInfo: ReturnType<typeof inferTacticalBiasFromRecentBars> = {
         bias: tacticalSnapshot.activeDirection === "NEUTRAL" ? "NONE" : tacticalSnapshot.activeDirection,
         tier: tacticalSnapshot.tier,
         score: tacticalSnapshot.score,
@@ -1403,7 +1403,7 @@ export class Orchestrator {
         .map(([key]) => key.replace(/^has/, ""));
       const readinessOk = readinessMissing.length === 0;
 
-      const tacticalBias = tacticalBiasInfo.bias;
+      const tacticalBias: Direction | "NONE" = tacticalBiasInfo.bias;
       const directionGate: DirectionGate = (() => {
         if (tacticalBias === "NONE" || tacticalBiasInfo.tier === "NONE") {
           return {
@@ -1416,7 +1416,7 @@ export class Orchestrator {
         return {
           allow: true,
           tier,
-          direction: tacticalBias,
+          direction: tacticalBias as Direction,
           reason: `tactical direction ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`
         };
       })();
@@ -1802,7 +1802,7 @@ export class Orchestrator {
         indicatorMetaLine,
         indicatorTfSummary,
         ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
-      ];
+      ].filter((warning): warning is string => Boolean(warning));
 
       const recentBarsForLLM = this.recentBars5m.slice(-20).map((b) => ({
         ts: b.ts,
@@ -2323,7 +2323,7 @@ export class Orchestrator {
         kind: "GATE" as const,
         allowed: decision.status === "ARMED",
         permission,
-        direction: tacticalSnapshot.activeDirection,
+        direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? "NONE" : tacticalSnapshot.activeDirection,
         gateTier: directionGate.allow ? (directionGate.tier === "LEANING" ? "LEANING" : "OPEN") : "STRICT",
         blockers: decision.blockers,
         blockerReasons: decision.blockerReasons,
@@ -2409,7 +2409,7 @@ export class Orchestrator {
         entryPermission: ruleScores.entryPermission,
         timingPhase: timingSnapshot?.phase ?? timingSnapshot?.state,
         directionBand: getDirectionConfidenceBand(dirInf.confidence),
-        direction: tacticalSnapshot.activeDirection,
+        direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? "NONE" : tacticalSnapshot.activeDirection,
         llmAction: decision.llm?.action,
         decisionStatus: decision.status
       };
