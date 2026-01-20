@@ -444,7 +444,7 @@ export class SetupEngine {
         ...(neutralAligned ? ["CHOP_CONTEXT"] : []),
       ];
       pushCandidate({
-        id: `setup_${ts}_breakretest_${direction.toLowerCase()}`,
+        id: `setup_${ts}_follow_${direction.toLowerCase()}`,
         ts,
         symbol,
         direction,

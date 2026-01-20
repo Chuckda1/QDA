@@ -343,6 +343,16 @@ export function inferTacticalBiasFromRecentBars(
   }
 
   if (slopeAtr !== undefined) {
+    if (slopeAtr <= -0.8 && redRatio >= relaxedCandleRatio) {
+      score -= 2;
+      reasons.push(`downMomentum=${slopeAtr.toFixed(2)} ATR`);
+    } else if (slopeAtr >= 0.8 && greenRatio >= relaxedCandleRatio) {
+      score += 2;
+      reasons.push(`upMomentum=${slopeAtr.toFixed(2)} ATR`);
+    }
+  }
+
+  if (slopeAtr !== undefined) {
     if (slopeAtr >= 0.5) {
       score += 1;
       reasons.push(`slope=${slopeAtr.toFixed(2)} ATR up`);
