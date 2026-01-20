@@ -7,10 +7,9 @@ export type PotdMode = "OFF" | "PRIOR" | "HARD";
 export type BotMode = "QUIET" | "ACTIVE";
 export type TradeAction = "GO_ALL_IN" | "SCALP" | "WAIT" | "PASS";
 export type SetupPattern =
-  | "PULLBACK_CONTINUATION"
-  | "BREAK_RETEST"
-  | "REVERSAL_ATTEMPT"
-  | "VALUE_RECLAIM";
+  | "FOLLOW"
+  | "RECLAIM"
+  | "FADE";
 
 export interface SetupCandidate {
   id: string;

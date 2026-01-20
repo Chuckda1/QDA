@@ -136,9 +136,9 @@ function computeVwapSlopeAtr(bars: OHLCVBar[], vwapPeriod: number, lookbackBars:
  * SetupEngine: Deterministic pattern detection for trading setups
  * 
  * Implements three patterns:
- * 1. PULLBACK_CONTINUATION: Trend continuation after pullback
- * 2. BREAK_RETEST: Breakout above/below level, retest, then reclaim
- * 3. REVERSAL_ATTEMPT: Countertrend reversal (oversold bounce / overbought fade)
+ * 1. FOLLOW: Trend continuation after pullback or break-retest
+ * 2. RECLAIM: VWAP/value reclaim or reject
+ * 3. FADE: Mean reversion / exhaustion
  */
 export class SetupEngine {
   /**
@@ -322,7 +322,7 @@ export class SetupEngine {
       candidates.push(enriched);
     };
 
-    // Try PULLBACK_CONTINUATION pattern
+    // Try FOLLOW pattern (trend continuation)
     const pullbackResult = this.findPullbackContinuation({
       ts,
       symbol,
@@ -336,7 +336,7 @@ export class SetupEngine {
       pushCandidate(pullbackResult.candidate);
     }
 
-    // Try VALUE_RECLAIM pattern (high-expectancy pullback reclaim)
+    // Try RECLAIM pattern (high-expectancy value reclaim)
     const valueReclaimResult = this.findValueReclaim({
       ts,
       symbol,
@@ -345,6 +345,7 @@ export class SetupEngine {
       regime,
       macroBias: ctx.macroBias,
       directionInference,
+      tacticalBias: ctx.tacticalBias,
       indicators: { atr, ema9, ema20, vwap }
     });
     if (valueReclaimResult.candidate) {
@@ -352,7 +353,7 @@ export class SetupEngine {
     }
 
     // -------------------------
-    // Pattern 2: BREAK_RETEST (trend)
+    // Pattern 2: FOLLOW (break-retest)
     // -------------------------
     for (const direction of ["LONG", "SHORT"] as const) {
       // Require regime OR structure alignment for trend patterns.
@@ -364,9 +365,8 @@ export class SetupEngine {
       const chopAligned = chopOverride && chopOverrideDirection === direction;
       const neutralAligned = regime.regime === "CHOP" || regime.regime === "TRANSITION";
 
-      if (!(regimeAligned || structureAligned || chopAligned || neutralAligned)) continue;
 
-      const pattern: SetupPattern = "BREAK_RETEST";
+      const pattern: SetupPattern = "FOLLOW";
       const reasons = [
         ...baseReasons,
         `pattern=${pattern}`,
@@ -438,6 +438,11 @@ export class SetupEngine {
       );
       const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
 
+      const alignmentFlags = [
+        ...(regimeAligned ? [] : ["COUNTER_REGIME"]),
+        ...(structureAligned ? [] : ["COUNTER_STRUCTURE"]),
+        ...(neutralAligned ? ["CHOP_CONTEXT"] : []),
+      ];
       pushCandidate({
         id: `setup_${ts}_breakretest_${direction.toLowerCase()}`,
         ts,
@@ -449,15 +454,16 @@ export class SetupEngine {
         stop,
         targets,
         rationale: reasons,
+        flags: alignmentFlags.length ? alignmentFlags : undefined,
         score: { alignment: Math.round(alignment), structure: Math.round(structureScore), quality: Math.round(quality), total }
       });
     }
 
     // -------------------------
-    // Pattern 3: REVERSAL_ATTEMPT (countertrend)
+    // Pattern 3: FADE (countertrend)
     // -------------------------
     {
-      const pattern: SetupPattern = "REVERSAL_ATTEMPT";
+      const pattern: SetupPattern = "FADE";
       const reasons = [...baseReasons, `pattern=${pattern}`, "countertrend=true"];
 
       const rsi = indicators.rsi14 ?? computeRSI(closes, 14);
@@ -468,15 +474,10 @@ export class SetupEngine {
     // In TREND_DOWN: look for oversold bounce attempt (LONG)
     // In TREND_UP: look for overbought fade attempt (SHORT)
       // In CHOP: allow either extreme (lower confidence)
-      const reversalDirections: Array<{ direction: Direction; needRsi: number }> =
-        regime.regime === "TREND_DOWN"
-          ? [{ direction: "LONG", needRsi: 35 }]
-          : regime.regime === "TREND_UP"
-          ? [{ direction: "SHORT", needRsi: 65 }]
-          : [
-              { direction: "LONG", needRsi: 30 },
-              { direction: "SHORT", needRsi: 70 },
-            ];
+      const reversalDirections: Array<{ direction: Direction; needRsi: number }> = [
+        { direction: "LONG", needRsi: regime.regime === "TREND_DOWN" ? 35 : 30 },
+        { direction: "SHORT", needRsi: regime.regime === "TREND_UP" ? 65 : 70 },
+      ];
 
       for (const rd of reversalDirections) {
         const direction = rd.direction;
@@ -558,11 +559,11 @@ export class SetupEngine {
 
     let preferred: SetupCandidate | undefined;
     if (regime.regime === "TREND_UP" || regime.regime === "TREND_DOWN") {
-      preferred = pickByPreference(["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM", "REVERSAL_ATTEMPT"]);
+      preferred = pickByPreference(["FOLLOW", "RECLAIM", "FADE"]);
     } else if (regime.regime === "TRANSITION") {
-      preferred = pickByPreference(["BREAK_RETEST", "VALUE_RECLAIM", "PULLBACK_CONTINUATION", "REVERSAL_ATTEMPT"]);
+      preferred = pickByPreference(["RECLAIM", "FOLLOW", "FADE"]);
     } else {
-      preferred = pickByPreference(["BREAK_RETEST", "VALUE_RECLAIM", "REVERSAL_ATTEMPT", "PULLBACK_CONTINUATION"]);
+      preferred = pickByPreference(["RECLAIM", "FOLLOW", "FADE"]);
     }
 
     return { candidate: preferred ?? byScore[0]!, candidates: byScore };
@@ -580,7 +581,7 @@ export class SetupEngine {
       directions.push("LONG", "SHORT");
     }
 
-    const patterns: SetupPattern[] = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"];
+    const patterns: SetupPattern[] = ["FOLLOW", "RECLAIM", "FADE"];
     const candidates: SetupCandidate[] = [];
     for (const direction of directions) {
       for (const pattern of patterns) {
@@ -614,10 +615,9 @@ export class SetupEngine {
   }
 
   /**
-   * Find PULLBACK_CONTINUATION pattern
+   * Find FOLLOW pattern
    * Requirements:
-   * - Regime alignment (BULL for LONG, BEAR for SHORT)
-   * - Structure alignment (BULLISH for LONG, BEARISH for SHORT)
+   * - Tactical bias or direction inference provides direction
    * - EMA9 reclaim signal (price above EMA9 for LONG, below for SHORT)
    * - Recent swing point for stop placement
    */
@@ -633,39 +633,29 @@ export class SetupEngine {
     if (!atr || !ema9 || !ema20) {
       const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
       const early = fallbackDir
-        ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Missing required indicators for pullback continuation")
+        ? this.buildEarlyCandidateFromContext(ctx, "FOLLOW", fallbackDir, "Missing required indicators for follow setup")
         : undefined;
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Missing required indicators for pullback continuation" };
     }
 
-    // Determine direction from regime (TREND) or tactical bias (TRANSITION)
-    let direction: Direction | undefined;
-    if (regime.regime === "TREND_UP" && structure.structure === "BULLISH") {
-      direction = "LONG";
-    } else if (regime.regime === "TREND_DOWN" && structure.structure === "BEARISH") {
-      direction = "SHORT";
-    } else if (regime.regime === "TRANSITION") {
-      const tacticalDir = tacticalBias?.bias;
-      const tacticalOk = tacticalDir && tacticalDir !== "NONE" && tacticalBias?.tier !== "NONE";
-      const structureOpposed =
-        (tacticalDir === "LONG" && structure.structure === "BEARISH") ||
-        (tacticalDir === "SHORT" && structure.structure === "BULLISH");
-      if (tacticalOk && !structureOpposed) {
-        direction = tacticalDir as Direction;
-      } else {
-        const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
-        const early = fallbackDir
-          ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Transition requires tactical bias + non-opposite structure")
-          : undefined;
-        return { candidate: early, candidates: early ? [early] : undefined, reason: "Transition requires tactical bias + non-opposite structure" };
-      }
-    } else {
-      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
-      const early = fallbackDir
-        ? this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", fallbackDir, "Regime/structure misalignment")
-        : undefined;
-      return { candidate: early, candidates: early ? [early] : undefined, reason: "Regime/structure misalignment" };
+    const direction: Direction | undefined =
+      tacticalBias?.bias && tacticalBias.bias !== "NONE" && tacticalBias.tier !== "NONE"
+        ? tacticalBias.bias
+        : directionInference.direction;
+    if (!direction) {
+      return { candidate: undefined, candidates: undefined, reason: "No tactical bias or direction inference" };
     }
+    const structureOpposed =
+      (direction === "LONG" && structure.structure === "BEARISH") ||
+      (direction === "SHORT" && structure.structure === "BULLISH");
+    const regimeOpposed =
+      (direction === "LONG" && regime.regime === "TREND_DOWN") ||
+      (direction === "SHORT" && regime.regime === "TREND_UP");
+    const contextFlags = [
+      ...(structureOpposed ? ["COUNTER_STRUCTURE"] : []),
+      ...(regimeOpposed ? ["COUNTER_REGIME"] : []),
+      ...((regime.regime === "CHOP" || regime.regime === "TRANSITION") ? ["CHOP_CONTEXT"] : []),
+    ];
 
     // Check EMA9 reclaim signal
     const reclaimSignal = direction === "LONG"
@@ -673,7 +663,7 @@ export class SetupEngine {
       : currentPrice < ema9;
 
     if (!reclaimSignal) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, `No EMA9 reclaim signal for ${direction}`);
+      const early = this.buildEarlyCandidateFromContext(ctx, "FOLLOW", direction, `No EMA9 reclaim signal for ${direction}`);
       return { candidate: early, candidates: early ? [early] : undefined, reason: `No EMA9 reclaim signal for ${direction}` };
     }
 
@@ -691,7 +681,7 @@ export class SetupEngine {
     }
 
     if (swingPoint === undefined) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, "Could not find swing point");
+      const early = this.buildEarlyCandidateFromContext(ctx, "FOLLOW", direction, "Could not find swing point");
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Could not find swing point" };
     }
 
@@ -711,12 +701,12 @@ export class SetupEngine {
     // Calculate risk (entryMid to stop)
     const risk = Math.abs(entryMid - stop);
     if (risk <= 0) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, "Invalid risk calculation");
+      const early = this.buildEarlyCandidateFromContext(ctx, "FOLLOW", direction, "Invalid risk calculation");
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Invalid risk calculation" };
     }
     const riskAtr = risk / atr;
     if (riskAtr < 0.25 || riskAtr > 1.2) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "PULLBACK_CONTINUATION", direction, `Risk/ATR out of bounds (${riskAtr.toFixed(2)})`);
+      const early = this.buildEarlyCandidateFromContext(ctx, "FOLLOW", direction, `Risk/ATR out of bounds (${riskAtr.toFixed(2)})`);
       return { candidate: early, candidates: early ? [early] : undefined, reason: `Risk/ATR out of bounds (${riskAtr.toFixed(2)})` };
     }
 
@@ -744,12 +734,13 @@ export class SetupEngine {
       ts,
       symbol,
       direction,
-      pattern: "PULLBACK_CONTINUATION",
+      pattern: "FOLLOW",
       triggerPrice: currentPrice,
       entryZone,
       stop,
       targets,
       rationale,
+      flags: contextFlags.length ? [...(contextFlags ?? [])] : undefined,
       score: {
         alignment: alignmentScore,
         structure: structureScore,
@@ -827,15 +818,15 @@ export class SetupEngine {
   }
 
   /**
-   * Find VALUE_RECLAIM pattern
+   * Find RECLAIM pattern
    * Requirements:
-   * - Macro bias aligns (LONG bias for LONG reclaim, SHORT bias for SHORT reclaim)
+   * - Tactical bias or direction inference provides direction
    * - Price pulls into VWAP/EMA20 band
    * - Higher low / lower high signal (rejection)
    * - Close back above/below EMA9 and hold 1-2 bars
    */
   private findValueReclaim(ctx: SetupEngineContext): SetupEngineResult {
-    const { ts, symbol, currentPrice, bars, regime, macroBias, indicators, directionInference, tacticalBias } = ctx;
+    const { ts, symbol, currentPrice, bars, regime, indicators, directionInference, tacticalBias } = ctx;
     const atr = indicators.atr!;
     const ema9 = indicators.ema9!;
     const ema20 = indicators.ema20!;
@@ -845,7 +836,7 @@ export class SetupEngine {
     if (!atr || !ema9 || !ema20) {
       const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
       const early = fallbackDir
-        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Missing required indicators for value reclaim")
+        ? this.buildEarlyCandidateFromContext(ctx, "RECLAIM", fallbackDir, "Missing required indicators for reclaim setup")
         : undefined;
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Missing required indicators for value reclaim" };
     }
@@ -853,19 +844,15 @@ export class SetupEngine {
     if (bars.length < 6) {
       const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
       const early = fallbackDir
-        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Insufficient bars for value reclaim")
+        ? this.buildEarlyCandidateFromContext(ctx, "RECLAIM", fallbackDir, "Insufficient bars for reclaim setup")
         : undefined;
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Insufficient bars for value reclaim" };
     }
 
     const direction: Direction | undefined =
-      macroBias === "LONG" ? "LONG" : macroBias === "SHORT" ? "SHORT" : undefined;
+      tacticalBias?.bias && tacticalBias.bias !== "NONE" ? tacticalBias.bias : directionInference.direction;
     if (!direction) {
-      const fallbackDir = directionInference.direction ?? (tacticalBias?.bias !== "NONE" ? tacticalBias?.bias : undefined);
-      const early = fallbackDir
-        ? this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", fallbackDir, "Macro bias neutral - value reclaim skipped")
-        : undefined;
-      return { candidate: early, candidates: early ? [early] : undefined, reason: "Macro bias neutral - value reclaim skipped" };
+      return { candidate: undefined, candidates: undefined, reason: "No tactical bias or direction inference" };
     }
 
     const bandLow = vwap !== undefined ? Math.min(vwap, ema20) : ema20;
@@ -885,7 +872,7 @@ export class SetupEngine {
       : last.close < ema9 && prev.close < ema9;
 
     if (!pulledIntoValue || !rejectionSignal || !emaHold) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", direction, "Value reclaim conditions not met");
+      const early = this.buildEarlyCandidateFromContext(ctx, "RECLAIM", direction, "Reclaim conditions not met");
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Value reclaim conditions not met" };
     }
 
@@ -898,7 +885,7 @@ export class SetupEngine {
 
     const risk = Math.abs(triggerPrice - stop);
     if (risk <= 0) {
-      const early = this.buildEarlyCandidateFromContext(ctx, "VALUE_RECLAIM", direction, "Invalid risk for value reclaim");
+      const early = this.buildEarlyCandidateFromContext(ctx, "RECLAIM", direction, "Invalid risk for reclaim");
       return { candidate: early, candidates: early ? [early] : undefined, reason: "Invalid risk for value reclaim" };
     }
 
@@ -909,7 +896,9 @@ export class SetupEngine {
     const targets = makeTargetsFromR(direction, entryMid, stop);
 
     const alignment = clamp(
-      (direction === "LONG" && macroBias === "LONG") || (direction === "SHORT" && macroBias === "SHORT") ? 85 : 60,
+      tacticalBias?.bias && tacticalBias.bias !== "NONE"
+        ? (tacticalBias.bias === direction ? 85 : 60)
+        : directionInference.confidence ?? 60,
       0,
       100
     );
@@ -926,8 +915,9 @@ export class SetupEngine {
     const total = Math.round(0.45 * alignment + 0.25 * structureScore + 0.30 * quality);
 
     const rationale = [
-      `pattern=VALUE_RECLAIM`,
-      `macroBias=${macroBias}`,
+      `pattern=RECLAIM`,
+      `tacticalBias=${tacticalBias?.bias ?? "N/A"}`,
+      `dirInf=${directionInference.direction ?? "N/A"}(${directionInference.confidence ?? 0})`,
       `valueBand=${bandLow.toFixed(2)}-${bandHigh.toFixed(2)}`,
       `rejection=${rejectionSignal}`,
       `emaHold=${emaHold}`,
@@ -940,7 +930,7 @@ export class SetupEngine {
         ts,
         symbol,
         direction,
-        pattern: "VALUE_RECLAIM",
+        pattern: "RECLAIM",
         triggerPrice,
         entryZone,
         stop,

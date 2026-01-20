@@ -6,7 +6,7 @@ import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
-import { computeMacroBias, computeRegime, regimeAllowsDirection, type RegimeOptions } from "../rules/regimeRules.js";
+import { computeMacroBias, computeRegime, type RegimeOptions } from "../rules/regimeRules.js";
 import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
@@ -70,6 +70,16 @@ type TickSnapshot = TickInput & {
   timeframe: "1m" | "5m" | "15m";
 };
 
+type ScorecardSnapshot = {
+  topPlayKey: string;
+  entryPermission?: EntryPermission;
+  timingPhase?: string;
+  directionBand: "LOW" | "MID" | "HIGH" | "UNKNOWN";
+  direction?: Direction | "NONE";
+  llmAction?: TradeAction;
+  decisionStatus?: string;
+};
+
 type ConfirmBar = {
   ts: number;
   close: number;
@@ -90,85 +100,11 @@ function computeEmaSlopePct(closes: number[], period: number, lookbackBars: numb
   return ((emaNow - emaPast) / emaPast) * 100;
 }
 
-function directionGate15mMoreLeaning(input: {
-  close15m: number;
-  vwap15m?: number;
-  ema9_15m?: number;
-  ema20_15m?: number;
-  structure15m?: "BULLISH" | "BEARISH" | "MIXED" | "CHOP";
-  vwapSlope15m?: number;
-  ema20Slope15m?: number;
-}): DirectionGate {
-  const { close15m, vwap15m, ema9_15m, ema20_15m, structure15m, vwapSlope15m, ema20Slope15m } = input;
-
-  if (vwap15m === undefined || ema9_15m === undefined || ema20_15m === undefined) {
-    return { allow: false, tier: "NONE", reason: "Direction gate: missing VWAP/EMA inputs" };
-  }
-
-  const onVwapLong = close15m > vwap15m;
-  const onVwapShort = close15m < vwap15m;
-
-  const emaLong = ema9_15m > ema20_15m;
-  const emaShort = ema9_15m < ema20_15m;
-
-  const structureBull = structure15m === "BULLISH";
-  const structureBear = structure15m === "BEARISH";
-
-  const slopeBull =
-    (vwapSlope15m !== undefined && vwapSlope15m > 0) ||
-    (ema20Slope15m !== undefined && ema20Slope15m > 0);
-
-  const slopeBear =
-    (vwapSlope15m !== undefined && vwapSlope15m < 0) ||
-    (ema20Slope15m !== undefined && ema20Slope15m < 0);
-
-  const longCore2 = onVwapLong && emaLong;
-  const shortCore2 = onVwapShort && emaShort;
-
-  if (longCore2 && (structureBull || slopeBull)) {
-    return {
-      allow: true,
-      tier: "LOCKED",
-      direction: "LONG",
-      reason: `LOCKED LONG: VWAP side + EMA stack + ${(structureBull ? "structure" : "slope")} confirm`
-    };
-  }
-
-  if (shortCore2 && (structureBear || slopeBear)) {
-    return {
-      allow: true,
-      tier: "LOCKED",
-      direction: "SHORT",
-      reason: `LOCKED SHORT: VWAP side + EMA stack + ${(structureBear ? "structure" : "slope")} confirm`
-    };
-  }
-
-  const longOpposed = structureBear;
-  const shortOpposed = structureBull;
-
-  if (onVwapLong && !longOpposed && (emaLong || slopeBull || structureBull)) {
-    return {
-      allow: true,
-      tier: "LEANING",
-      direction: "LONG",
-      reason: "LEANING LONG: on correct VWAP side; not opposed; EMA/slope/structure supportive"
-    };
-  }
-
-  if (onVwapShort && !shortOpposed && (emaShort || slopeBear || structureBear)) {
-    return {
-      allow: true,
-      tier: "LEANING",
-      direction: "SHORT",
-      reason: "LEANING SHORT: on correct VWAP side; not opposed; EMA/slope/structure supportive"
-    };
-  }
-
-  return {
-    allow: false,
-    tier: "NONE",
-    reason: `Direction unclear/contested: close=${close15m.toFixed(2)} vwap=${vwap15m.toFixed(2)} ema9=${ema9_15m.toFixed(2)} ema20=${ema20_15m.toFixed(2)} structure=${structure15m ?? "?"}`
-  };
+function getDirectionConfidenceBand(confidence?: number): "LOW" | "MID" | "HIGH" | "UNKNOWN" {
+  if (!Number.isFinite(confidence)) return "UNKNOWN";
+  if ((confidence ?? 0) >= 70) return "HIGH";
+  if ((confidence ?? 0) >= 55) return "MID";
+  return "LOW";
 }
 
 const REGIME_15M_FAST_OPTIONS: Partial<RegimeOptions> = {
@@ -202,6 +138,7 @@ export class Orchestrator {
   private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
   private lastSetupSummary5mTs: number | null = null;
   private lastDecision: AuthoritativeDecision | null = null;
+  private lastScorecardSnapshot: ScorecardSnapshot | null = null;
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
@@ -747,12 +684,12 @@ export class Orchestrator {
       blockers?: string[];
       blockerReasons?: string[];
       rationale?: string[];
-      permissionMode?: "SCALP_ONLY" | "SWING_ALLOWED" | "BLOCKED";
+      permissionMode?: "SCALP_ONLY" | "NORMAL" | "REDUCE_SIZE" | "WATCH_ONLY";
     }) => {
       const permission = {
         long: play.direction === "LONG",
         short: play.direction === "SHORT",
-        mode: params.permissionMode ?? (play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED")
+        mode: params.permissionMode ?? (play.tier === "LEANING" ? "SCALP_ONLY" : "NORMAL")
       };
       return {
         decisionId: `${play.symbol}_${ts}_${play.id}`,
@@ -790,7 +727,7 @@ export class Orchestrator {
           permission: {
             long: play.direction === "LONG",
             short: play.direction === "SHORT",
-            mode: play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED"
+            mode: play.tier === "LEANING" ? "SCALP_ONLY" : "NORMAL"
           },
           direction: play.direction,
           gateTier: "STRICT",
@@ -1017,7 +954,7 @@ export class Orchestrator {
       // Set cooldown after play closed
       this.cooldownAfterPlayClosed = Date.now();
       // INVARIANT: PLAY_CLOSED must have matching active play (verified - we have play)
-      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
+      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "NORMAL";
       events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
         symbol: play.symbol,
@@ -1055,7 +992,7 @@ export class Orchestrator {
 
       if (confirm.ok) {
         play.mode = "FULL";
-        const sizedPermissionMode = "SWING_ALLOWED";
+        const sizedPermissionMode = "NORMAL";
         events.push(this.ev("PLAY_SIZED_UP", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -1073,7 +1010,7 @@ export class Orchestrator {
         }));
       } else if (confirm.shouldCancel) {
         play.status = "CLOSED";
-        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
+        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "NORMAL";
         events.push(this.ev("PLAY_CLOSED", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -1338,66 +1275,23 @@ export class Orchestrator {
         .map(([key]) => key.replace(/^has/, ""));
       const readinessOk = readinessMissing.length === 0;
 
-      let directionGate = directionGate15mMoreLeaning(
-        anchorReady
-          ? {
-              close15m: this.last15mClose ?? close,
-              vwap15m: this.last15mVwap ?? anchorRegime.vwap,
-              ema9_15m: this.last15mEma9,
-              ema20_15m: this.last15mEma20,
-              structure15m: this.last15mStructure ?? anchorRegime.structure,
-              vwapSlope15m: this.last15mVwapSlopePct ?? anchorRegime.vwapSlopePct,
-              ema20Slope15m: this.last15mEma20Slope,
-            }
-          : {
-              close15m: close,
-              vwap15m: vwap ?? anchorRegime.vwap,
-              ema9_15m: ema9,
-              ema20_15m: ema20,
-              structure15m: anchorRegime.structure,
-              vwapSlope15m: anchorRegime.vwapSlopePct,
-              ema20Slope15m: ema20Slope5m,
-            }
-      );
-
       const tacticalBias = tacticalBiasInfo.bias;
-      const potdDirection: Direction | undefined =
-        this.potdBias === "LONG" || this.potdBias === "SHORT" ? this.potdBias : undefined;
-      const potdActiveForGate = this.potdMode !== "OFF" && !!potdDirection && this.potdConfidence > 0;
-      if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
-        const tacticalTierOk = tacticalBiasInfo.tier !== "NONE";
-        if (!tacticalTierOk) {
-          if (potdActiveForGate) {
-            directionGate = {
-              allow: true,
-              tier: "LEANING",
-              direction: potdDirection,
-              reason: `POTD bias ${this.potdBias} (tactical unclear; scalp-only)`,
-            };
-          } else {
-            directionGate = {
-              allow: false,
-              tier: "NONE",
-              reason: `tactical bias not clear (tier=${tacticalBiasInfo.tier})`,
-            };
-          }
-        } else {
-          if (tacticalBias === "NONE") {
-            directionGate = {
-              allow: false,
-              tier: "NONE",
-              reason: "tactical bias not clear (bias=NONE)",
-            };
-          } else {
-          directionGate = {
-            allow: true,
-            tier: "LEANING",
-            direction: tacticalBias,
-            reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`,
+      const directionGate = (() => {
+        if (tacticalBias === "NONE" || tacticalBiasInfo.tier === "NONE") {
+          return {
+            allow: false,
+            tier: "NONE" as const,
+            reason: `tactical bias unclear (${tacticalBiasInfo.tier})`
           };
-          }
         }
-      }
+        const tier = tacticalBiasInfo.tier === "CLEAR" ? "LOCKED" : "LEANING";
+        return {
+          allow: true,
+          tier,
+          direction: tacticalBias,
+          reason: `tactical bias ${tacticalBias} (${tacticalBiasInfo.tier}, ${tacticalBiasInfo.confidence}%)${tacticalBiasInfo.shock ? " | shock mode" : ""}`
+        };
+      })();
 
       const transitionLockActive = this.transitionLockRemaining > 0;
       const shockMode = tacticalBiasInfo.shock;
@@ -1405,24 +1299,16 @@ export class Orchestrator {
         ? Math.round(Math.max(anchorRegime.bullScore, anchorRegime.bearScore) / 3 * 100)
         : undefined;
       const anchorProvisional = !anchorReady;
-      const permissionMode =
-        anchorRegime.regime === "CHOP" ||
-        anchorRegime.regime === "TRANSITION" ||
-        transitionLockActive ||
-        shockMode ||
-        anchorProvisional
-          ? "SCALP_ONLY"
-          : "SWING_ALLOWED";
-      const chopTransition = anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION";
-      const permission = chopTransition
-        ? { long: true, short: true, mode: "SCALP_ONLY" }
-        : directionGate.allow
-        ? {
-            long: directionGate.direction === "LONG",
-            short: directionGate.direction === "SHORT",
-            mode: permissionMode,
-          }
-        : { long: false, short: false, mode: "BLOCKED" };
+      const permissionMode: "SCALP_ONLY" | "NORMAL" | "REDUCE_SIZE" | "WATCH_ONLY" = (() => {
+        if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") return "SCALP_ONLY";
+        if (shockMode || transitionLockActive || anchorProvisional) return "REDUCE_SIZE";
+        return "NORMAL";
+      })();
+      const permission = {
+        long: true,
+        short: true,
+        mode: permissionMode,
+      };
 
       const setupResult = this.setupEngine.findSetup({
         ts,
@@ -1590,34 +1476,7 @@ export class Orchestrator {
         : "COUNTERTREND";
       let potdCountertrend = potdConfirmed && setupCandidate.direction !== this.potdBias;
 
-      if (setupCandidate.pattern !== "REVERSAL_ATTEMPT") {
-        if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
-          if (tacticalBiasInfo.tier === "NONE") {
-            if (!(potdActive && setupCandidate.direction === this.potdBias)) {
-              blockers.push("chop");
-              blockerReasons.push(`blocked: CHOP/TRANSITION requires tactical bias (tier=${tacticalBiasInfo.tier})`);
-            }
-          } else if (setupCandidate.direction !== tacticalBias) {
-            blockers.push("guardrail");
-            blockerReasons.push(`blocked: tactical bias ${tacticalBias} only`);
-          }
-        } else {
-          const regimeCheck = regimeAllowsDirection(anchorRegime.regime, setupCandidate.direction);
-          if (!regimeCheck.allowed) {
-            blockers.push("guardrail");
-            blockerReasons.push(regimeCheck.reason);
-          }
-        }
-      }
-
-      if (macroBiasInfo.bias === "LONG" && setupCandidate.direction === "SHORT" && anchorRegime.regime !== "TREND_DOWN") {
-        blockers.push("guardrail");
-        blockerReasons.push("bias gate: 15m bias LONG blocks SHORT setups until 15m turns");
-      }
-      if (macroBiasInfo.bias === "SHORT" && setupCandidate.direction === "LONG" && anchorRegime.regime !== "TREND_UP") {
-        blockers.push("guardrail");
-        blockerReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
-      }
+      // Direction gating is handled by tactical bias; regime/macro is risk-mode only.
 
       const marketState = {
         regime: anchorRegime.regime,
@@ -2056,35 +1915,6 @@ export class Orchestrator {
           nextReasons.push(`POTD hard mode: ${this.potdBias} only (manual override required)`);
         }
 
-        if (candidate.pattern !== "REVERSAL_ATTEMPT") {
-          if (anchorRegime.regime === "CHOP" || anchorRegime.regime === "TRANSITION") {
-            if (tacticalBiasInfo.tier === "NONE") {
-              if (!(potdActive && candidate.direction === this.potdBias)) {
-                nextBlockers.push("chop");
-                nextReasons.push(`blocked: CHOP/TRANSITION requires tactical bias (tier=${tacticalBiasInfo.tier})`);
-              }
-            } else if (candidate.direction !== tacticalBias) {
-              nextBlockers.push("guardrail");
-              nextReasons.push(`blocked: tactical bias ${tacticalBias} only`);
-            }
-          } else {
-            const regimeCheck = regimeAllowsDirection(anchorRegime.regime, candidate.direction);
-            if (!regimeCheck.allowed) {
-              nextBlockers.push("guardrail");
-              nextReasons.push(regimeCheck.reason);
-            }
-          }
-        }
-
-        if (macroBiasInfo.bias === "LONG" && candidate.direction === "SHORT" && anchorRegime.regime !== "TREND_DOWN") {
-          nextBlockers.push("guardrail");
-          nextReasons.push("bias gate: 15m bias LONG blocks SHORT setups until 15m turns");
-        }
-        if (macroBiasInfo.bias === "SHORT" && candidate.direction === "LONG" && anchorRegime.regime !== "TREND_UP") {
-          nextBlockers.push("guardrail");
-          nextReasons.push("bias gate: 15m bias SHORT blocks LONG setups until 15m turns");
-        }
-
         if (llmErrorReason) {
           nextBlockers.push("arming_failed");
           nextReasons.push(llmErrorReason);
@@ -2208,7 +2038,7 @@ export class Orchestrator {
 
       const distanceToVwap = vwap !== undefined && atr ? Math.abs(close - vwap) : undefined;
       const atrSlopeRising = anchorRegime.atrSlope !== undefined && anchorRegime.atrSlope > 0;
-      const patternAllowsAllIn = ["PULLBACK_CONTINUATION", "BREAK_RETEST", "VALUE_RECLAIM"].includes(setupCandidate.pattern);
+      const patternAllowsAllIn = ["FOLLOW", "RECLAIM"].includes(setupCandidate.pattern);
       const chaseRisk = setupCandidate.flags?.includes("CHASE_RISK") ?? false;
       const goAllInAllowed = distanceToVwap !== undefined && atr
         ? distanceToVwap <= 0.8 * atr && !atrSlopeRising && patternAllowsAllIn && !chaseRisk && !potdCountertrend
@@ -2369,27 +2199,38 @@ export class Orchestrator {
         }));
       }
 
-      events.push(this.ev("SCORECARD", ts, {
-        playId: setupCandidate.id,
-        symbol: setupCandidate.symbol,
-        proposedDirection: setupCandidate.direction,
-        price: close,
-        setup: {
-          pattern: setupCandidate.pattern,
-          triggerPrice: setupCandidate.triggerPrice,
-          stop: setupCandidate.stop
-        },
-        rules: rulesSnapshot,
-        llm: decision.llm,
-        decision: decisionSummary,
-        marketState,
-        timing: timingSnapshot,
-        topPlay,
-        blockerTags: blockers,
-        blockerReasons,
-        playState: "CANDIDATE",
-        notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
-      }));
+      const scorecardSnapshot: ScorecardSnapshot = {
+        topPlayKey: `${topPlay.setup ?? "N/A"}|${topPlay.direction ?? "N/A"}|${Math.round(topPlay.score ?? 0)}`,
+        entryPermission: ruleScores.entryPermission,
+        timingPhase: timingSnapshot?.phase ?? timingSnapshot?.state,
+        directionBand: getDirectionConfidenceBand(dirInf.confidence),
+        direction: dirInf.direction ?? "NONE",
+        llmAction: decision.llm?.action,
+        decisionStatus: decision.status
+      };
+      if (this.shouldPublishScorecard(scorecardSnapshot)) {
+        events.push(this.ev("SCORECARD", ts, {
+          playId: setupCandidate.id,
+          symbol: setupCandidate.symbol,
+          proposedDirection: setupCandidate.direction,
+          price: close,
+          setup: {
+            pattern: setupCandidate.pattern,
+            triggerPrice: setupCandidate.triggerPrice,
+            stop: setupCandidate.stop
+          },
+          rules: rulesSnapshot,
+          llm: decision.llm,
+          decision: decisionSummary,
+          marketState,
+          timing: timingSnapshot,
+          topPlay,
+          blockerTags: blockers,
+          blockerReasons,
+          playState: "CANDIDATE",
+          notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
+        }));
+      }
 
       if (decision.status !== "ARMED") {
         events.push(this.ev("NO_ENTRY", ts, {
@@ -2558,7 +2399,7 @@ export class Orchestrator {
             permission: {
               long: play.direction === "LONG",
               short: play.direction === "SHORT",
-              mode: play.tier === "LEANING" ? "SCALP_ONLY" : "SWING_ALLOWED"
+              mode: play.tier === "LEANING" ? "SCALP_ONLY" : "NORMAL"
             },
             direction: play.direction,
             rationale: ["armed coaching update"]
@@ -2660,7 +2501,7 @@ export class Orchestrator {
       play.stopHit = true;
       play.status = "CLOSED";
       const reason = `Exhaustion exit: ${exhaustionSignals.join(", ")}`;
-      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
+      const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "NORMAL";
       events.push(this.ev("PLAY_CLOSED", ts, {
         playId: play.id,
         symbol: play.symbol,
@@ -2729,8 +2570,6 @@ export class Orchestrator {
       if (vwapLoss) triggers.push("VWAP_LOSS");
     }
     const regimeNow = computeRegime(bars5m, close);
-    const regimePermission = regimeAllowsDirection(regimeNow.regime, play.direction);
-    if (!regimePermission.allowed) triggers.push("PERMISSION_FLIP_AGAINST_TRADE");
 
     const triggerCooldownMs = 10 * 60_000;
     const tierA = new Set(["STOP_THREATENED", "TARGET_HIT", "PLAY_SIZED_UP", "PERMISSION_FLIP_AGAINST_TRADE"]);
@@ -2874,7 +2713,7 @@ export class Orchestrator {
 
         // Emit LLM_COACH_UPDATE only if materially changed OR cooldown expired
         // (For now, emit every 5m bar - you can add material change detection later)
-        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "SWING_ALLOWED";
+        const playPermissionMode = play.mode === "SCOUT" ? "SCALP_ONLY" : "NORMAL";
         events.push(this.ev("LLM_COACH_UPDATE", ts, {
           playId: play.id,
           symbol: play.symbol,
@@ -2969,6 +2808,26 @@ export class Orchestrator {
     }
 
     return events;
+  }
+
+  private shouldPublishScorecard(next: ScorecardSnapshot): boolean {
+    if (!this.lastScorecardSnapshot) {
+      this.lastScorecardSnapshot = next;
+      return true;
+    }
+    const prev = this.lastScorecardSnapshot;
+    const changed =
+      prev.topPlayKey !== next.topPlayKey ||
+      prev.entryPermission !== next.entryPermission ||
+      prev.timingPhase !== next.timingPhase ||
+      prev.directionBand !== next.directionBand ||
+      prev.direction !== next.direction ||
+      prev.llmAction !== next.llmAction ||
+      prev.decisionStatus !== next.decisionStatus;
+    if (changed) {
+      this.lastScorecardSnapshot = next;
+    }
+    return changed;
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {

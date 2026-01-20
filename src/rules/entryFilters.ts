@@ -212,8 +212,8 @@ export class EntryFilters {
 
     // Skip this filter for break/breakdown style setups
     if (
-      setupPattern === "BREAK_RETEST" ||
-      setupPattern === "REVERSAL_ATTEMPT" ||
+      setupPattern === "RECLAIM" ||
+      setupPattern === "FADE" ||
       setupFlags?.includes("CHOP_OVERRIDE")
     ) {
       return { allowed: true, permission: "ALLOWED" };

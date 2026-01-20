@@ -265,7 +265,7 @@ Step 2) Determine what the RULES are implying: Look at ruleScores.regime, ruleSc
 Step 3) Compute agreement (0-100): how aligned your bias is with the rules.
 
 Step 3b) Validate the RULES setupCandidate: do the proposed levels/pattern make sense given the snapshot? You MUST set action=PASS if invalid.
-   - If pattern is REVERSAL_ATTEMPT (countertrend), be STRICT: default to WAIT or PASS unless the snapshot clearly shows a reversal trigger.
+  - If intent is FADE (countertrend), be STRICT: default to WAIT or PASS unless the snapshot clearly shows a reversal trigger.
 
 Step 4) Assess legitimacy (0-100): How valid is this setup overall? Consider all factors: indicators, structure, regime, warnings.
 
