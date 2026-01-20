@@ -1,6 +1,6 @@
 import type { Bias, Direction, SetupCandidate, SetupPattern } from "../types.js";
 import type { OHLCVBar } from "../utils/indicators.js";
-import { computeATR, computeEMA, computeVWAP, computeRSI } from "../utils/indicators.js";
+import { computeATR, computeEMA, computeRSI, computeSessionVWAP, computeVWAP } from "../utils/indicators.js";
 import type { RegimeResult } from "./regimeRules.js";
 import type { StructureResult } from "../utils/structure.js";
 import type { DirectionInference, TacticalBias } from "./directionRules.js";
@@ -15,6 +15,7 @@ export interface SetupEngineContext {
   directionInference: DirectionInference;
   tacticalBias?: Pick<TacticalBias, "bias" | "tier">;
   indicators: {
+    tf?: "1m" | "5m";
     atr?: number;
     ema9?: number;
     ema20?: number;
@@ -158,7 +159,7 @@ export class SetupEngine {
     const closes = bars.map((b) => b.close);
     const ema9 = indicators.ema9 ?? computeEMA(closes.slice(-60), 9);
     const ema20 = indicators.ema20 ?? computeEMA(closes.slice(-80), 20);
-    const vwap = indicators.vwap ?? computeVWAP(bars, 30);
+    const vwap = indicators.vwap ?? computeSessionVWAP(bars);
 
     if (!atr || atr <= 0) {
       const early = this.buildEarlyCandidates(ctx, "ATR unavailable; cannot size setup");
@@ -222,7 +223,7 @@ export class SetupEngine {
     if (ctx.macroBias) {
       baseReasons.push(`macroBias=${ctx.macroBias}`);
     }
-    baseReasons.push(`ema9=${ema9.toFixed(2)} ema20=${ema20.toFixed(2)} atr=${atr.toFixed(2)}`);
+    baseReasons.push(`ema9=${ema9.toFixed(2)} ema20=${ema20.toFixed(2)} atr=${atr.toFixed(2)} tf=${indicators.tf ?? "unknown"}`);
     if (vwap !== undefined) baseReasons.push(`vwap=${vwap.toFixed(2)} vwapSlope=${regime.vwapSlope ?? "N/A"}`);
     baseReasons.push(
       `dirInf=${directionInference.direction ?? "N/A"} conf=${directionInference.confidence ?? 0} (${(directionInference.reasons ?? []).join(" | ")})`
@@ -306,7 +307,8 @@ export class SetupEngine {
         flags.add("LATE_ENTRY");
       }
       if (regime.regime === "CHOP" || regime.regime === "TRANSITION") flags.add("CHOP_RISK");
-      if (ctx.macroBias && candidate.direction !== ctx.macroBias && ctx.macroBias !== "NEUTRAL") flags.add("COUNTER_ANCHOR");
+      if (ctx.macroBias && candidate.direction !== ctx.macroBias && ctx.macroBias !== "NEUTRAL") flags.add("COUNTER_MACRO");
+      if (!ctx.directionInference.direction) flags.add("LOW_CONFIDENCE");
       candidate.flags = Array.from(flags);
       return candidate;
     };

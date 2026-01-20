@@ -40,6 +40,14 @@ export interface SetupCandidate {
     risk?: number;
   };
   featureBundle?: {
+    indicators?: {
+      ema9_1m?: number;
+      ema20_1m?: number;
+      vwap_1m?: number;
+      ema9_5m?: number;
+      ema20_5m?: number;
+      vwap_5m?: number;
+    };
     location?: {
       priceVsVWAP?: { atR?: number };
       priceVsEMA20?: { atR?: number };

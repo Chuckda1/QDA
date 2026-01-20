@@ -9,6 +9,7 @@ import type { Direction, EntryPermission, SetupPattern } from "../types.js";
 import { getETClock } from "../utils/timeUtils.js";
 
 export interface IndicatorData {
+  tf?: "1m" | "5m";
   vwap?: number;
   ema20?: number;
   ema9?: number;
@@ -194,7 +195,7 @@ export class EntryFilters {
       return {
         allowed: false,
         permission: "WAIT_FOR_PULLBACK",
-        reason: `WAIT_FOR_PULLBACK: extended-from-mean (${issues.join("; ")}). ${rearmHint}`
+        reason: `WAIT_FOR_PULLBACK: extended-from-mean (${issues.join("; ")}). ${rearmHint} tf=${indicators?.tf ?? "unknown"}`
       };
     }
 

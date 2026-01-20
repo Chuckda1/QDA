@@ -1,3 +1,5 @@
+import { etToUtcTimestamp, getETParts } from "./timeUtils.js";
+
 export type OHLCVBar = {
   ts: number;
   open?: number;
@@ -89,6 +91,36 @@ export function computeVWAP(bars: OHLCVBar[], period: number): number | undefine
     return undefined;
   }
 
+  return totalPriceVolume / totalVolume;
+}
+
+export function computeSessionVWAP(bars: OHLCVBar[]): number | undefined {
+  if (!bars.length) {
+    return undefined;
+  }
+  const lastTs = bars[bars.length - 1]!.ts;
+  const lastDate = new Date(lastTs);
+  const sessionStartTs = etToUtcTimestamp(9, 30, lastDate);
+  const sessionEndTs = etToUtcTimestamp(16, 0, lastDate);
+  const { weekday } = getETParts(lastDate);
+  if (weekday === 0 || weekday === 6) {
+    return undefined;
+  }
+
+  let totalVolume = 0;
+  let totalPriceVolume = 0;
+  for (const bar of bars) {
+    if (bar.ts < sessionStartTs || bar.ts >= sessionEndTs) continue;
+    const vol = bar.volume ?? 0;
+    if (vol <= 0) continue;
+    const typicalPrice = (bar.high + bar.low + bar.close) / 3;
+    totalVolume += vol;
+    totalPriceVolume += typicalPrice * vol;
+  }
+
+  if (totalVolume === 0) {
+    return undefined;
+  }
   return totalPriceVolume / totalVolume;
 }
 

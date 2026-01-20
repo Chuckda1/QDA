@@ -1,11 +1,13 @@
 import type { Direction } from "../types.js";
 import type { OHLCVBar } from "../utils/indicators.js";
-import { computeATR, computeEMA, computeVWAP } from "../utils/indicators.js";
+import { computeATR, computeEMA, computeSessionVWAP } from "../utils/indicators.js";
 
 export interface DirectionInference {
   direction: Direction | undefined;
   confidence: number; // 0-100
   reasons: string[];
+  indicatorTf?: "1m" | "5m";
+  veto?: { reason: string; tf: "1m" | "5m"; vwap?: number; ema9?: number; ema20?: number };
 }
 
 export interface TacticalBias {
@@ -16,6 +18,7 @@ export interface TacticalBias {
   reasons: string[];
   shock: boolean;
   shockReason?: string;
+  indicatorTf?: "1m" | "5m";
 }
 
 /**
@@ -30,7 +33,10 @@ function pctMove(from: number, to: number): number {
  * Infer trading direction from recent 1m bars
  * Returns LONG, SHORT, or undefined (unclear)
  */
-export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInference {
+export function inferDirectionFromRecentBars(
+  bars: OHLCVBar[],
+  opts?: { indicators?: { vwap?: number; ema9?: number; ema20?: number; tf: "1m" | "5m" } }
+): DirectionInference {
   if (!bars || bars.length < 6) {
     return {
       direction: undefined,
@@ -48,9 +54,10 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
   const firstClose = closes[0]!;
 
   const atr14 = computeATR(bars, 14);
-  const ema9 = computeEMA(bars.slice(-30).map((b) => b.close), 9);
-  const ema20 = computeEMA(bars.slice(-60).map((b) => b.close), 20);
-  const vwap30 = computeVWAP(bars, 30);
+  const ema9 = opts?.indicators?.ema9 ?? computeEMA(bars.slice(-30).map((b) => b.close), 9);
+  const ema20 = opts?.indicators?.ema20 ?? computeEMA(bars.slice(-60).map((b) => b.close), 20);
+  const vwap30 = opts?.indicators?.vwap ?? computeSessionVWAP(bars);
+  const indicatorTf = opts?.indicators?.tf;
 
   const slope = lastClose - firstClose;
   const slopePct = pctMove(firstClose, lastClose);
@@ -157,10 +164,14 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
 
   // VWAP + EMA alignment veto (fast safety filter)
   const last = window[window.length - 1]!;
+  let veto: DirectionInference["veto"] | undefined;
   if (direction === "LONG" && vwap30 !== undefined) {
     const emaBearStack = ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : false;
     if (last.close < vwap30 && emaBearStack) {
       direction = undefined;
+      if (indicatorTf) {
+        veto = { reason: "bear alignment veto (price<VWAP and EMA9<EMA20)", tf: indicatorTf, vwap: vwap30, ema9, ema20 };
+      }
     }
   }
   if (direction === "SHORT" && vwap30 !== undefined) {
@@ -169,6 +180,9 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
     const downMomentumOk = strongDown && redRatio >= strongCandleRatio;
     if (last.close > vwap30 && emaBullStack && !downMomentumOk) {
       direction = undefined;
+      if (indicatorTf) {
+        veto = { reason: "bull alignment veto (price>VWAP and EMA9>EMA20)", tf: indicatorTf, vwap: vwap30, ema9, ema20 };
+      }
     }
   }
 
@@ -182,9 +196,9 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
       const emaBearStack = ema9 !== undefined && ema20 !== undefined ? ema9 < ema20 : false;
       const emaBullStack = ema9 !== undefined && ema20 !== undefined ? ema9 > ema20 : false;
       if (last.close < vwap30 && emaBearStack) {
-        reasons.unshift("veto: price<VWAP and EMA9<EMA20 (bear alignment) — block LONG");
+        reasons.unshift(`veto: price<VWAP and EMA9<EMA20 (bear alignment) — block LONG tf=${indicatorTf ?? "unknown"}`);
       } else if (last.close > vwap30 && emaBullStack) {
-        reasons.unshift("veto: price>VWAP and EMA9>EMA20 (bull alignment) — block SHORT");
+        reasons.unshift(`veto: price>VWAP and EMA9>EMA20 (bull alignment) — block SHORT tf=${indicatorTf ?? "unknown"}`);
       }
     }
     if (slopeAtr !== undefined) {
@@ -245,7 +259,7 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
     confidence = Math.min(100, Math.max(0, Math.round(confidence)));
   }
 
-  return { direction, confidence, reasons };
+  return { direction, confidence, reasons, indicatorTf, veto };
 }
 
 /**
@@ -254,7 +268,7 @@ export function inferDirectionFromRecentBars(bars: OHLCVBar[]): DirectionInferen
  */
 export function inferTacticalBiasFromRecentBars(
   bars: OHLCVBar[],
-  opts?: { lookback?: number }
+  opts?: { lookback?: number; indicators?: { vwap?: number; ema9?: number; ema20?: number; tf: "1m" | "5m" } }
 ): TacticalBias {
   if (!bars || bars.length < 6) {
     return {
@@ -274,9 +288,10 @@ export function inferTacticalBiasFromRecentBars(
   const first = window[0]!;
 
   const atr14 = computeATR(bars, 14);
-  const ema9 = computeEMA(bars.slice(-30).map((b) => b.close), 9);
-  const ema20 = computeEMA(bars.slice(-60).map((b) => b.close), 20);
-  const vwap30 = computeVWAP(bars, 30);
+  const ema9 = opts?.indicators?.ema9 ?? computeEMA(bars.slice(-30).map((b) => b.close), 9);
+  const ema20 = opts?.indicators?.ema20 ?? computeEMA(bars.slice(-60).map((b) => b.close), 20);
+  const vwap30 = opts?.indicators?.vwap ?? computeSessionVWAP(bars);
+  const indicatorTf = opts?.indicators?.tf;
 
   const slope = last.close - first.close;
   const slopeAtr = atr14 && atr14 > 0 ? slope / atr14 : undefined;
@@ -400,6 +415,7 @@ export function inferTacticalBiasFromRecentBars(
     confidence,
     reasons,
     shock,
-    shockReason
+    shockReason,
+    indicatorTf
   };
 }

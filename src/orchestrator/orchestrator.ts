@@ -7,7 +7,7 @@ import { inferDirectionFromRecentBars, inferTacticalBiasFromRecentBars } from ".
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
 import { computeMacroBias, computeRegime, type RegimeOptions } from "../rules/regimeRules.js";
-import { computeATR, computeBollingerBands, computeEMA, computeVWAP, computeRSI, type OHLCVBar } from "../utils/indicators.js";
+import { computeATR, computeBollingerBands, computeEMA, computeRSI, computeSessionVWAP, computeVWAP, type OHLCVBar } from "../utils/indicators.js";
 import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
@@ -98,6 +98,25 @@ function computeEmaSlopePct(closes: number[], period: number, lookbackBars: numb
   const emaPast = computeEMA(pastCloses, period);
   if (emaNow === undefined || emaPast === undefined || emaPast === 0) return undefined;
   return ((emaNow - emaPast) / emaPast) * 100;
+}
+
+function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
+  tf: "1m" | "5m";
+  vwap?: number;
+  ema9?: number;
+  ema20?: number;
+  atr?: number;
+  rsi14?: number;
+} {
+  const closes = bars.map((b) => b.close);
+  return {
+    tf,
+    vwap: bars.length >= 30 ? computeSessionVWAP(bars) : undefined,
+    ema9: closes.length >= 9 ? computeEMA(closes.slice(-60), 9) : undefined,
+    ema20: closes.length >= 20 ? computeEMA(closes.slice(-80), 20) : undefined,
+    atr: bars.length >= 15 ? computeATR(bars, 14) : undefined,
+    rsi14: closes.length >= 15 ? computeRSI(closes, 14) : undefined,
+  };
 }
 
 function getDirectionConfidenceBand(confidence?: number): "LOW" | "MID" | "HIGH" | "UNKNOWN" {
@@ -578,7 +597,7 @@ export class Orchestrator {
             close,
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
-            directionInference: inferDirectionFromRecentBars(this.recentBars1m),
+            directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
             setupReason: `data gap: ${gapMinutes} min gap detected, resetting history`,
             datafeedIssue: `time gap: ${gapMinutes} minutes (${gapMs}ms)`,
           };
@@ -621,7 +640,7 @@ export class Orchestrator {
             close,
             regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
             macroBias: this.lastMacroBias,
-            directionInference: inferDirectionFromRecentBars(this.recentBars1m),
+            directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
             setupReason: `insufficient OHLC: missing ${missing.join(", ")}`,
             datafeedIssue: `missing OHLC fields: ${missing.join(", ")}`,
           };
@@ -655,7 +674,7 @@ export class Orchestrator {
           close,
           regime: this.lastRegime15m ?? computeRegime(this.recentBars1m, close),
           macroBias: this.lastMacroBias,
-          directionInference: inferDirectionFromRecentBars(this.recentBars1m),
+          directionInference: inferDirectionFromRecentBars(this.recentBars1m, { indicators: buildIndicatorSet(this.recentBars1m, "1m") }),
           setupReason: `data gap cooldown: ${this.dataGapCooldown} bars remaining`,
           datafeedIssue: `cooldown after gap: ${this.dataGapCooldown} bars`,
         };
@@ -744,7 +763,7 @@ export class Orchestrator {
     }
 
     const inZone = close >= play.entryZone.low && close <= play.entryZone.high;
-    const vwap1m = computeVWAP(this.recentBars1m, 30);
+    const vwap1m = computeSessionVWAP(this.recentBars1m);
     const atr1m = computeATR(this.recentBars1m, 14);
     const timingSignal = computeTimingSignal({
       bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
@@ -1220,7 +1239,7 @@ export class Orchestrator {
           close,
           regime: fallbackRegime,
           macroBias: this.lastRegime15mReady ? this.lastMacroBias : "NEUTRAL",
-          directionInference: inferDirectionFromRecentBars(this.recentBars5m),
+          directionInference: inferDirectionFromRecentBars(this.recentBars5m, { indicators: buildIndicatorSet(this.recentBars5m, "5m") }),
           setupReason: "insufficient 5m history (< 6 bars)",
         };
         this.lastDecision = buildDecision({
@@ -1246,21 +1265,27 @@ export class Orchestrator {
         ? { bias: this.lastMacroBias, reasons: ["anchor=15m"] }
         : { bias: "NEUTRAL" as Bias, reasons: ["anchor=5m provisional: bias neutral"] };
 
-      const dirInf = inferDirectionFromRecentBars(this.recentBars5m);
+      const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
+      const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
+
+      const dirBars = this.recentBars1m.length >= 12 ? this.recentBars1m : this.recentBars5m;
+      const dirIndicators = dirBars === this.recentBars1m ? indicators1m : indicators5m;
+      const dirInf = inferDirectionFromRecentBars(dirBars, { indicators: dirIndicators });
       if (!dirInf.direction) {
         console.log(`[5m] Direction inference unclear (continuing): ${dirInf.reasons.join(" | ")}`);
       }
 
       const tacticalBars = this.recentBars1m.length >= 6 ? this.recentBars1m : this.recentBars5m;
       const tacticalLookback = tacticalBars === this.recentBars1m ? 5 : 3;
-      const tacticalBiasInfo = inferTacticalBiasFromRecentBars(tacticalBars, { lookback: tacticalLookback });
+      const tacticalIndicators = tacticalBars === this.recentBars1m ? indicators1m : indicators5m;
+      const tacticalBiasInfo = inferTacticalBiasFromRecentBars(tacticalBars, { lookback: tacticalLookback, indicators: tacticalIndicators });
 
-      const atr = computeATR(this.recentBars5m, 14);
+      const atr = indicators5m.atr;
+      const ema9 = indicators5m.ema9;
+      const ema20 = indicators5m.ema20;
+      const vwap = indicators5m.vwap;
+      const rsi14 = indicators5m.rsi14;
       const closes = this.recentBars5m.map((b) => b.close);
-      const ema9 = computeEMA(closes.slice(-60), 9);
-      const ema20 = computeEMA(closes.slice(-80), 20);
-      const vwap = computeVWAP(this.recentBars5m, 30);
-      const rsi14 = computeRSI(closes, 14);
       const ema20Slope5m = computeEmaSlopePct(closes, 20, 3);
       const indicatorReadiness = {
         hasBars: this.recentBars5m.length >= 30,
@@ -1319,7 +1344,7 @@ export class Orchestrator {
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
         tacticalBias: { bias: tacticalBiasInfo.bias, tier: tacticalBiasInfo.tier },
-        indicators: { vwap, ema9, ema20, atr, rsi14 }
+        indicators: { tf: "5m", vwap, ema9, ema20, atr, rsi14 }
       });
 
       const setupCandidates = setupResult.candidates ?? (setupResult.candidate ? [setupResult.candidate] : []);
@@ -1336,6 +1361,29 @@ export class Orchestrator {
           candidate.holdReason = `WARMUP: missing ${missingList}`;
           candidate.flags = [...(candidate.flags ?? []), "MISSING_INDICATORS"];
         }
+      }
+      const indicatorBundle = {
+        ema9_1m: indicators1m.ema9,
+        ema20_1m: indicators1m.ema20,
+        vwap_1m: indicators1m.vwap,
+        ema9_5m: indicators5m.ema9,
+        ema20_5m: indicators5m.ema20,
+        vwap_5m: indicators5m.vwap,
+      };
+      for (const candidate of setupCandidates) {
+        const emaStack5m = indicators5m.ema9 !== undefined && indicators5m.ema20 !== undefined
+          ? (indicators5m.ema9 > indicators5m.ema20 ? "BULL" : "BEAR")
+          : undefined;
+        if (
+          (emaStack5m === "BULL" && candidate.direction === "SHORT") ||
+          (emaStack5m === "BEAR" && candidate.direction === "LONG")
+        ) {
+          candidate.flags = Array.from(new Set([...(candidate.flags ?? []), "COUNTER_5M_STACK"]));
+        }
+        candidate.featureBundle = {
+          ...(candidate.featureBundle ?? {}),
+          indicators: indicatorBundle,
+        };
       }
       const stageCounts = setupCandidates.reduce<Record<string, number>>((acc, candidate) => {
         const stage = candidate.stage ?? "READY";
@@ -1564,7 +1612,7 @@ export class Orchestrator {
         }
       }
 
-      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}) | ${dirInf.reasons.join(" | ")}`;
+      const dirWarning = `Direction inference: ${dirInf.direction ?? "N/A"} (confidence=${dirInf.confidence}, tf=${dirInf.indicatorTf ?? "unknown"}) | ${dirInf.reasons.join(" | ")}`;
       const regimeWarning = `Regime gate (${anchorLabel}): ${anchorRegime.regime} | ${anchorRegime.reasons.join(" | ")}`;
       const biasWarning = `Macro bias (${anchorLabel}): ${macroBiasInfo.bias}`;
       const entryPermission = filterResult.permission ?? "ALLOWED";
@@ -1574,12 +1622,29 @@ export class Orchestrator {
         : "POTD: OFF";
       const indicatorMeta = {
         entryTF: "5m",
+        directionTF: dirIndicators.tf,
+        tacticalTF: tacticalIndicators.tf,
         atrLen: 14,
         vwapLen: 30,
+        vwapType: "RTH",
         emaLens: [9, 20],
         regimeTF: anchorLabel
       };
-      const indicatorMetaLine = `TF: entry=5m atr=14 vwap=30 ema=9/20 regime=${anchorLabel}`;
+      const indicatorMetaLine = `TF: entry=5m dir=${dirIndicators.tf} tactical=${tacticalIndicators.tf} atr=14 vwap=RTH ema=9/20 regime=${anchorLabel}`;
+      const last1mClose = this.recentBars1m.length ? this.recentBars1m[this.recentBars1m.length - 1]!.close : close;
+      const emaStack1m = indicators1m.ema9 !== undefined && indicators1m.ema20 !== undefined
+        ? (indicators1m.ema9 > indicators1m.ema20 ? "BULL" : "BEAR")
+        : "N/A";
+      const emaStack5m = indicators5m.ema9 !== undefined && indicators5m.ema20 !== undefined
+        ? (indicators5m.ema9 > indicators5m.ema20 ? "BULL" : "BEAR")
+        : "N/A";
+      const vwapSide1m = indicators1m.vwap !== undefined ? (last1mClose > indicators1m.vwap ? "ABOVE" : "BELOW") : "N/A";
+      const vwapSide5m = indicators5m.vwap !== undefined ? (close > indicators5m.vwap ? "ABOVE" : "BELOW") : "N/A";
+      const indicatorTfSummary = `INDICATORS: emaStack(1m=${emaStack1m},5m=${emaStack5m}) vwapSide(1m=${vwapSide1m},5m=${vwapSide5m})`;
+      const vetoSourceLine = dirInf.veto
+        ? `VETO source: ${dirInf.veto.reason} tf=${dirInf.veto.tf} vwap=${dirInf.veto.vwap?.toFixed(2) ?? "N/A"} ema9=${dirInf.veto.ema9?.toFixed(2) ?? "N/A"} ema20=${dirInf.veto.ema20?.toFixed(2) ?? "N/A"}`
+        : undefined;
+      console.log(`[5m] ${indicatorTfSummary}${vetoSourceLine ? ` | ${vetoSourceLine}` : ""}`);
 
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
@@ -1589,6 +1654,8 @@ export class Orchestrator {
         permissionWarning,
         potdWarning,
         indicatorMetaLine,
+        indicatorTfSummary,
+        vetoSourceLine,
         ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
       ];
 
@@ -1602,11 +1669,14 @@ export class Orchestrator {
       }));
 
       const indicatorSnapshot = {
-        vwap,
-        ema9,
-        ema20,
-        atr,
-        rsi14,
+        vwap: indicators5m.vwap,
+        ema9: indicators5m.ema9,
+        ema20: indicators5m.ema20,
+        atr: indicators5m.atr,
+        rsi14: indicators5m.rsi14,
+        vwap1m: indicators1m.vwap,
+        ema9_1m: indicators1m.ema9,
+        ema20_1m: indicators1m.ema20,
         vwapSlope: anchorRegime.vwapSlope,
         structure: anchorRegime.structure
       };
@@ -1808,7 +1878,7 @@ export class Orchestrator {
         bars: this.recentBars1m.length ? this.recentBars1m : this.recentBars5m,
         direction: setupCandidate.direction,
         entryZone: setupCandidate.entryZone,
-        vwap: computeVWAP(this.recentBars1m, 30),
+        vwap: computeSessionVWAP(this.recentBars1m),
         atr: computeATR(this.recentBars1m, 14)
       });
       const timingBarRef = this.recentBars1m[this.recentBars1m.length - 1] ?? this.recentBars5m[this.recentBars5m.length - 1]!;
@@ -1934,7 +2004,7 @@ export class Orchestrator {
         low,
         open,
         volume,
-        indicators: { vwap, ema20, ema9, atr, rsi14 },
+        indicators: { tf: "5m", vwap, ema20, ema9, atr, rsi14 },
         recentBars: this.recentBars5m.length >= 5
           ? this.recentBars5m.slice(-20).map((b) => ({
               ts: b.ts,
@@ -2560,7 +2630,7 @@ export class Orchestrator {
     if (play.coachingState.maxFavorableR !== undefined && unrealizedR <= play.coachingState.maxFavorableR - 0.5) {
       triggers.push("ADVERSE_EXCURSION");
     }
-    const vwapNow = computeVWAP(bars5m, 30);
+    const vwapNow = computeSessionVWAP(bars5m);
     const entrySnapshot = play.entrySnapshot ?? play.armedSnapshot;
     const selectedCandidate = entrySnapshot?.candidates?.find((candidate) => candidate.id === entrySnapshot?.llmSelection?.selectedCandidateId)
       ?? entrySnapshot?.candidates?.[0];
