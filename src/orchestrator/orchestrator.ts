@@ -1276,7 +1276,7 @@ export class Orchestrator {
       const readinessOk = readinessMissing.length === 0;
 
       const tacticalBias = tacticalBiasInfo.bias;
-      const directionGate = (() => {
+      const directionGate: DirectionGate = (() => {
         if (tacticalBias === "NONE" || tacticalBiasInfo.tier === "NONE") {
           return {
             allow: false,
