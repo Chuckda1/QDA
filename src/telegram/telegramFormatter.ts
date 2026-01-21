@@ -1,0 +1,73 @@
+import type { TelegramSnapshot, TelegramSnapshotType } from "./telegramNormalizer.js";
+
+export type TelegramAlert = {
+  type: TelegramSnapshotType;
+  lines: string[];
+  text: string;
+};
+
+const MAX_LINES: Record<TelegramSnapshotType, number> = {
+  SIGNAL: 7,
+  WATCH: 6,
+  UPDATE: 4,
+};
+
+const formatPrice = (value?: number): string => (Number.isFinite(value) ? (value as number).toFixed(2) : "n/a");
+
+const formatUpdateHeader = (input: {
+  fromSide?: "LONG" | "SHORT";
+  toSide?: "LONG" | "SHORT";
+  px?: number;
+}): string => {
+  const flip = input.fromSide && input.toSide ? `${input.fromSide} → ${input.toSide} 🔁` : "UPDATE 🔁";
+  const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
+  return `UPDATE: ${flip} | px ${px}`;
+};
+
+const enforceLineLimit = (type: TelegramSnapshotType, lines: string[]): string[] => {
+  const trimmed = lines.filter(Boolean);
+  return trimmed.slice(0, MAX_LINES[type]);
+};
+
+export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | null {
+  if (snapshot.type === "SIGNAL") {
+    const header = `${snapshot.symbol} ${snapshot.dir} ✅ ${snapshot.conf ?? "?"}% | SIGNAL | risk=${snapshot.risk}`;
+    const entryTf = snapshot.entryTriggerTf ? `${snapshot.entryTriggerTf} close` : "1m close";
+    const entry = `ENTRY: ${snapshot.entryTrigger ?? "n/a"} (${entryTf})`;
+    const stop = `STOP: ${formatPrice(snapshot.stop)} | INVALID: ${snapshot.invalidation ?? "n/a"}`;
+    const tp = `TP1: ${formatPrice(snapshot.tp1)} | TP2: ${formatPrice(snapshot.tp2)} | MGMT: SL→BE after TP1`;
+    const size = `SIZE: ${(snapshot.sizeMultiplier ?? 1).toFixed(2)}x`;
+    const why = `WHY: ${snapshot.why ?? "n/a"}`;
+    const warn = snapshot.warnTags?.length ? `WARN: ${snapshot.warnTags.join(",")}` : undefined;
+    const lines = enforceLineLimit("SIGNAL", [header, entry, stop, tp, size, why, warn].filter(Boolean));
+    return { type: "SIGNAL", lines, text: lines.join("\n") };
+  }
+
+  if (snapshot.type === "WATCH") {
+    const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk}`;
+    const arm = `ARM: ${snapshot.armCondition ?? "n/a"}`;
+    const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
+    const planStop = `PLAN STOP: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
+    const why = `WHY: ${snapshot.why ?? "n/a"}`;
+    const warn = snapshot.warnTags?.length ? `WARN: ${snapshot.warnTags.join(",")}` : undefined;
+    const lines = enforceLineLimit("WATCH", [header, arm, entry, planStop, why, warn].filter(Boolean));
+    return { type: "WATCH", lines, text: lines.join("\n") };
+  }
+
+  if (snapshot.type === "UPDATE" && snapshot.update) {
+    const update = snapshot.update;
+    const header = formatUpdateHeader({
+      fromSide: update.fromSide,
+      toSide: update.toSide,
+      px: update.price,
+    });
+    const last = update.lastSignal ? ` | last ${update.lastSignal}` : "";
+    const cause = `CAUSE: ${update.cause}${last}`;
+    const next = `NEXT: ${update.next}`;
+    const ts = `TS: ${update.ts}`;
+    const lines = enforceLineLimit("UPDATE", [header, cause, next, ts]);
+    return { type: "UPDATE", lines, text: lines.join("\n") };
+  }
+
+  return null;
+}

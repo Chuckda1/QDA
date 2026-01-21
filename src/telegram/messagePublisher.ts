@@ -2,13 +2,16 @@ import type { DomainEvent, DomainEventType } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
+import { buildTelegramAlert } from "./telegramFormatter.js";
+import { normalizeTelegramSnapshot } from "./telegramNormalizer.js";
+import { buildTelegramSignature } from "./telegramSignature.js";
 import { getETParts } from "../utils/timeUtils.js";
 import { orderEvents } from "./messageOrder.js";
 
 export class MessagePublisher {
   // STAGE 4: Single publish queue to serialize all messages
   private publishQueue: Promise<void> = Promise.resolve();
-  private publishState = new Map<string, { lastSentAt: number; lastSignature?: string; lastEntryPermission?: string; lastLlmBucket?: string; lastCandidateCount?: number; lastDirection?: string; lastDirectionBand?: string; lastTopPlayKey?: string; lastStage?: string; lastDecisionStatus?: string }>();
+  private publishState = new Map<string, { lastSentAt: number; lastSignature?: string }>();
   private suppressCounters = {
     suppressedByDedupe: 0,
     suppressedByThrottle: 0,
@@ -26,11 +29,17 @@ export class MessagePublisher {
    * STAGE 4: This should only be called from publishOrdered to ensure serialization
    */
   private async publish(event: DomainEvent): Promise<boolean> {
+    const snapshot = normalizeTelegramSnapshot(event);
+    if (!snapshot) return false;
+    const alert = buildTelegramAlert(snapshot);
+    if (!alert || alert.lines.length === 0) {
+      return false;
+    }
     if (!this.governor.shouldSend(event, this.bot, this.chatId)) {
       return false;
     }
 
-    const text = this.formatEvent(event);
+    const text = alert.text;
     await sendTelegramMessageSafe(this.bot, this.chatId, text);
     return true;
   }
@@ -42,7 +51,7 @@ export class MessagePublisher {
     }
     const sent = await this.publish(event);
     if (sent) {
-      this.updatePublishState(event, decision.signature, decision.entryPermission, decision.llmBucket, decision.candidateCount);
+      this.updatePublishState(event, decision.signature);
     }
     return sent;
   }
@@ -85,9 +94,6 @@ export class MessagePublisher {
   private shouldSuppressEvent(event: DomainEvent): {
     suppress: boolean;
     signature?: string;
-    entryPermission?: string;
-    llmBucket?: string;
-    candidateCount?: number;
   } {
     const hiddenTypes: DomainEventType[] = ["ENTRY_WINDOW_OPENED", "TIMING_COACH", "SETUP_SUMMARY", "TRADE_PLAN", "LLM_PICK", "SCORECARD"];
     if (hiddenTypes.includes(event.type)) {
@@ -100,143 +106,38 @@ export class MessagePublisher {
       }
     }
 
-    const typesToControl: DomainEventType[] = ["SETUP_CANDIDATES", "NO_ENTRY"];
+    const typesToControl: DomainEventType[] = ["SETUP_CANDIDATES", "NO_ENTRY", "PLAY_ARMED", "PLAY_CANCELLED", "PLAY_CLOSED", "PLAY_SIZED_UP"];
     if (!typesToControl.includes(event.type)) {
       return { suppress: false };
     }
 
-    const symbol = event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
-    const key = `${event.type}_${symbol}`;
+    const snapshot = normalizeTelegramSnapshot(event);
+    if (!snapshot) return { suppress: true };
+    const symbol = snapshot.symbol;
+    const key = symbol;
     const now = Date.now();
     const state = this.publishState.get(key);
-
-    const entryPermission = event.data.rules?.entryPermission ?? event.data.entryPermission ?? "N/A";
-    const permissionBucket = entryPermission === "WAIT_FOR_PULLBACK" ? "WAIT_FOR_PULLBACK" : "CLEAR";
-    const llmProb = event.data.llm?.probability ?? event.data.probability ?? event.data.decision?.llm?.probability;
-    const llmBucket = Number.isFinite(llmProb)
-      ? llmProb >= 80
-        ? "80+"
-        : llmProb >= 60
-        ? "60-79"
-        : "<60"
-      : "N/A";
-
-    const topPlay = event.data.topPlay ?? {};
-    const topPlayKey = `${topPlay.setup ?? "N/A"}|${topPlay.direction ?? "N/A"}|${Math.round(topPlay.score ?? 0)}`;
-    const stage = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
-
-    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
-    const tacticalDirection = tactical?.activeDirection ?? tactical?.bias ?? "N/A";
-    const tacticalConfidence = Number.isFinite(tactical?.confidence) ? tactical.confidence : undefined;
-    const confidenceBand =
-      typeof tacticalConfidence === "number"
-        ? tacticalConfidence >= 100
-          ? "100"
-          : tacticalConfidence >= 80
-          ? "80+"
-          : "<80"
-        : "N/A";
-
-    const decisionStatus = event.data.decision?.status ?? "N/A";
-    const blockerReason = event.data.decision?.blockerReasons?.[0] ?? event.data.blockerReasons?.[0] ?? "N/A";
-
-    const signature = [
-      symbol,
-      tacticalDirection,
-      confidenceBand,
-      topPlayKey,
-      stage,
-      permissionBucket,
-      decisionStatus,
-      blockerReason,
-    ].join("|");
-
-    const candidateCount = Array.isArray(event.data.candidates) ? event.data.candidates.length : undefined;
-
-    const throttleMs = event.type === "NO_ENTRY" ? 5 * 60_000 : 3 * 60_000;
-
-    const directionFlipped = state?.lastDirection && state.lastDirection !== tacticalDirection;
-    const bandChanged = state?.lastDirectionBand && state.lastDirectionBand !== confidenceBand;
-    const stageChanged = state?.lastStage && state.lastStage !== stage;
-    const topPlayChanged = state?.lastTopPlayKey && state.lastTopPlayKey !== topPlayKey;
-
-    const exception =
-      directionFlipped ||
-      bandChanged ||
-      stageChanged ||
-      topPlayChanged ||
-      (typeof candidateCount === "number" && typeof state?.lastCandidateCount === "number" && candidateCount > state.lastCandidateCount);
-
-    if (exception) {
-      this.suppressCounters.publishedByException += 1;
-      return { suppress: false, signature, entryPermission: permissionBucket, llmBucket, candidateCount };
-    }
+    const signature = buildTelegramSignature(snapshot);
 
     if (state?.lastSignature && state.lastSignature === signature) {
       this.suppressCounters.suppressedByDedupe += 1;
-      console.log(`[PUB] suppressed ${event.type} (dedupe)`);
       return { suppress: true };
     }
 
-    if (state?.lastSentAt && now - state.lastSentAt < throttleMs) {
-      this.suppressCounters.suppressedByThrottle += 1;
-      console.log(`[PUB] suppressed ${event.type} (throttle)`);
-      return { suppress: true };
-    }
-
-    return { suppress: false, signature, entryPermission: permissionBucket, llmBucket, candidateCount };
+    return { suppress: false, signature };
   }
 
   private updatePublishState(
     event: DomainEvent,
-    signature?: string,
-    entryPermission?: string,
-    llmBucket?: string,
-    candidateCount?: number
+    signature?: string
   ): void {
-    const symbol = event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
-    const key = `${event.type}_${symbol}`;
-    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
-    const tacticalDirection = tactical?.activeDirection ?? tactical?.bias ?? "N/A";
-    const tacticalConfidence = Number.isFinite(tactical?.confidence) ? tactical.confidence : undefined;
-    const confidenceBand =
-      typeof tacticalConfidence === "number"
-        ? tacticalConfidence >= 100
-          ? "100"
-          : tacticalConfidence >= 80
-          ? "80+"
-          : "<80"
-        : "N/A";
-    const topPlay = event.data.topPlay ?? {};
-    const topPlayKey = `${topPlay.setup ?? "N/A"}|${topPlay.direction ?? "N/A"}|${Math.round(topPlay.score ?? 0)}`;
-    const stage = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
-    const decisionStatus = event.data.decision?.status ?? "N/A";
-
+    const snapshot = normalizeTelegramSnapshot(event);
+    const symbol = snapshot?.symbol ?? event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
+    const key = symbol;
     this.publishState.set(key, {
       lastSentAt: Date.now(),
       lastSignature: signature,
-      lastEntryPermission: entryPermission,
-      lastLlmBucket: llmBucket,
-      lastCandidateCount: candidateCount,
-      lastDirection: tacticalDirection,
-      lastDirectionBand: confidenceBand,
-      lastTopPlayKey: topPlayKey,
-      lastStage: stage,
-      lastDecisionStatus: decisionStatus,
     });
-  }
-
-  private mapRiskMode(mode?: string): string {
-    switch (mode) {
-      case "REDUCE_SIZE":
-        return "REDUCE";
-      case "SCALP_ONLY":
-        return "SCALP";
-      case "WATCH_ONLY":
-        return "WATCH";
-      default:
-        return "NORMAL";
-    }
   }
 
   private mapScoreTag(quality?: string, qualityTag?: string): string {
@@ -289,51 +190,6 @@ export class MessagePublisher {
       return `${idx + 1}) ${intent} ${candidate.direction ?? "DIR"} — ${stage} — score ${Math.round(score ?? 0)} (${quality})${holdSuffix}`;
     });
     return ["Ideas:", ...lines];
-  }
-
-  private buildSetupAlert(event: DomainEvent): string {
-    const symbol = event.data.symbol ?? event.data.candidate?.symbol ?? event.data.topPlay?.symbol ?? "UNKNOWN";
-    const topPlay = event.data.topPlay ?? event.data.candidate ?? {};
-    const direction = topPlay.direction ?? event.data.direction ?? "N/A";
-    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
-    const confidence = Number.isFinite(tactical?.confidence) ? Math.round(tactical.confidence) : undefined;
-    const readiness = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
-    const risk = this.mapRiskMode(event.data.marketState?.permission?.mode);
-
-    const entryZone = topPlay.entryZone ?? event.data.candidate?.entryZone;
-    const stop = topPlay.stop ?? event.data.candidate?.stop;
-    const targets = topPlay.targets ?? event.data.candidate?.targets;
-
-    const line1 = `${symbol} | ${direction} ${confidence ?? "?"}% | ${readiness} | risk=${risk}`;
-    const line2 = entryZone
-      ? `Entry: ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}  Stop: ${Number.isFinite(stop) ? stop.toFixed(2) : "n/a"}`
-      : `Entry: n/a  Stop: ${Number.isFinite(stop) ? stop.toFixed(2) : "n/a"}`;
-    const line3 = targets
-      ? `Targets: ${targets.t1.toFixed(2)} / ${targets.t2.toFixed(2)} / ${targets.t3.toFixed(2)}`
-      : "Targets: n/a";
-    const flags = this.formatFlags(event, topPlay);
-
-    const lines = [line1, line2, line3];
-    if (flags) lines.push(flags);
-    return lines.slice(0, 4).join("\n");
-  }
-
-  private buildBlockedStatus(event: DomainEvent): string {
-    const symbol = event.data.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
-    const direction = event.data.direction ?? event.data.candidate?.direction ?? "N/A";
-    const blocker = event.data.decision?.blockerReasons?.[0] ?? event.data.blockerReasons?.[0] ?? "Blocked";
-    const reason = blocker.split(":")[1]?.trim() ?? blocker;
-    const entryPermission = event.data.decision?.permission ?? event.data.entryPermission ?? event.data.rules?.entryPermission;
-    const statusTag = entryPermission === "WAIT_FOR_PULLBACK" ? "WAIT_PULLBACK" : "BLOCKED";
-    const rearmMatch = blocker.match(/Re-arm[^.]*\./i);
-    const rearm = rearmMatch ? rearmMatch[0].replace(/Re-arm/i, "Re-arm") : undefined;
-
-    const lines = [
-      `${symbol} | ${direction} | ${statusTag}`,
-      `Reason: ${reason}`,
-      rearm ? `Re-arm: ${rearm.replace(/\.$/, "")}` : undefined,
-    ].filter(Boolean) as string[];
-    return lines.join("\n");
   }
 
   /**
@@ -642,90 +498,10 @@ export class MessagePublisher {
   }
 
   private formatEvent(event: DomainEvent): string {
-    const instanceId = event.instanceId;
-    
-    switch (event.type) {
-      case "PLAY_ARMED": {
-        const p = event.data.play;
-        if (!p) return `[${instanceId}] PLAY ARMED`;
-        const risk = this.mapRiskMode(event.data.marketState?.permission?.mode);
-        const line1 = `${p.symbol} | ${p.direction} | ARMED | risk=${risk}`;
-        const line2 = `Entry: ${p.entryZone.low.toFixed(2)}–${p.entryZone.high.toFixed(2)}  Stop: ${p.stop.toFixed(2)}`;
-        const line3 = `Targets: ${p.targets.t1.toFixed(2)} / ${p.targets.t2.toFixed(2)} / ${p.targets.t3.toFixed(2)}`;
-        const flags = this.formatFlags(event, p);
-        return [line1, line2, line3, flags].filter(Boolean).join("\n");
-      }
-      
-      case "SETUP_CANDIDATES":
-      {
-        const alert = this.buildSetupAlert(event);
-        const ideas = this.buildIdeasBlock(event);
-        return ideas.length ? [alert, "", ...ideas].join("\n") : alert;
-      }
-
-      case "NO_ENTRY":
-        return this.buildBlockedStatus(event);
-
-      case "PLAY_ENTERED":
-        return [
-          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | ENTERED`,
-          `Entry: ${(event.data.entryPrice ?? event.data.price)?.toFixed?.(2) ?? "n/a"}`,
-          event.data.reason ? `Reason: ${event.data.reason}` : ""
-        ].filter(Boolean).join("\n");
-
-      case "PLAY_SIZED_UP":
-        return [
-          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | SIZE UP`,
-          `Mode: ${event.data.mode || "FULL"}`,
-          event.data.reason ? `Reason: ${event.data.reason}` : ""
-        ].filter(Boolean).join("\n");
-
-      case "ENTRY_WINDOW_OPENED":
-        return "";
-
-      case "PLAY_CANCELLED":
-        return [
-          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | CANCELLED`,
-          event.data.reason ? `Reason: ${event.data.reason}` : ""
-        ].filter(Boolean).join("\n");
-
-      case "LLM_COACH_UPDATE":
-        return [
-          `[${instanceId}] 💬 LLM COACH UPDATE`,
-          `${event.data.direction} ${event.data.symbol}`,
-          `Price: $${event.data.price?.toFixed(2) || "N/A"}`,
-          event.data.action ? `Action: ${event.data.action}` : "",
-          Number.isFinite(event.data.confidence) ? `Confidence: ${Math.round(event.data.confidence)}%` : "",
-          Array.isArray(event.data.reasonCodes) && event.data.reasonCodes.length
-            ? `Reasons: ${event.data.reasonCodes.join(", ")}`
-            : "",
-          Array.isArray(event.data.triggers) && event.data.triggers.length
-            ? `Trigger: ${event.data.triggers.join(", ")} (cooldown ok)`
-            : "",
-          Array.isArray(event.data.blockedTriggers) && event.data.blockedTriggers.length
-            ? `Trigger Blocked: ${event.data.blockedTriggers.join(", ")}`
-            : "",
-          event.data.nextCheck ? `Next: ${event.data.nextCheck}` : "",
-          ``,
-          `${event.data.update || ""}`
-        ].join("\n");
-
-      case "PLAY_CLOSED":
-        return [
-          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | CLOSED`,
-          `Reason: ${event.data.reason ?? "n/a"}`,
-          `Result: ${event.data.result || "N/A"}`
-        ].join("\n");
-
-      case "PLAN_OF_DAY":
-        return [
-          `[${instanceId}] 📅 PLAN OF THE DAY`,
-          ``,
-          `${event.data.plan || "Market analysis and trade setup monitoring."}`
-        ].join("\n");
-
-      default:
-        return `[${instanceId}] ${event.type}`;
-    }
+    const snapshot = normalizeTelegramSnapshot(event);
+    if (!snapshot) return "";
+    const alert = buildTelegramAlert(snapshot);
+    if (!alert || alert.lines.length === 0) return "";
+    return alert.text;
   }
 }

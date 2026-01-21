@@ -8,6 +8,7 @@
     "dev": "node node_modules/tsx/dist/cli.mjs src/index.ts",
     "test": "node node_modules/tsx/dist/cli.mjs scripts/verify.ts",
     "verify": "node node_modules/tsx/dist/cli.mjs scripts/verify.ts",
+    "test:telegram": "node node_modules/tsx/dist/cli.mjs scripts/telegramFormatterTest.ts",
     "test:llm": "node node_modules/tsx/dist/cli.mjs scripts/mockLLMTest.ts",
     "test:stop": "node node_modules/tsx/dist/cli.mjs scripts/verifyStopLogic.ts"
   },
