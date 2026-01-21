@@ -228,23 +228,23 @@ const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[]): string
   const regime = event.data.marketState?.regime;
   const regimeLabel = regime === "TREND_UP" || regime === "TREND_DOWN" ? "trend" : regime === "CHOP" ? "chop" : "trend";
   const dirLabel = dir === "LONG" ? "up" : "down";
-  const reasons: string[] = [];
+  const whyParts: string[] = [];
   const { vwap, ema9, ema20 } = getIndicatorSnapshot(event);
   const close = event.data.price ?? event.data.close ?? event.data.candidate?.triggerPrice;
   const priceAboveVwap = isFiniteNumber(close) && isFiniteNumber(vwap) ? (close as number) > (vwap as number) : undefined;
   const emaAligned = isFiniteNumber(ema9) && isFiniteNumber(ema20) ? (ema9 as number) > (ema20 as number) : undefined;
 
-  if (timingPhase === "IMPULSE") reasons.push("impulse");
-  if (timingPhase === "PULLBACK") reasons.push("pullback");
+  if (timingPhase === "IMPULSE") whyParts.push("impulse");
+  if (timingPhase === "PULLBACK") whyParts.push("pullback");
 
   if (priceAboveVwap !== undefined) {
-    reasons.push(`price${priceAboveVwap ? ">" : "<"}VWAP`);
+    whyParts.push(`price${priceAboveVwap ? ">" : "<"}VWAP`);
   }
   if (emaAligned !== undefined) {
-    reasons.push(`EMA9${emaAligned ? ">" : "<"}EMA20`);
+    whyParts.push(`EMA9${emaAligned ? ">" : "<"}EMA20`);
   }
 
-  if (reasons.length === 0) {
+  if (whyParts.length === 0) {
     return `${regimeLabel} ${dirLabel}`;
   }
 
@@ -252,7 +252,7 @@ const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[]): string
     return `${regimeLabel} ${dirLabel}, impulse but extended`;
   }
 
-  return `${regimeLabel} ${dirLabel}, ${reasons.join(", ")}`;
+  return `${regimeLabel} ${dirLabel}, ${whyParts.join(", ")}`;
 };
 
 const buildEntryTrigger = (entryZone: { low: number; high: number }, dir: Direction): string => {
@@ -282,8 +282,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   const hardBlocker =
     isDataNotReady(event, reasons) ||
-    reasons.some((reason) => isTimeOfDayCutoff(reason)) ||
-    reasons.some((reason) => isMarketUnavailable(reason)) ||
+    reasons.some((reason: string) => isTimeOfDayCutoff(reason)) ||
+    reasons.some((reason: string) => isMarketUnavailable(reason)) ||
     blockers.includes("datafeed");
 
   if (event.type === "PLAY_ARMED" && entryZone && stop && targets) {
