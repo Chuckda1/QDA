@@ -26,7 +26,6 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
       snapshot.tp1 ?? "",
       snapshot.tp2 ?? "",
       snapshot.sizeMultiplier ?? "",
-      snapshot.why ?? "",
       (snapshot.warnTags ?? []).join(","),
     ].join("|");
   }
@@ -37,7 +36,6 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
       snapshot.armCondition ?? "",
       snapshot.entryRule ?? "",
       snapshot.planStop ?? "",
-      snapshot.why ?? "",
       (snapshot.warnTags ?? []).join(","),
     ].join("|");
   }

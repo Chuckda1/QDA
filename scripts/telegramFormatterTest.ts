@@ -151,7 +151,7 @@ const signatureB = buildTelegramSignature({
   planStop: "below VWAP",
   warnTags: ["EXTENDED"],
 });
-assert.notEqual(signatureA, signatureB, "Signature must change when WHY changes");
+assert.equal(signatureA, signatureB, "Signature should ignore WHY differences");
 
 const timeCutoffEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",

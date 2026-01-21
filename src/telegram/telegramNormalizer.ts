@@ -297,17 +297,28 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const softBlockers = event.data.softBlockers ?? decision?.softBlockers ?? [];
   const hardBlockerReasons = event.data.hardBlockerReasons ?? decision?.hardBlockerReasons ?? [];
   const softBlockerReasons = event.data.softBlockerReasons ?? decision?.softBlockerReasons ?? [];
-  const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons].map(normalizeReason);
+  const hardStopBlockers = event.data.hardStopBlockers ?? decision?.hardStopBlockers ?? [];
+  const hardWaitBlockers = event.data.hardWaitBlockers ?? decision?.hardWaitBlockers ?? [];
+  const hardStopReasons = event.data.hardStopReasons ?? decision?.hardStopReasons ?? [];
+  const hardWaitReasons = event.data.hardWaitReasons ?? decision?.hardWaitReasons ?? [];
+  const decisionState = event.data.decisionState ?? decision?.decisionState;
+  const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons, ...hardStopReasons, ...hardWaitReasons].map(normalizeReason);
   const warnTags = buildWarnTags(event, reasons, [...blockers, ...softBlockers]);
   const entryMode = deriveEntryMode(event, reasons, warnTags);
   const sizeMultiplier = deriveSizeMultiplier(warnTags);
   const armCondition = buildArmCondition(event, dir, reasons, warnTags);
   const why = buildWhy(event, dir, reasons);
 
-  const timeCutoff = reasons.some((reason: string) => isTimeOfDayCutoff(reason));
+  const timeCutoff =
+    reasons.some((reason: string) => isTimeOfDayCutoff(reason)) ||
+    hardStopReasons.some((reason: string) => isTimeOfDayCutoff(reason));
   const hardBlocker =
     hardBlockers.length > 0 ||
+    hardStopBlockers.length > 0 ||
+    hardWaitBlockers.length > 0 ||
     hardBlockerReasons.length > 0 ||
+    hardStopReasons.length > 0 ||
+    hardWaitReasons.length > 0 ||
     isDataNotReady(event, reasons) ||
     timeCutoff ||
     reasons.some((reason: string) => isMarketUnavailable(reason)) ||
@@ -356,7 +367,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (event.type === "NO_ENTRY" || event.type === "LLM_VERIFY") {
     const hasEntryData = !!entryZone && !!stop && !!targets;
-    if (hardBlocker) {
+    if (decisionState === "UPDATE" || (hardBlocker && timeCutoff)) {
       if (timeCutoff) {
         return {
           type: "UPDATE",
@@ -374,13 +385,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           },
         };
       }
+    }
+    if (hardBlocker || decisionState === "WATCH") {
       return {
         type: "WATCH",
         symbol,
         dir,
         conf,
         risk,
-        armCondition: buildHardArmCondition(hardBlockerReasons),
+        armCondition: buildHardArmCondition([...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons]),
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
         why,
@@ -408,6 +421,26 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       plan: planParts.join(", "),
       why,
       warnTags: warnTags.length ? warnTags : ["NONE"],
+    };
+  }
+
+  if (decisionState === "MANAGE") {
+    return {
+      type: "UPDATE",
+      symbol,
+      dir,
+      conf,
+      risk,
+      update: {
+        fromSide: dir,
+        toSide: dir,
+        emoji: "🛠️",
+        cause: "manage active play",
+        next: "monitor for exits",
+        ts: formatEtTimestamp(event.timestamp),
+        price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+        lastSignal: dir,
+      },
     };
   }
 

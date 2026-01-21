@@ -854,6 +854,7 @@ export class Orchestrator {
       blockerReasons?: string[];
       rationale?: string[];
       permissionMode?: "SCALP_ONLY" | "NORMAL" | "REDUCE_SIZE" | "WATCH_ONLY";
+      decisionState?: "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
     }) => {
       const permission = {
         long: play.direction === "LONG",
@@ -870,7 +871,8 @@ export class Orchestrator {
         ...(params.kind === "GATE" ? { gateTier: params.gateTier ?? (play.tier === "LEANING" ? "LEANING" : "OPEN") } : {}),
         blockers: params.blockers,
         blockerReasons: params.blockerReasons,
-        rationale: params.rationale
+        rationale: params.rationale,
+        decisionState: params.decisionState ?? "MANAGE"
       };
     };
 
@@ -2155,14 +2157,20 @@ export class Orchestrator {
       ruleScores.potd.alignment = potdAlignment;
 
       const buildBlockers = (candidate: SetupCandidate) => {
-        const hardBlockers: DecisionBlocker[] = [];
+        const hardStopBlockers: DecisionBlocker[] = [];
+        const hardWaitBlockers: DecisionBlocker[] = [];
         const softBlockers: DecisionBlocker[] = [];
-        const hardReasons: string[] = [];
+        const hardStopReasons: string[] = [];
+        const hardWaitReasons: string[] = [];
         const softReasons: string[] = [];
 
-        const pushHard = (blocker: DecisionBlocker, reason: string) => {
-          hardBlockers.push(blocker);
-          hardReasons.push(reason);
+        const pushHardStop = (blocker: DecisionBlocker, reason: string) => {
+          hardStopBlockers.push(blocker);
+          hardStopReasons.push(reason);
+        };
+        const pushHardWait = (blocker: DecisionBlocker, reason: string) => {
+          hardWaitBlockers.push(blocker);
+          hardWaitReasons.push(reason);
         };
         const pushSoft = (blocker: DecisionBlocker, reason: string) => {
           softBlockers.push(blocker);
@@ -2173,7 +2181,7 @@ export class Orchestrator {
           pushSoft("guardrail", `EARLY idea: ${candidate.holdReason ?? "waiting for timing"}`);
         }
         if (!readinessOk) {
-          pushHard("guardrail", `DATA_READY: missing ${readinessMissing.join(", ")}`);
+          pushHardWait("guardrail", `DATA_READY: missing ${readinessMissing.join(", ")}`);
         }
 
         if (!directionGate.allow) {
@@ -2183,19 +2191,19 @@ export class Orchestrator {
         }
 
         if (!Number.isFinite(candidate.stop)) {
-          pushHard("guardrail", "STOP_INVALID: stop missing");
+          pushHardStop("guardrail", "STOP_INVALID: stop missing");
         } else {
           const stopInvalid =
             candidate.direction === "LONG"
               ? candidate.stop >= candidate.entryZone.low
               : candidate.stop <= candidate.entryZone.high;
           if (stopInvalid) {
-            pushHard("guardrail", "STOP_INVALID: stop not beyond entry zone");
+            pushHardStop("guardrail", "STOP_INVALID: stop not beyond entry zone");
           }
         }
 
         if (!atr || atr <= 0) {
-          pushHard("guardrail", "ATR_INVALID: missing or non-positive ATR");
+          pushHardWait("guardrail", "ATR_INVALID: missing or non-positive ATR");
         } else {
           const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
           const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
@@ -2212,10 +2220,17 @@ export class Orchestrator {
         }
 
         if (llmErrorReason) {
-          pushHard("arming_failed", llmErrorReason);
+          pushHardStop("arming_failed", llmErrorReason);
         }
 
-        return { hardBlockers, softBlockers, hardReasons, softReasons };
+        return {
+          hardStopBlockers,
+          hardWaitBlockers,
+          softBlockers,
+          hardStopReasons,
+          hardWaitReasons,
+          softReasons,
+        };
       };
 
       const baseBlockers = buildBlockers(setupCandidate);
@@ -2251,8 +2266,8 @@ export class Orchestrator {
       if (!filterResult.allowed) {
         const reason = filterResult.reason ?? "entry filter";
         if (reason.toLowerCase().includes("time-of-day cutoff")) {
-          baseBlockers.hardBlockers.push("time_window");
-          baseBlockers.hardReasons.push(reason);
+          baseBlockers.hardStopBlockers.push("time_window");
+          baseBlockers.hardStopReasons.push(reason);
         } else if (reason.toLowerCase().includes("extended-from-mean")) {
           baseBlockers.softBlockers.push("entry_filter");
           baseBlockers.softReasons.push(reason);
@@ -2280,12 +2295,12 @@ export class Orchestrator {
       }
 
       if (guardrailBlockReason) {
-        baseBlockers.hardBlockers.push(guardrailBlockTag ?? "guardrail");
-        baseBlockers.hardReasons.push(guardrailBlockReason);
+        baseBlockers.hardStopBlockers.push(guardrailBlockTag ?? "guardrail");
+        baseBlockers.hardStopReasons.push(guardrailBlockReason);
       }
       if (watchOnly) {
-        baseBlockers.hardBlockers.push("arming_failed");
-        baseBlockers.hardReasons.push("mode QUIET");
+        baseBlockers.hardStopBlockers.push("arming_failed");
+        baseBlockers.hardStopReasons.push("mode QUIET");
       }
       if (this.lastDiagnostics) {
         this.lastDiagnostics = {
@@ -2385,10 +2400,14 @@ export class Orchestrator {
         baseBlockers.softReasons.push(reason);
       }
 
-      const hardBlockers = baseBlockers.hardBlockers;
+      const hardStopBlockers = baseBlockers.hardStopBlockers;
+      const hardWaitBlockers = baseBlockers.hardWaitBlockers;
       const softBlockers = baseBlockers.softBlockers;
-      const hardBlockerReasons = baseBlockers.hardReasons;
+      const hardStopReasons = baseBlockers.hardStopReasons;
+      const hardWaitReasons = baseBlockers.hardWaitReasons;
       const softBlockerReasons = baseBlockers.softReasons;
+      const hardBlockers = [...hardStopBlockers, ...hardWaitBlockers];
+      const hardBlockerReasons = [...hardStopReasons, ...hardWaitReasons];
       blockers = [...hardBlockers, ...softBlockers];
       blockerReasons = [...hardBlockerReasons, ...softBlockerReasons];
 
@@ -2421,6 +2440,13 @@ export class Orchestrator {
         indicators: indicatorSnapshot,
         ruleScores
       };
+
+      const decisionState =
+        hardStopBlockers.length || hardWaitBlockers.length
+          ? "WATCH"
+          : softBlockers.length
+          ? "WATCH"
+          : "SIGNAL";
 
       const decision = buildDecision({
         ts,
@@ -2472,6 +2498,11 @@ export class Orchestrator {
         softBlockers,
         hardBlockerReasons,
         softBlockerReasons,
+        hardStopBlockers,
+        hardWaitBlockers,
+        hardStopReasons,
+        hardWaitReasons,
+        decisionState,
         rationale: [
           directionGate.reason,
           ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
