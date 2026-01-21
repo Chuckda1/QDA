@@ -2389,8 +2389,8 @@ export class Orchestrator {
       const softBlockers = baseBlockers.softBlockers;
       const hardBlockerReasons = baseBlockers.hardReasons;
       const softBlockerReasons = baseBlockers.softReasons;
-      const blockers = [...hardBlockers, ...softBlockers];
-      const blockerReasons = [...hardBlockerReasons, ...softBlockerReasons];
+      blockers = [...hardBlockers, ...softBlockers];
+      blockerReasons = [...hardBlockerReasons, ...softBlockerReasons];
 
       const rulesSnapshot: DecisionRulesSnapshot = {
         regime: {
