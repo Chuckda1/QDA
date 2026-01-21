@@ -198,6 +198,8 @@ export class Orchestrator {
   private lastDiagnostics: SetupDiagnosticsSnapshot | null = null;
   private lastSetupSummary5mTs: number | null = null;
   private lastDecision: AuthoritativeDecision | null = null;
+  private lastMarketState: Record<string, any> | null = null;
+  private lastTimingSnapshot: Record<string, any> | null = null;
   private lastScorecardSnapshot: ScorecardSnapshot | null = null;
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
@@ -470,6 +472,18 @@ export class Orchestrator {
 
   getLastDiagnostics(): SetupDiagnosticsSnapshot | null {
     return this.lastDiagnostics;
+  }
+
+  getLastDecision(): AuthoritativeDecision | null {
+    return this.lastDecision;
+  }
+
+  getLastMarketState(): Record<string, any> | null {
+    return this.lastMarketState;
+  }
+
+  getLastTimingSnapshot(): Record<string, any> | null {
+    return this.lastTimingSnapshot;
   }
 
   /**
@@ -1602,6 +1616,8 @@ export class Orchestrator {
             overridden: false,
           }
         };
+        this.lastMarketState = marketStateForNoCandidates;
+        this.lastTimingSnapshot = null;
         events.push(this.ev("SETUP_CANDIDATES", ts, {
           symbol,
           price: close,
@@ -2043,6 +2059,8 @@ export class Orchestrator {
         phaseSinceTs: timingState.phaseSinceTs,
         rawState: timingSignal.state
       };
+      this.lastMarketState = marketState;
+      this.lastTimingSnapshot = timingSnapshot;
       if (lowContext) {
         const minTimingScore = 75;
         if (timingSignal.score < minTimingScore) {
@@ -2356,6 +2374,7 @@ export class Orchestrator {
             holdReason: candidate.holdReason,
             entryZone: candidate.entryZone,
             stop: candidate.stop,
+            extendedFromMeanAtr: candidate.featureBundle?.location?.extendedFromMean?.atR,
             flags: candidate.flags ?? [],
             warningFlags: candidate.warningFlags ?? candidate.flags ?? [],
           };

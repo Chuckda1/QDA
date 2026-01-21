@@ -8,7 +8,7 @@ import { orderEvents } from "./messageOrder.js";
 export class MessagePublisher {
   // STAGE 4: Single publish queue to serialize all messages
   private publishQueue: Promise<void> = Promise.resolve();
-  private publishState = new Map<string, { lastSentAt: number; lastSignature?: string; lastEntryPermission?: string; lastLlmBucket?: string; lastCandidateCount?: number }>();
+  private publishState = new Map<string, { lastSentAt: number; lastSignature?: string; lastEntryPermission?: string; lastLlmBucket?: string; lastCandidateCount?: number; lastDirection?: string; lastDirectionBand?: string; lastTopPlayKey?: string; lastStage?: string; lastDecisionStatus?: string }>();
   private suppressCounters = {
     suppressedByDedupe: 0,
     suppressedByThrottle: 0,
@@ -89,7 +89,18 @@ export class MessagePublisher {
     llmBucket?: string;
     candidateCount?: number;
   } {
-    const typesToControl: DomainEventType[] = ["SCORECARD", "NO_ENTRY", "LLM_PICK", "SETUP_CANDIDATES"];
+    const hiddenTypes: DomainEventType[] = ["ENTRY_WINDOW_OPENED", "TIMING_COACH", "SETUP_SUMMARY", "TRADE_PLAN", "LLM_PICK", "SCORECARD"];
+    if (hiddenTypes.includes(event.type)) {
+      return { suppress: true };
+    }
+    if (event.type === "LLM_VERIFY") {
+      const action = event.data.llm?.action ?? event.data.action ?? event.data.decision?.llm?.action;
+      if (action === "WAIT" || action === "PASS") {
+        return { suppress: true };
+      }
+    }
+
+    const typesToControl: DomainEventType[] = ["SETUP_CANDIDATES", "NO_ENTRY"];
     if (!typesToControl.includes(event.type)) {
       return { suppress: false };
     }
@@ -109,57 +120,51 @@ export class MessagePublisher {
         ? "60-79"
         : "<60"
       : "N/A";
-    const candidateId =
-      event.data.topPlay?.id ??
-      event.data.selectedCandidateId ??
-      event.data.candidate?.id ??
-      event.data.playId ??
-      event.data.play?.id ??
-      "none";
-    const stage = event.data.topPlay?.stage ?? event.data.candidate?.stage ?? "READY";
-    const timingPhase = event.data.timing?.phase ?? event.data.timing?.state ?? "N/A";
-    const entryReady = timingPhase === "ENTRY_WINDOW";
-    const regime = event.data.marketState?.regime ?? "N/A";
-    const mode = event.data.marketState?.permission?.mode ?? "N/A";
-    const blockers = (event.data.decision?.blockers ?? event.data.blockerTags ?? []).slice(0, 2).sort().join(",");
-    const action = event.data.llm?.action ?? event.data.action ?? event.data.decision?.llm?.action ?? "N/A";
-    const tacticalDirection =
-      event.data.marketState?.tacticalSnapshot?.activeDirection ??
-      event.data.marketState?.tacticalBias?.bias ??
-      "N/A";
+
+    const topPlay = event.data.topPlay ?? {};
+    const topPlayKey = `${topPlay.setup ?? "N/A"}|${topPlay.direction ?? "N/A"}|${Math.round(topPlay.score ?? 0)}`;
+    const stage = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
+
+    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
+    const tacticalDirection = tactical?.activeDirection ?? tactical?.bias ?? "N/A";
+    const tacticalConfidence = Number.isFinite(tactical?.confidence) ? tactical.confidence : undefined;
+    const confidenceBand =
+      typeof tacticalConfidence === "number"
+        ? tacticalConfidence >= 100
+          ? "100"
+          : tacticalConfidence >= 80
+          ? "80+"
+          : "<80"
+        : "N/A";
+
     const decisionStatus = event.data.decision?.status ?? "N/A";
-    const topPlayKey = event.data.topPlay?.setup ?? event.data.candidate?.pattern ?? "N/A";
+    const blockerReason = event.data.decision?.blockerReasons?.[0] ?? event.data.blockerReasons?.[0] ?? "N/A";
+
     const signature = [
       symbol,
-      candidateId,
+      tacticalDirection,
+      confidenceBand,
+      topPlayKey,
       stage,
       permissionBucket,
-      timingPhase,
-      entryReady ? "READY" : "NOT_READY",
-      regime,
-      mode,
-      blockers,
-      action,
-      llmBucket,
-      tacticalDirection,
       decisionStatus,
-      topPlayKey,
+      blockerReason,
     ].join("|");
 
     const candidateCount = Array.isArray(event.data.candidates) ? event.data.candidates.length : undefined;
 
-    const throttleMs =
-      event.type === "SCORECARD"
-        ? 4 * 60_000
-        : event.type === "NO_ENTRY"
-        ? 5 * 60_000
-        : event.type === "SETUP_CANDIDATES"
-        ? 3 * 60_000
-        : 3 * 60_000;
+    const throttleMs = event.type === "NO_ENTRY" ? 5 * 60_000 : 3 * 60_000;
+
+    const directionFlipped = state?.lastDirection && state.lastDirection !== tacticalDirection;
+    const bandChanged = state?.lastDirectionBand && state.lastDirectionBand !== confidenceBand;
+    const stageChanged = state?.lastStage && state.lastStage !== stage;
+    const topPlayChanged = state?.lastTopPlayKey && state.lastTopPlayKey !== topPlayKey;
 
     const exception =
-      (state?.lastEntryPermission && state.lastEntryPermission !== permissionBucket) ||
-      (state?.lastLlmBucket && state.lastLlmBucket !== llmBucket) ||
+      directionFlipped ||
+      bandChanged ||
+      stageChanged ||
+      topPlayChanged ||
       (typeof candidateCount === "number" && typeof state?.lastCandidateCount === "number" && candidateCount > state.lastCandidateCount);
 
     if (exception) {
@@ -191,13 +196,144 @@ export class MessagePublisher {
   ): void {
     const symbol = event.data.symbol ?? event.data.play?.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
     const key = `${event.type}_${symbol}`;
+    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
+    const tacticalDirection = tactical?.activeDirection ?? tactical?.bias ?? "N/A";
+    const tacticalConfidence = Number.isFinite(tactical?.confidence) ? tactical.confidence : undefined;
+    const confidenceBand =
+      typeof tacticalConfidence === "number"
+        ? tacticalConfidence >= 100
+          ? "100"
+          : tacticalConfidence >= 80
+          ? "80+"
+          : "<80"
+        : "N/A";
+    const topPlay = event.data.topPlay ?? {};
+    const topPlayKey = `${topPlay.setup ?? "N/A"}|${topPlay.direction ?? "N/A"}|${Math.round(topPlay.score ?? 0)}`;
+    const stage = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
+    const decisionStatus = event.data.decision?.status ?? "N/A";
+
     this.publishState.set(key, {
       lastSentAt: Date.now(),
       lastSignature: signature,
       lastEntryPermission: entryPermission,
       lastLlmBucket: llmBucket,
       lastCandidateCount: candidateCount,
+      lastDirection: tacticalDirection,
+      lastDirectionBand: confidenceBand,
+      lastTopPlayKey: topPlayKey,
+      lastStage: stage,
+      lastDecisionStatus: decisionStatus,
     });
+  }
+
+  private mapRiskMode(mode?: string): string {
+    switch (mode) {
+      case "REDUCE_SIZE":
+        return "REDUCE";
+      case "SCALP_ONLY":
+        return "SCALP";
+      case "WATCH_ONLY":
+        return "WATCH";
+      default:
+        return "NORMAL";
+    }
+  }
+
+  private mapScoreTag(quality?: string, qualityTag?: string): string {
+    const tag = (qualityTag ?? "").toUpperCase();
+    if (quality === "A+" || quality === "A") return "A";
+    if (quality === "B") return "B";
+    if (quality === "C") return "C";
+    if (quality === "D") return "LOW";
+    if (tag.includes("HIGH")) return "A";
+    if (tag.includes("LOW")) return "LOW";
+    if (tag.includes("OK")) return "OK";
+    return "OK";
+  }
+
+  private shortenHoldReason(reason?: string): string | undefined {
+    if (!reason) return undefined;
+    const upper = reason.toUpperCase();
+    if (upper.includes("WAIT_FOR_PULLBACK") || upper.includes("PULLBACK")) return "wait_pullback";
+    if (upper.includes("WARMUP") || upper.includes("MISSING")) return "warmup";
+    if (upper.includes("TIMING")) return "wait_timing";
+    return reason.split(".")[0]?.slice(0, 24);
+  }
+
+  private formatFlags(event: DomainEvent, candidate?: any): string | undefined {
+    const flags: string[] = [];
+    const warningFlags = candidate?.warningFlags?.length ? candidate.warningFlags : candidate?.flags;
+    if (Array.isArray(warningFlags)) {
+      if (warningFlags.includes("EXTENDED")) {
+        const atr = candidate?.extendedFromMeanAtr;
+        flags.push(`EXTENDED${Number.isFinite(atr) ? `(${atr.toFixed(1)}ATR)` : ""}`);
+      }
+    }
+    const entryPermission = event.data.decision?.permission ?? event.data.entryPermission ?? event.data.rules?.entryPermission;
+    if (entryPermission === "WAIT_FOR_PULLBACK") {
+      flags.push("PULLBACK_REQUIRED");
+    }
+    return flags.length ? `Flags: ${flags.join(" • ")}` : undefined;
+  }
+
+  private buildIdeasBlock(event: DomainEvent): string[] {
+    const candidates = event.data.candidates;
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+    const lines = candidates.slice(0, 3).map((candidate: any, idx: number) => {
+      const intent = candidate.intentBucket ?? candidate.setup ?? "SETUP";
+      const stage = candidate.stage ?? "READY";
+      const score = Number.isFinite(candidate.score) ? candidate.score : candidate.score?.total;
+      const quality = this.mapScoreTag(candidate.quality, candidate.qualityTag);
+      const hold = this.shortenHoldReason(candidate.holdReason);
+      const holdSuffix = hold ? ` — hold: ${hold}` : "";
+      return `${idx + 1}) ${intent} ${candidate.direction ?? "DIR"} — ${stage} — score ${Math.round(score ?? 0)} (${quality})${holdSuffix}`;
+    });
+    return ["Ideas:", ...lines];
+  }
+
+  private buildSetupAlert(event: DomainEvent): string {
+    const symbol = event.data.symbol ?? event.data.candidate?.symbol ?? event.data.topPlay?.symbol ?? "UNKNOWN";
+    const topPlay = event.data.topPlay ?? event.data.candidate ?? {};
+    const direction = topPlay.direction ?? event.data.direction ?? "N/A";
+    const tactical = event.data.marketState?.tacticalSnapshot ?? event.data.marketState?.tacticalBias;
+    const confidence = Number.isFinite(tactical?.confidence) ? Math.round(tactical.confidence) : undefined;
+    const readiness = topPlay.stage ?? event.data.candidate?.stage ?? "READY";
+    const risk = this.mapRiskMode(event.data.marketState?.permission?.mode);
+
+    const entryZone = topPlay.entryZone ?? event.data.candidate?.entryZone;
+    const stop = topPlay.stop ?? event.data.candidate?.stop;
+    const targets = topPlay.targets ?? event.data.candidate?.targets;
+
+    const line1 = `${symbol} | ${direction} ${confidence ?? "?"}% | ${readiness} | risk=${risk}`;
+    const line2 = entryZone
+      ? `Entry: ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}  Stop: ${Number.isFinite(stop) ? stop.toFixed(2) : "n/a"}`
+      : `Entry: n/a  Stop: ${Number.isFinite(stop) ? stop.toFixed(2) : "n/a"}`;
+    const line3 = targets
+      ? `Targets: ${targets.t1.toFixed(2)} / ${targets.t2.toFixed(2)} / ${targets.t3.toFixed(2)}`
+      : "Targets: n/a";
+    const flags = this.formatFlags(event, topPlay);
+
+    const lines = [line1, line2, line3];
+    if (flags) lines.push(flags);
+    return lines.slice(0, 4).join("\n");
+  }
+
+  private buildBlockedStatus(event: DomainEvent): string {
+    const symbol = event.data.symbol ?? event.data.candidate?.symbol ?? "UNKNOWN";
+    const direction = event.data.direction ?? event.data.candidate?.direction ?? "N/A";
+    const blocker = event.data.decision?.blockerReasons?.[0] ?? event.data.blockerReasons?.[0] ?? "Blocked";
+    const reason = blocker.split(":")[1]?.trim() ?? blocker;
+    const entryPermission = event.data.decision?.permission ?? event.data.entryPermission ?? event.data.rules?.entryPermission;
+    const statusTag = entryPermission === "WAIT_FOR_PULLBACK" ? "WAIT_PULLBACK" : "BLOCKED";
+    const rearmMatch = blocker.match(/Re-arm[^.]*\./i);
+    const rearm = rearmMatch ? rearmMatch[0].replace(/Re-arm/i, "Re-arm") : undefined;
+
+    const lines = [
+      `${symbol} | ${direction} | ${statusTag}`,
+      `Reason: ${reason}`,
+      rearm ? `Re-arm: ${rearm.replace(/\.$/, "")}` : undefined,
+    ].filter(Boolean) as string[];
+    return lines.join("\n");
   }
 
   /**
@@ -510,194 +646,46 @@ export class MessagePublisher {
     
     switch (event.type) {
       case "PLAY_ARMED": {
-        if (event.data.marketState) {
-          return this.formatBanner(event, "PLAY ARMED");
-        }
         const p = event.data.play;
-        return [
-          `[${instanceId}] 🔎 ${p.mode} PLAY ARMED`,
-          `Symbol: ${p.symbol}`,
-          `Direction: ${p.direction}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          `Score: ${p.score.toFixed(1)} (${p.grade})`,
-          `Entry: $${p.entryZone.low.toFixed(2)} - $${p.entryZone.high.toFixed(2)}`,
-          `Stop: $${p.stop.toFixed(2)}`,
-          `Targets: $${p.targets.t1.toFixed(2)}, $${p.targets.t2.toFixed(2)}, $${p.targets.t3.toFixed(2)}`,
-          ...this.formatDecisionLines(event.data.decision)
-        ].filter(Boolean).join("\n");
+        if (!p) return `[${instanceId}] PLAY ARMED`;
+        const risk = this.mapRiskMode(event.data.marketState?.permission?.mode);
+        const line1 = `${p.symbol} | ${p.direction} | ARMED | risk=${risk}`;
+        const line2 = `Entry: ${p.entryZone.low.toFixed(2)}–${p.entryZone.high.toFixed(2)}  Stop: ${p.stop.toFixed(2)}`;
+        const line3 = `Targets: ${p.targets.t1.toFixed(2)} / ${p.targets.t2.toFixed(2)} / ${p.targets.t3.toFixed(2)}`;
+        const flags = this.formatFlags(event, p);
+        return [line1, line2, line3, flags].filter(Boolean).join("\n");
       }
       
-      case "TIMING_COACH": {
-        const eligibility = event.data.eligibility || (event.data.waitBars === 0 ? "READY" : "NOT_READY");
-        const eligibilityReason = event.data.eligibilityReason || (event.data.waitBars === 0 ? "entry zone active" : "cooldown");
-        const checkmark = eligibility === "READY" ? "✅" : "";
-        const lines = [
-          `[${instanceId}] 🧠 TIMING COACH`,
-          `${event.data.direction} ${event.data.symbol}`,
-          `Mode: ${event.data.mode}`,
-          `Eligibility: ${eligibility} ${checkmark} (${eligibilityReason})`
-        ];
-        
-        // Add cooldown info if not ready
-        if (eligibility === "NOT_READY" && event.data.waitBars > 0) {
-          lines.push(`Cooldown remaining: ${event.data.waitBars} bar(s)`);
-        }
-        
-        // Add LLM status
-        if (event.data.llmStatus) {
-          lines.push(`LLM: ${event.data.llmStatus}`);
-        }
-        
-        return lines.join("\n");
-      }
-
-      case "LLM_VERIFY":
-        return [
-          `[${instanceId}] 🤖 LLM VERIFY`,
-          `${event.data.direction} ${event.data.symbol}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          `Legitimacy: ${event.data.legitimacy}%`,
-          `Follow-through: ${event.data.followThroughProb}%`,
-          `Action: ${event.data.action}`,
-          ``,
-          `${event.data.reasoning || ""}`,
-          ...this.formatDecisionLines(event.data.decision)
-        ].filter(Boolean).join("\n");
-
       case "SETUP_CANDIDATES":
-        return this.formatBanner(event, "SETUP CANDIDATES");
-
-      case "LLM_PICK":
-        return this.formatBanner(event, "LLM PICK");
-
-      case "SCORECARD": {
-        if (event.data.marketState) {
-          return this.formatBanner(event, "SCORECARD");
-        }
-        const r = event.data.rules ?? {};
-        const l = event.data.llm ?? {};
-        const ind = r.indicators ?? {};
-        const regime = r.regime ?? {};
-        const bias = r.macroBias ?? {};
-        const dir = r.directionInference ?? {};
-        const entryPermission = r.entryPermission ?? "ALLOWED";
-        const potd = r.potd ?? {};
-        const indicatorMeta = r.indicatorMeta ?? null;
-        const setup = event.data.setup ?? {};
-
-        const fmtNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x.toFixed(2) : "n/a");
-        const fmtPct = (x: any) => (typeof x === "number" && Number.isFinite(x) ? `${Math.round(x)}%` : "n/a");
-
-        return [
-          `[${instanceId}] 🧾 SCORECARD`,
-          `${event.data.symbol}  Proposed: ${event.data.proposedDirection}  |  LLM Bias: ${l.biasDirection ?? "N/A"}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          `Setup: ${setup.pattern ?? "N/A"}  |  Trigger: $${fmtNum(setup.triggerPrice)}  |  Stop: $${fmtNum(setup.stop)}`,
-          `Regime: ${regime.regime ?? "N/A"}  |  Bias: ${bias.bias ?? "N/A"}  |  Entry: ${entryPermission}`,
-          `Structure: ${regime.structure ?? "N/A"}  |  VWAP slope: ${regime.vwapSlope ?? "N/A"}`,
-          `POTD: ${potd.bias ?? "NONE"} (conf=${potd.confidence ?? "n/a"} mode=${potd.mode ?? "OFF"})  |  Alignment: ${potd.alignment ?? "OFF"}`,
-          `Rules dir: ${dir.direction ?? "N/A"} (${fmtPct(dir.confidence)})`,
-          `Ind: VWAP=${fmtNum(ind.vwap)} EMA9=${fmtNum(ind.ema9)} EMA20=${fmtNum(ind.ema20)} RSI=${fmtNum(ind.rsi14)} ATR=${fmtNum(ind.atr)}`,
-          indicatorMeta ? `TF: entry=${indicatorMeta.entryTF} atr=${indicatorMeta.atrLen} vwap=${indicatorMeta.vwapLen} ema=${(indicatorMeta.emaLens ?? []).join("/") || "n/a"} regime=${indicatorMeta.regimeTF}` : "",
-          `Agreement: ${fmtPct(l.agreement)}  |  Legitimacy: ${fmtPct(l.legitimacy)}  |  Prob(T1): ${fmtPct(l.probability)}`,
-          `Action: ${l.action ?? "N/A"}`,
-          ``,
-          `${l.reasoning ?? ""}`.trim(),
-          ...this.formatDecisionLines(event.data.decision)
-        ].filter(Boolean).join("\n");
-      }
-
-      case "SETUP_SUMMARY": {
-        if (event.data.marketState) {
-          return this.formatBanner(event, "SETUP SUMMARY");
-        }
-        const c = event.data?.candidate;
-        if (!c) {
-          return [
-            `[${instanceId}] 🧩 SETUP SUMMARY`,
-            `${event.data?.summary ?? "No candidate"}`,
-            ...this.formatDecisionLines(event.data.decision)
-          ].filter(Boolean).join("\n");
-        }
-        return [
-          `[${instanceId}] 🧩 SETUP SUMMARY (5m)`,
-          `${c.direction} ${c.symbol}  |  ${c.pattern}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          `Score: ${c.score?.total ?? "n/a"}`,
-          `Trigger: $${Number.isFinite(c.triggerPrice) ? c.triggerPrice.toFixed(2) : "n/a"}`,
-          `Entry: $${c.entryZone?.low?.toFixed?.(2) ?? "n/a"} - $${c.entryZone?.high?.toFixed?.(2) ?? "n/a"}`,
-          `Stop: $${Number.isFinite(c.stop) ? c.stop.toFixed(2) : "n/a"}`,
-          event.data?.notes ? `Notes: ${event.data.notes}` : "",
-          ...this.formatDecisionLines(event.data.decision)
-        ].filter(Boolean).join("\n");
+      {
+        const alert = this.buildSetupAlert(event);
+        const ideas = this.buildIdeasBlock(event);
+        return ideas.length ? [alert, "", ...ideas].join("\n") : alert;
       }
 
       case "NO_ENTRY":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "NO ENTRY");
-        }
-        return [
-          `[${instanceId}] ⛔ NO ENTRY`,
-          event.data?.direction && event.data?.symbol ? `${event.data.direction} ${event.data.symbol}` : "",
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          ...this.formatDecisionLines(event.data.decision)
-        ].filter(Boolean).join("\n");
-
-      case "TRADE_PLAN":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "TRADE PLAN");
-        }
-        return [
-          `[${instanceId}] 📋 TRADE PLAN`,
-          `${event.data.direction} ${event.data.symbol}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          `Action: ${event.data.action}`,
-          `Size: ${event.data.size || "N/A"}`,
-          `Probability: ${event.data.probability || "N/A"}%`,
-          ``,
-          `${event.data.plan || ""}`
-        ].join("\n");
+        return this.buildBlockedStatus(event);
 
       case "PLAY_ENTERED":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "PLAY ENTERED");
-        }
         return [
-          `[${instanceId}] ✅ PLAY ENTERED`,
-          `${event.data.direction} ${event.data.symbol}`,
-          `Entry: $${event.data.entryPrice?.toFixed(2) || event.data.price?.toFixed(2) || "N/A"}`,
+          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | ENTERED`,
+          `Entry: ${(event.data.entryPrice ?? event.data.price)?.toFixed?.(2) ?? "n/a"}`,
           event.data.reason ? `Reason: ${event.data.reason}` : ""
-        ].join("\n");
+        ].filter(Boolean).join("\n");
 
       case "PLAY_SIZED_UP":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "PLAY SIZED UP");
-        }
         return [
-          `[${instanceId}] 📈 SIZE UP`,
-          `${event.data.direction} ${event.data.symbol}`,
+          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | SIZE UP`,
           `Mode: ${event.data.mode || "FULL"}`,
           event.data.reason ? `Reason: ${event.data.reason}` : ""
         ].filter(Boolean).join("\n");
 
       case "ENTRY_WINDOW_OPENED":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "ENTRY WINDOW OPENED");
-        }
-        return [
-          `[${instanceId}] 🟡 ENTRY WINDOW`,
-          `${event.data.direction} ${event.data.symbol}`,
-          event.data.price !== undefined ? `Price: $${event.data.price.toFixed(2)}` : "",
-          event.data.entryZone ? `Zone: $${event.data.entryZone.low.toFixed(2)} - $${event.data.entryZone.high.toFixed(2)}` : ""
-        ].filter(Boolean).join("\n");
+        return "";
 
       case "PLAY_CANCELLED":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "PLAY CANCELLED");
-        }
         return [
-          `[${instanceId}] 🚫 PLAY CANCELLED`,
-          `${event.data.direction} ${event.data.symbol}`,
+          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | CANCELLED`,
           event.data.reason ? `Reason: ${event.data.reason}` : ""
         ].filter(Boolean).join("\n");
 
@@ -723,15 +711,10 @@ export class MessagePublisher {
         ].join("\n");
 
       case "PLAY_CLOSED":
-        if (event.data.marketState) {
-          return this.formatBanner(event, "PLAY CLOSED");
-        }
         return [
-          `[${instanceId}] 🏁 PLAY CLOSED`,
-          `${event.data.direction} ${event.data.symbol}`,
-          `Reason: ${event.data.reason}`,
-          `Result: ${event.data.result || "N/A"}`,
-          `Close: $${event.data.close?.toFixed(2) || "N/A"}`
+          `${event.data.symbol ?? "SPY"} | ${event.data.direction ?? "N/A"} | CLOSED`,
+          `Reason: ${event.data.reason ?? "n/a"}`,
+          `Result: ${event.data.result || "N/A"}`
         ].join("\n");
 
       case "PLAN_OF_DAY":

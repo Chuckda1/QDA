@@ -147,6 +147,88 @@ export class CommandHandler {
     return lines.join("\n");
   }
 
+  async detail(): Promise<string> {
+    const d = this.orch.getLastDiagnostics();
+    const decision = this.orch.getLastDecision();
+    const marketState = this.orch.getLastMarketState();
+    const timing = this.orch.getLastTimingSnapshot();
+    if (!d) return "No diagnostics yet (waiting for enough bars).";
+
+    const indicators = decision?.rules?.indicators ?? {};
+    const tactical = d.tacticalSnapshot ?? marketState?.tacticalSnapshot;
+
+    const fmtPct = (x?: number) => (Number.isFinite(x) ? `${Math.round(x!)}%` : "n/a");
+    const fmtNum = (x?: number) => (Number.isFinite(x) ? x!.toFixed(2) : "n/a");
+    const fmtEtTime = (ts?: number) =>
+      ts
+        ? new Date(ts).toLocaleTimeString("en-US", {
+            timeZone: "America/New_York",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+          })
+        : "n/a";
+
+    const vwap1m = indicators.vwap1m ?? indicators.vwap;
+    const atr1m = indicators.atr ?? indicators.atr1m;
+    const distToVwapAtr =
+      Number.isFinite(vwap1m) && Number.isFinite(atr1m) && (atr1m as number) > 0
+        ? ((d.close - (vwap1m as number)) / (atr1m as number))
+        : undefined;
+
+    const emaStack = (ema9?: number, ema20?: number) => {
+      if (!Number.isFinite(ema9) || !Number.isFinite(ema20)) return "n/a";
+      if ((ema9 as number) > (ema20 as number)) return "bullish";
+      if ((ema9 as number) < (ema20 as number)) return "bearish";
+      return "flat";
+    };
+
+    const blockers = decision?.blockerReasons?.length
+      ? decision.blockerReasons
+      : d.guardrailBlock
+      ? [d.guardrailBlock]
+      : d.setupReason
+      ? [d.setupReason]
+      : [];
+
+    const riskMode = marketState?.permission?.mode ?? "NORMAL";
+    const regime = marketState?.regime ?? d.regime.regime;
+    const regimeConfidence = marketState?.confidence ?? undefined;
+
+    const lines: string[] = [];
+    lines.push(`DETAIL (${d.symbol})`);
+    if (tactical) {
+      lines.push(`Tactical: ${tactical.activeDirection} ${fmtPct(tactical.confidence)}  score=${tactical.score}`);
+    }
+    lines.push(`Context(5m): ${regime} ${fmtPct(regimeConfidence)}   risk=${riskMode}`);
+    if (timing) {
+      lines.push(`Timing: ${timing.phase ?? timing.state ?? "n/a"} score=${fmtNum(timing.score)} since ${fmtEtTime(timing.phaseSinceTs)}`);
+    }
+    if (Number.isFinite(vwap1m) || Number.isFinite(distToVwapAtr)) {
+      const distLabel = Number.isFinite(distToVwapAtr) ? `${(distToVwapAtr as number).toFixed(2)}ATR` : "n/a";
+      lines.push(`VWAP(1m): ${fmtNum(vwap1m as number)}  dist=${distLabel}`);
+    }
+    const ema1m = emaStack(indicators.ema9_1m ?? indicators.ema9, indicators.ema20_1m ?? indicators.ema20);
+    if (ema1m !== "n/a") {
+      lines.push(`EMA(1m): ${ema1m === "bullish" ? "9>20 bullish" : ema1m === "bearish" ? "9<20 bearish" : "flat"}`);
+    }
+    const ema5m = emaStack(indicators.ema9, indicators.ema20);
+    if (ema5m !== "n/a") {
+      lines.push(`EMA(5m): ${ema5m}`);
+    }
+    if (tactical?.shock) {
+      lines.push(`Shock: ON (${tactical.shockReason ?? "range expansion"})`);
+    }
+    if (blockers.length) {
+      lines.push("Blockers:");
+      for (const reason of blockers) {
+        lines.push(`- ${reason}`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
   /**
    * Manually mark play as entered (when you actually enter the trade)
    */
