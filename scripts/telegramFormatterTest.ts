@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import type { DomainEvent } from "../src/types.js";
+import type { DomainEvent, TacticalSnapshot } from "../src/types.js";
 import { buildTelegramAlert } from "../src/telegram/telegramFormatter.js";
 import { normalizeTelegramSnapshot } from "../src/telegram/telegramNormalizer.js";
 import { buildTelegramSignature } from "../src/telegram/telegramSignature.js";
+import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 
 const makeBaseEvent = (type: DomainEvent["type"], data: Record<string, any>): DomainEvent => ({
   type,
@@ -151,5 +152,50 @@ const signatureB = buildTelegramSignature({
   warnTags: ["EXTENDED"],
 });
 assert.notEqual(signatureA, signatureB, "Signature must change when WHY changes");
+
+const timeCutoffEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  hardBlockers: ["time_window"],
+  hardBlockerReasons: ["Time-of-day cutoff: No new plays after 15:30 ET"],
+});
+const timeCutoffSnapshot = normalizeTelegramSnapshot(timeCutoffEvent);
+assert.ok(timeCutoffSnapshot, "Time cutoff snapshot missing");
+assert.equal(timeCutoffSnapshot?.type, "UPDATE", "Time cutoff should produce UPDATE");
+
+const dataReadyEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  hardBlockers: ["guardrail"],
+  hardBlockerReasons: ["DATA_READY: missing VWAP"],
+  topPlay: {
+    entryZone: { low: 451.2, high: 452.4 },
+    stop: 449.8,
+    targets: { t1: 454.2, t2: 456.4, t3: 458.2 },
+  },
+});
+const dataReadySnapshot = normalizeTelegramSnapshot(dataReadyEvent);
+assert.ok(dataReadySnapshot, "Data readiness snapshot missing");
+assert.equal(dataReadySnapshot?.type, "WATCH", "Data readiness should produce WATCH");
+
+const debounceOrch = new Orchestrator("debounce-test");
+const baseSnapshot: TacticalSnapshot = {
+  activeDirection: "LONG",
+  confidence: 80,
+  reasons: ["price>VWAP"],
+  tier: "CLEAR",
+  score: 3,
+  shock: false,
+  indicatorTf: "1m",
+};
+const ts = Date.now();
+const s1 = (debounceOrch as any).applyTacticalDebounce(baseSnapshot, ts) as TacticalSnapshot;
+const s2 = (debounceOrch as any).applyTacticalDebounce({ ...baseSnapshot, activeDirection: "SHORT" }, ts + 60_000) as TacticalSnapshot;
+const s3 = (debounceOrch as any).applyTacticalDebounce({ ...baseSnapshot, activeDirection: "SHORT" }, ts + 120_000) as TacticalSnapshot;
+const s4 = (debounceOrch as any).applyTacticalDebounce({ ...baseSnapshot, activeDirection: "LONG" }, ts + 180_000) as TacticalSnapshot;
+assert.equal(s1.activeDirection, "LONG", "Initial direction should be LONG");
+assert.equal(s2.activeDirection, "LONG", "Debounce should block first flip");
+assert.equal(s3.activeDirection, "SHORT", "Debounce should allow second flip");
+assert.equal(s4.activeDirection, "SHORT", "Cooldown should block immediate re-flip");
 
 console.log("✅ Telegram formatter tests passed.");

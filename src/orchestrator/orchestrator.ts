@@ -216,6 +216,13 @@ export class Orchestrator {
   private transitionLockRemaining: number = 0;
   private readonly transitionLockBars: number = 3;
 
+  private lastTacticalDirection?: Direction | "NEUTRAL";
+  private pendingTacticalDirection?: Direction | "NEUTRAL";
+  private pendingTacticalCount: number = 0;
+  private lastTacticalFlipTs: number | null = null;
+  private readonly tacticalFlipConfirmBars: number = 2;
+  private readonly tacticalFlipCooldownMs: number;
+
   // Guardrail tracking
   private playsToday: number = 0;
   private currentETDay: string = "";
@@ -279,6 +286,7 @@ export class Orchestrator {
     this.maxGapMs = parseInt(process.env.MAX_DATA_GAP_MS || "180000", 10); // Default 3 minutes
     this.dataGapCooldownBars = parseInt(process.env.DATA_GAP_COOLDOWN_BARS || "3", 10);
     this.allowSyntheticBars = process.env.ALLOW_SYNTHETIC_BARS === "true";
+    this.tacticalFlipCooldownMs = parseInt(process.env.TACTICAL_FLIP_COOLDOWN_MS || "240000", 10);
 
     // Load LLM reliability config from env vars
     this.llmTimeoutMs = parseInt(process.env.LLM_TIMEOUT_MS || "10000", 10); // Default 10 seconds
@@ -586,6 +594,49 @@ export class Orchestrator {
     return { allowed: true };
   }
 
+  private applyTacticalDebounce(snapshot: TacticalSnapshot, ts: number): TacticalSnapshot {
+    if (snapshot.indicatorTf !== "1m") return snapshot;
+    const candidateDir = snapshot.activeDirection;
+    if (!this.lastTacticalDirection) {
+      this.lastTacticalDirection = candidateDir;
+      return snapshot;
+    }
+    if (candidateDir === this.lastTacticalDirection) {
+      this.pendingTacticalDirection = undefined;
+      this.pendingTacticalCount = 0;
+      return snapshot;
+    }
+
+    if (this.lastTacticalFlipTs && ts - this.lastTacticalFlipTs < this.tacticalFlipCooldownMs) {
+      return {
+        ...snapshot,
+        activeDirection: this.lastTacticalDirection,
+        reasons: [...snapshot.reasons, "flip cooldown active"],
+      };
+    }
+
+    if (this.pendingTacticalDirection === candidateDir) {
+      this.pendingTacticalCount += 1;
+    } else {
+      this.pendingTacticalDirection = candidateDir;
+      this.pendingTacticalCount = 1;
+    }
+
+    if (this.pendingTacticalCount >= this.tacticalFlipConfirmBars) {
+      this.lastTacticalDirection = candidateDir;
+      this.lastTacticalFlipTs = ts;
+      this.pendingTacticalDirection = undefined;
+      this.pendingTacticalCount = 0;
+      return snapshot;
+    }
+
+    return {
+      ...snapshot,
+      activeDirection: this.lastTacticalDirection,
+      reasons: [...snapshot.reasons, `await ${this.tacticalFlipConfirmBars - this.pendingTacticalCount} bar confirm`],
+    };
+  }
+
   setMode(mode: BotState["mode"]): void {
     this.state.mode = mode;
   }
@@ -779,6 +830,20 @@ export class Orchestrator {
     }
 
     const play = this.state.activePlay!;
+    const softManagementActive =
+      this.lastMarketState?.permission?.mode === "REDUCE_SIZE" ||
+      this.lastMarketState?.permission?.mode === "SCALP_ONLY" ||
+      this.lastMarketState?.tacticalBias?.shock === true ||
+      this.transitionLockRemaining > 0;
+    if (softManagementActive) {
+      if (play.mode === "FULL") {
+        play.mode = "SCOUT"; // reduce adds while soft blockers are active
+      }
+      play.coachingState = {
+        ...(play.coachingState ?? {}),
+        intent: "PROTECT",
+      };
+    }
     const buildDecisionPayload = (params: {
       kind: "GATE" | "EXECUTION" | "MANAGEMENT";
       status: string;
@@ -1319,13 +1384,14 @@ export class Orchestrator {
           ? this.lastRegime15m
           : computeRegime(this.recentBars5m, close, REGIME_5M_PROVISIONAL_OPTIONS);
         const fallbackIndicators = buildIndicatorSet(this.recentBars1m, "1m");
-        const fallbackTactical = buildTacticalSnapshot({
+        const fallbackRaw = buildTacticalSnapshot({
           bars: this.recentBars1m,
           indicators: fallbackIndicators,
           tf: "1m",
           confirmBars: this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
           confirmIndicators: this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined,
         });
+        const fallbackTactical = this.applyTacticalDebounce(fallbackRaw, ts);
         this.lastDiagnostics = {
           ts,
           symbol,
@@ -1370,13 +1436,15 @@ export class Orchestrator {
       const tacticalPrimaryBars = this.recentBars1m.length >= 6 ? this.recentBars1m : this.recentBars5m;
       const tacticalPrimaryIndicators = tacticalPrimaryBars === this.recentBars1m ? indicators1m : indicators5m;
       const tacticalPrimaryTf = tacticalPrimaryBars === this.recentBars1m ? "1m" : "5m";
-      const tacticalSnapshot = buildTacticalSnapshot({
+      const tacticalRaw = buildTacticalSnapshot({
         bars: tacticalPrimaryBars,
         indicators: tacticalPrimaryIndicators,
         tf: tacticalPrimaryTf,
         confirmBars: tacticalPrimaryTf === "1m" && this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
         confirmIndicators: tacticalPrimaryTf === "1m" ? indicators5m : undefined,
       });
+      const tacticalSnapshot =
+        tacticalPrimaryTf === "1m" ? this.applyTacticalDebounce(tacticalRaw, ts) : tacticalRaw;
       const dirInf = {
         direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? undefined : tacticalSnapshot.activeDirection,
         confidence: tacticalSnapshot.confidence,
@@ -2087,32 +2155,52 @@ export class Orchestrator {
       ruleScores.potd.alignment = potdAlignment;
 
       const buildBlockers = (candidate: SetupCandidate) => {
-        const nextBlockers: DecisionBlocker[] = [];
-        const nextReasons: string[] = [];
+        const hardBlockers: DecisionBlocker[] = [];
+        const softBlockers: DecisionBlocker[] = [];
+        const hardReasons: string[] = [];
+        const softReasons: string[] = [];
+
+        const pushHard = (blocker: DecisionBlocker, reason: string) => {
+          hardBlockers.push(blocker);
+          hardReasons.push(reason);
+        };
+        const pushSoft = (blocker: DecisionBlocker, reason: string) => {
+          softBlockers.push(blocker);
+          softReasons.push(reason);
+        };
 
         if (candidate.stage === "EARLY") {
-          nextBlockers.push("guardrail");
-          nextReasons.push(`EARLY idea: ${candidate.holdReason ?? "waiting for timing"}`);
+          pushSoft("guardrail", `EARLY idea: ${candidate.holdReason ?? "waiting for timing"}`);
         }
         if (!readinessOk) {
-          nextBlockers.push("guardrail");
-          nextReasons.push(`DATA_READY: missing ${readinessMissing.join(", ")}`);
+          pushHard("guardrail", `DATA_READY: missing ${readinessMissing.join(", ")}`);
         }
 
         if (!directionGate.allow) {
-          nextBlockers.push("guardrail");
-          nextReasons.push(directionGate.reason);
+          pushSoft("guardrail", directionGate.reason);
         } else if (candidate.direction !== directionGate.direction) {
-          nextBlockers.push("guardrail");
-          nextReasons.push(`Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
+          pushSoft("guardrail", `Direction gate: ${directionGate.tier} ${directionGate.direction} only`);
         }
 
-        if (atr) {
+        if (!Number.isFinite(candidate.stop)) {
+          pushHard("guardrail", "STOP_INVALID: stop missing");
+        } else {
+          const stopInvalid =
+            candidate.direction === "LONG"
+              ? candidate.stop >= candidate.entryZone.low
+              : candidate.stop <= candidate.entryZone.high;
+          if (stopInvalid) {
+            pushHard("guardrail", "STOP_INVALID: stop not beyond entry zone");
+          }
+        }
+
+        if (!atr || atr <= 0) {
+          pushHard("guardrail", "ATR_INVALID: missing or non-positive ATR");
+        } else {
           const entryMid = (candidate.entryZone.low + candidate.entryZone.high) / 2;
           const riskAtr = Math.abs(entryMid - candidate.stop) / atr;
           if (riskAtr > 1.5) {
-            nextBlockers.push("guardrail");
-            nextReasons.push(`RISK_CAP: risk/ATR ${riskAtr.toFixed(2)} > 1.50`);
+            pushSoft("guardrail", `RISK_CAP: risk/ATR ${riskAtr.toFixed(2)} > 1.50`);
           }
         }
 
@@ -2120,19 +2208,17 @@ export class Orchestrator {
           timingSnapshot?.phase === "ENTRY_WINDOW" ||
           timingSnapshot?.state === "ENTRY_WINDOW_OPEN";
         if (llmSummary?.action && ["GO_ALL_IN", "SCALP"].includes(llmSummary.action) && !timingReady) {
-          nextBlockers.push("time_window");
-          nextReasons.push(`TIMING_THRESHOLD: ${timingSnapshot?.phase ?? timingSnapshot?.state ?? "N/A"}`);
+          pushSoft("time_window", `TIMING_THRESHOLD: ${timingSnapshot?.phase ?? timingSnapshot?.state ?? "N/A"}`);
         }
 
         if (llmErrorReason) {
-          nextBlockers.push("arming_failed");
-          nextReasons.push(llmErrorReason);
+          pushHard("arming_failed", llmErrorReason);
         }
 
-        return { blockers: nextBlockers, blockerReasons: nextReasons };
+        return { hardBlockers, softBlockers, hardReasons, softReasons };
       };
 
-      ({ blockers, blockerReasons } = buildBlockers(setupCandidate));
+      const baseBlockers = buildBlockers(setupCandidate);
 
       const filterContext: EntryFilterContext = {
         timestamp: ts,
@@ -2163,9 +2249,19 @@ export class Orchestrator {
         console.log(`[5m] Entry filter warnings: ${filterResult.warnings.join(" | ")}`);
       }
       if (!filterResult.allowed) {
-        blockers.push("entry_filter");
-        if (filterResult.reason) {
-          blockerReasons.push(filterResult.reason);
+        const reason = filterResult.reason ?? "entry filter";
+        if (reason.toLowerCase().includes("time-of-day cutoff")) {
+          baseBlockers.hardBlockers.push("time_window");
+          baseBlockers.hardReasons.push(reason);
+        } else if (reason.toLowerCase().includes("extended-from-mean")) {
+          baseBlockers.softBlockers.push("entry_filter");
+          baseBlockers.softReasons.push(reason);
+        } else if (reason.toLowerCase().includes("no reclaim signal")) {
+          baseBlockers.softBlockers.push("entry_filter");
+          baseBlockers.softReasons.push(reason);
+        } else {
+          baseBlockers.softBlockers.push("entry_filter");
+          baseBlockers.softReasons.push(reason);
         }
         console.log(`[5m] Entry blocked by filter: ${filterResult.reason}`);
       }
@@ -2184,14 +2280,12 @@ export class Orchestrator {
       }
 
       if (guardrailBlockReason) {
-        blockers.push(guardrailBlockTag ?? "guardrail");
-        blockerReasons.push(guardrailBlockReason);
+        baseBlockers.hardBlockers.push(guardrailBlockTag ?? "guardrail");
+        baseBlockers.hardReasons.push(guardrailBlockReason);
       }
       if (watchOnly) {
-        if (!blockers.includes("arming_failed")) {
-          blockers.push("arming_failed");
-        }
-        blockerReasons.push("mode QUIET");
+        baseBlockers.hardBlockers.push("arming_failed");
+        baseBlockers.hardReasons.push("mode QUIET");
       }
       if (this.lastDiagnostics) {
         this.lastDiagnostics = {
@@ -2269,6 +2363,35 @@ export class Orchestrator {
         llmSummary.note = [llmSummary.note, "go-all-in blocked by vwap/ATR slope/pattern/chase risk"].filter(Boolean).join(" | ");
       }
 
+      const softContextReasons: string[] = [];
+      if (shockMode) {
+        softContextReasons.push(`SHOCK: ${tacticalBiasInfo.shockReason ?? "range expansion"}`);
+      }
+      if (transitionLockActive) {
+        softContextReasons.push("TRANSITION_LOCK: active");
+      }
+      if (tacticalSnapshot.confirm && tacticalSnapshot.confirm.bias !== "NONE") {
+        if (tacticalSnapshot.confirm.bias !== tacticalSnapshot.activeDirection) {
+          softContextReasons.push(
+            `TIMEFRAME_CONFLICT: 1m=${tacticalSnapshot.activeDirection} 5m=${tacticalSnapshot.confirm.bias}`
+          );
+        }
+      }
+      if (lowContext && lowContextReasons.length) {
+        softContextReasons.push(`LOW_CANDIDATE_DENSITY: ${lowContextReasons.join(" | ")}`);
+      }
+      for (const reason of softContextReasons) {
+        baseBlockers.softBlockers.push("guardrail");
+        baseBlockers.softReasons.push(reason);
+      }
+
+      const hardBlockers = baseBlockers.hardBlockers;
+      const softBlockers = baseBlockers.softBlockers;
+      const hardBlockerReasons = baseBlockers.hardReasons;
+      const softBlockerReasons = baseBlockers.softReasons;
+      const blockers = [...hardBlockers, ...softBlockers];
+      const blockerReasons = [...hardBlockerReasons, ...softBlockerReasons];
+
       const rulesSnapshot: DecisionRulesSnapshot = {
         regime: {
           regime: anchorRegime.regime,
@@ -2345,6 +2468,10 @@ export class Orchestrator {
         gateTier: directionGate.allow ? (directionGate.tier === "LEANING" ? "LEANING" : "OPEN") : "STRICT",
         blockers: decision.blockers,
         blockerReasons: decision.blockerReasons,
+        hardBlockers,
+        softBlockers,
+        hardBlockerReasons,
+        softBlockerReasons,
         rationale: [
           directionGate.reason,
           ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
@@ -2416,6 +2543,10 @@ export class Orchestrator {
           decision: decisionSummary,
           blockerTags: blockers,
           blockerReasons,
+          hardBlockers,
+          softBlockers,
+          hardBlockerReasons,
+          softBlockerReasons,
           marketState,
           timing: timingSnapshot,
           playState: "CANDIDATE",
@@ -2451,6 +2582,10 @@ export class Orchestrator {
           topPlay,
           blockerTags: blockers,
           blockerReasons,
+          hardBlockers,
+          softBlockers,
+          hardBlockerReasons,
+          softBlockerReasons,
           playState: "CANDIDATE",
           notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
         }));
@@ -2468,6 +2603,10 @@ export class Orchestrator {
           topPlay,
           blockerTags: blockers,
           blockerReasons,
+          hardBlockers,
+          softBlockers,
+          hardBlockerReasons,
+          softBlockerReasons,
           playState: "CANDIDATE",
           notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
         }));
@@ -2494,6 +2633,10 @@ export class Orchestrator {
           topPlay,
           blockerTags: blockers,
           blockerReasons,
+          hardBlockers,
+          softBlockers,
+          hardBlockerReasons,
+          softBlockerReasons,
           playState: "ARMED",
           armReason: "regime + score + LLM approved"
         }));
@@ -2512,6 +2655,10 @@ export class Orchestrator {
           topPlay,
           blockerTags: blockers,
           blockerReasons,
+          hardBlockers,
+          softBlockers,
+          hardBlockerReasons,
+          softBlockerReasons,
           playState: "ARMED",
           armReason: "regime + score + LLM approved"
         }));
@@ -2534,6 +2681,10 @@ export class Orchestrator {
             topPlay,
             blockerTags: blockers,
             blockerReasons,
+            hardBlockers,
+            softBlockers,
+            hardBlockerReasons,
+            softBlockerReasons,
             playState: decision.status === "ARMED" ? "ARMED" : "CANDIDATE"
           }));
           this.lastSetupSummary5mTs = ts;

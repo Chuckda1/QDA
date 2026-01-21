@@ -163,6 +163,9 @@ const buildWarnTags = (event: DomainEvent, reasons: string[], blockers: string[]
   if (reasons.some((reason) => /No reclaim signal/i.test(reason))) tags.push("RECLAIM");
   if (reasons.some((reason) => /cooldown/i.test(reason))) tags.push("COOLDOWN");
   if (reasons.some((reason) => /LOW_CONTEXT/i.test(reason))) tags.push("LOW_CONTEXT");
+  if (reasons.some((reason) => /TRANSITION_LOCK|SHOCK/i.test(reason))) tags.push("TRANSITION");
+  if (reasons.some((reason) => /TIMEFRAME_CONFLICT/i.test(reason))) tags.push("TF_CONFLICT");
+  if (reasons.some((reason) => /LOW_CANDIDATE_DENSITY/i.test(reason))) tags.push("LOW_DENSITY");
   if (isDataNotReady(event, reasons)) tags.push("DATA");
 
   for (const blocker of blockers) {
@@ -260,6 +263,23 @@ const buildEntryTrigger = (entryZone: { low: number; high: number }, dir: Direct
   return `break&hold ${dir === "LONG" ? "above" : "below"} ${level.toFixed(2)}`;
 };
 
+const buildHardArmCondition = (reasons: string[]): string => {
+  const reasonText = reasons.join(" ").toLowerCase();
+  if (reasonText.includes("data_ready") || reasonText.includes("warmup") || reasonText.includes("vwap")) {
+    return "data ready (VWAP/ATR)";
+  }
+  if (reasonText.includes("stop_invalid")) {
+    return "valid stop set";
+  }
+  if (reasonText.includes("atr_invalid")) {
+    return "ATR valid";
+  }
+  if (reasonText.includes("data gap") || reasonText.includes("datafeed")) {
+    return "fresh bars";
+  }
+  return "resolve hard block";
+};
+
 export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot | null {
   const symbol = getSymbol(event);
   const dir = getDirection(event);
@@ -273,16 +293,23 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const decision = event.data.decision;
   const blockers = decision?.blockers ?? event.data.blockerTags ?? [];
   const blockerReasons = decision?.blockerReasons ?? event.data.blockerReasons ?? [];
-  const reasons = blockerReasons.map(normalizeReason);
-  const warnTags = buildWarnTags(event, reasons, blockers);
+  const hardBlockers = event.data.hardBlockers ?? decision?.hardBlockers ?? [];
+  const softBlockers = event.data.softBlockers ?? decision?.softBlockers ?? [];
+  const hardBlockerReasons = event.data.hardBlockerReasons ?? decision?.hardBlockerReasons ?? [];
+  const softBlockerReasons = event.data.softBlockerReasons ?? decision?.softBlockerReasons ?? [];
+  const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons].map(normalizeReason);
+  const warnTags = buildWarnTags(event, reasons, [...blockers, ...softBlockers]);
   const entryMode = deriveEntryMode(event, reasons, warnTags);
   const sizeMultiplier = deriveSizeMultiplier(warnTags);
   const armCondition = buildArmCondition(event, dir, reasons, warnTags);
   const why = buildWhy(event, dir, reasons);
 
+  const timeCutoff = reasons.some((reason: string) => isTimeOfDayCutoff(reason));
   const hardBlocker =
+    hardBlockers.length > 0 ||
+    hardBlockerReasons.length > 0 ||
     isDataNotReady(event, reasons) ||
-    reasons.some((reason: string) => isTimeOfDayCutoff(reason)) ||
+    timeCutoff ||
     reasons.some((reason: string) => isMarketUnavailable(reason)) ||
     blockers.includes("datafeed");
 
@@ -297,9 +324,9 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         update: {
           fromSide: dir,
           toSide: dir,
-          emoji: "⚠️",
-          cause: "hard block active",
-          next: "wait for data/market",
+          emoji: timeCutoff ? "⏱️" : "⚠️",
+          cause: timeCutoff ? "time cutoff" : "hard block active",
+          next: timeCutoff ? "stop new entries" : "wait for readiness",
           ts: formatEtTimestamp(event.timestamp),
         },
       };
@@ -328,24 +355,39 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   }
 
   if (event.type === "NO_ENTRY" || event.type === "LLM_VERIFY") {
-    if (!entryZone || !stop || !targets) return null;
+    const hasEntryData = !!entryZone && !!stop && !!targets;
     if (hardBlocker) {
+      if (timeCutoff) {
+        return {
+          type: "UPDATE",
+          symbol,
+          dir,
+          conf,
+          risk,
+          update: {
+            fromSide: dir,
+            toSide: dir,
+            emoji: "⏱️",
+            cause: "time cutoff",
+            next: "stop new entries",
+            ts: formatEtTimestamp(event.timestamp),
+          },
+        };
+      }
       return {
-        type: "UPDATE",
+        type: "WATCH",
         symbol,
         dir,
         conf,
         risk,
-        update: {
-          fromSide: dir,
-          toSide: dir,
-          emoji: "⚠️",
-          cause: "data/time/market block",
-          next: "wait for readiness",
-          ts: formatEtTimestamp(event.timestamp),
-        },
+        armCondition: buildHardArmCondition(hardBlockerReasons),
+        entryRule: "pullback only (NO chase)",
+        planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        why,
+        warnTags: warnTags.length ? warnTags : ["DATA"],
       };
     }
+    if (!hasEntryData) return null;
 
     const entryRule = warnTags.includes("RECLAIM") ? "reclaim only" : "pullback only (NO chase)";
     const planParts = ["patience", entryMode === "PULLBACK" ? "pullback entry" : "breakout entry"];
