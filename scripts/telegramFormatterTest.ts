@@ -212,11 +212,14 @@ assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
 const rangeAlert = buildTelegramAlert(rangeSnapshot!);
 assert.ok(rangeAlert, "Range WATCH alert missing");
 assert.ok(rangeAlert?.lines.length <= 9, "Range WATCH line count exceeded");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("TS:")), "Range WATCH missing timestamp");
+assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing WATCH");
+assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
+assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("RANGE:")), "Range WATCH missing range line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("LONG ARM:")), "Range WATCH missing long arm");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("SHORT ENTRY:")), "Range WATCH missing short entry");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("NEXT:")), "Range WATCH missing next line");
 assert.ok(
   rangeAlert?.lines.some((l) => l.includes("(+1)")),
   "Range WATCH warn tags should be capped"

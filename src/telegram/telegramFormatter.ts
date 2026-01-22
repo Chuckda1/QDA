@@ -57,6 +57,15 @@ const formatWarnTags = (tags?: string[]): string | undefined => {
   return `WARN: ${capped.join(",")}${suffix}`;
 };
 
+const formatEtTimeShort = (ts?: string): string | undefined => {
+  if (!ts) return undefined;
+  const parts = ts.split(" ");
+  const time = parts[1];
+  if (!time) return ts;
+  const hhmm = time.slice(0, 5);
+  return `${hhmm} ET`;
+};
+
 export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | null {
   if (snapshot.type === "SIGNAL") {
     const header = `${snapshot.symbol} ${snapshot.dir} ✅ ${snapshot.conf ?? "?"}% | SIGNAL | risk=${snapshot.risk}`;
@@ -73,23 +82,25 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
 
   if (snapshot.type === "WATCH") {
     if (snapshot.range) {
-      const header = `${snapshot.symbol} RANGE 🟡 | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}`;
-      const ts = `TS: ${snapshot.range.ts}`;
-      const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)} - ${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
+      const time = formatEtTimeShort(snapshot.range.ts);
+      const timeSuffix = time ? ` | ${time}` : "";
+      const header = `${snapshot.symbol} ⚪ RANGE | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
+      const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)}-${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
       const longArm = `LONG ARM: ${snapshot.range.longArm}`;
       const longEntry = `LONG ENTRY: ${snapshot.range.longEntry}`;
       const shortArm = `SHORT ARM: ${snapshot.range.shortArm}`;
       const shortEntry = `SHORT ENTRY: ${snapshot.range.shortEntry}`;
       const stop = `STOP: ${snapshot.range.stopAnchor || "when armed"}`;
+      const next = "NEXT: wait for ARM → bot creates play";
       const warn = formatWarnTags(snapshot.warnTags);
       const lines = enforceLineLimit(
         "WATCH",
-        [header, ts, rangeLine, longArm, longEntry, shortArm, shortEntry, stop, warn].filter(nonEmpty)
+        [header, rangeLine, longArm, longEntry, shortArm, shortEntry, stop, next, warn].filter(nonEmpty)
       );
       return { type: "WATCH", lines, text: lines.join("\n") };
     }
     const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk}`;
-    const arm = `ARM: ${snapshot.armCondition ?? "n/a"}`;
+    const arm = `ARM: ${snapshot.armCondition ?? "n/a"} (creates play)`;
     const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
     const planStop = `PLAN STOP: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
     const why = `WHY: ${snapshot.why ?? "n/a"}`;

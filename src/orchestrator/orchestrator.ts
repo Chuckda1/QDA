@@ -204,6 +204,17 @@ export class Orchestrator {
   private lastScorecardSnapshot: ScorecardSnapshot | null = null;
   private lastRangeWatchKey: string | null = null;
   private lastRangeWatchTs: number | null = null;
+  private lastRangeWatchMetrics: {
+    low: number;
+    high: number;
+    vwap?: number;
+    warnKey: string;
+    longEntry: string;
+    shortEntry: string;
+  } | null = null;
+  private rangeModeActive: boolean = false;
+  private rangeModeConsecutiveTrue: number = 0;
+  private rangeModeConsecutiveFalse: number = 0;
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
@@ -2436,7 +2447,6 @@ export class Orchestrator {
       if (softContextReasons.some((reason) => reason.startsWith("LOW_CANDIDATE_DENSITY"))) {
         chopSignals.add("LOW_DENSITY");
       }
-      const rangeModeActive = chopSignals.size >= 2;
       const marketStateTag = this.deriveMarketStateTag(anchorRegime.regime, chopSignals);
       marketState.marketState = marketStateTag;
 
@@ -2488,6 +2498,20 @@ export class Orchestrator {
         : hasHardBlockers || softBlockers.length
         ? "WATCH"
         : "SIGNAL";
+      const rangeCondition =
+        decisionState === "WATCH" &&
+        readinessOk &&
+        hardStopBlockers.length === 0 &&
+        hardStopReasons.length === 0 &&
+        hardWaitBlockers.length === 0 &&
+        hardWaitReasons.length === 0 &&
+        chopSignals.size >= 2;
+      const rangeModeActive = this.updateRangeMode(rangeCondition, decisionState === "SIGNAL");
+      if (!rangeModeActive) {
+        this.lastRangeWatchKey = null;
+        this.lastRangeWatchTs = null;
+        this.lastRangeWatchMetrics = null;
+      }
 
       const decision = buildDecision({
         ts,
@@ -2581,6 +2605,13 @@ export class Orchestrator {
         });
       const formatZone = (zone?: { low: number; high: number }): string =>
         zone ? `${zone.low.toFixed(2)}-${zone.high.toFixed(2)}` : "n/a";
+      const rangeWarnKey = (() => {
+        const tags = Array.from(chopSignals).sort();
+        const capped = tags.slice(0, 2);
+        const extra = tags.length - capped.length;
+        const suffix = extra > 0 ? ` (+${extra})` : "";
+        return `${capped.join(",")}${suffix}`;
+      })();
       const rangeWatchPayload = rangeModeActive
         ? (() => {
             const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
@@ -2602,7 +2633,7 @@ export class Orchestrator {
             const shortEntry = shortCandidate
               ? `break&hold below ${shortCandidate.entryZone.low.toFixed(2)}`
               : `break&hold below ${rangeLow.toFixed(2)}`;
-            const stopAnchor = `when armed (long < ${rangeLow.toFixed(2)} / short > ${rangeHigh.toFixed(2)})`;
+            const stopAnchor = `long < ${rangeLow.toFixed(2)} | short > ${rangeHigh.toFixed(2)} (armed)`;
             return {
               range: { low: rangeLow, high: rangeHigh },
               vwap: indicatorSnapshot.vwap,
@@ -2622,6 +2653,7 @@ export class Orchestrator {
             Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
             rangeWatchPayload.longEntry,
             rangeWatchPayload.shortEntry,
+            rangeWarnKey
           ].join("|")
         : null;
       events.push(this.ev("SETUP_CANDIDATES", ts, {
@@ -2710,8 +2742,29 @@ export class Orchestrator {
       }
 
       if (rangeModeActive && rangeWatchPayload) {
+        const atr = indicatorSnapshot.atr;
+        const rangeThreshold = Number.isFinite(atr) ? (atr as number) * 0.15 : 0.15;
+        const vwapThreshold = Number.isFinite(atr) ? (atr as number) * 0.1 : 0.1;
+        const prior = this.lastRangeWatchMetrics;
+        const rangeMoved =
+          !prior ||
+          Math.abs(rangeWatchPayload.range.low - prior.low) >= rangeThreshold ||
+          Math.abs(rangeWatchPayload.range.high - prior.high) >= rangeThreshold;
+        const vwapMoved = (() => {
+          const currentVwap = rangeWatchPayload.vwap;
+          if (!prior) return true;
+          if (currentVwap === undefined && prior.vwap === undefined) return false;
+          if (currentVwap === undefined || prior.vwap === undefined) return true;
+          return Math.abs(currentVwap - prior.vwap) >= vwapThreshold;
+        })();
+        const triggersChanged =
+          !prior ||
+          prior.longEntry !== rangeWatchPayload.longEntry ||
+          prior.shortEntry !== rangeWatchPayload.shortEntry ||
+          prior.warnKey !== rangeWarnKey;
         const shouldEmitRange =
-          this.lastRangeWatchKey !== rangeWatchKey || this.lastRangeWatchTs !== ts;
+          (rangeMoved || vwapMoved || triggersChanged) &&
+          this.lastRangeWatchTs !== ts;
         if (shouldEmitRange) {
           events.push(this.ev("NO_ENTRY", ts, {
             playId: decision.decisionId,
@@ -2734,6 +2787,14 @@ export class Orchestrator {
           }));
           this.lastRangeWatchKey = rangeWatchKey;
           this.lastRangeWatchTs = ts;
+          this.lastRangeWatchMetrics = {
+            low: rangeWatchPayload.range.low,
+            high: rangeWatchPayload.range.high,
+            vwap: rangeWatchPayload.vwap,
+            warnKey: rangeWarnKey,
+            longEntry: rangeWatchPayload.longEntry,
+            shortEntry: rangeWatchPayload.shortEntry,
+          };
         }
       } else if (decisionState === "WATCH" || decision.status !== "ARMED") {
         events.push(this.ev("NO_ENTRY", ts, {
@@ -3370,6 +3431,30 @@ export class Orchestrator {
     if (regime === "TRANSITION") return "TRANSITION";
     if (regime === "CHOP") return "RANGE";
     return "TREND";
+  }
+
+  private updateRangeMode(rangeCondition: boolean, hasSignal: boolean): boolean {
+    if (hasSignal) {
+      this.rangeModeActive = false;
+      this.rangeModeConsecutiveTrue = 0;
+      this.rangeModeConsecutiveFalse = 0;
+      return false;
+    }
+    if (rangeCondition) {
+      this.rangeModeConsecutiveTrue += 1;
+      this.rangeModeConsecutiveFalse = 0;
+    } else {
+      this.rangeModeConsecutiveFalse += 1;
+      this.rangeModeConsecutiveTrue = 0;
+    }
+    if (this.rangeModeActive) {
+      if (this.rangeModeConsecutiveFalse >= 3) {
+        this.rangeModeActive = false;
+      }
+    } else if (this.rangeModeConsecutiveTrue >= 2) {
+      this.rangeModeActive = true;
+    }
+    return this.rangeModeActive;
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {
