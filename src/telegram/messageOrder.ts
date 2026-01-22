@@ -23,6 +23,7 @@ const PRIORITY: Record<DomainEventType, number> = {
   LLM_COACH_UPDATE: 14, // Position management coaching (after entry)
   PLAY_CANCELLED: 15,
   PLAY_CLOSED: 16,
+  PREMARKET_UPDATE: 17,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
 };
 
