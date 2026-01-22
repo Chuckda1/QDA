@@ -204,11 +204,13 @@ const formatEtTimestamp = (ts: number): string => {
 const extractRearmClause = (reason: string): string | undefined => {
   const match = reason.match(/Re-arm[^.]*\./i);
   if (!match) return undefined;
-  return match[0]
+  const clause = match[0]
     .replace(/Re-arm\s*when\s*/i, "")
     .replace(/Re-arm\s*/i, "")
     .replace(/\.$/, "")
     .trim();
+  if (/distance_to_vwap\s*<=\s*0(\.0+)?/i.test(clause)) return undefined;
+  return clause;
 };
 
 const extractReclaimCondition = (reason: string, dir: Direction): string | undefined => {
@@ -292,7 +294,14 @@ const buildArmCondition = (event: DomainEvent, dir: Direction, reasons: string[]
     parts.push("tighter stop (reduce risk/ATR)");
   }
 
-  return parts.length ? unique(parts).join(" OR ") : undefined;
+  const cleaned = parts.filter((part) => !/distance_to_vwap\s*<=\s*0(\.0+)?/i.test(part));
+  return cleaned.length ? unique(cleaned).join(" OR ") : undefined;
+};
+
+const buildPlanStop = (dir: Direction, stop?: number, vwap?: number): string => {
+  if (isFiniteNumber(stop)) return `use ${stop.toFixed(2)} as stop when armed`;
+  if (isFiniteNumber(vwap)) return `${dir === "LONG" ? "below" : "above"} VWAP (auto when armed)`;
+  return "last swing (auto when armed)";
 };
 
 const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[]): string => {
@@ -359,6 +368,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const stop = getStop(event);
   const targets = getTargets(event);
   const indicatorTf = event.data.marketState?.tacticalSnapshot?.indicatorTf ?? event.data.marketState?.tacticalBias?.indicatorTf ?? "1m";
+  const { vwap } = getIndicatorSnapshot(event);
   const decision = event.data.decision;
   const blockers = decision?.blockers ?? event.data.blockerTags ?? [];
   const blockerReasons = decision?.blockerReasons ?? event.data.blockerReasons ?? [];
@@ -555,7 +565,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         ts,
         armCondition: hardArm,
         entryRule: "pullback only (NO chase)",
-        planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        planStop: buildPlanStop(dir, stop, vwap),
         next,
         why,
         warnTags: warnTags.length ? warnTags : ["DATA"],
@@ -600,7 +610,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         ts,
         armCondition: derivedArm,
         entryRule: "pullback only (NO chase)",
-        planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        planStop: buildPlanStop(dir, stop, vwap),
         next,
         why,
         warnTags: warnTags.length ? warnTags : ["DATA"],
@@ -611,7 +621,6 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     const entryRule = warnTags.includes("RECLAIM") ? "reclaim only" : "pullback only (NO chase)";
     const planParts = ["patience", entryMode === "PULLBACK" ? "pullback entry" : "breakout entry"];
     if (warnTags.includes("RISK_ATR")) planParts.push("tight stop");
-    const { vwap } = getIndicatorSnapshot(event);
     const planStop = isFiniteNumber(vwap)
       ? `${dir === "LONG" ? "below" : "above"} VWAP or last swing (auto when armed)`
       : "last swing (auto when armed)";

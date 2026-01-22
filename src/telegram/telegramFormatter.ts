@@ -49,11 +49,26 @@ const enforceLineLimit = (type: TelegramSnapshotType, lines: string[]): string[]
 
 const nonEmpty = (line?: string): line is string => Boolean(line);
 
-const formatWarnTags = (warnTags?: string[]): string | undefined => {
+const formatWarnTags = (warnTags?: string[]): { label: string; value: string } | undefined => {
   if (!warnTags || warnTags.length === 0) return undefined;
-  const shown = warnTags.slice(0, 4);
-  const extra = warnTags.length - shown.length;
-  return extra > 0 ? `${shown.join(",")},+${extra}` : shown.join(",");
+  const cleaned = warnTags.map((tag) => tag.trim()).filter((tag) => tag.length > 0);
+  if (cleaned.length === 0) return undefined;
+  const hardTags = new Set(["DATA", "GUARDRAIL", "COOLDOWN"]);
+  const hard: string[] = [];
+  const soft: string[] = [];
+  for (const tag of cleaned) {
+    if (hardTags.has(tag)) {
+      hard.push(tag);
+    } else {
+      soft.push(tag);
+    }
+  }
+  const ordered = [...hard, ...soft];
+  const shown = ordered.slice(0, 4);
+  const extra = ordered.length - shown.length;
+  const label = hard.length && soft.length ? "WARN(H/S)" : hard.length ? "WARN(H)" : "WARN(S)";
+  const value = extra > 0 ? `${shown.join(",")},+${extra}` : shown.join(",");
+  return { label, value };
 };
 
 export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | null {
@@ -67,7 +82,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const tp = `TP1: ${formatPrice(snapshot.tp1)} | TP2: ${formatPrice(snapshot.tp2)} | MGMT: SL→BE after TP1`;
     const size = `SIZE: ${(snapshot.sizeMultiplier ?? 1).toFixed(2)}x | MODE: ${snapshot.entryMode ?? "PULLBACK"}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
-    const why = warnTags ? `WHY: ${snapshot.why ?? "n/a"} | WARN: ${warnTags}` : `WHY: ${snapshot.why ?? "n/a"}`;
+    const why = warnTags
+      ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
+      : `WHY: ${snapshot.why ?? "n/a"}`;
     const lines = enforceLineLimit("SIGNAL", [header, entry, stop, tp, size, why].filter(nonEmpty));
     return { type: "SIGNAL", lines, text: lines.join("\n") };
   }
@@ -80,7 +97,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const planStop = `STOP PLAN: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
     const next = `NEXT: ${snapshot.next ?? "waiting on arm trigger"}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
-    const why = warnTags ? `WHY: ${snapshot.why ?? "n/a"} | WARN: ${warnTags}` : `WHY: ${snapshot.why ?? "n/a"}`;
+    const why = warnTags
+      ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
+      : `WHY: ${snapshot.why ?? "n/a"}`;
     const lines = enforceLineLimit("WATCH", [header, arm, entry, planStop, next, why].filter(nonEmpty));
     return { type: "WATCH", lines, text: lines.join("\n") };
   }
@@ -113,7 +132,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const cause = `ACTION: ${update.cause}`;
     const next = `NEXT: ${update.next}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
-    const warn = warnTags ? `WARN: ${warnTags}` : undefined;
+    const warn = warnTags ? `${warnTags.label}: ${warnTags.value}` : undefined;
     const lines = enforceLineLimit("MANAGE", [header, cause, next, warn].filter(nonEmpty));
     return { type: "MANAGE", lines, text: lines.join("\n") };
   }

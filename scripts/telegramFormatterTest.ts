@@ -183,7 +183,10 @@ assert.ok(manageAlert?.lines[0]?.includes("px"), "MANAGE header missing px");
 assert.ok(/ET$/.test(manageAlert?.lines[0] ?? ""), "MANAGE header missing ET timestamp");
 assert.ok(manageAlert?.lines[1]?.startsWith("ACTION:"), "MANAGE action line missing");
 assert.ok(manageAlert?.lines[2]?.startsWith("NEXT:"), "MANAGE next line missing");
-assert.ok(manageAlert?.lines[3]?.startsWith("WARN:"), "MANAGE warn line missing");
+assert.ok(
+  /^WARN\((H\/S|H|S)\):/.test(manageAlert?.lines[3] ?? ""),
+  "MANAGE warn line missing"
+);
 
 const premarketSnapshot = normalizeTelegramSnapshot(premarketEvent);
 assert.ok(premarketSnapshot, "Premarket snapshot missing");
