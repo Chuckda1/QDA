@@ -888,6 +888,7 @@ export class Orchestrator {
         playId: decision.decisionId,
         symbol: play.symbol,
         direction: play.direction,
+        decisionState: "UPDATE",
         decision: {
           decisionId: decision.decisionId,
           status: decision.status,
@@ -988,11 +989,13 @@ export class Orchestrator {
           price: close,
           reason: "Entry window expired",
           timing: timingSnapshot,
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
             allowed: false,
-            rationale: ["Entry window expired"]
+            rationale: ["Entry window expired"],
+            decisionState: "UPDATE"
           }),
           playState: "CANDIDATE",
           notArmedReason: "Entry window expired"
@@ -1010,11 +1013,13 @@ export class Orchestrator {
           price: close,
           reason: "Pre-entry stop break",
           timing: timingSnapshot,
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
             allowed: false,
-            rationale: ["Pre-entry stop break"]
+            rationale: ["Pre-entry stop break"],
+            decisionState: "UPDATE"
           }),
           playState: "CANDIDATE",
           notArmedReason: "Pre-entry stop break"
@@ -1031,11 +1036,13 @@ export class Orchestrator {
           price: close,
           reason: "Pre-entry stop break",
           timing: timingSnapshot,
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "CANCELLED",
             allowed: false,
-            rationale: ["Pre-entry stop break"]
+            rationale: ["Pre-entry stop break"],
+            decisionState: "UPDATE"
           }),
           playState: "CANDIDATE",
           notArmedReason: "Pre-entry stop break"
@@ -1136,12 +1143,14 @@ export class Orchestrator {
         result: "LOSS",
         exitType: "STOP_HIT",
         llmAction: "N/A", // Hard stop, LLM not consulted
+        decisionState: "UPDATE",
         decision: buildDecisionPayload({
           kind: "MANAGEMENT",
           status: "CLOSED",
           allowed: true,
           permissionMode: playPermissionMode,
-          rationale: ["stop loss hit on close"]
+          rationale: ["stop loss hit on close"],
+          decisionState: "UPDATE"
         }),
         playState: "ENTERED"
       }));
@@ -1170,12 +1179,14 @@ export class Orchestrator {
           direction: play.direction,
           mode: play.mode,
           reason: confirm.reason,
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "MANAGEMENT",
             status: "ENTERED",
             allowed: true,
             permissionMode: sizedPermissionMode,
-            rationale: [confirm.reason]
+            rationale: [confirm.reason],
+            decisionState: "UPDATE"
           }),
           playState: "ENTERED"
         }));
@@ -1192,12 +1203,14 @@ export class Orchestrator {
           result: "LOSS",
           exitType: "TIME_STOP",
           llmAction: "RULES_EXIT",
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "MANAGEMENT",
             status: "CLOSED",
             allowed: true,
             permissionMode: playPermissionMode,
-            rationale: [confirm.reason]
+            rationale: [confirm.reason],
+            decisionState: "UPDATE"
           }),
           playState: "ENTERED"
         }));
@@ -2630,6 +2643,7 @@ export class Orchestrator {
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
           price: close,
+          decisionState,
           decision: decisionSummary,
           marketState,
           timing: timingSnapshot,
@@ -2659,6 +2673,7 @@ export class Orchestrator {
         this.playsToday += 1;
         events.push(this.ev("PLAY_ARMED", ts, {
           play: decision.play,
+          decisionState,
           decision: decisionSummary,
           price: close,
           marketState,
@@ -2922,6 +2937,7 @@ export class Orchestrator {
         result: "WIN",
         exitType: "EXHAUSTION",
         llmAction: "RULES_EXIT",
+        decisionState: "UPDATE",
         decision: {
           decisionId: `${play.symbol}_${ts}_${play.id}`,
           status: "CLOSED",
@@ -2932,7 +2948,8 @@ export class Orchestrator {
             mode: playPermissionMode
           },
           direction: play.direction,
-          rationale: [reason]
+          rationale: [reason],
+          decisionState: "UPDATE"
         },
         playState: "ENTERED"
       }));
@@ -3178,6 +3195,7 @@ export class Orchestrator {
             targetHit: rulesContext.targetHit,
             llmAction,
             llmReasoning,
+            decisionState: "UPDATE",
             decision: {
               decisionId: `${play.symbol}_${ts}_${play.id}`,
               status: "CLOSED",
@@ -3188,7 +3206,8 @@ export class Orchestrator {
                 mode: playPermissionMode
               },
               direction: play.direction,
-              rationale: [llmReasoning || llmAction]
+              rationale: [llmReasoning || llmAction],
+              decisionState: "UPDATE"
             },
             playState: "ENTERED"
           }));

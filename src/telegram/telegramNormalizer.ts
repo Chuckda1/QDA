@@ -1,4 +1,5 @@
 import type { Direction, DomainEvent } from "../types.js";
+import { getDecisionState } from "../utils/decisionState.js";
 
 export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
 
@@ -280,10 +281,38 @@ const buildHardArmCondition = (reasons: string[]): string => {
   return "resolve hard block";
 };
 
+const buildContractViolationUpdate = (params: {
+  event: DomainEvent;
+  symbol: string;
+  dir?: Direction;
+  conf?: number;
+  risk: string;
+  reason: string;
+  next?: string;
+}): TelegramSnapshot => {
+  console.error(
+    `[TELEGRAM] contract violation: ${params.reason} type=${params.event.type} symbol=${params.symbol}`
+  );
+  const fallbackDir: Direction = params.dir ?? "LONG";
+  return {
+    type: "UPDATE",
+    symbol: params.symbol,
+    dir: fallbackDir,
+    conf: params.conf,
+    risk: params.risk,
+    update: {
+      cause: `contract violation: ${params.reason}`,
+      next: params.next ?? "check upstream decision payload",
+      ts: formatEtTimestamp(params.event.timestamp),
+      price: params.event.data.price ?? params.event.data.close ?? params.event.data.entryPrice,
+    },
+  };
+};
+
 export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot | null {
   const symbol = getSymbol(event);
   const dir = getDirection(event);
-  if (!dir) return null;
+  const fallbackDir: Direction = dir ?? "LONG";
   const conf = getTacticalConfidence(event);
   const risk = getRiskMode(event);
   const entryZone = getEntryZone(event);
@@ -301,13 +330,13 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const hardWaitBlockers = event.data.hardWaitBlockers ?? decision?.hardWaitBlockers ?? [];
   const hardStopReasons = event.data.hardStopReasons ?? decision?.hardStopReasons ?? [];
   const hardWaitReasons = event.data.hardWaitReasons ?? decision?.hardWaitReasons ?? [];
-  const decisionState = event.data.decisionState ?? decision?.decisionState;
+  const decisionState = getDecisionState(event);
   const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons, ...hardStopReasons, ...hardWaitReasons].map(normalizeReason);
   const warnTags = buildWarnTags(event, reasons, [...blockers, ...softBlockers]);
   const entryMode = deriveEntryMode(event, reasons, warnTags);
   const sizeMultiplier = deriveSizeMultiplier(warnTags);
-  const armCondition = buildArmCondition(event, dir, reasons, warnTags);
-  const why = buildWhy(event, dir, reasons);
+  const armCondition = buildArmCondition(event, fallbackDir, reasons, warnTags);
+  const why = buildWhy(event, fallbackDir, reasons);
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
@@ -316,7 +345,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     return {
       type: "UPDATE",
       symbol,
-      dir,
+      dir: fallbackDir,
       conf,
       risk,
       update: {
@@ -335,7 +364,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     return {
       type: "MANAGE",
       symbol,
-      dir,
+      dir: fallbackDir,
       conf,
       risk,
       update: {
@@ -363,34 +392,71 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     reasons.some((reason: string) => isMarketUnavailable(reason)) ||
     blockers.includes("datafeed");
 
-  if (event.type === "PLAY_ARMED" && entryZone && stop && targets) {
-    if (hardBlocker) {
-      return {
-        type: "UPDATE",
-        symbol,
-        dir,
-        conf,
-        risk,
-        update: {
-          fromSide: dir,
-          toSide: dir,
-          emoji: timeCutoff ? "⏱️" : "⚠️",
-          cause: timeCutoff ? "time cutoff" : "hard block active",
-          next: timeCutoff ? "stop new entries" : "wait for readiness",
-          ts: formatEtTimestamp(event.timestamp),
-        },
-      };
-    }
-    return {
-      type: "SIGNAL",
+  if (event.type === "SETUP_CANDIDATES" || event.type === "LLM_VERIFY") {
+    // Explicitly internal-only: never emit Telegram alerts.
+    return null;
+  }
+
+  if (!decisionState) {
+    return null;
+  }
+
+  if (!dir && decisionState !== "UPDATE") {
+    return buildContractViolationUpdate({
+      event,
       symbol,
       dir,
       conf,
       risk,
-      entryTrigger: buildEntryTrigger(entryZone, dir),
+      reason: "missing direction",
+    });
+  }
+
+  if (decisionState === "UPDATE") {
+    const cause = timeCutoff ? "time cutoff" : (event.data.reason ?? event.data.result ?? event.data.mode ?? "status update");
+    const next = timeCutoff ? "stop new entries" : (event.data.next ?? "wait for new setup");
+    const price = event.data.price ?? event.data.close ?? event.data.play?.entryPrice ?? event.data.entryPrice;
+    const lastSignal = event.data.lastSignal ?? event.data.prevDirection ?? event.data.previousDirection ?? event.data.play?.direction;
+    return {
+      type: "UPDATE",
+      symbol,
+      dir: fallbackDir,
+      conf,
+      risk,
+      update: {
+        fromSide: lastSignal === "LONG" || lastSignal === "SHORT" ? lastSignal : undefined,
+        toSide: dir ?? fallbackDir,
+        emoji: timeCutoff ? "⏱️" : "🔁",
+        cause,
+        next,
+        ts: formatEtTimestamp(event.timestamp),
+        price: isFiniteNumber(price) ? price : undefined,
+        lastSignal: lastSignal ? String(lastSignal) : undefined,
+      },
+    };
+  }
+
+  if (decisionState === "SIGNAL") {
+    if (!entryZone || !stop || !targets) {
+      return buildContractViolationUpdate({
+        event,
+        symbol,
+        dir,
+        conf,
+        risk,
+        reason: "signal missing entry/stop/targets",
+      });
+    }
+    return {
+      type: "SIGNAL",
+      symbol,
+      dir: dir ?? fallbackDir,
+      conf,
+      risk,
+      entryTrigger: buildEntryTrigger(entryZone, dir ?? fallbackDir),
       entryTriggerTf: indicatorTf,
       stop,
-      invalidation: `${indicatorTf} close ${dir === "LONG" ? "<" : ">"} ${stop.toFixed(2)}`,
+      invalidation: `${indicatorTf} close ${(dir ?? fallbackDir) === "LONG" ? "<" : ">"} ${stop.toFixed(2)}`,
       tp1: targets.t1,
       tp2: targets.t2,
       sizeMultiplier,
@@ -399,62 +465,58 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     };
   }
 
-  if (event.type === "SETUP_CANDIDATES") {
-    // Explicitly internal-only: never emit Telegram alerts.
-    return null;
-  }
-
-  if (event.type === "NO_ENTRY" || event.type === "LLM_VERIFY") {
-    const hasEntryData = !!entryZone && !!stop && !!targets;
-    if (decisionState === "UPDATE" || (hardBlocker && timeCutoff)) {
-      if (timeCutoff) {
-        return {
-          type: "UPDATE",
+  if (decisionState === "WATCH") {
+    if (hardBlocker) {
+      const hardArm = buildHardArmCondition([...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons]);
+      if (!hardArm) {
+        return buildContractViolationUpdate({
+          event,
           symbol,
           dir,
           conf,
           risk,
-          update: {
-            fromSide: dir,
-            toSide: dir,
-            emoji: "⏱️",
-            cause: "time cutoff",
-            next: "stop new entries",
-            ts: formatEtTimestamp(event.timestamp),
-          },
-        };
+          reason: "watch missing ARM",
+        });
       }
-    }
-    if (hardBlocker || decisionState === "WATCH") {
       return {
         type: "WATCH",
         symbol,
-        dir,
+        dir: dir ?? fallbackDir,
         conf,
         risk,
-        armCondition: buildHardArmCondition([...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons]),
+        armCondition: hardArm,
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
         why,
         warnTags: warnTags.length ? warnTags : ["DATA"],
       };
     }
-    if (!hasEntryData) return null;
 
     const entryRule = warnTags.includes("RECLAIM") ? "reclaim only" : "pullback only (NO chase)";
     const planParts = ["patience", entryMode === "PULLBACK" ? "pullback entry" : "breakout entry"];
     if (warnTags.includes("RISK_ATR")) planParts.push("tight stop");
     const { vwap } = getIndicatorSnapshot(event);
     const planStop = isFiniteNumber(vwap)
-      ? `${dir === "LONG" ? "below" : "above"} VWAP or last swing (auto when armed)`
+      ? `${(dir ?? fallbackDir) === "LONG" ? "below" : "above"} VWAP or last swing (auto when armed)`
       : "last swing (auto when armed)";
+    const derivedArm = armCondition ?? (entryZone ? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}` : undefined);
+    if (!derivedArm) {
+      return buildContractViolationUpdate({
+        event,
+        symbol,
+        dir,
+        conf,
+        risk,
+        reason: "watch missing ARM",
+      });
+    }
     return {
       type: "WATCH",
       symbol,
-      dir,
+      dir: dir ?? fallbackDir,
       conf,
       risk,
-      armCondition: armCondition ?? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}`,
+      armCondition: derivedArm,
       entryRule,
       planStop,
       plan: planParts.join(", "),
@@ -469,7 +531,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     return {
       type: "MANAGE",
       symbol,
-      dir,
+      dir: dir ?? fallbackDir,
       conf,
       risk,
       update: {
@@ -480,29 +542,6 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         ts: formatEtTimestamp(event.timestamp),
         price: event.data.price ?? event.data.close ?? event.data.entryPrice,
         lastSignal: dir,
-      },
-    };
-  }
-
-  if (event.type === "PLAY_CANCELLED" || event.type === "PLAY_CLOSED" || event.type === "PLAY_SIZED_UP") {
-    const cause = event.data.reason ?? event.data.result ?? event.data.mode ?? "status update";
-    const price = event.data.price ?? event.data.close ?? event.data.play?.entryPrice ?? event.data.entryPrice;
-    const lastSignal = event.data.lastSignal ?? event.data.prevDirection ?? event.data.previousDirection ?? event.data.play?.direction;
-    return {
-      type: "UPDATE",
-      symbol,
-      dir,
-      conf,
-      risk,
-      update: {
-        fromSide: lastSignal === "LONG" || lastSignal === "SHORT" ? lastSignal : undefined,
-        toSide: dir,
-        emoji: "🔁",
-        cause,
-        next: "wait for new setup",
-        ts: formatEtTimestamp(event.timestamp),
-        price: isFiniteNumber(price) ? price : undefined,
-        lastSignal: lastSignal ? String(lastSignal) : undefined,
       },
     };
   }
