@@ -1,6 +1,7 @@
 import type { BotMode, DomainEvent, DomainEventType } from "../types.js";
 import type { TelegramBotLike } from "../telegram/sendTelegramMessageSafe.js";
 import { getETDateString } from "../utils/timeUtils.js";
+import { getDecisionState, isActionableDecisionState } from "../utils/decisionState.js";
 
 export interface GovernorState {
   lastPlanDate: string; // ET date string "YYYY-MM-DD"
@@ -120,21 +121,26 @@ export class MessageGovernor {
       return true;
     }
 
-    const decisionState =
-      event.data?.decisionState ??
-      event.data?.decision?.decisionState ??
-      event.data?.decision?.state;
+    const decisionState = getDecisionState(event);
+    const shouldLog = isActionableDecisionState(decisionState);
+    const logSuppressed = (reason: string): void => {
+      if (!shouldLog) return;
+      const stateLabel = decisionState ?? "NONE";
+      console.log(`[GOV] suppressed ${event.type} state=${stateLabel} reason=${reason}`);
+    };
 
     // In QUIET mode: allow only UPDATE alerts (plan handled above)
     if (this.mode === "QUIET") {
       if (decisionState === "UPDATE") {
         const key = this.getDedupeKey(event);
         if (this.hasDedupe(key)) {
+          logSuppressed("dedupe");
           return false;
         }
         this.markDedupe(key, event.timestamp);
         return true;
       }
+      logSuppressed("quiet_mode");
       return false;
     }
 
@@ -147,19 +153,14 @@ export class MessageGovernor {
         return false;
       }
 
-      const decisionBlockers = event.data?.decision?.blockers;
-      if (Array.isArray(decisionBlockers) && decisionBlockers.includes("low_probability")) {
-        return false;
-      }
-
-      const allowedStates = new Set(["SIGNAL", "WATCH", "UPDATE", "MANAGE"]);
-      if (!allowedStates.has(decisionState)) {
+      if (!isActionableDecisionState(decisionState)) {
         return false;
       }
       
       // Check dedupe key
       const key = this.getDedupeKey(event);
       if (this.hasDedupe(key)) {
+        logSuppressed("dedupe");
         return false;
       }
       

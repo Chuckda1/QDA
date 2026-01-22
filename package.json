@@ -10,7 +10,8 @@
     "verify": "node node_modules/tsx/dist/cli.mjs scripts/verify.ts",
     "test:telegram": "node node_modules/tsx/dist/cli.mjs scripts/telegramFormatterTest.ts",
     "test:llm": "node node_modules/tsx/dist/cli.mjs scripts/mockLLMTest.ts",
-    "test:stop": "node node_modules/tsx/dist/cli.mjs scripts/verifyStopLogic.ts"
+    "test:stop": "node node_modules/tsx/dist/cli.mjs scripts/verifyStopLogic.ts",
+    "replay:decisions": "node node_modules/tsx/dist/cli.mjs scripts/decisionAlertReplay.ts"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",

@@ -282,6 +282,23 @@ export class Scheduler {
       const c = d.candidate;
       levels = `entry ${fmtNum(c.entryZone.low)}-${fmtNum(c.entryZone.high)}, stop ${fmtNum(c.stop)}`;
     }
+    const biasConfidence = d?.directionInference?.confidence;
+
+    const armParts: string[] = [];
+    if (!d) {
+      armParts.push("wait for first bars");
+    } else if (!d.candidate) {
+      armParts.push("wait for confirmed setup");
+    } else {
+      const c = d.candidate;
+      armParts.push(`retest ${fmtNum(c.entryZone.low)}-${fmtNum(c.entryZone.high)}`);
+      if (d.entryPermission === "WAIT_FOR_PULLBACK") {
+        armParts.push("pullback only");
+      } else if (d.entryPermission === "BLOCKED") {
+        armParts.push("filters must clear");
+      }
+    }
+    const arm = armParts.length ? armParts.join(" | ") : undefined;
 
     const event = {
       type: "PREMARKET_UPDATE" as const,
@@ -293,8 +310,11 @@ export class Scheduler {
         price: d?.close,
         decisionState: "UPDATE",
         premarket: {
+          kind: "PREMARKET_BRIEF",
           bias,
-          levels
+          confidence: biasConfidence,
+          levels,
+          arm
         }
       }
     };
