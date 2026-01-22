@@ -16,6 +16,18 @@ const INTERNAL_EVENT_TYPES = new Set<DomainEventType>([
   "ARMED_COACH"
 ]);
 
+const DECISION_ALERT_EVENT_TYPES = new Set<DomainEventType>([
+  "PLAY_ARMED",
+  "PLAY_ENTERED",
+  "PLAY_SIZED_UP",
+  "PLAY_CANCELLED",
+  "PLAY_CLOSED",
+  "NO_ENTRY",
+  "LLM_COACH_UPDATE",
+  "PREMARKET_UPDATE",
+  "PLAN_OF_DAY"
+]);
+
 export const getDecisionState = (event: DomainEvent): DecisionState | undefined => {
   const raw =
     event.data?.decisionState ??
@@ -34,3 +46,6 @@ export const isDecisionAlertEvent = (event: DomainEvent): boolean => {
   if (isInternalEventType(event.type)) return false;
   return isActionableDecisionState(getDecisionState(event));
 };
+
+export const requiresDecisionState = (type: DomainEventType): boolean =>
+  DECISION_ALERT_EVENT_TYPES.has(type) && type !== "PLAN_OF_DAY";

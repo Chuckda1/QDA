@@ -12,6 +12,7 @@ import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
+import { requiresDecisionState } from "../utils/decisionState.js";
 import {
   buildDecision,
   buildNoEntryDecision,
@@ -1102,11 +1103,13 @@ export class Orchestrator {
           entryTrigger,
           reason: "Pullback depth hit",
           timing: enteredTimingSnapshot,
+          decisionState: "UPDATE",
           decision: buildDecisionPayload({
             kind: "EXECUTION",
             status: "ENTERED",
             allowed: true,
-            rationale: ["pullback depth hit", `timing score=${timingSignal.score}`]
+            rationale: ["pullback depth hit", `timing score=${timingSignal.score}`],
+            decisionState: "UPDATE"
           }),
           playState: "ENTERED",
           armReason: "depth trigger hit"
@@ -3261,6 +3264,9 @@ export class Orchestrator {
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {
+    if (requiresDecisionState(type) && !data.decisionState) {
+      throw new Error(`[DecisionState] missing decisionState for ${type}`);
+    }
     return { type, timestamp, instanceId: this.instanceId, data };
   }
 

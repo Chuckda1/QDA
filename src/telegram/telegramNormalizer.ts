@@ -340,8 +340,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
+    const kind = premarket.kind ?? "PREMARKET_UPDATE";
     const bias = premarket.bias ?? "NEUTRAL";
     const levels = premarket.levels ?? "levels n/a";
+    const confText = Number.isFinite(premarket.confidence) ? ` (${Math.round(premarket.confidence)}%)` : "";
+    const arm = premarket.arm ? ` | arm ${premarket.arm}` : "";
     return {
       type: "UPDATE",
       symbol,
@@ -349,8 +352,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       conf,
       risk,
       update: {
-        cause: `premarket bias ${bias}`,
-        next: `levels ${levels}`,
+        cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
+        next: `levels ${levels}${arm}`,
         ts: formatEtTimestamp(event.timestamp),
         price: event.data.price,
       },
@@ -466,9 +469,26 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   }
 
   if (decisionState === "WATCH") {
+    const readinessMissing = hardWaitBlockers.length > 0 || hardWaitReasons.length > 0;
     if (hardBlocker) {
-      const hardArm = buildHardArmCondition([...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons]);
+      const hardArmReasons = [...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons];
+      const hardArm = hardArmReasons.length ? buildHardArmCondition(hardArmReasons) : undefined;
       if (!hardArm) {
+        if (readinessMissing) {
+          return {
+            type: "UPDATE",
+            symbol,
+            dir: dir ?? fallbackDir,
+            conf,
+            risk,
+            update: {
+              cause: "readiness not met",
+              next: "wait for data readiness",
+              ts: formatEtTimestamp(event.timestamp),
+              price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+            },
+          };
+        }
         return buildContractViolationUpdate({
           event,
           symbol,
@@ -501,6 +521,21 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       : "last swing (auto when armed)";
     const derivedArm = armCondition ?? (entryZone ? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}` : undefined);
     if (!derivedArm) {
+      if (readinessMissing) {
+        return {
+          type: "UPDATE",
+          symbol,
+          dir: dir ?? fallbackDir,
+          conf,
+          risk,
+          update: {
+            cause: "readiness not met",
+            next: "wait for data readiness",
+            ts: formatEtTimestamp(event.timestamp),
+            price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+          },
+        };
+      }
       return buildContractViolationUpdate({
         event,
         symbol,

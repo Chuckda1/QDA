@@ -33,7 +33,9 @@ const stats = {
   decisionAlerts: 0,
   snapshots: 0,
   sent: 0,
+  droppedByPublisherFilter: 0,
   suppressedBySignature: 0,
+  suppressedByMode: 0,
   suppressedByGovernor: 0,
   contractViolations: 0,
 };
@@ -44,7 +46,10 @@ for (const event of events) {
   const decisionState = getDecisionState(event) ?? "NONE";
   decisionCounts[decisionState] = (decisionCounts[decisionState] ?? 0) + 1;
 
-  if (!isDecisionAlertEvent(event)) continue;
+  if (!isDecisionAlertEvent(event)) {
+    stats.droppedByPublisherFilter += 1;
+    continue;
+  }
   stats.decisionAlerts += 1;
 
   const snapshot = normalizeTelegramSnapshot(event);
@@ -69,7 +74,11 @@ for (const event of events) {
   if (governor.shouldSend(event, {} as any, 0)) {
     stats.sent += 1;
   } else {
-    stats.suppressedByGovernor += 1;
+    if (mode === "QUIET" && decisionState !== "UPDATE") {
+      stats.suppressedByMode += 1;
+    } else {
+      stats.suppressedByGovernor += 1;
+    }
   }
 }
 
@@ -80,5 +89,7 @@ console.log(`Decision alerts: ${stats.decisionAlerts}`);
 console.log(`Snapshots: ${stats.snapshots}`);
 console.log(`Sent: ${stats.sent}`);
 console.log(`Suppressed by signature: ${stats.suppressedBySignature}`);
+console.log(`Suppressed by mode: ${stats.suppressedByMode}`);
 console.log(`Suppressed by governor: ${stats.suppressedByGovernor}`);
+console.log(`Dropped by publisher filter: ${stats.droppedByPublisherFilter}`);
 console.log(`Contract violations: ${stats.contractViolations}`);

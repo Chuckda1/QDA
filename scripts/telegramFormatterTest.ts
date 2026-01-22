@@ -98,8 +98,11 @@ const premarketEvent = makeBaseEvent("PREMARKET_UPDATE", {
   price: 451.9,
   decisionState: "UPDATE",
   premarket: {
+    kind: "PREMARKET_BRIEF",
     bias: "LONG",
+    confidence: 62,
     levels: "entry 451.20-452.40, stop 449.80",
+    arm: "retest 451.20-452.40 | pullback only",
   },
 });
 
@@ -150,6 +153,9 @@ assert.ok(updateAlert?.lines.length <= 4, "UPDATE line count exceeded");
 assert.ok(updateAlert?.text.includes("\n"), "UPDATE missing newline separators");
 assert.ok(!updateAlert?.text.includes("\\n"), "UPDATE contains literal \\n");
 assert.ok(updateAlert?.lines[0]?.startsWith("UPDATE:"), "UPDATE header missing status");
+assert.ok(updateAlert?.lines[0]?.includes("SPY"), "UPDATE header missing symbol");
+assert.ok(!updateAlert?.lines[0]?.includes("UPDATE: UPDATE"), "UPDATE header duplicated");
+assert.ok(updateAlert?.lines[0]?.includes("LONG → SHORT"), "UPDATE header missing side flip");
 assert.ok(updateAlert?.lines[0]?.includes("px"), "UPDATE price missing");
 assert.ok(updateAlert?.text.includes("\nCAUSE:"), "UPDATE header not separated from cause");
 assert.ok(updateAlert?.lines[1]?.startsWith("CAUSE:"), "UPDATE cause line missing");
@@ -261,6 +267,21 @@ assert.equal(watchMissingArmSnapshot?.type, "UPDATE", "WATCH without ARM should 
 assert.ok(
   watchMissingArmSnapshot?.update?.cause.includes("contract violation"),
   "WATCH without ARM should flag contract violation"
+);
+
+const watchReadinessEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "WATCH",
+  hardWaitBlockers: ["guardrail"],
+  decision: { decisionState: "WATCH" },
+});
+const watchReadinessSnapshot = normalizeTelegramSnapshot(watchReadinessEvent);
+assert.ok(watchReadinessSnapshot, "Readiness snapshot missing");
+assert.equal(watchReadinessSnapshot?.type, "UPDATE", "Readiness missing should emit UPDATE");
+assert.ok(
+  watchReadinessSnapshot?.update?.cause.includes("readiness not met"),
+  "Readiness missing should explain readiness"
 );
 
 const debounceOrch = new Orchestrator("debounce-test");
