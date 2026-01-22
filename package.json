@@ -11,6 +11,7 @@
     "test:telegram": "node node_modules/tsx/dist/cli.mjs scripts/telegramFormatterTest.ts",
     "test:llm": "node node_modules/tsx/dist/cli.mjs scripts/mockLLMTest.ts",
     "test:stop": "node node_modules/tsx/dist/cli.mjs scripts/verifyStopLogic.ts",
+    "test:one-engine": "node node_modules/tsx/dist/cli.mjs scripts/oneEngineInvariantTest.ts",
     "replay:decisions": "node node_modules/tsx/dist/cli.mjs scripts/decisionAlertReplay.ts"
   },
   "dependencies": {

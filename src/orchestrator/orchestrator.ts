@@ -2635,6 +2635,44 @@ export class Orchestrator {
             };
           })()
         : null;
+      const isDev = process.env.NODE_ENV !== "production";
+      if (isDev && rangeModeActive && decisionState === "WATCH" && !rangeWatchPayload) {
+        console.warn("[ONE_ENGINE_VIOLATION] range mode active without range payload", {
+          symbol,
+          ts,
+          decisionState,
+          hardStopBlockers,
+          hardWaitBlockers,
+          softBlockers,
+          softBlockerReasons,
+        });
+      }
+      if (isDev && entryPermission === "BLOCKED" && hardStopBlockers.length === 0 && hardWaitBlockers.length === 0) {
+        console.warn("[ONE_ENGINE_VIOLATION] soft blockers set entryPermission=BLOCKED", {
+          symbol,
+          ts,
+          decisionState,
+          entryPermission,
+          softBlockerReasons,
+          directionGate: directionGate.reason,
+        });
+      }
+      if (isDev && decisionState === "WATCH" && hardStopBlockers.length === 0 && hardWaitBlockers.length === 0) {
+        const softContextTokens = ["TIMEFRAME_CONFLICT", "LOW_CANDIDATE_DENSITY", "TRANSITION_LOCK", "SHOCK"];
+        const softVetoReasons = softBlockerReasons.filter((reason) =>
+          softContextTokens.some((token) => reason.includes(token))
+        );
+        if (softVetoReasons.length > 0 && entryPermission === "ALLOWED") {
+          console.warn("[ONE_ENGINE_VIOLATION] contextual veto outside hard stops", {
+            symbol,
+            ts,
+            decisionState,
+            entryPermission,
+            softVetoReasons,
+            directionGate: directionGate.reason,
+          });
+        }
+      }
       const rangeWatchKey = rangeWatchPayload
         ? [
             rangeWatchPayload.range.low.toFixed(2),
