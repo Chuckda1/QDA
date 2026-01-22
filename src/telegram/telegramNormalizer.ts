@@ -9,6 +9,18 @@ export type TelegramSnapshot = {
   dir: Direction;
   conf?: number;
   risk: string;
+  range?: {
+    low: number;
+    high: number;
+    vwap?: number;
+    price?: number;
+    ts: string;
+    longArm: string;
+    longEntry: string;
+    shortArm: string;
+    shortEntry: string;
+    stopAnchor: string;
+  };
   entryTrigger?: string;
   entryTriggerTf?: string;
   stop?: number;
@@ -32,6 +44,17 @@ export type TelegramSnapshot = {
     price?: number;
     lastSignal?: string;
   };
+};
+
+type RangeWatchPayload = {
+  range: { low: number; high: number };
+  vwap?: number;
+  price?: number;
+  longArm: string;
+  longEntry: string;
+  shortArm: string;
+  shortEntry: string;
+  stopAnchor?: string;
 };
 
 const RISK_ATR_HIGH = 1.5;
@@ -402,6 +425,42 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (!decisionState) {
     return null;
+  }
+
+  const rangeWatch = event.data.rangeWatch as RangeWatchPayload | undefined;
+  if (decisionState === "WATCH" && rangeWatch) {
+    const rangeLow = rangeWatch.range?.low;
+    const rangeHigh = rangeWatch.range?.high;
+    if (!isFiniteNumber(rangeLow) || !isFiniteNumber(rangeHigh)) {
+      return buildContractViolationUpdate({
+        event,
+        symbol,
+        dir,
+        conf,
+        risk,
+        reason: "range watch missing range bounds",
+      });
+    }
+    return {
+      type: "WATCH",
+      symbol,
+      dir: fallbackDir,
+      conf,
+      risk,
+      range: {
+        low: rangeLow,
+        high: rangeHigh,
+        vwap: rangeWatch.vwap,
+        price: rangeWatch.price ?? event.data.price ?? event.data.close,
+        ts: formatEtTimestamp(event.timestamp),
+        longArm: rangeWatch.longArm,
+        longEntry: rangeWatch.longEntry,
+        shortArm: rangeWatch.shortArm,
+        shortEntry: rangeWatch.shortEntry,
+        stopAnchor: rangeWatch.stopAnchor ?? "when armed",
+      },
+      warnTags: warnTags.length ? warnTags : ["RANGE"],
+    };
   }
 
   if (!dir && decisionState !== "UPDATE") {

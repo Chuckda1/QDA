@@ -31,6 +31,21 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
   }
 
   if (snapshot.type === "WATCH") {
+    if (snapshot.range) {
+      return [
+        ...base,
+        "RANGE",
+        snapshot.range.low,
+        snapshot.range.high,
+        snapshot.range.vwap ?? "",
+        snapshot.range.longArm,
+        snapshot.range.longEntry,
+        snapshot.range.shortArm,
+        snapshot.range.shortEntry,
+        snapshot.range.stopAnchor,
+        (snapshot.warnTags ?? []).join(","),
+      ].join("|");
+    }
     return [
       ...base,
       snapshot.armCondition ?? "",

@@ -181,6 +181,47 @@ const premarketSnapshot = normalizeTelegramSnapshot(premarketEvent);
 assert.ok(premarketSnapshot, "Premarket snapshot missing");
 assert.equal(premarketSnapshot?.type, "UPDATE", "Premarket should produce UPDATE");
 
+const rangeWatchEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  decisionState: "WATCH",
+  price: 689.4,
+  marketState: {
+    permission: { mode: "NORMAL" },
+    tacticalSnapshot: { confidence: 78 },
+  },
+  softBlockerReasons: [
+    "TIMEFRAME_CONFLICT: 1m=LONG 5m=SHORT",
+    "LOW_CANDIDATE_DENSITY: candidateCount=2",
+    "TRANSITION_LOCK: active",
+  ],
+  rangeWatch: {
+    range: { low: 688.5, high: 690.1 },
+    vwap: 689.2,
+    price: 689.4,
+    longArm: "retest 688.80-689.20",
+    longEntry: "break&hold above 689.20",
+    shortArm: "retest 689.70-690.00",
+    shortEntry: "break&hold below 688.80",
+    stopAnchor: "when armed (long < 688.50 / short > 690.10)",
+  },
+});
+const rangeSnapshot = normalizeTelegramSnapshot(rangeWatchEvent);
+assert.ok(rangeSnapshot, "Range WATCH snapshot missing");
+assert.equal(rangeSnapshot?.type, "WATCH", "Range WATCH should produce WATCH");
+assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
+const rangeAlert = buildTelegramAlert(rangeSnapshot!);
+assert.ok(rangeAlert, "Range WATCH alert missing");
+assert.ok(rangeAlert?.lines.length <= 9, "Range WATCH line count exceeded");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("TS:")), "Range WATCH missing timestamp");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("RANGE:")), "Range WATCH missing range line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("LONG ARM:")), "Range WATCH missing long arm");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("SHORT ENTRY:")), "Range WATCH missing short entry");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
+assert.ok(
+  rangeAlert?.lines.some((l) => l.includes("(+1)")),
+  "Range WATCH warn tags should be capped"
+);
+
 const setupSnapshot = normalizeTelegramSnapshot(makeBaseEvent("SETUP_CANDIDATES", { symbol: "SPY" }));
 assert.equal(setupSnapshot, null, "SETUP_CANDIDATES should not emit telegram alerts");
 

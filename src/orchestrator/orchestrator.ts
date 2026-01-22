@@ -202,6 +202,8 @@ export class Orchestrator {
   private lastMarketState: Record<string, any> | null = null;
   private lastTimingSnapshot: Record<string, any> | null = null;
   private lastScorecardSnapshot: ScorecardSnapshot | null = null;
+  private lastRangeWatchKey: string | null = null;
+  private lastRangeWatchTs: number | null = null;
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
@@ -856,7 +858,11 @@ export class Orchestrator {
       rationale?: string[];
       permissionMode?: "SCALP_ONLY" | "NORMAL" | "REDUCE_SIZE" | "WATCH_ONLY";
       decisionState?: "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
+      marketState?: "TREND" | "RANGE" | "TRANSITION";
     }) => {
+      const marketStateTag =
+        params.marketState ??
+        this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime);
       const permission = {
         long: play.direction === "LONG",
         short: play.direction === "SHORT",
@@ -873,6 +879,7 @@ export class Orchestrator {
         blockers: params.blockers,
         blockerReasons: params.blockerReasons,
         rationale: params.rationale,
+        marketState: marketStateTag,
         decisionState: params.decisionState ?? "MANAGE"
       };
     };
@@ -904,7 +911,8 @@ export class Orchestrator {
           },
           direction: play.direction,
           gateTier: "STRICT",
-          rationale: decision.blockerReasons
+          rationale: decision.blockerReasons,
+          marketState: this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime)
         },
         blockerTags: decision.blockers,
         blockerReasons: decision.blockerReasons,
@@ -1667,7 +1675,9 @@ export class Orchestrator {
           probability: undefined,
           action: undefined
         };
+        const marketStateTagNoCandidates = this.deriveMarketStateTag(anchorRegime.regime);
         const marketStateForNoCandidates = {
+          marketState: marketStateTagNoCandidates,
           regime: anchorRegime.regime,
           confidence: regimeConfidence,
           permission,
@@ -1715,7 +1725,8 @@ export class Orchestrator {
             kind: "GATE",
             status: "NO_SETUP",
             allowed: false,
-            rationale: [setupResult.reason || "no setup pattern found"]
+            rationale: [setupResult.reason || "no setup pattern found"],
+            marketState: marketStateTagNoCandidates
           },
           playState: "CANDIDATE",
           notArmedReason: setupResult.reason || "no setup pattern found"
@@ -2417,6 +2428,18 @@ export class Orchestrator {
         baseBlockers.softReasons.push(reason);
       }
 
+      const chopSignals = new Set<string>();
+      if (anchorRegime.regime === "TRANSITION") chopSignals.add("TRANSITION");
+      if (softContextReasons.some((reason) => reason.startsWith("TIMEFRAME_CONFLICT"))) {
+        chopSignals.add("TF_CONFLICT");
+      }
+      if (softContextReasons.some((reason) => reason.startsWith("LOW_CANDIDATE_DENSITY"))) {
+        chopSignals.add("LOW_DENSITY");
+      }
+      const rangeModeActive = chopSignals.size >= 2;
+      const marketStateTag = this.deriveMarketStateTag(anchorRegime.regime, chopSignals);
+      marketState.marketState = marketStateTag;
+
       const hardStopBlockers = baseBlockers.hardStopBlockers;
       const hardWaitBlockers = baseBlockers.hardWaitBlockers;
       const softBlockers = baseBlockers.softBlockers;
@@ -2521,6 +2544,7 @@ export class Orchestrator {
         hardStopReasons,
         hardWaitReasons,
         decisionState,
+        marketState: marketStateTag,
         rationale: [
           directionGate.reason,
           ...(lowContext ? [`LOW_CONTEXT: ${lowContextReasons.join(" | ")}`] : [])
@@ -2555,6 +2579,51 @@ export class Orchestrator {
             warningFlags: candidate.warningFlags ?? candidate.flags ?? [],
           };
         });
+      const formatZone = (zone?: { low: number; high: number }): string =>
+        zone ? `${zone.low.toFixed(2)}-${zone.high.toFixed(2)}` : "n/a";
+      const rangeWatchPayload = rangeModeActive
+        ? (() => {
+            const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
+            if (!rangeCandidates.length) return null;
+            const rangeLow = Math.min(...rangeCandidates.map((c) => c.entryZone.low));
+            const rangeHigh = Math.max(...rangeCandidates.map((c) => c.entryZone.high));
+            if (!Number.isFinite(rangeLow) || !Number.isFinite(rangeHigh)) return null;
+            const longCandidate = rangeCandidates.find((c) => c.direction === "LONG");
+            const shortCandidate = rangeCandidates.find((c) => c.direction === "SHORT");
+            const longArm = longCandidate
+              ? `retest ${formatZone(longCandidate.entryZone)}`
+              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
+            const longEntry = longCandidate
+              ? `break&hold above ${longCandidate.entryZone.high.toFixed(2)}`
+              : `break&hold above ${rangeHigh.toFixed(2)}`;
+            const shortArm = shortCandidate
+              ? `retest ${formatZone(shortCandidate.entryZone)}`
+              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
+            const shortEntry = shortCandidate
+              ? `break&hold below ${shortCandidate.entryZone.low.toFixed(2)}`
+              : `break&hold below ${rangeLow.toFixed(2)}`;
+            const stopAnchor = `when armed (long < ${rangeLow.toFixed(2)} / short > ${rangeHigh.toFixed(2)})`;
+            return {
+              range: { low: rangeLow, high: rangeHigh },
+              vwap: indicatorSnapshot.vwap,
+              price: close,
+              longArm,
+              longEntry,
+              shortArm,
+              shortEntry,
+              stopAnchor,
+            };
+          })()
+        : null;
+      const rangeWatchKey = rangeWatchPayload
+        ? [
+            rangeWatchPayload.range.low.toFixed(2),
+            rangeWatchPayload.range.high.toFixed(2),
+            Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
+            rangeWatchPayload.longEntry,
+            rangeWatchPayload.shortEntry,
+          ].join("|")
+        : null;
       events.push(this.ev("SETUP_CANDIDATES", ts, {
         symbol,
         price: close,
@@ -2640,7 +2709,33 @@ export class Orchestrator {
         }));
       }
 
-      if (decisionState === "WATCH" || decision.status !== "ARMED") {
+      if (rangeModeActive && rangeWatchPayload) {
+        const shouldEmitRange =
+          this.lastRangeWatchKey !== rangeWatchKey || this.lastRangeWatchTs !== ts;
+        if (shouldEmitRange) {
+          events.push(this.ev("NO_ENTRY", ts, {
+            playId: decision.decisionId,
+            symbol: setupCandidate.symbol,
+            price: close,
+            decisionState: "WATCH",
+            decision: decisionSummary,
+            marketState,
+            timing: timingSnapshot,
+            topPlay,
+            blockerTags: blockers,
+            blockerReasons,
+            hardBlockers,
+            softBlockers,
+            hardBlockerReasons,
+            softBlockerReasons,
+            rangeWatch: rangeWatchPayload,
+            playState: "CANDIDATE",
+            notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined
+          }));
+          this.lastRangeWatchKey = rangeWatchKey;
+          this.lastRangeWatchTs = ts;
+        }
+      } else if (decisionState === "WATCH" || decision.status !== "ARMED") {
         events.push(this.ev("NO_ENTRY", ts, {
           playId: decision.decisionId,
           symbol: setupCandidate.symbol,
@@ -2824,6 +2919,7 @@ export class Orchestrator {
             decisionId: `${play.symbol}_${ts}_${play.id}`,
             status: play.status,
             kind: "EXECUTION",
+            marketState: this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime),
             permission: {
               long: play.direction === "LONG",
               short: play.direction === "SHORT",
@@ -2945,6 +3041,7 @@ export class Orchestrator {
           decisionId: `${play.symbol}_${ts}_${play.id}`,
           status: "CLOSED",
           kind: "MANAGEMENT",
+          marketState: this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime),
           permission: {
             long: play.direction === "LONG",
             short: play.direction === "SHORT",
@@ -3166,6 +3263,7 @@ export class Orchestrator {
             decisionId: `${play.symbol}_${ts}_${play.id}`,
             status: play.status,
             kind: "MANAGEMENT",
+            marketState: this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime),
             permission: {
               long: play.direction === "LONG",
               short: play.direction === "SHORT",
@@ -3203,6 +3301,7 @@ export class Orchestrator {
               decisionId: `${play.symbol}_${ts}_${play.id}`,
               status: "CLOSED",
               kind: "MANAGEMENT",
+              marketState: this.deriveMarketStateTag(this.lastMarketState?.regime ?? this.lastRegime15m?.regime),
               permission: {
                 long: play.direction === "LONG",
                 short: play.direction === "SHORT",
@@ -3261,6 +3360,16 @@ export class Orchestrator {
       this.lastScorecardSnapshot = next;
     }
     return changed;
+  }
+
+  private deriveMarketStateTag(
+    regime?: RegimeResult["regime"],
+    chopSignals?: Set<string>
+  ): "TREND" | "RANGE" | "TRANSITION" {
+    if (chopSignals && chopSignals.size >= 2) return "RANGE";
+    if (regime === "TRANSITION") return "TRANSITION";
+    if (regime === "CHOP") return "RANGE";
+    return "TREND";
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {
