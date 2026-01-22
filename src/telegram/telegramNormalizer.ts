@@ -456,7 +456,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         };
       }
     }
-    if (hardBlocker || decisionState === "WATCH") {
+    if (hardBlocker) {
       const hardArmReasons = [...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons];
       const hardArm = hardArmReasons.length ? buildHardArmCondition(hardArmReasons) : undefined;
       if (readinessMissing) {
@@ -491,6 +491,46 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         conf,
         risk,
         armCondition: hardArm,
+        entryRule: "pullback only (NO chase)",
+        planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        why,
+        warnTags: warnTags.length ? warnTags : ["DATA"],
+      };
+    }
+    if (decisionState === "WATCH") {
+      const derivedArm = armCondition ?? (entryZone ? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}` : undefined);
+      if (!derivedArm) {
+        if (readinessMissing) {
+          return {
+            type: "UPDATE",
+            symbol,
+            dir,
+            conf,
+            risk,
+            update: {
+              cause: "readiness not met",
+              next: "wait for data readiness",
+              ts: formatEtTimestamp(event.timestamp),
+              price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+            },
+          };
+        }
+        return buildContractViolationUpdate({
+          event,
+          symbol,
+          dir,
+          conf,
+          risk,
+          reason: "missing arm condition",
+        });
+      }
+      return {
+        type: "WATCH",
+        symbol,
+        dir,
+        conf,
+        risk,
+        armCondition: derivedArm,
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
         why,
