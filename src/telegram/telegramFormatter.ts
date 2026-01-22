@@ -23,6 +23,9 @@ const formatUpdateHeader = (input: {
 }): string => {
   const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
   if (input.fromSide && input.toSide) {
+    if (input.fromSide === input.toSide) {
+      return `UPDATE: ${input.symbol} ${input.fromSide} 🔁 | px ${px}`;
+    }
     return `UPDATE: ${input.symbol} ${input.fromSide} → ${input.toSide} 🔁 | px ${px}`;
   }
   const side = input.toSide ?? input.fromSide;
@@ -141,11 +144,15 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
 
   if (snapshot.type === "UPDATE" && snapshot.update) {
     const update = snapshot.update;
-    const header = formatUpdateHeader({
+    const updatePx = Number.isFinite(update.price) ? update.price : snapshot.px;
+    const isTimeCutoff = update.cause === "time cutoff";
+    const header = isTimeCutoff
+      ? `UPDATE: TIME CUTOFF ⏱️ | ${snapshot.symbol} | px ${Number.isFinite(updatePx) ? formatPrice(updatePx) : "—"}`
+      : formatUpdateHeader({
       symbol: snapshot.symbol,
       fromSide: update.fromSide,
       toSide: update.toSide,
-      px: update.price,
+      px: updatePx,
     });
     const ts = snapshot.ts ?? update.ts;
     const headerWithTs = `${header} | ${ts}`;

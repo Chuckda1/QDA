@@ -468,6 +468,24 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (event.type === "PLAY_ARMED" && entryZone && stop && targets) {
     if (hardBlocker) {
+      if (timeCutoff) {
+        return {
+          type: "UPDATE",
+          symbol,
+          dir,
+          conf,
+          risk,
+          px,
+          ts,
+          update: {
+            emoji: "⏱️",
+            cause: "time cutoff",
+            next: "stop new entries",
+            ts,
+            price: px,
+          },
+        };
+      }
       return {
         type: "UPDATE",
         symbol,
@@ -477,12 +495,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         px,
         ts,
         update: {
-          fromSide: dir,
-          toSide: dir,
           emoji: timeCutoff ? "⏱️" : "⚠️",
           cause: timeCutoff ? "time cutoff" : "hard block active",
           next: timeCutoff ? "stop new entries" : "wait for readiness",
           ts,
+          price: px,
         },
       };
     }
@@ -560,12 +577,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           px,
           ts,
           update: {
-            fromSide: dir,
-            toSide: dir,
             emoji: "⏱️",
             cause: "time cutoff",
             next: "stop new entries",
             ts,
+            price: px,
           },
         };
       }

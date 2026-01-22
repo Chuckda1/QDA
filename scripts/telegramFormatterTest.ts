@@ -260,6 +260,7 @@ const timeCutoffEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
   decisionState: "UPDATE",
+  price: 688.9,
   hardBlockers: ["time_window"],
   hardBlockerReasons: ["Time-of-day cutoff: No new plays after 15:30 ET"],
   decision: { decisionState: "UPDATE" },
@@ -267,6 +268,11 @@ const timeCutoffEvent = makeBaseEvent("NO_ENTRY", {
 const timeCutoffSnapshot = normalizeTelegramSnapshot(timeCutoffEvent);
 assert.ok(timeCutoffSnapshot, "Time cutoff snapshot missing");
 assert.equal(timeCutoffSnapshot?.type, "UPDATE", "Time cutoff should produce UPDATE");
+const timeCutoffAlert = buildTelegramAlert(timeCutoffSnapshot!);
+assert.ok(timeCutoffAlert, "Time cutoff alert missing");
+assert.ok(timeCutoffAlert?.lines[0]?.includes("TIME CUTOFF"), "Time cutoff header should call out cutoff");
+assert.ok(!timeCutoffAlert?.lines[0]?.includes("→"), "Time cutoff should not show side flip");
+assert.ok(timeCutoffAlert?.lines[0]?.includes("px"), "Time cutoff should include px");
 
 const dataReadyEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
