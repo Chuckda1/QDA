@@ -9,6 +9,8 @@ export type TelegramSnapshot = {
   dir: Direction;
   conf?: number;
   risk: string;
+  px?: number;
+  ts?: string;
   entryTrigger?: string;
   entryTriggerTf?: string;
   stop?: number;
@@ -16,12 +18,15 @@ export type TelegramSnapshot = {
   tp1?: number;
   tp2?: number;
   sizeMultiplier?: number;
+  entryMode?: "MOMENTUM" | "PULLBACK";
+  chaseAllowed?: boolean;
   why?: string;
   warnTags?: string[];
   armCondition?: string;
   entryRule?: string;
   planStop?: string;
   plan?: string;
+  next?: string;
   update?: {
     fromSide?: "LONG" | "SHORT";
     toSide?: "LONG" | "SHORT";
@@ -86,6 +91,39 @@ const getRiskAtr = (event: DomainEvent): number | undefined => {
   return isFiniteNumber(riskAtr) ? riskAtr : undefined;
 };
 
+const getPrice = (event: DomainEvent): number | undefined => {
+  const px =
+    event.data.price ??
+    event.data.close ??
+    event.data.entryPrice ??
+    event.data.candidate?.triggerPrice ??
+    event.data.topPlay?.triggerPrice ??
+    event.data.play?.entryPrice;
+  return isFiniteNumber(px) ? px : undefined;
+};
+
+const buildNextLine = (event: DomainEvent, reasons: string[], warnTags: string[]): string | undefined => {
+  const pullbackMatch = reasons
+    .map((reason) => reason.match(/Pullback depth\s+([\d.]+)\s+is less than minimum\s+([\d.]+)/i))
+    .find(Boolean);
+  if (pullbackMatch) {
+    const current = pullbackMatch[1];
+    const min = pullbackMatch[2];
+    return `pullback depth >= ${min} ATR (now ${current})`;
+  }
+
+  if (reasons.some((reason) => /No reclaim signal/i.test(reason))) {
+    return "waiting on reclaim signal";
+  }
+
+  const distToVwap = getDistToVwapAtr(event);
+  if (warnTags.includes("EXTENDED") && isFiniteNumber(distToVwap)) {
+    return `distance_to_VWAP <= ${REARM_VWAP_ATR} ATR (now ${distToVwap.toFixed(2)})`;
+  }
+
+  return undefined;
+};
+
 const getDistToVwapAtr = (event: DomainEvent): number | undefined => {
   const loc = event.data.candidate?.featureBundle?.location;
   const dist = loc?.priceVsVWAP?.atR ?? loc?.extendedFromMean?.atR;
@@ -129,16 +167,19 @@ const buildContractViolationUpdate = (params: {
   console.error(
     `[TELEGRAM] contract violation: ${params.reason} type=${params.event.type} symbol=${params.symbol}`
   );
+  const ts = formatEtTimestamp(params.event.timestamp);
   return {
     type: "UPDATE",
     symbol: params.symbol,
     dir: params.dir,
     conf: params.conf,
     risk: params.risk,
+    px: getPrice(params.event),
+    ts,
     update: {
       cause: `contract violation: ${params.reason}`,
       next: "fix event payload",
-      ts: formatEtTimestamp(params.event.timestamp),
+      ts,
       price: params.event.data.price ?? params.event.data.close ?? params.event.data.entryPrice,
     },
   };
@@ -201,7 +242,8 @@ const buildWarnTags = (event: DomainEvent, reasons: string[], blockers: string[]
     if (blocker === "entry_filter" && !tags.includes("EXTENDED")) tags.push("ENTRY_FILTER");
   }
 
-  return unique(tags);
+  const extraTags = Array.isArray(event.data.warnTags) ? event.data.warnTags.filter((tag) => typeof tag === "string") : [];
+  return unique([...tags, ...extraTags]);
 };
 
 const deriveEntryMode = (event: DomainEvent, reasons: string[], warnTags: string[]): "MOMENTUM" | "PULLBACK" => {
@@ -335,6 +377,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const sizeMultiplier = deriveSizeMultiplier(warnTags);
   const armCondition = buildArmCondition(event, dir, reasons, warnTags);
   const why = buildWhy(event, dir, reasons);
+  const px = getPrice(event);
+  const ts = formatEtTimestamp(event.timestamp);
+  const next = buildNextLine(event, reasons, warnTags);
+  const chaseAllowed = entryMode === "MOMENTUM" && !warnTags.includes("EXTENDED") && !warnTags.includes("RISK_ATR");
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
@@ -349,10 +395,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
       update: {
         cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
         next: `levels ${levels}${arm}`,
-        ts: formatEtTimestamp(event.timestamp),
+        ts,
         price: event.data.price,
       },
     };
@@ -368,10 +416,13 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
+      warnTags: warnTags.length ? warnTags : undefined,
       update: {
         cause: `LLM ${action}${urgency}`,
         next: nextCheck,
-        ts: formatEtTimestamp(event.timestamp),
+        ts,
         price: event.data.price ?? event.data.close ?? event.data.entryPrice,
         lastSignal: dir,
       },
@@ -401,13 +452,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        px,
+        ts,
         update: {
           fromSide: dir,
           toSide: dir,
           emoji: timeCutoff ? "⏱️" : "⚠️",
           cause: timeCutoff ? "time cutoff" : "hard block active",
           next: timeCutoff ? "stop new entries" : "wait for readiness",
-          ts: formatEtTimestamp(event.timestamp),
+          ts,
         },
       };
     }
@@ -417,6 +470,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
       entryTrigger: buildEntryTrigger(entryZone, dir),
       entryTriggerTf: indicatorTf,
       stop,
@@ -424,6 +479,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       tp1: targets.t1,
       tp2: targets.t2,
       sizeMultiplier,
+      entryMode,
+      chaseAllowed,
       why,
       warnTags: warnTags.length ? warnTags : undefined,
     };
@@ -445,13 +502,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           dir,
           conf,
           risk,
+          px,
+          ts,
           update: {
             fromSide: dir,
             toSide: dir,
             emoji: "⏱️",
             cause: "time cutoff",
             next: "stop new entries",
-            ts: formatEtTimestamp(event.timestamp),
+            ts,
           },
         };
       }
@@ -466,10 +525,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           dir,
           conf,
           risk,
+          px,
+          ts,
           update: {
             cause: "readiness not met",
             next: "wait for data readiness",
-            ts: formatEtTimestamp(event.timestamp),
+            ts,
             price: event.data.price ?? event.data.close ?? event.data.entryPrice,
           },
         };
@@ -490,9 +551,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        px,
+        ts,
         armCondition: hardArm,
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        next,
         why,
         warnTags: warnTags.length ? warnTags : ["DATA"],
       };
@@ -507,10 +571,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
             dir,
             conf,
             risk,
+            px,
+            ts,
             update: {
               cause: "readiness not met",
               next: "wait for data readiness",
-              ts: formatEtTimestamp(event.timestamp),
+              ts,
               price: event.data.price ?? event.data.close ?? event.data.entryPrice,
             },
           };
@@ -530,9 +596,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        px,
+        ts,
         armCondition: derivedArm,
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
+        next,
         why,
         warnTags: warnTags.length ? warnTags : ["DATA"],
       };
@@ -578,10 +647,13 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
       armCondition: derivedArm,
       entryRule,
       planStop,
       plan: planParts.join(", "),
+      next,
       why,
       warnTags: warnTags.length ? warnTags : ["NONE"],
     };
@@ -596,12 +668,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
+      warnTags: warnTags.length ? warnTags : undefined,
       update: {
         fromSide: dir,
         toSide: dir,
         cause: manageCause,
         next: manageNext,
-        ts: formatEtTimestamp(event.timestamp),
+        ts,
         price: event.data.price ?? event.data.close ?? event.data.entryPrice,
         lastSignal: dir,
       },
@@ -618,13 +693,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      px,
+      ts,
       update: {
         fromSide: lastSignal === "LONG" || lastSignal === "SHORT" ? lastSignal : undefined,
         toSide: dir,
         emoji: "🔁",
         cause,
         next: "wait for new setup",
-        ts: formatEtTimestamp(event.timestamp),
+        ts,
         price: isFiniteNumber(price) ? price : undefined,
         lastSignal: lastSignal ? String(lastSignal) : undefined,
       },

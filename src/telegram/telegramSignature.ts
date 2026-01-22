@@ -19,6 +19,7 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
   if (snapshot.type === "SIGNAL") {
     return [
       ...base,
+      snapshot.px ?? "",
       snapshot.entryTrigger ?? "",
       snapshot.entryTriggerTf ?? "",
       snapshot.stop ?? "",
@@ -26,6 +27,8 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
       snapshot.tp1 ?? "",
       snapshot.tp2 ?? "",
       snapshot.sizeMultiplier ?? "",
+      snapshot.entryMode ?? "",
+      snapshot.chaseAllowed ?? "",
       (snapshot.warnTags ?? []).join(","),
     ].join("|");
   }
@@ -33,9 +36,11 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
   if (snapshot.type === "WATCH") {
     return [
       ...base,
+      snapshot.px ?? "",
       snapshot.armCondition ?? "",
       snapshot.entryRule ?? "",
       snapshot.planStop ?? "",
+      snapshot.next ?? "",
       (snapshot.warnTags ?? []).join(","),
     ].join("|");
   }
