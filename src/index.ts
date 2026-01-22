@@ -65,6 +65,7 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
     bars5mCount,
     bars15mCount,
     activePlayId: play?.id || null,
+    pendingPlayId: s.pendingPlay?.id || null,
     entered: play?.status === "ENTERED",
     state: getPlayState(play),
     lastLLMCallAt: s.lastLLMCallAt || null,
@@ -124,6 +125,7 @@ try {
 
 const orch = new Orchestrator(instanceId, llmService, {
   activePlay: persisted?.activePlay ?? null,
+  pendingPlay: persisted?.pendingPlay ?? null,
   pendingCandidate: persisted?.pendingCandidate ?? null,
   pendingCandidateExpiresAt: persisted?.pendingCandidateExpiresAt,
   potd: persisted?.potd,
@@ -221,6 +223,7 @@ setInterval(() => {
     instanceId,
     savedAt: Date.now(),
     activePlay: orch.getState().activePlay ?? null,
+    pendingPlay: orch.getState().pendingPlay ?? null,
     pendingCandidate: orch.getState().pendingCandidate ?? null,
     pendingCandidateExpiresAt: orch.getState().pendingCandidateExpiresAt,
     timingState: orch.getState().timingState,

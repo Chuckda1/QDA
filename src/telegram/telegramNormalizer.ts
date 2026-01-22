@@ -11,6 +11,18 @@ export type TelegramSnapshot = {
   risk: string;
   px?: number;
   ts?: string;
+  range?: {
+    low: number;
+    high: number;
+    vwap?: number;
+    price?: number;
+    ts?: string;
+    longArm?: string;
+    longEntry?: string;
+    shortArm?: string;
+    shortEntry?: string;
+    stopAnchor?: string;
+  };
   entryTrigger?: string;
   entryTriggerTf?: string;
   stop?: number;
@@ -504,6 +516,39 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   if (event.type === "NO_ENTRY" || event.type === "LLM_VERIFY") {
     const hasEntryData = !!entryZone && !!stop && !!targets;
     const readinessMissing = hardWaitBlockers.length > 0 || hardWaitReasons.length > 0;
+    const rangePayload = event.data.range;
+    if (rangePayload && event.type === "NO_ENTRY") {
+      const rangeTs =
+        typeof rangePayload.ts === "number"
+          ? formatEtTimestamp(rangePayload.ts)
+          : typeof rangePayload.ts === "string"
+          ? rangePayload.ts
+          : ts;
+      return {
+        type: "WATCH",
+        symbol,
+        dir,
+        conf,
+        risk,
+        px: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
+        ts: rangeTs,
+        range: {
+          low: rangePayload.low,
+          high: rangePayload.high,
+          vwap: rangePayload.vwap,
+          price: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
+          ts: rangeTs,
+          longArm: rangePayload.longArm,
+          longEntry: rangePayload.longEntry,
+          shortArm: rangePayload.shortArm,
+          shortEntry: rangePayload.shortEntry,
+          stopAnchor: rangePayload.stopAnchor,
+        },
+        warnTags: Array.isArray(event.data.rangeWarnTags)
+          ? event.data.rangeWarnTags.filter((tag: unknown) => typeof tag === "string")
+          : warnTags,
+      };
+    }
     if (decisionState === "UPDATE" || (hardBlocker && timeCutoff)) {
       if (timeCutoff) {
         return {

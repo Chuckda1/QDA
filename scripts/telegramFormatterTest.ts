@@ -132,6 +132,43 @@ assert.ok(!watchText.includes("RISK_CAP"), "WATCH contains raw blocker text");
 assert.ok(!/WAIT_FOR_|arming_failed|entry_filter|BLOCKED|SETUP CANDIDATES/i.test(watchText), "WATCH contains raw blocker token");
 assert.ok(/^[A-Z]+/.test(watchAlert?.lines[0] ?? ""), "WATCH header malformed");
 
+const rangeEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "WATCH",
+  range: {
+    low: 689.2,
+    high: 690.1,
+    vwap: 689.6,
+    price: 689.7,
+    longArm: "retest 689.40-689.70",
+    longEntry: "break&hold above 690.10",
+    shortArm: "retest 689.60-689.90",
+    shortEntry: "break&hold below 689.20",
+    stopAnchor: "long < 689.20 | short > 690.10 (armed)",
+    ts: Date.now(),
+  },
+  rangeWarnTags: ["TRANSITION", "LOW_DENSITY", "TF_CONFLICT", "GUARDRAIL", "EXTENDED"],
+});
+const rangeSnapshot = normalizeTelegramSnapshot(rangeEvent);
+assert.ok(rangeSnapshot, "Range WATCH snapshot missing");
+assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
+const rangeAlert = buildTelegramAlert(rangeSnapshot!);
+assert.ok(rangeAlert, "Range WATCH alert missing");
+assert.ok(rangeAlert?.lines.length <= 9, "Range WATCH line count exceeded");
+assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing WATCH");
+assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
+assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("RANGE:")), "Range WATCH missing range line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("LONG ARM:")), "Range WATCH missing long arm");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("SHORT ENTRY:")), "Range WATCH missing short entry");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("NEXT:")), "Range WATCH missing next line");
+assert.ok(
+  rangeAlert?.lines.some((l) => l.includes("+1")),
+  "Range WATCH warn tags should be capped"
+);
+
 const signalSnapshot = normalizeTelegramSnapshot(signalEvent);
 assert.ok(signalSnapshot, "SIGNAL snapshot missing");
 const signalAlert = buildTelegramAlert(signalSnapshot!);

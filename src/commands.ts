@@ -234,6 +234,10 @@ export class CommandHandler {
    */
   async enter(): Promise<string> {
     const s = this.orch.getState();
+    if (!s.activePlay && s.pendingPlay) {
+      s.activePlay = s.pendingPlay;
+      s.pendingPlay = null;
+    }
     if (!s.activePlay) {
       return "❌ No active play to enter. Wait for a play to be armed first.";
     }
@@ -259,7 +263,8 @@ export class CommandHandler {
         symbol: s.activePlay.symbol,
         direction: s.activePlay.direction,
         price: entryPrice,
-        entryPrice
+        entryPrice,
+        decisionState: "UPDATE"
       }
     };
 

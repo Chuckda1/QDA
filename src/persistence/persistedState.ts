@@ -8,6 +8,7 @@ export interface PersistedBotStateV1 {
   instanceId: string;
   savedAt: number;
   activePlay: Play | null;
+  pendingPlay?: Play | null;
   pendingCandidate?: SetupCandidate | null;
   pendingCandidateExpiresAt?: number;
   timingState?: TimingStateContext;

@@ -202,6 +202,19 @@ export class Orchestrator {
   private lastMarketState: Record<string, any> | null = null;
   private lastTimingSnapshot: Record<string, any> | null = null;
   private lastScorecardSnapshot: ScorecardSnapshot | null = null;
+  private lastRangeWatchKey: string | null = null;
+  private lastRangeWatchTs: number | null = null;
+  private lastRangeWatchMetrics: {
+    low: number;
+    high: number;
+    vwap?: number;
+    warnKey: string;
+    longEntry: string;
+    shortEntry: string;
+  } | null = null;
+  private rangeModeActive: boolean = false;
+  private rangeModeConsecutiveTrue: number = 0;
+  private rangeModeConsecutiveFalse: number = 0;
   private lastRegime15m: RegimeResult | null = null;
   private lastMacroBias: Bias = "NEUTRAL";
   private lastRegime15mTs: number | null = null;
@@ -265,6 +278,7 @@ export class Orchestrator {
     llmService?: LLMService,
     initialState?: {
       activePlay?: Play | null;
+      pendingPlay?: Play | null;
       pendingCandidate?: SetupCandidate | null;
       pendingCandidateExpiresAt?: number;
       potd?: { bias: PotdBias; confidence: number; mode: PotdMode; updatedAt?: number; source?: string };
@@ -321,6 +335,10 @@ export class Orchestrator {
         activePlay.status = "ARMED";
       }
     }
+    const pendingPlay = initialState?.pendingPlay ?? null;
+    if (pendingPlay && !pendingPlay.status) {
+      pendingPlay.status = "PENDING";
+    }
 
     const initialPotd = initialState?.potd;
     if (initialPotd) {
@@ -333,6 +351,7 @@ export class Orchestrator {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
       activePlay,
+      pendingPlay,
       pendingCandidate: initialState?.pendingCandidate ?? null,
       pendingCandidateExpiresAt: initialState?.pendingCandidateExpiresAt,
       mode: "QUIET",
@@ -2405,6 +2424,18 @@ export class Orchestrator {
         baseBlockers.softBlockers.push("guardrail");
         baseBlockers.softReasons.push(reason);
       }
+      const chopSignals = new Set<string>();
+      if (anchorRegime.regime === "CHOP") chopSignals.add("CHOP");
+      if (shockMode) chopSignals.add("SHOCK");
+      if (transitionLockActive) chopSignals.add("TRANSITION");
+      if (tacticalSnapshot.confirm && tacticalSnapshot.confirm.bias !== "NONE") {
+        if (tacticalSnapshot.confirm.bias !== tacticalSnapshot.activeDirection) {
+          chopSignals.add("TF_CONFLICT");
+        }
+      }
+      if (lowContext && lowContextReasons.length) {
+        chopSignals.add("LOW_DENSITY");
+      }
 
       const hardStopBlockers = baseBlockers.hardStopBlockers;
       const hardWaitBlockers = baseBlockers.hardWaitBlockers;
@@ -2454,6 +2485,20 @@ export class Orchestrator {
         : hasHardBlockers || softBlockers.length
         ? "WATCH"
         : "SIGNAL";
+      const rangeCondition =
+        decisionState === "WATCH" &&
+        readinessOk &&
+        hardStopBlockers.length === 0 &&
+        hardStopReasons.length === 0 &&
+        hardWaitBlockers.length === 0 &&
+        hardWaitReasons.length === 0 &&
+        chopSignals.size >= 2;
+      const rangeModeActive = this.updateRangeMode(rangeCondition, decisionState === "SIGNAL");
+      if (!rangeModeActive) {
+        this.lastRangeWatchKey = null;
+        this.lastRangeWatchTs = null;
+        this.lastRangeWatchMetrics = null;
+      }
 
       const decision = buildDecision({
         ts,
@@ -2521,6 +2566,11 @@ export class Orchestrator {
           riskAtr
         }
       };
+      if (decisionState === "WATCH") {
+        this.state.pendingPlay = this.buildPendingPlay(setupCandidate, llmSummary, ts);
+      } else if (decision.status === "ARMED" || decisionState === "SIGNAL") {
+        this.state.pendingPlay = null;
+      }
       const rankedCandidates = setupCandidates
         .slice()
         .sort((a, b) => b.score.total - a.score.total)
@@ -2544,6 +2594,57 @@ export class Orchestrator {
             warningFlags: candidate.warningFlags ?? candidate.flags ?? [],
           };
         });
+      const formatZone = (zone?: { low: number; high: number }): string =>
+        zone ? `${zone.low.toFixed(2)}-${zone.high.toFixed(2)}` : "n/a";
+      const rangeWarnKey = (() => {
+        const tags = Array.from(chopSignals).sort();
+        const capped = tags.slice(0, 2);
+        const extra = tags.length - capped.length;
+        const suffix = extra > 0 ? ` (+${extra})` : "";
+        return `${capped.join(",")}${suffix}`;
+      })();
+      const rangeWatchPayload = rangeModeActive
+        ? (() => {
+            const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
+            const rangeLow = Math.min(...rangeCandidates.map((candidate) => candidate.entryZone.low));
+            const rangeHigh = Math.max(...rangeCandidates.map((candidate) => candidate.entryZone.high));
+            const longCandidate = rangeCandidates.find((candidate) => candidate.direction === "LONG");
+            const shortCandidate = rangeCandidates.find((candidate) => candidate.direction === "SHORT");
+            const longArm = longCandidate
+              ? `retest ${formatZone(longCandidate.entryZone)}`
+              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
+            const shortArm = shortCandidate
+              ? `retest ${formatZone(shortCandidate.entryZone)}`
+              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
+            const longEntry = longCandidate
+              ? `break&hold above ${longCandidate.entryZone.high.toFixed(2)}`
+              : `break&hold above ${rangeHigh.toFixed(2)}`;
+            const shortEntry = shortCandidate
+              ? `break&hold below ${shortCandidate.entryZone.low.toFixed(2)}`
+              : `break&hold below ${rangeLow.toFixed(2)}`;
+            const stopAnchor = `long < ${rangeLow.toFixed(2)} | short > ${rangeHigh.toFixed(2)} (armed)`;
+            return {
+              range: { low: rangeLow, high: rangeHigh },
+              vwap: indicatorSnapshot.vwap,
+              price: close,
+              longArm,
+              longEntry,
+              shortArm,
+              shortEntry,
+              stopAnchor,
+            };
+          })()
+        : null;
+      const rangeWatchKey = rangeWatchPayload
+        ? [
+            rangeWatchPayload.range.low.toFixed(2),
+            rangeWatchPayload.range.high.toFixed(2),
+            Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
+            rangeWatchPayload.longEntry,
+            rangeWatchPayload.shortEntry,
+            rangeWarnKey
+          ].join("|")
+        : null;
       events.push(this.ev("SETUP_CANDIDATES", ts, {
         symbol,
         price: close,
@@ -2629,7 +2730,74 @@ export class Orchestrator {
         }));
       }
 
-      if (decisionState === "WATCH" || decision.status !== "ARMED") {
+      if (rangeModeActive && rangeWatchPayload) {
+        const atr = indicatorSnapshot.atr;
+        const rangeThreshold = Number.isFinite(atr) ? (atr as number) * 0.15 : 0.15;
+        const vwapThreshold = Number.isFinite(atr) ? (atr as number) * 0.1 : 0.1;
+        const prior = this.lastRangeWatchMetrics;
+        const rangeMoved =
+          !prior ||
+          Math.abs(rangeWatchPayload.range.low - prior.low) >= rangeThreshold ||
+          Math.abs(rangeWatchPayload.range.high - prior.high) >= rangeThreshold;
+        const vwapMoved = (() => {
+          const currentVwap = rangeWatchPayload.vwap;
+          if (!prior) return true;
+          if (currentVwap === undefined && prior.vwap === undefined) return false;
+          if (currentVwap === undefined || prior.vwap === undefined) return true;
+          return Math.abs(currentVwap - prior.vwap) >= vwapThreshold;
+        })();
+        const triggersChanged =
+          !prior ||
+          prior.longEntry !== rangeWatchPayload.longEntry ||
+          prior.shortEntry !== rangeWatchPayload.shortEntry ||
+          prior.warnKey !== rangeWarnKey;
+        const shouldEmitRange =
+          (rangeMoved || vwapMoved || triggersChanged) &&
+          this.lastRangeWatchTs !== ts;
+        if (shouldEmitRange) {
+          events.push(this.ev("NO_ENTRY", ts, {
+            playId: decision.decisionId,
+            symbol: setupCandidate.symbol,
+            direction: setupCandidate.direction,
+            price: close,
+            decisionState: "WATCH",
+            decision: decisionSummary,
+            marketState,
+            timing: timingSnapshot,
+            topPlay,
+            blockerTags: blockers,
+            blockerReasons,
+            hardBlockers,
+            softBlockers,
+            hardBlockerReasons,
+            softBlockerReasons,
+            playState: "CANDIDATE",
+            notArmedReason: blockerReasons.length ? blockerReasons.join(" | ") : undefined,
+            range: {
+              ...rangeWatchPayload.range,
+              vwap: rangeWatchPayload.vwap,
+              price: rangeWatchPayload.price,
+              longArm: rangeWatchPayload.longArm,
+              longEntry: rangeWatchPayload.longEntry,
+              shortArm: rangeWatchPayload.shortArm,
+              shortEntry: rangeWatchPayload.shortEntry,
+              stopAnchor: rangeWatchPayload.stopAnchor,
+              ts,
+            },
+            rangeWarnTags: Array.from(chopSignals)
+          }));
+          this.lastRangeWatchKey = rangeWatchKey;
+          this.lastRangeWatchTs = ts;
+          this.lastRangeWatchMetrics = {
+            low: rangeWatchPayload.range.low,
+            high: rangeWatchPayload.range.high,
+            vwap: rangeWatchPayload.vwap,
+            warnKey: rangeWarnKey,
+            longEntry: rangeWatchPayload.longEntry,
+            shortEntry: rangeWatchPayload.shortEntry,
+          };
+        }
+      } else if (decisionState === "WATCH" || decision.status !== "ARMED") {
         events.push(this.ev("NO_ENTRY", ts, {
           playId: decision.decisionId,
           symbol: setupCandidate.symbol,
@@ -2654,6 +2822,7 @@ export class Orchestrator {
       if (decision.status === "ARMED" && decision.play) {
         this.state.pendingCandidate = null;
         this.state.pendingCandidateExpiresAt = undefined;
+        this.state.pendingPlay = null;
         if (directionGate.allow) {
           decision.play.tier = directionGate.tier;
           if (directionGate.tier === "LEANING") {
@@ -3245,6 +3414,59 @@ export class Orchestrator {
       this.lastScorecardSnapshot = next;
     }
     return changed;
+  }
+
+  private buildPendingPlay(candidate: SetupCandidate, llmSummary: DecisionLlmSummary | undefined, ts: number): Play {
+    const playMode: Play["mode"] = llmSummary?.action === "GO_ALL_IN" ? "FULL" : "SCOUT";
+    const grade =
+      candidate.score.total >= 70 ? "A" : candidate.score.total >= 60 ? "B" : candidate.score.total >= 50 ? "C" : "D";
+    return {
+      id: candidate.id,
+      symbol: candidate.symbol,
+      direction: candidate.direction,
+      score: candidate.score.total,
+      grade,
+      entryZone: candidate.entryZone,
+      stop: candidate.stop,
+      targets: candidate.targets,
+      valueBand: candidate.meta?.valueBand,
+      vwapRef: candidate.meta?.vwapRef ?? null,
+      mode: playMode,
+      confidence: llmSummary?.probability ?? candidate.score.total,
+      legitimacy: llmSummary?.legitimacy,
+      followThroughProb: llmSummary?.followThroughProb,
+      action: llmSummary?.action,
+      armedTimestamp: undefined,
+      expiresAt: ts + 30 * 60 * 1000,
+      triggerPrice: candidate.triggerPrice,
+      status: "PENDING",
+      inEntryZone: false,
+      stopHit: false,
+    };
+  }
+
+  private updateRangeMode(rangeCondition: boolean, hasSignal: boolean): boolean {
+    if (hasSignal) {
+      this.rangeModeActive = false;
+      this.rangeModeConsecutiveTrue = 0;
+      this.rangeModeConsecutiveFalse = 0;
+      return false;
+    }
+    if (rangeCondition) {
+      this.rangeModeConsecutiveTrue += 1;
+      this.rangeModeConsecutiveFalse = 0;
+    } else {
+      this.rangeModeConsecutiveFalse += 1;
+      this.rangeModeConsecutiveTrue = 0;
+    }
+    if (this.rangeModeActive) {
+      if (this.rangeModeConsecutiveFalse >= 3) {
+        this.rangeModeActive = false;
+      }
+    } else if (this.rangeModeConsecutiveTrue >= 2) {
+      this.rangeModeActive = true;
+    }
+    return this.rangeModeActive;
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {

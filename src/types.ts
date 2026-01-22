@@ -184,7 +184,7 @@ export interface Play {
   action?: TradeAction;
   
   // tracking
-  status: "ARMED" | "ENTRY_WINDOW" | "ENTERED" | "CANCELLED" | "CLOSED";
+  status: "PENDING" | "ARMED" | "ENTRY_WINDOW" | "ENTERED" | "CANCELLED" | "CLOSED";
   tier?: "LOCKED" | "LEANING";
   lastCoachUpdate?: number;
   armedTimestamp?: number; // timestamp when play was armed
@@ -257,6 +257,7 @@ export interface BotState {
   session: string;
   price?: number;
   activePlay?: Play | null;
+  pendingPlay?: Play | null;
   pendingCandidate?: SetupCandidate | null;
   pendingCandidateExpiresAt?: number;
   mode: BotMode;
