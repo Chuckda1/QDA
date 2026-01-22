@@ -889,6 +889,7 @@ export class Orchestrator {
         playId: decision.decisionId,
         symbol: play.symbol,
         direction: play.direction,
+        decisionState: "UPDATE",
         decision: {
           decisionId: decision.decisionId,
           status: decision.status,
@@ -903,7 +904,8 @@ export class Orchestrator {
           },
           direction: play.direction,
           gateTier: "STRICT",
-          rationale: decision.blockerReasons
+          rationale: decision.blockerReasons,
+          decisionState: "UPDATE"
         },
         blockerTags: decision.blockers,
         blockerReasons: decision.blockerReasons,
@@ -2633,6 +2635,7 @@ export class Orchestrator {
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
           price: close,
+          decisionState,
           decision: decisionSummary,
           marketState,
           timing: timingSnapshot,
