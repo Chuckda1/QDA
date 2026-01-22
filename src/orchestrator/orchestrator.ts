@@ -3264,8 +3264,14 @@ export class Orchestrator {
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {
-    if (requiresDecisionState(type) && !data.decisionState) {
-      throw new Error(`[DecisionState] missing decisionState for ${type}`);
+    if (requiresDecisionState(type)) {
+      const derivedState = data.decisionState ?? data.decision?.decisionState;
+      if (!derivedState) {
+        throw new Error(`[DecisionState] missing decisionState for ${type}`);
+      }
+      if (!data.decisionState) {
+        data.decisionState = derivedState;
+      }
     }
     return { type, timestamp, instanceId: this.instanceId, data };
   }
