@@ -1,6 +1,6 @@
 import type { Direction, DomainEvent } from "../types.js";
 
-export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE";
+export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
 
 export type TelegramSnapshot = {
   type: TelegramSnapshotType;
@@ -309,6 +309,45 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const armCondition = buildArmCondition(event, dir, reasons, warnTags);
   const why = buildWhy(event, dir, reasons);
 
+  if (event.type === "PREMARKET_UPDATE") {
+    const premarket = event.data.premarket ?? {};
+    const bias = premarket.bias ?? "NEUTRAL";
+    const levels = premarket.levels ?? "levels n/a";
+    return {
+      type: "UPDATE",
+      symbol,
+      dir,
+      conf,
+      risk,
+      update: {
+        cause: `premarket bias ${bias}`,
+        next: `levels ${levels}`,
+        ts: formatEtTimestamp(event.timestamp),
+        price: event.data.price,
+      },
+    };
+  }
+
+  if (event.type === "LLM_COACH_UPDATE") {
+    const action = event.data.action ?? "MANAGE";
+    const urgency = event.data.urgency ? ` (${event.data.urgency})` : "";
+    const nextCheck = event.data.nextCheck ? `next check ${event.data.nextCheck}` : "monitor for exits";
+    return {
+      type: "MANAGE",
+      symbol,
+      dir,
+      conf,
+      risk,
+      update: {
+        cause: `LLM ${action}${urgency}`,
+        next: nextCheck,
+        ts: formatEtTimestamp(event.timestamp),
+        price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+        lastSignal: dir,
+      },
+    };
+  }
+
   const timeCutoff =
     reasons.some((reason: string) => isTimeOfDayCutoff(reason)) ||
     hardStopReasons.some((reason: string) => isTimeOfDayCutoff(reason));
@@ -425,8 +464,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   }
 
   if (decisionState === "MANAGE") {
+    const manageCause = event.data.reason ?? event.data.result ?? event.data.mode ?? "manage active play";
+    const manageNext = event.data.next ?? "monitor for exits";
     return {
-      type: "UPDATE",
+      type: "MANAGE",
       symbol,
       dir,
       conf,
@@ -434,9 +475,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       update: {
         fromSide: dir,
         toSide: dir,
-        emoji: "🛠️",
-        cause: "manage active play",
-        next: "monitor for exits",
+        cause: manageCause,
+        next: manageNext,
         ts: formatEtTimestamp(event.timestamp),
         price: event.data.price ?? event.data.close ?? event.data.entryPrice,
         lastSignal: dir,

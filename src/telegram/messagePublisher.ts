@@ -100,15 +100,21 @@ export class MessagePublisher {
       return { suppress: true };
     }
     if (event.type === "LLM_VERIFY") {
-      const action = event.data.llm?.action ?? event.data.action ?? event.data.decision?.llm?.action;
-      if (action === "WAIT" || action === "PASS") {
-        return { suppress: true };
-      }
+      return { suppress: true };
     }
 
-    const typesToControl: DomainEventType[] = ["SETUP_CANDIDATES", "NO_ENTRY", "PLAY_ARMED", "PLAY_CANCELLED", "PLAY_CLOSED", "PLAY_SIZED_UP"];
-    if (!typesToControl.includes(event.type)) {
-      return { suppress: false };
+    const allowedTypes: DomainEventType[] = [
+      "NO_ENTRY",
+      "PLAY_ARMED",
+      "PLAY_CANCELLED",
+      "PLAY_CLOSED",
+      "PLAY_ENTERED",
+      "PLAY_SIZED_UP",
+      "LLM_COACH_UPDATE",
+      "PREMARKET_UPDATE"
+    ];
+    if (!allowedTypes.includes(event.type)) {
+      return { suppress: true };
     }
 
     const snapshot = normalizeTelegramSnapshot(event);

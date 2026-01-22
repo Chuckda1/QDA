@@ -53,5 +53,18 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
     ].join("|");
   }
 
+  if (snapshot.type === "MANAGE" && snapshot.update) {
+    return [
+      ...base,
+      snapshot.update.fromSide ?? "",
+      snapshot.update.toSide ?? "",
+      snapshot.update.cause ?? "",
+      snapshot.update.next ?? "",
+      snapshot.update.ts ?? "",
+      snapshot.update.price ?? "",
+      snapshot.update.lastSignal ?? "",
+    ].join("|");
+  }
+
   return base.join("|");
 }

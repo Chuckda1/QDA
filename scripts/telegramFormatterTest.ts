@@ -71,6 +71,26 @@ const updateEvent = makeBaseEvent("PLAY_CANCELLED", {
   },
 });
 
+const manageEvent = makeBaseEvent("LLM_COACH_UPDATE", {
+  symbol: "SPY",
+  direction: "LONG",
+  price: 452.8,
+  action: "HOLD",
+  urgency: "LOW",
+  nextCheck: "5m",
+});
+
+const premarketEvent = makeBaseEvent("PREMARKET_UPDATE", {
+  symbol: "SPY",
+  direction: "LONG",
+  price: 451.9,
+  decisionState: "UPDATE",
+  premarket: {
+    bias: "LONG",
+    levels: "entry 451.20-452.40, stop 449.80",
+  },
+});
+
 const watchSnapshot = normalizeTelegramSnapshot(watchEvent);
 assert.ok(watchSnapshot, "WATCH snapshot missing");
 const watchAlert = buildTelegramAlert(watchSnapshot!);
@@ -125,6 +145,23 @@ assert.ok(updateAlert?.lines[1]?.includes("last"), "UPDATE last signal missing")
 assert.ok(updateAlert?.lines[2]?.startsWith("NEXT:"), "UPDATE next line missing");
 assert.ok(updateAlert?.lines[3]?.startsWith("TS:"), "UPDATE timestamp line missing");
 assert.ok(updateAlert?.lines[3]?.endsWith(" ET"), "UPDATE timestamp not ET");
+
+const manageSnapshot = normalizeTelegramSnapshot(manageEvent);
+assert.ok(manageSnapshot, "MANAGE snapshot missing");
+const manageAlert = buildTelegramAlert(manageSnapshot!);
+assert.ok(manageAlert, "MANAGE alert missing");
+assert.equal(manageAlert?.type, "MANAGE");
+assert.ok(manageAlert?.lines.length <= 4, "MANAGE line count exceeded");
+assert.ok(manageAlert?.text.includes("\n"), "MANAGE missing newline separators");
+assert.ok(!manageAlert?.text.includes("\\n"), "MANAGE contains literal \\n");
+assert.ok(manageAlert?.lines[0]?.startsWith("MANAGE:"), "MANAGE header missing status");
+assert.ok(manageAlert?.lines[1]?.startsWith("ACTION:"), "MANAGE action line missing");
+assert.ok(manageAlert?.lines[2]?.startsWith("NEXT:"), "MANAGE next line missing");
+assert.ok(manageAlert?.lines[3]?.startsWith("TS:"), "MANAGE timestamp line missing");
+
+const premarketSnapshot = normalizeTelegramSnapshot(premarketEvent);
+assert.ok(premarketSnapshot, "Premarket snapshot missing");
+assert.equal(premarketSnapshot?.type, "UPDATE", "Premarket should produce UPDATE");
 
 const setupSnapshot = normalizeTelegramSnapshot(makeBaseEvent("SETUP_CANDIDATES", { symbol: "SPY" }));
 assert.equal(setupSnapshot, null, "SETUP_CANDIDATES should not emit telegram alerts");

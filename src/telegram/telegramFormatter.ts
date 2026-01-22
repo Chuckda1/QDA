@@ -10,6 +10,7 @@ const MAX_LINES: Record<TelegramSnapshotType, number> = {
   SIGNAL: 7,
   WATCH: 6,
   UPDATE: 4,
+  MANAGE: 4,
 };
 
 const formatPrice = (value?: number): string => (Number.isFinite(value) ? (value as number).toFixed(2) : "n/a");
@@ -22,6 +23,16 @@ const formatUpdateHeader = (input: {
   const flip = input.fromSide && input.toSide ? `${input.fromSide} → ${input.toSide} 🔁` : "UPDATE 🔁";
   const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
   return `UPDATE: ${flip} | px ${px}`;
+};
+
+const formatManageHeader = (input: {
+  symbol: string;
+  dir: "LONG" | "SHORT";
+  px?: number;
+  risk: string;
+}): string => {
+  const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
+  return `MANAGE: ${input.symbol} ${input.dir} 🛠️ | px ${px} | risk=${input.risk}`;
 };
 
 const enforceLineLimit = (type: TelegramSnapshotType, lines: string[]): string[] => {
@@ -69,6 +80,21 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const ts = `TS: ${update.ts}`;
     const lines = enforceLineLimit("UPDATE", [header, cause, next, ts]);
     return { type: "UPDATE", lines, text: lines.join("\n") };
+  }
+
+  if (snapshot.type === "MANAGE" && snapshot.update) {
+    const update = snapshot.update;
+    const header = formatManageHeader({
+      symbol: snapshot.symbol,
+      dir: snapshot.dir,
+      px: update.price,
+      risk: snapshot.risk,
+    });
+    const cause = `ACTION: ${update.cause}`;
+    const next = `NEXT: ${update.next}`;
+    const ts = `TS: ${update.ts}`;
+    const lines = enforceLineLimit("MANAGE", [header, cause, next, ts]);
+    return { type: "MANAGE", lines, text: lines.join("\n") };
   }
 
   return null;

@@ -1943,7 +1943,8 @@ export class Orchestrator {
       let llmSummary: DecisionLlmSummary | undefined;
       let llmErrorReason: string | undefined;
 
-      const shouldRunLlm = !!this.llmService && !watchOnly && setupCandidates.length > 0;
+      const shouldRunLlm =
+        !!this.llmService && !watchOnly && setupCandidates.length > 0 && readinessOk;
 
       if (shouldRunLlm) {
         try {
@@ -2441,12 +2442,13 @@ export class Orchestrator {
         ruleScores
       };
 
-      const decisionState =
-        hardStopBlockers.length || hardWaitBlockers.length
-          ? "WATCH"
-          : softBlockers.length
-          ? "WATCH"
-          : "SIGNAL";
+      const hasHardBlockers = hardStopBlockers.length || hardWaitBlockers.length;
+      const hasTimeCutoff = hardStopBlockers.includes("time_window");
+      const decisionState = hasTimeCutoff
+        ? "UPDATE"
+        : hasHardBlockers || softBlockers.length
+        ? "WATCH"
+        : "SIGNAL";
 
       const decision = buildDecision({
         ts,
@@ -2622,7 +2624,7 @@ export class Orchestrator {
         }));
       }
 
-      if (decision.status !== "ARMED") {
+      if (decisionState === "WATCH" || decision.status !== "ARMED") {
         events.push(this.ev("NO_ENTRY", ts, {
           playId: decision.decisionId,
           symbol: setupCandidate.symbol,
@@ -3127,6 +3129,7 @@ export class Orchestrator {
           symbol: play.symbol,
           direction: play.direction,
           price: close,
+          decisionState: "MANAGE",
           action: llmAction,
           reasoning: llmReasoning,
           urgency: llmUrgency,

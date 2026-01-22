@@ -63,8 +63,10 @@ function getNthSunday(year: number, month: number, n: number): number {
 export class Scheduler {
   private checkInterval: NodeJS.Timeout | null = null;
   private planSentToday: boolean = false;
+  private premarketSentToday: boolean = false;
   private lastTickTime: number = 0;
   private lastPlanOfDayDate: string = ""; // STAGE 6: Track date to prevent duplicates
+  private lastPremarketDate: string = "";
 
   constructor(
     private governor: MessageGovernor,
@@ -119,6 +121,8 @@ export class Scheduler {
       }
       this.planSentToday = false;
       this.lastPlanOfDayDate = todayET;
+      this.premarketSentToday = false;
+      this.lastPremarketDate = todayET;
       this.governor.resetPlanFlag();
     }
 
@@ -127,6 +131,13 @@ export class Scheduler {
       console.log(`[Scheduler] Sending Plan of Day (ET: ${hour}:${minute.toString().padStart(2, '0')}, date: ${todayET})`);
       this.sendPlanOfDay().catch(err => console.error("Failed to send Plan of Day:", err));
       this.planSentToday = true;
+    }
+
+    if (hour === 9 && minute >= 28 && minute < 30 && !this.premarketSentToday) {
+      console.log(`[Scheduler] Sending premarket update (ET: ${hour}:${minute.toString().padStart(2, '0')}, date: ${todayET})`);
+      this.sendPremarketUpdate().catch(err => console.error("Failed to send premarket update:", err));
+      this.premarketSentToday = true;
+      this.lastPremarketDate = todayET;
     }
 
     // STAGE 6: Determine mode based on time (explicit ranges)
@@ -248,6 +259,45 @@ export class Scheduler {
       }
     };
     // STAGE 4: All messages must go through publishOrdered for serialization
+    await this.publisher.publishOrdered([event]);
+  }
+
+  private async sendPremarketUpdate(): Promise<void> {
+    const d = this.getLatestDiagnostics?.() ?? null;
+    const now = Date.now();
+
+    const fmtNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x.toFixed(2) : "n/a");
+    const symbol = d?.symbol ?? "MARKET";
+    const bias = d?.macroBias ?? "NEUTRAL";
+    const inferred = d?.directionInference?.direction;
+    const direction: Direction =
+      bias === "LONG" || bias === "SHORT"
+        ? bias
+        : inferred === "LONG" || inferred === "SHORT"
+        ? inferred
+        : "LONG";
+
+    let levels = "no confirmed setup";
+    if (d?.candidate) {
+      const c = d.candidate;
+      levels = `entry ${fmtNum(c.entryZone.low)}-${fmtNum(c.entryZone.high)}, stop ${fmtNum(c.stop)}`;
+    }
+
+    const event = {
+      type: "PREMARKET_UPDATE" as const,
+      timestamp: now,
+      instanceId: this.instanceId,
+      data: {
+        symbol,
+        direction,
+        price: d?.close,
+        decisionState: "UPDATE",
+        premarket: {
+          bias,
+          levels
+        }
+      }
+    };
     await this.publisher.publishOrdered([event]);
   }
 }

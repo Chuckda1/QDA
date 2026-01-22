@@ -120,8 +120,21 @@ export class MessageGovernor {
       return true;
     }
 
-    // In QUIET mode: block everything except plan (already handled above)
+    const decisionState =
+      event.data?.decisionState ??
+      event.data?.decision?.decisionState ??
+      event.data?.decision?.state;
+
+    // In QUIET mode: allow only UPDATE alerts (plan handled above)
     if (this.mode === "QUIET") {
+      if (decisionState === "UPDATE") {
+        const key = this.getDedupeKey(event);
+        if (this.hasDedupe(key)) {
+          return false;
+        }
+        this.markDedupe(key, event.timestamp);
+        return true;
+      }
       return false;
     }
 
@@ -136,6 +149,11 @@ export class MessageGovernor {
 
       const decisionBlockers = event.data?.decision?.blockers;
       if (Array.isArray(decisionBlockers) && decisionBlockers.includes("low_probability")) {
+        return false;
+      }
+
+      const allowedStates = new Set(["SIGNAL", "WATCH", "UPDATE", "MANAGE"]);
+      if (!allowedStates.has(decisionState)) {
         return false;
       }
       
