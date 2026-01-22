@@ -1,4 +1,5 @@
 import type { Direction, DomainEvent } from "../types.js";
+import { getDecisionState } from "../utils/decisionState.js";
 
 export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
 
@@ -116,6 +117,32 @@ const isTimeOfDayCutoff = (reason?: string): boolean => !!reason && /time-of-day
 
 const isMarketUnavailable = (reason?: string): boolean =>
   !!reason && /(market unavailable|spread|liquidity)/i.test(reason);
+
+const buildContractViolationUpdate = (params: {
+  event: DomainEvent;
+  symbol: string;
+  dir: Direction;
+  conf?: number;
+  risk: string;
+  reason: string;
+}): TelegramSnapshot => {
+  console.error(
+    `[TELEGRAM] contract violation: ${params.reason} type=${params.event.type} symbol=${params.symbol}`
+  );
+  return {
+    type: "UPDATE",
+    symbol: params.symbol,
+    dir: params.dir,
+    conf: params.conf,
+    risk: params.risk,
+    update: {
+      cause: `contract violation: ${params.reason}`,
+      next: "fix event payload",
+      ts: formatEtTimestamp(params.event.timestamp),
+      price: params.event.data.price ?? params.event.data.close ?? params.event.data.entryPrice,
+    },
+  };
+};
 
 const formatEtTimestamp = (ts: number): string => {
   const dt = new Date(ts);
@@ -301,7 +328,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const hardWaitBlockers = event.data.hardWaitBlockers ?? decision?.hardWaitBlockers ?? [];
   const hardStopReasons = event.data.hardStopReasons ?? decision?.hardStopReasons ?? [];
   const hardWaitReasons = event.data.hardWaitReasons ?? decision?.hardWaitReasons ?? [];
-  const decisionState = event.data.decisionState ?? decision?.decisionState;
+  const decisionState = getDecisionState(event);
   const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons, ...hardStopReasons, ...hardWaitReasons].map(normalizeReason);
   const warnTags = buildWarnTags(event, reasons, [...blockers, ...softBlockers]);
   const entryMode = deriveEntryMode(event, reasons, warnTags);
@@ -311,8 +338,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
+    const kind = premarket.kind ?? "PREMARKET_UPDATE";
     const bias = premarket.bias ?? "NEUTRAL";
     const levels = premarket.levels ?? "levels n/a";
+    const confText = Number.isFinite(premarket.confidence) ? ` (${Math.round(premarket.confidence)}%)` : "";
+    const arm = premarket.arm ? ` | arm ${premarket.arm}` : "";
     return {
       type: "UPDATE",
       symbol,
@@ -320,8 +350,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       conf,
       risk,
       update: {
-        cause: `premarket bias ${bias}`,
-        next: `levels ${levels}`,
+        cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
+        next: `levels ${levels}${arm}`,
         ts: formatEtTimestamp(event.timestamp),
         price: event.data.price,
       },
@@ -406,6 +436,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
 
   if (event.type === "NO_ENTRY" || event.type === "LLM_VERIFY") {
     const hasEntryData = !!entryZone && !!stop && !!targets;
+    const readinessMissing = hardWaitBlockers.length > 0 || hardWaitReasons.length > 0;
     if (decisionState === "UPDATE" || (hardBlocker && timeCutoff)) {
       if (timeCutoff) {
         return {
@@ -426,13 +457,40 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       }
     }
     if (hardBlocker || decisionState === "WATCH") {
+      const hardArmReasons = [...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons];
+      const hardArm = hardArmReasons.length ? buildHardArmCondition(hardArmReasons) : undefined;
+      if (readinessMissing) {
+        return {
+          type: "UPDATE",
+          symbol,
+          dir,
+          conf,
+          risk,
+          update: {
+            cause: "readiness not met",
+            next: "wait for data readiness",
+            ts: formatEtTimestamp(event.timestamp),
+            price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+          },
+        };
+      }
+      if (!hardArm) {
+        return buildContractViolationUpdate({
+          event,
+          symbol,
+          dir,
+          conf,
+          risk,
+          reason: "missing hard arm condition",
+        });
+      }
       return {
         type: "WATCH",
         symbol,
         dir,
         conf,
         risk,
-        armCondition: buildHardArmCondition([...hardStopReasons, ...hardWaitReasons, ...hardBlockerReasons]),
+        armCondition: hardArm,
         entryRule: "pullback only (NO chase)",
         planStop: isFiniteNumber(stop) ? "use valid stop when armed" : "stop missing (needs valid stop)",
         why,
@@ -448,13 +506,39 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     const planStop = isFiniteNumber(vwap)
       ? `${dir === "LONG" ? "below" : "above"} VWAP or last swing (auto when armed)`
       : "last swing (auto when armed)";
+    const derivedArm = armCondition ?? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}`;
+    if (!derivedArm) {
+      if (readinessMissing) {
+        return {
+          type: "UPDATE",
+          symbol,
+          dir,
+          conf,
+          risk,
+          update: {
+            cause: "readiness not met",
+            next: "wait for data readiness",
+            ts: formatEtTimestamp(event.timestamp),
+            price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+          },
+        };
+      }
+      return buildContractViolationUpdate({
+        event,
+        symbol,
+        dir,
+        conf,
+        risk,
+        reason: "missing arm condition",
+      });
+    }
     return {
       type: "WATCH",
       symbol,
       dir,
       conf,
       risk,
-      armCondition: armCondition ?? `retest ${entryZone.low.toFixed(2)}–${entryZone.high.toFixed(2)}`,
+      armCondition: derivedArm,
       entryRule,
       planStop,
       plan: planParts.join(", "),

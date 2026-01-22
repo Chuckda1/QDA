@@ -16,13 +16,20 @@ const MAX_LINES: Record<TelegramSnapshotType, number> = {
 const formatPrice = (value?: number): string => (Number.isFinite(value) ? (value as number).toFixed(2) : "n/a");
 
 const formatUpdateHeader = (input: {
+  symbol: string;
   fromSide?: "LONG" | "SHORT";
   toSide?: "LONG" | "SHORT";
   px?: number;
 }): string => {
-  const flip = input.fromSide && input.toSide ? `${input.fromSide} → ${input.toSide} 🔁` : "UPDATE 🔁";
   const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
-  return `UPDATE: ${flip} | px ${px}`;
+  if (input.fromSide && input.toSide) {
+    return `UPDATE: ${input.symbol} ${input.fromSide} → ${input.toSide} 🔁 | px ${px}`;
+  }
+  const side = input.toSide ?? input.fromSide;
+  if (side) {
+    return `UPDATE: ${input.symbol} ${side} 🔁 | px ${px}`;
+  }
+  return `UPDATE: ${input.symbol} | px ${px}`;
 };
 
 const formatManageHeader = (input: {
@@ -70,6 +77,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   if (snapshot.type === "UPDATE" && snapshot.update) {
     const update = snapshot.update;
     const header = formatUpdateHeader({
+      symbol: snapshot.symbol,
       fromSide: update.fromSide,
       toSide: update.toSide,
       px: update.price,

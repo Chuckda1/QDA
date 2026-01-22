@@ -4,6 +4,8 @@ import { buildTelegramAlert } from "../src/telegram/telegramFormatter.js";
 import { normalizeTelegramSnapshot } from "../src/telegram/telegramNormalizer.js";
 import { buildTelegramSignature } from "../src/telegram/telegramSignature.js";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
+import { MessageGovernor } from "../src/governor/messageGovernor.js";
+import { isDecisionAlertEvent } from "../src/utils/decisionState.js";
 
 const makeBaseEvent = (type: DomainEvent["type"], data: Record<string, any>): DomainEvent => ({
   type,
@@ -15,6 +17,7 @@ const makeBaseEvent = (type: DomainEvent["type"], data: Record<string, any>): Do
 const watchEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
+  decisionState: "WATCH",
   topPlay: {
     symbol: "SPY",
     direction: "LONG",
@@ -30,8 +33,13 @@ const watchEvent = makeBaseEvent("NO_ENTRY", {
     dataReadiness: { ready: true },
   },
   timing: { phase: "PULLBACK" },
+  softBlockers: ["entry_filter"],
+  softBlockerReasons: [
+    "WAIT_FOR_PULLBACK: extended-from-mean (Price 1.35 above VWAP). Re-arm when distance_to_VWAP <= 0.8 * ATR."
+  ],
   decision: {
     status: "BLOCKED",
+    decisionState: "WATCH",
     blockers: ["entry_filter"],
     blockerReasons: [
       "WAIT_FOR_PULLBACK: extended-from-mean (Price 1.35 above VWAP). Re-arm when distance_to_VWAP <= 0.8 * ATR."
@@ -49,6 +57,7 @@ const signalEvent = makeBaseEvent("PLAY_ARMED", {
     targets: { t1: 455.0, t2: 456.9, t3: 459.2 },
     action: "GO_ALL_IN",
   },
+  decisionState: "SIGNAL",
   marketState: {
     regime: "TREND_UP",
     permission: { mode: "NORMAL" },
@@ -56,7 +65,7 @@ const signalEvent = makeBaseEvent("PLAY_ARMED", {
     dataReadiness: { ready: true },
   },
   timing: { phase: "IMPULSE" },
-  decision: { metrics: { legitimacy: 65, followThrough: 62, riskAtr: 1.1 } },
+  decision: { decisionState: "SIGNAL", metrics: { legitimacy: 65, followThrough: 62, riskAtr: 1.1 } },
 });
 
 const updateEvent = makeBaseEvent("PLAY_CANCELLED", {
@@ -65,10 +74,12 @@ const updateEvent = makeBaseEvent("PLAY_CANCELLED", {
   reason: "invalidated",
   price: 451.2,
   lastSignal: "LONG",
+  decisionState: "UPDATE",
   marketState: {
     permission: { mode: "NORMAL" },
     tacticalSnapshot: { confidence: 80 },
   },
+  decision: { decisionState: "UPDATE" },
 });
 
 const manageEvent = makeBaseEvent("LLM_COACH_UPDATE", {
@@ -78,6 +89,7 @@ const manageEvent = makeBaseEvent("LLM_COACH_UPDATE", {
   action: "HOLD",
   urgency: "LOW",
   nextCheck: "5m",
+  decisionState: "MANAGE",
 });
 
 const premarketEvent = makeBaseEvent("PREMARKET_UPDATE", {
@@ -86,8 +98,11 @@ const premarketEvent = makeBaseEvent("PREMARKET_UPDATE", {
   price: 451.9,
   decisionState: "UPDATE",
   premarket: {
+    kind: "PREMARKET_BRIEF",
     bias: "LONG",
+    confidence: 62,
     levels: "entry 451.20-452.40, stop 449.80",
+    arm: "retest 451.20-452.40 | pullback only",
   },
 });
 
@@ -138,6 +153,9 @@ assert.ok(updateAlert?.lines.length <= 4, "UPDATE line count exceeded");
 assert.ok(updateAlert?.text.includes("\n"), "UPDATE missing newline separators");
 assert.ok(!updateAlert?.text.includes("\\n"), "UPDATE contains literal \\n");
 assert.ok(updateAlert?.lines[0]?.startsWith("UPDATE:"), "UPDATE header missing status");
+assert.ok(updateAlert?.lines[0]?.includes("SPY"), "UPDATE header missing symbol");
+assert.ok(!updateAlert?.lines[0]?.includes("UPDATE: UPDATE"), "UPDATE header duplicated");
+assert.ok(updateAlert?.lines[0]?.includes("LONG → SHORT"), "UPDATE header missing side flip");
 assert.ok(updateAlert?.lines[0]?.includes("px"), "UPDATE price missing");
 assert.ok(updateAlert?.text.includes("\nCAUSE:"), "UPDATE header not separated from cause");
 assert.ok(updateAlert?.lines[1]?.startsWith("CAUSE:"), "UPDATE cause line missing");
@@ -193,8 +211,10 @@ assert.equal(signatureA, signatureB, "Signature should ignore WHY differences");
 const timeCutoffEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
+  decisionState: "UPDATE",
   hardBlockers: ["time_window"],
   hardBlockerReasons: ["Time-of-day cutoff: No new plays after 15:30 ET"],
+  decision: { decisionState: "UPDATE" },
 });
 const timeCutoffSnapshot = normalizeTelegramSnapshot(timeCutoffEvent);
 assert.ok(timeCutoffSnapshot, "Time cutoff snapshot missing");
@@ -203,6 +223,7 @@ assert.equal(timeCutoffSnapshot?.type, "UPDATE", "Time cutoff should produce UPD
 const dataReadyEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
+  decisionState: "WATCH",
   hardBlockers: ["guardrail"],
   hardBlockerReasons: ["DATA_READY: missing VWAP"],
   topPlay: {
@@ -210,10 +231,58 @@ const dataReadyEvent = makeBaseEvent("NO_ENTRY", {
     stop: 449.8,
     targets: { t1: 454.2, t2: 456.4, t3: 458.2 },
   },
+  decision: { decisionState: "WATCH" },
 });
 const dataReadySnapshot = normalizeTelegramSnapshot(dataReadyEvent);
 assert.ok(dataReadySnapshot, "Data readiness snapshot missing");
 assert.equal(dataReadySnapshot?.type, "WATCH", "Data readiness should produce WATCH");
+
+const governorActive = new MessageGovernor();
+governorActive.setMode("ACTIVE");
+assert.ok(governorActive.shouldSend(watchEvent, {} as any, 0), "WATCH should send in ACTIVE");
+
+const governorQuiet = new MessageGovernor();
+governorQuiet.setMode("QUIET");
+const quietUpdateEvent = makeBaseEvent("PLAY_CANCELLED", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "UPDATE",
+  reason: "time cutoff",
+  decision: { decisionState: "UPDATE" },
+});
+assert.ok(governorQuiet.shouldSend(quietUpdateEvent, {} as any, 0), "UPDATE should send in QUIET");
+
+const debugEvent = makeBaseEvent("SETUP_CANDIDATES", { symbol: "SPY" });
+assert.equal(isDecisionAlertEvent(debugEvent), false, "Debug events should not be decision alerts");
+
+const watchMissingArmEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "WATCH",
+  decision: { decisionState: "WATCH" },
+});
+const watchMissingArmSnapshot = normalizeTelegramSnapshot(watchMissingArmEvent);
+assert.ok(watchMissingArmSnapshot, "Missing ARM snapshot missing");
+assert.equal(watchMissingArmSnapshot?.type, "UPDATE", "WATCH without ARM should emit UPDATE");
+assert.ok(
+  watchMissingArmSnapshot?.update?.cause.includes("contract violation"),
+  "WATCH without ARM should flag contract violation"
+);
+
+const watchReadinessEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "WATCH",
+  hardWaitBlockers: ["guardrail"],
+  decision: { decisionState: "WATCH" },
+});
+const watchReadinessSnapshot = normalizeTelegramSnapshot(watchReadinessEvent);
+assert.ok(watchReadinessSnapshot, "Readiness snapshot missing");
+assert.equal(watchReadinessSnapshot?.type, "UPDATE", "Readiness missing should emit UPDATE");
+assert.ok(
+  watchReadinessSnapshot?.update?.cause.includes("readiness not met"),
+  "Readiness missing should explain readiness"
+);
 
 const debounceOrch = new Orchestrator("debounce-test");
 const baseSnapshot: TacticalSnapshot = {

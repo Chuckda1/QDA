@@ -1,4 +1,4 @@
-import type { DomainEvent, DomainEventType } from "../types.js";
+import type { DomainEvent } from "../types.js";
 import type { MessageGovernor } from "../governor/messageGovernor.js";
 import type { TelegramBotLike } from "./sendTelegramMessageSafe.js";
 import { sendTelegramMessageSafe } from "./sendTelegramMessageSafe.js";
@@ -7,6 +7,7 @@ import { normalizeTelegramSnapshot } from "./telegramNormalizer.js";
 import { buildTelegramSignature } from "./telegramSignature.js";
 import { getETParts } from "../utils/timeUtils.js";
 import { orderEvents } from "./messageOrder.js";
+import { isDecisionAlertEvent } from "../utils/decisionState.js";
 
 export class MessagePublisher {
   // STAGE 4: Single publish queue to serialize all messages
@@ -56,67 +57,10 @@ export class MessagePublisher {
     return sent;
   }
 
-  private reduceByPriority(events: DomainEvent[]): DomainEvent[] {
-    const priorityOrder: DomainEventType[] = [
-      "PLAY_ENTERED",
-      "PLAY_CLOSED",
-      "PLAY_ARMED",
-      "ENTRY_WINDOW_OPENED",
-      "LLM_PICK",
-      "SCORECARD",
-      "SETUP_CANDIDATES",
-      "NO_ENTRY",
-    ];
-    const byTs = new Map<number, DomainEvent[]>();
-    for (const event of events) {
-      const list = byTs.get(event.timestamp) ?? [];
-      list.push(event);
-      byTs.set(event.timestamp, list);
-    }
-    const reduced: DomainEvent[] = [];
-    for (const [_, group] of byTs.entries()) {
-      const sorted = orderEvents(group);
-      const highest = sorted.find((event) => priorityOrder.includes(event.type));
-      if (highest) {
-        reduced.push(highest);
-        for (const event of sorted) {
-          if (!priorityOrder.includes(event.type)) {
-            reduced.push(event);
-          }
-        }
-      } else {
-        reduced.push(...sorted);
-      }
-    }
-    return reduced;
-  }
-
   private shouldSuppressEvent(event: DomainEvent): {
     suppress: boolean;
     signature?: string;
   } {
-    const hiddenTypes: DomainEventType[] = ["ENTRY_WINDOW_OPENED", "TIMING_COACH", "SETUP_SUMMARY", "TRADE_PLAN", "LLM_PICK", "SCORECARD"];
-    if (hiddenTypes.includes(event.type)) {
-      return { suppress: true };
-    }
-    if (event.type === "LLM_VERIFY") {
-      return { suppress: true };
-    }
-
-    const allowedTypes: DomainEventType[] = [
-      "NO_ENTRY",
-      "PLAY_ARMED",
-      "PLAY_CANCELLED",
-      "PLAY_CLOSED",
-      "PLAY_ENTERED",
-      "PLAY_SIZED_UP",
-      "LLM_COACH_UPDATE",
-      "PREMARKET_UPDATE"
-    ];
-    if (!allowedTypes.includes(event.type)) {
-      return { suppress: true };
-    }
-
     const snapshot = normalizeTelegramSnapshot(event);
     if (!snapshot) return { suppress: true };
     const symbol = snapshot.symbol;
@@ -272,9 +216,13 @@ export class MessagePublisher {
       }
     }
 
-    const reducedEvents = this.reduceByPriority(events);
+    const decisionEvents = events.filter((event) => isDecisionAlertEvent(event));
+    if (decisionEvents.length === 0) {
+      console.log("[PUB] skipped batch: no decision alerts");
+      return;
+    }
     // Sort events by priority (strict ordering)
-    const orderedEvents = orderEvents(reducedEvents);
+    const orderedEvents = orderEvents(decisionEvents);
 
     // STAGE 4: Publish in strict order with logging
     const total = orderedEvents.length;
