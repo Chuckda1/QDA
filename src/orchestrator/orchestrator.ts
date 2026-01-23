@@ -1,4 +1,4 @@
-import type { Bias, BotState, Direction, DomainEvent, EntryPermission, GateStatus, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
@@ -331,6 +331,70 @@ function computeRangeBias(params: {
   return { bias: "NEUTRAL", confidence: 50, note: "mid-box / mixed momentum" };
 }
 
+function computeRangeRails(params: {
+  ts: number;
+  rangeCandidates: SetupCandidate[];
+  recentBars1m: OHLCVBar[];
+  recentBars5m: OHLCVBar[];
+  atr1m?: number;
+  atr5m?: number;
+}): {
+  rangeLow: number;
+  rangeHigh: number;
+  contextRange?: RangeBand;
+  microBox?: RangeBand;
+  buffer: number;
+  minWidth: number;
+  rangeWidth: number;
+  planSource: { low: number; high: number };
+  rangeTooTight: boolean;
+} {
+  const rangeLow = Math.min(...params.rangeCandidates.map((candidate) => candidate.entryZone.low));
+  const rangeHigh = Math.max(...params.rangeCandidates.map((candidate) => candidate.entryZone.high));
+  const rangeWidth = rangeHigh - rangeLow;
+  const atr1m = params.atr1m ?? computeATR(params.recentBars1m, 14);
+  const atr5m = params.atr5m ?? computeATR(params.recentBars5m, 14);
+  const minWidth = Math.max(0.2, 0.25 * (atr1m ?? 0));
+  const baseBuffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
+  const contextRange = computeContextRange({
+    ts: params.ts,
+    bars1m: params.recentBars1m,
+    bars5m: params.recentBars5m,
+  });
+  const microBox =
+    params.recentBars1m.length >= 20
+      ? findMicroBox({
+          bars: params.recentBars1m,
+          atr: atr1m ?? atr5m,
+          maxBars: 20,
+          minWindow: 5,
+          source: "1m",
+          ts: params.ts,
+        })
+      : findMicroBox({
+          bars: params.recentBars5m,
+          atr: atr5m ?? atr1m,
+          maxBars: 6,
+          minWindow: 3,
+          source: "5m",
+          ts: params.ts,
+        });
+  const buffer = microBox ? baseBuffer : Math.max(baseBuffer, 0.05);
+  const planSource = microBox ?? contextRange ?? { low: rangeLow, high: rangeHigh };
+  const rangeTooTight = rangeWidth < minWidth;
+  return {
+    rangeLow,
+    rangeHigh,
+    contextRange,
+    microBox,
+    buffer,
+    minWidth,
+    rangeWidth,
+    planSource,
+    rangeTooTight,
+  };
+}
+
 export function buildChopPlan(params: {
   ts: number;
   close: number;
@@ -356,63 +420,49 @@ export function buildChopPlan(params: {
   minWidth: number;
   rangeWidth: number;
   bias: { bias: Bias; confidence: number; note: string };
+  activeSide: "LONG_ONLY" | "SHORT_ONLY" | "NONE";
+  location: { zone: "LOW" | "MID" | "HIGH"; pos: number };
 } {
-  const rangeLow = Math.min(...params.rangeCandidates.map((candidate) => candidate.entryZone.low));
-  const rangeHigh = Math.max(...params.rangeCandidates.map((candidate) => candidate.entryZone.high));
-  const rangeWidth = rangeHigh - rangeLow;
-  const atr1m = params.atr1m ?? computeATR(params.recentBars1m, 14);
-  const atr5m = params.atr5m ?? computeATR(params.recentBars5m, 14);
-  const minWidth = Math.max(0.25, 0.6 * (atr1m ?? 0));
-  const buffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
-  const contextRange = computeContextRange({
+  const rails = computeRangeRails({
     ts: params.ts,
-    bars1m: params.recentBars1m,
-    bars5m: params.recentBars5m,
+    rangeCandidates: params.rangeCandidates,
+    recentBars1m: params.recentBars1m,
+    recentBars5m: params.recentBars5m,
+    atr1m: params.atr1m,
+    atr5m: params.atr5m,
   });
-  const microBox =
-    params.recentBars1m.length >= 20
-      ? findMicroBox({
-          bars: params.recentBars1m,
-          atr: atr1m ?? atr5m,
-          maxBars: 20,
-          minWindow: 5,
-          source: "1m",
-          ts: params.ts,
-        })
-      : findMicroBox({
-          bars: params.recentBars5m,
-          atr: atr5m ?? atr1m,
-          maxBars: 6,
-          minWindow: 3,
-          source: "5m",
-          ts: params.ts,
-        });
-  const planSource = microBox ?? contextRange ?? { low: rangeLow, high: rangeHigh };
+  const atr1m = params.atr1m ?? computeATR(params.recentBars1m, 14);
   let mode = "NORMAL";
   let note: string | undefined;
-  if (rangeWidth < minWidth) {
+  if (rails.rangeTooTight) {
     mode = "TIGHT";
     note = "range too tight — waiting for expansion";
   }
-  const displayLow = planSource.low;
-  const displayHigh = planSource.high;
+  const displayLow = rails.planSource.low;
+  const displayHigh = rails.planSource.high;
+  const width = displayHigh - displayLow;
+  const pos = width > 0 ? (params.close - displayLow) / width : 0.5;
+  let zone: "LOW" | "MID" | "HIGH" = "MID";
+  if (pos <= 0.35) zone = "LOW";
+  else if (pos >= 0.65) zone = "HIGH";
+  const activeSide = zone === "LOW" ? "LONG_ONLY" : zone === "HIGH" ? "SHORT_ONLY" : "NONE";
   const longArm = `retest ${displayLow.toFixed(2)}-${displayHigh.toFixed(2)}`;
   const shortArm = longArm;
-  const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
-  const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
-  const stopAnchor = `long < ${(displayLow - buffer).toFixed(2)} | short > ${(displayHigh + buffer).toFixed(2)} (armed)`;
+  const longEntry = `break&hold above ${(displayHigh + rails.buffer).toFixed(2)}`;
+  const shortEntry = `break&hold below ${(displayLow - rails.buffer).toFixed(2)}`;
+  const stopAnchor = `long < ${(displayLow - rails.buffer).toFixed(2)} | short > ${(displayHigh + rails.buffer).toFixed(2)} (armed)`;
   const bias = computeRangeBias({
     price: params.close,
     vwap: params.indicatorSnapshot.vwap,
-    microBox,
+    microBox: rails.microBox,
     bars1m: params.recentBars1m,
     bars5m: params.recentBars5m,
-    atr: atr1m ?? atr5m,
+    atr: atr1m ?? params.atr5m,
   });
   return {
     range: { low: displayLow, high: displayHigh },
-    contextRange,
-    microBox,
+    contextRange: rails.contextRange,
+    microBox: rails.microBox,
     longArm,
     longEntry,
     shortArm,
@@ -420,11 +470,13 @@ export function buildChopPlan(params: {
     stopAnchor,
     mode,
     note,
-    buffer,
+    buffer: rails.buffer,
     atr1m,
-    minWidth,
-    rangeWidth,
+    minWidth: rails.minWidth,
+    rangeWidth: rails.rangeWidth,
     bias,
+    activeSide,
+    location: { zone, pos: Number(pos.toFixed(2)) },
   };
 }
 
@@ -484,6 +536,8 @@ export class Orchestrator {
     contextRange?: RangeBand;
     microBox?: RangeBand;
     bias?: { bias: Bias; confidence: number; note: string };
+    activeSide?: "LONG_ONLY" | "SHORT_ONLY" | "NONE";
+    location?: { zone: "LOW" | "MID" | "HIGH"; pos: number };
     longArm: string;
     longEntry: string;
     shortArm: string;
@@ -497,6 +551,13 @@ export class Orchestrator {
     rangeWidth: number;
     ts: number;
   } | null = null;
+  private lastSetupCandidates: SetupCandidate[] = [];
+  private rangeTrendState: {
+    state: "RANGE_ACTIVE" | "TREND_CANDIDATE" | "TREND_CONFIRMED";
+    direction?: Direction;
+    sinceTs?: number;
+    confirmedBars?: number;
+  } = { state: "RANGE_ACTIVE" };
   private lastVolumeRegime: string | null = null;
   private lastVolumeRegimeTs: number | null = null;
   private rangeModeActive: boolean = false;
@@ -987,6 +1048,22 @@ export class Orchestrator {
 
   private buildSnapshot(input: TickInput, timeframe: "1m" | "5m" | "15m"): TickSnapshot {
     return { ...input, timeframe };
+  }
+
+  private buildFreshness(nowTs: number): DataFreshness {
+    const age1mSec = this.state.last1mTs ? Math.round((nowTs - this.state.last1mTs) / 1000) : undefined;
+    const age5mSec = this.state.last5mTs ? Math.round((nowTs - this.state.last5mTs) / 1000) : undefined;
+    return {
+      nowTs,
+      last1mTs: this.state.last1mTs,
+      last5mTs: this.state.last5mTs,
+      age1mSec,
+      age5mSec,
+      barCount1m: this.recentBars1m.length,
+      barCount5m: this.recentBars5m.length,
+      session: this.state.session,
+      lastTradePx: this.state.price,
+    };
   }
 
   /**
@@ -1868,6 +1945,7 @@ export class Orchestrator {
           }
         }
       }
+      this.lastSetupCandidates = setupCandidates;
       const potdActivePre = this.potdMode !== "OFF" && this.potdBias !== "NONE" && this.potdConfidence > 0;
       const potdConfirmedPre = potdActivePre && macroBiasInfo.bias === this.potdBias;
       const potdAlignmentNoCandidate: "ALIGNED" | "COUNTERTREND" | "UNCONFIRMED" | "OFF" = !potdActivePre
@@ -2627,6 +2705,15 @@ export class Orchestrator {
       };
 
       const baseBlockers = buildBlockers(setupCandidate);
+      const freshness = this.buildFreshness(Date.now());
+      if (freshness.age1mSec !== undefined && freshness.age1mSec > 90) {
+        baseBlockers.hardStopBlockers.push("data_stale");
+        baseBlockers.hardStopReasons.push(`DATA_STALE: last1m age ${freshness.age1mSec}s`);
+      }
+      if (freshness.age5mSec !== undefined && freshness.age5mSec > 6 * 60) {
+        baseBlockers.hardStopBlockers.push("data_stale");
+        baseBlockers.hardStopReasons.push(`DATA_STALE: last5m age ${freshness.age5mSec}s`);
+      }
 
       const filterContext: EntryFilterContext = {
         timestamp: ts,
@@ -3044,6 +3131,8 @@ export class Orchestrator {
               contextRange: plan.contextRange,
               microBox: plan.microBox,
               bias: plan.bias,
+              activeSide: plan.activeSide,
+              location: plan.location,
               longArm: plan.longArm,
               longEntry: plan.longEntry,
               shortArm: plan.shortArm,
@@ -3305,6 +3394,8 @@ export class Orchestrator {
               contextRange: rangeWatchPayload.contextRange,
               microBox: rangeWatchPayload.microBox,
               bias: rangeWatchPayload.bias,
+              activeSide: rangeWatchPayload.activeSide,
+              location: rangeWatchPayload.location,
               buffer: rangeWatchPayload.buffer,
               atr1m: rangeWatchPayload.atr1m,
               longArm: rangeWatchPayload.longArm,

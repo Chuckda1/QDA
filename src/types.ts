@@ -2,7 +2,14 @@ export type Direction = "LONG" | "SHORT";
 export type Bias = "LONG" | "SHORT" | "NEUTRAL";
 export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
 export type EntryPermission = "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
-export type ModeState = "CHOP" | "RANGE" | "RANGE_ARMED" | "RANGE_EXIT_WATCH" | "TREND_ACTIVE";
+export type ModeState =
+  | "CHOP"
+  | "RANGE"
+  | "RANGE_ARMED"
+  | "RANGE_EXIT_WATCH"
+  | "TREND_CANDIDATE"
+  | "TREND_CONFIRMED"
+  | "TREND_ACTIVE";
 export type PotdBias = "LONG" | "SHORT" | "NONE";
 export type PotdMode = "OFF" | "PRIOR" | "HARD";
 export type BotMode = "QUIET" | "ACTIVE";
@@ -129,6 +136,18 @@ export type GateStatus = {
     distToVwapAtr?: number;
     relVol?: number;
   };
+};
+
+export type DataFreshness = {
+  nowTs: number;
+  last1mTs?: number;
+  last5mTs?: number;
+  age1mSec?: number;
+  age5mSec?: number;
+  barCount1m: number;
+  barCount5m: number;
+  session: string;
+  lastTradePx?: number;
 };
 
 export type DomainEventType =

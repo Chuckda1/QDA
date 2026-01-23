@@ -25,6 +25,8 @@ export type TelegramSnapshot = {
     microBox?: { low: number; high: number };
     buffer?: number;
     atr1m?: number;
+    activeSide?: "LONG_ONLY" | "SHORT_ONLY" | "NONE";
+    location?: { zone: "LOW" | "MID" | "HIGH"; pos: number };
     longArm?: string;
     longEntry?: string;
     shortArm?: string;
@@ -694,6 +696,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
             : undefined,
           buffer: Number.isFinite(rangePayload.buffer) ? rangePayload.buffer : undefined,
           atr1m: Number.isFinite(rangePayload.atr1m) ? rangePayload.atr1m : undefined,
+          activeSide: rangePayload.activeSide,
+          location: rangePayload.location,
           longArm: rangePayload.longArm,
           longEntry: rangePayload.longEntry,
           shortArm: rangePayload.shortArm,

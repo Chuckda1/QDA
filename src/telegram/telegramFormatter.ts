@@ -121,8 +121,21 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const rangeBias = snapshot.rangeBias?.bias ?? snapshot.dir;
       const rangeConf = snapshot.rangeBias?.confidence ?? snapshot.conf;
       const bias = `BIAS: ${rangeBias} (${rangeConf ?? "?"}%)`;
-      const planA = `PLAN A: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
-      const planB = `PLAN B: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
+      const location = snapshot.range.location
+        ? `LOCATION: ${snapshot.range.location.zone} (pos=${snapshot.range.location.pos})`
+        : undefined;
+      const activeSide = snapshot.range.activeSide ?? "NONE";
+      const activeLine = `ACTIVE_SIDE: ${activeSide}`;
+      const planA =
+        activeSide === "LONG_ONLY"
+          ? `PLAN: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`
+          : "LONG disabled (not at range low)";
+      const planB =
+        activeSide === "SHORT_ONLY"
+          ? `PLAN: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`
+          : activeSide === "NONE"
+          ? "MID zone: wait for breakout confirmation"
+          : "SHORT disabled (not at range high)";
       const arm = "ARM: retest range (bot creates play)";
       const stop = `STOP: ${snapshot.range.stopAnchor || "when armed"}`;
       const next = "NEXT: wait for break+hold → bot creates play";
@@ -135,7 +148,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         bufferLine,
         microLine,
         vol,
+        location,
         bias,
+        activeLine,
         planA,
         planB,
         arm,
@@ -144,7 +159,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         note,
         warn
       ].filter(nonEmpty);
-      return { type: "WATCH", lines: lines.slice(0, 10), text: lines.slice(0, 10).join("\n") };
+      return { type: "WATCH", lines: lines.slice(0, 12), text: lines.slice(0, 12).join("\n") };
     }
     const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
     const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk} | px ${px} | ${snapshot.ts ?? "n/a"}`;

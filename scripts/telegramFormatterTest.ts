@@ -157,6 +157,8 @@ const rangeEvent = makeBaseEvent("NO_ENTRY", {
     microBox: { low: 689.4, high: 689.9 },
     vwap: 689.6,
     price: 689.7,
+    activeSide: "LONG_ONLY",
+    location: { zone: "LOW", pos: 0.22 },
     longArm: "retest 689.40-689.70",
     longEntry: "break&hold above 690.10",
     shortArm: "retest 689.60-689.90",
@@ -172,15 +174,15 @@ assert.ok(rangeSnapshot, "Range WATCH snapshot missing");
 assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
 const rangeAlert = buildTelegramAlert(rangeSnapshot!);
 assert.ok(rangeAlert, "Range WATCH alert missing");
-assert.ok(rangeAlert?.lines.length <= 10, "Range WATCH line count exceeded");
+assert.ok(rangeAlert?.lines.length <= 12, "Range WATCH line count exceeded");
 assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing WATCH");
 assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
 assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("CONTEXT_RANGE:")), "Range WATCH missing context range line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("MICRO_BOX:")), "Range WATCH missing micro box line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BIAS:")), "Range WATCH missing bias line");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN A:")), "Range WATCH missing plan A line");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN B:")), "Range WATCH missing plan B line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("ACTIVE_SIDE:")), "Range WATCH missing active side line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN:")), "Range WATCH missing plan line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("ARM:")), "Range WATCH missing arm line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("NEXT:")), "Range WATCH missing next line");
