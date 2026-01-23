@@ -3021,7 +3021,7 @@ export class Orchestrator {
       })();
       const rangeWatchPayload = rangeModeActive
         ? (() => {
-            const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
+            const rangeCandidates = setupCandidates;
             const plan = buildChopPlan({
               ts,
               close,
