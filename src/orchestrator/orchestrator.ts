@@ -968,11 +968,70 @@ export class Orchestrator {
       phaseSinceTs: timingState.phaseSinceTs,
       rawState: timingSignal.state
     };
+    const rangeCurrent = this.lastRangeWatchMetrics
+      ? {
+          low: this.lastRangeWatchMetrics.low,
+          high: this.lastRangeWatchMetrics.high,
+          vwap: this.lastRangeWatchMetrics.vwap,
+          longEntry: this.lastRangeWatchMetrics.longEntry,
+          shortEntry: this.lastRangeWatchMetrics.shortEntry,
+          warnKey: this.lastRangeWatchMetrics.warnKey,
+        }
+      : null;
+    const zoneWidth = play.entryZone.high - play.entryZone.low;
+    const entryTrigger = play.direction === "LONG"
+      ? play.entryZone.low + 0.35 * zoneWidth
+      : play.entryZone.high - 0.35 * zoneWidth;
+    const depthHit = play.direction === "LONG"
+      ? (low ?? close) <= entryTrigger
+      : (high ?? close) >= entryTrigger;
+    const timingEnterScore = play.tier === "LEANING" ? 65 : 80;
+    const timingScoreArmed = timingSignal.score >= 70;
+    const timingScoreEnter = timingSignal.score >= timingEnterScore;
+    const entryGateSnapshot = {
+      inZone,
+      timingScore: Math.round(timingSignal.score),
+      timingBreakAccept: timingSignal.components.breakAcceptance >= 25,
+      timingRetest: timingSignal.components.retestQuality > 0,
+      timingVwap: timingSignal.components.vwapReaction > 0,
+      timingAtrNormalization: timingSignal.components.atrNormalization > 0,
+      timingScoreArmed,
+      timingScoreEnter,
+      depthHit,
+    };
+    if (play.status !== "ENTERED") {
+      this.logTelemetry("ENTRY_GATES", {
+        ts,
+        tf: "1m",
+        lastBars: {
+          "1m": this.state.last1mTs ?? null,
+          "5m": this.state.last5mTs ?? null,
+          "15m": this.state.last15mTs ?? null,
+        },
+        px: close,
+        pxSource: "barClose:1m",
+        playState: play.status,
+        direction: play.direction,
+        range: {
+          current: rangeCurrent,
+          frozen: play.armedRange ?? null,
+        },
+        gates: entryGateSnapshot,
+      });
+    }
 
     // 1) Zone touch + timing score arms an ENTRY_WINDOW (does NOT enter)
     if (inZone && play.status === "ARMED" && !play.inEntryZone) {
-      if (timingSignal.score < 70) {
+      if (!timingScoreArmed) {
         // Keep waiting for timing to confirm
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ENTRY_WINDOW_ARM",
+          ts,
+          gates: ["timing_score<70"],
+          playState: play.status,
+          direction: play.direction,
+          px: close,
+        });
         return events;
       }
       play.inEntryZone = true;
@@ -1020,6 +1079,14 @@ export class Orchestrator {
           notArmedReason: "Entry window expired"
         }));
         this.state.activePlay = null;
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ENTRY_WINDOW",
+          ts,
+          gates: ["entry_window_expired"],
+          playState: play.status,
+          direction: play.direction,
+          px: close,
+        });
         return events;
       }
 
@@ -1042,6 +1109,14 @@ export class Orchestrator {
           notArmedReason: "Pre-entry stop break"
         }));
         this.state.activePlay = null;
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ENTRY_WINDOW",
+          ts,
+          gates: ["pre_entry_stop_break"],
+          playState: play.status,
+          direction: play.direction,
+          px: close,
+        });
         return events;
       }
       if (play.direction === "SHORT" && close >= play.stop) {
@@ -1063,19 +1138,32 @@ export class Orchestrator {
           notArmedReason: "Pre-entry stop break"
         }));
         this.state.activePlay = null;
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ENTRY_WINDOW",
+          ts,
+          gates: ["pre_entry_stop_break"],
+          playState: play.status,
+          direction: play.direction,
+          px: close,
+        });
         return events;
       }
 
-      const zoneWidth = play.entryZone.high - play.entryZone.low;
-      const entryTrigger = play.direction === "LONG"
-        ? play.entryZone.low + 0.35 * zoneWidth
-        : play.entryZone.high - 0.35 * zoneWidth;
-      const depthHit = play.direction === "LONG"
-        ? (low ?? close) <= entryTrigger
-        : (high ?? close) >= entryTrigger;
+      if (!depthHit || !timingScoreEnter) {
+        const vetoes: string[] = [];
+        if (!depthHit) vetoes.push("depth_not_hit");
+        if (!timingScoreEnter) vetoes.push(`timing_score<${timingEnterScore}`);
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ENTRY",
+          ts,
+          gates: vetoes,
+          playState: play.status,
+          direction: play.direction,
+          px: close,
+        });
+      }
 
-      const timingEnterScore = play.tier === "LEANING" ? 65 : 80;
-      if (depthHit && timingSignal.score >= timingEnterScore) {
+      if (depthHit && timingScoreEnter) {
         play.status = "ENTERED";
         play.entryPrice = close;
         play.entryTimestamp = ts;
@@ -1440,6 +1528,27 @@ export class Orchestrator {
           blockerReasons: ["insufficient 5m history (< 6 bars)"],
           expiryMs: 30 * 60 * 1000
         });
+        this.logTelemetry("CYCLE", {
+          ts,
+          tf: "5m",
+          lastBars: {
+            "1m": this.state.last1mTs ?? null,
+            "5m": this.state.last5mTs ?? null,
+            "15m": this.state.last15mTs ?? null,
+          },
+          px: close,
+          pxSource: "barClose:5m",
+          playState: "CANDIDATE",
+          direction: fallbackTactical.activeDirection ?? "NONE",
+          range: {
+            current: null,
+            frozen: null,
+          },
+          gates: {
+            dataReady: false,
+            reason: "insufficient_5m_history",
+          },
+        });
         return events;
       }
 
@@ -1734,6 +1843,27 @@ export class Orchestrator {
           blockers: ["no_active_play"],
           blockerReasons: [setupResult.reason || "no setup pattern found"],
           expiryMs: 30 * 60 * 1000
+        });
+        this.logTelemetry("CYCLE", {
+          ts,
+          tf: "5m",
+          lastBars: {
+            "1m": this.state.last1mTs ?? null,
+            "5m": this.state.last5mTs ?? null,
+            "15m": this.state.last15mTs ?? null,
+          },
+          px: close,
+          pxSource: "barClose:5m",
+          playState: "CANDIDATE",
+          direction: tacticalSnapshot.activeDirection ?? "NONE",
+          range: {
+            current: null,
+            frozen: null,
+          },
+          gates: {
+            hasCandidate: false,
+            reason: setupResult.reason || "no setup pattern found",
+          },
         });
         return events;
       }
@@ -2154,6 +2284,10 @@ export class Orchestrator {
         phaseSinceTs: timingState.phaseSinceTs,
         rawState: timingSignal.state
       };
+      const timingComponents = timingSignal.components;
+      const timingReady =
+        timingSnapshot.phase === "ENTRY_WINDOW" ||
+        timingSnapshot.state === "ENTRY_WINDOW_OPEN";
       this.lastMarketState = marketState;
       this.lastTimingSnapshot = timingSnapshot;
       if (lowContext) {
@@ -2493,6 +2627,8 @@ export class Orchestrator {
         hardWaitBlockers.length === 0 &&
         hardWaitReasons.length === 0 &&
         chopSignals.size >= 2;
+      const priorRangeMetrics = this.lastRangeWatchMetrics;
+      const priorRangeTs = this.lastRangeWatchTs;
       const rangeModeActive = this.updateRangeMode(rangeCondition, decisionState === "SIGNAL");
       if (!rangeModeActive) {
         this.lastRangeWatchKey = null;
@@ -2566,6 +2702,52 @@ export class Orchestrator {
           riskAtr
         }
       };
+      const entryFilterReason = (filterResult.reason ?? "").toLowerCase();
+      const tfConflict =
+        !!tacticalSnapshot.confirm &&
+        tacticalSnapshot.confirm.bias !== "NONE" &&
+        tacticalSnapshot.confirm.bias !== tacticalSnapshot.activeDirection;
+      const llmApproved = !!llmSummary && llmSummary.action !== "PASS" && llmSummary.action !== "WAIT";
+      const entryGateSnapshot = {
+        hasCandidate: !!setupCandidate,
+        dataReady: readinessOk,
+        guardrailsOk: !guardrailBlockReason,
+        modeActive: !watchOnly,
+        directionAllowed: directionGate.allow,
+        directionAligned: directionGate.allow ? setupCandidate.direction === directionGate.direction : false,
+        entryFilterAllowed: filterResult.allowed,
+        entryPermission,
+        timeCutoffOk: !hardStopBlockers.includes("time_window"),
+        llmApproved,
+        timingReady,
+        timingScore: Math.round(timingSignal.score),
+        timingBreakAccept: timingComponents.breakAcceptance >= 25,
+        timingRetest: timingComponents.retestQuality > 0,
+        timingVwap: timingComponents.vwapReaction > 0,
+        timingAtrNormalization: timingComponents.atrNormalization > 0,
+        hardStopClear: hardStopBlockers.length === 0,
+        hardWaitClear: hardWaitBlockers.length === 0,
+        softClear: softBlockers.length === 0,
+        extendedFromMean: entryFilterReason.includes("extended-from-mean"),
+        noReclaimSignal: entryFilterReason.includes("no reclaim signal"),
+        pullbackDepthOk: !entryFilterReason.includes("pullback depth"),
+        tfConflict,
+        transitionLockActive,
+        shockMode,
+        lowRelVolume: setupCandidate.flags?.includes("LOW_RVOL") ?? false,
+      };
+      const entryVeto = new Set<string>();
+      if (!readinessOk) entryVeto.add("data_ready");
+      if (guardrailBlockReason) entryVeto.add("guardrail");
+      if (watchOnly) entryVeto.add("mode_quiet");
+      if (!directionGate.allow) entryVeto.add("direction_gate");
+      if (directionGate.allow && setupCandidate.direction !== directionGate.direction) entryVeto.add("direction_mismatch");
+      if (!filterResult.allowed) entryVeto.add("entry_filter");
+      if (!llmApproved) entryVeto.add("llm");
+      if (!timingReady && ["GO_ALL_IN", "SCALP"].includes(llmSummary?.action ?? "")) entryVeto.add("timing_window");
+      hardStopBlockers.forEach((blocker) => entryVeto.add(`hard:${blocker}`));
+      hardWaitBlockers.forEach((blocker) => entryVeto.add(`wait:${blocker}`));
+      softBlockers.forEach((blocker) => entryVeto.add(`soft:${blocker}`));
       if (decisionState === "WATCH") {
         this.state.pendingPlay = this.buildPendingPlay(setupCandidate, llmSummary, ts);
       } else if (decision.status === "ARMED" || decisionState === "SIGNAL") {
@@ -2858,6 +3040,17 @@ export class Orchestrator {
       }
 
       if (decision.status === "ARMED" && decision.play) {
+        if (priorRangeMetrics) {
+          decision.play.armedRange = {
+            low: priorRangeMetrics.low,
+            high: priorRangeMetrics.high,
+            vwap: priorRangeMetrics.vwap,
+            longEntry: priorRangeMetrics.longEntry,
+            shortEntry: priorRangeMetrics.shortEntry,
+            warnKey: priorRangeMetrics.warnKey,
+            ts: priorRangeTs ?? undefined,
+          };
+        }
         this.state.pendingCandidate = null;
         this.state.pendingCandidateExpiresAt = undefined;
         this.state.pendingPlay = null;
@@ -2936,6 +3129,46 @@ export class Orchestrator {
           this.lastSetupSummary5mTs = ts;
         }
       }
+
+      if (decision.status !== "ARMED" && entryVeto.size > 0) {
+        this.logTelemetry("ENTRY_VETO", {
+          stage: "ARM",
+          ts,
+          gates: Array.from(entryVeto),
+          reasons: [...hardStopReasons, ...hardWaitReasons, ...softBlockerReasons],
+          status: decision.status,
+        });
+      }
+      const rangeCurrent = rangeWatchPayload
+        ? {
+            low: rangeWatchPayload.range.low,
+            high: rangeWatchPayload.range.high,
+            vwap: rangeWatchPayload.vwap,
+            longEntry: rangeWatchPayload.longEntry,
+            shortEntry: rangeWatchPayload.shortEntry,
+            longArm: rangeWatchPayload.longArm,
+            shortArm: rangeWatchPayload.shortArm,
+          }
+        : null;
+      const rangeFrozen = this.state.activePlay?.armedRange ?? null;
+      this.logTelemetry("CYCLE", {
+        ts,
+        tf: "5m",
+        lastBars: {
+          "1m": this.state.last1mTs ?? null,
+          "5m": this.state.last5mTs ?? null,
+          "15m": this.state.last15mTs ?? null,
+        },
+        px: close,
+        pxSource: "barClose:5m",
+        playState: this.state.activePlay?.status ?? "NONE",
+        direction: this.state.activePlay?.direction ?? setupCandidate.direction,
+        range: {
+          current: rangeCurrent,
+          frozen: rangeFrozen,
+        },
+        gates: entryGateSnapshot,
+      });
 
       return events;
     }
@@ -3505,6 +3738,10 @@ export class Orchestrator {
       this.rangeModeActive = true;
     }
     return this.rangeModeActive;
+  }
+
+  private logTelemetry(tag: string, payload: Record<string, any>): void {
+    console.log(`[${tag}] ${JSON.stringify(payload)}`);
   }
 
   private ev(type: DomainEvent["type"], timestamp: number, data: Record<string, any>): DomainEvent {

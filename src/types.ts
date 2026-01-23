@@ -206,6 +206,15 @@ export interface Play {
     maxFavorableR?: number;
     maxAdverseR?: number;
   };
+  armedRange?: {
+    low: number;
+    high: number;
+    vwap?: number;
+    longEntry?: string;
+    shortEntry?: string;
+    warnKey?: string;
+    ts?: number;
+  };
 }
 
 export type TimingPhase =
