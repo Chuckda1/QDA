@@ -211,6 +211,23 @@ export class Orchestrator {
     warnKey: string;
     longEntry: string;
     shortEntry: string;
+    mode?: "NORMAL" | "TIGHT";
+  } | null = null;
+  private rangeFrozen: {
+    low: number;
+    high: number;
+    vwap?: number;
+    longArm: string;
+    shortArm: string;
+    longEntry: string;
+    shortEntry: string;
+    stopAnchor: string;
+    mode: "NORMAL" | "TIGHT";
+    note?: string;
+    buffer?: number;
+    minWidth?: number;
+    rangeWidth?: number;
+    ts: number;
   } | null = null;
   private rangeModeActive: boolean = false;
   private rangeModeConsecutiveTrue: number = 0;
@@ -2629,11 +2646,14 @@ export class Orchestrator {
         chopSignals.size >= 2;
       const priorRangeMetrics = this.lastRangeWatchMetrics;
       const priorRangeTs = this.lastRangeWatchTs;
+      const wasRangeModeActive = this.rangeModeActive;
       const rangeModeActive = this.updateRangeMode(rangeCondition, decisionState === "SIGNAL");
+      const shouldFreezeRange = rangeModeActive && !wasRangeModeActive;
       if (!rangeModeActive) {
         this.lastRangeWatchKey = null;
         this.lastRangeWatchTs = null;
         this.lastRangeWatchMetrics = null;
+        this.rangeFrozen = null;
       }
 
       const decision = buildDecision({
@@ -2788,32 +2808,64 @@ export class Orchestrator {
       const rangeWatchPayload = rangeModeActive
         ? (() => {
             const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
+            if (!rangeCandidates.length) return null;
             const rangeLow = Math.min(...rangeCandidates.map((candidate) => candidate.entryZone.low));
             const rangeHigh = Math.max(...rangeCandidates.map((candidate) => candidate.entryZone.high));
-            const longCandidate = rangeCandidates.find((candidate) => candidate.direction === "LONG");
-            const shortCandidate = rangeCandidates.find((candidate) => candidate.direction === "SHORT");
-            const longArm = longCandidate
-              ? `retest ${formatZone(longCandidate.entryZone)}`
-              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
-            const shortArm = shortCandidate
-              ? `retest ${formatZone(shortCandidate.entryZone)}`
-              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
-            const longEntry = longCandidate
-              ? `break&hold above ${longCandidate.entryZone.high.toFixed(2)}`
-              : `break&hold above ${rangeHigh.toFixed(2)}`;
-            const shortEntry = shortCandidate
-              ? `break&hold below ${shortCandidate.entryZone.low.toFixed(2)}`
-              : `break&hold below ${rangeLow.toFixed(2)}`;
-            const stopAnchor = `long < ${rangeLow.toFixed(2)} | short > ${rangeHigh.toFixed(2)} (armed)`;
-            return {
-              range: { low: rangeLow, high: rangeHigh },
+            const rangeWidth = rangeHigh - rangeLow;
+            const atr1m = indicators1m.atr ?? computeATR(this.recentBars1m, 14);
+            const minWidth = Math.max(0.25, Number.isFinite(atr1m) ? (atr1m as number) * 0.6 : 0.25);
+            const buffer = Math.max(0.03, Number.isFinite(atr1m) ? (atr1m as number) * 0.1 : 0.03);
+            const tightRange = rangeWidth > 0 && rangeWidth < minWidth;
+            const microBars =
+              this.recentBars1m.length >= 6 ? this.recentBars1m.slice(-20) : this.recentBars5m.slice(-6);
+            const microHigh = microBars.length
+              ? Math.max(...microBars.map((b) => b.high ?? b.close))
+              : rangeHigh;
+            const microLow = microBars.length
+              ? Math.min(...microBars.map((b) => b.low ?? b.close))
+              : rangeLow;
+            const displayLow = tightRange ? microLow : rangeLow;
+            const displayHigh = tightRange ? microHigh : rangeHigh;
+            const armText = `retest ${formatZone({ low: displayLow, high: displayHigh })}`;
+            const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
+            const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
+            const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
+            const mode: "NORMAL" | "TIGHT" = tightRange ? "TIGHT" : "NORMAL";
+            const note = tightRange ? "range too tight — waiting for expansion" : undefined;
+            const snapshot = {
+              low: displayLow,
+              high: displayHigh,
               vwap: indicatorSnapshot.vwap,
-              price: close,
-              longArm,
+              longArm: armText,
+              shortArm: armText,
               longEntry,
-              shortArm,
               shortEntry,
               stopAnchor,
+              mode,
+              note,
+              buffer,
+              minWidth,
+              rangeWidth,
+              ts,
+            };
+            if (shouldFreezeRange || !this.rangeFrozen) {
+              this.rangeFrozen = snapshot;
+            }
+            const frozen = this.rangeFrozen ?? snapshot;
+            return {
+              range: { low: frozen.low, high: frozen.high },
+              vwap: frozen.vwap,
+              price: close,
+              longArm: frozen.longArm,
+              longEntry: frozen.longEntry,
+              shortArm: frozen.shortArm,
+              shortEntry: frozen.shortEntry,
+              stopAnchor: frozen.stopAnchor,
+              mode: frozen.mode,
+              note: frozen.note,
+              buffer: frozen.buffer,
+              minWidth: frozen.minWidth,
+              rangeWidth: frozen.rangeWidth,
             };
           })()
         : null;
@@ -2862,7 +2914,8 @@ export class Orchestrator {
             Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
             rangeWatchPayload.longEntry,
             rangeWatchPayload.shortEntry,
-            rangeWarnKey
+            rangeWarnKey,
+            rangeWatchPayload.mode ?? "NORMAL"
           ].join("|")
         : null;
       events.push(this.ev("SETUP_CANDIDATES", ts, {
@@ -2970,7 +3023,8 @@ export class Orchestrator {
           !prior ||
           prior.longEntry !== rangeWatchPayload.longEntry ||
           prior.shortEntry !== rangeWatchPayload.shortEntry ||
-          prior.warnKey !== rangeWarnKey;
+          prior.warnKey !== rangeWarnKey ||
+          prior.mode !== rangeWatchPayload.mode;
         const shouldEmitRange =
           (rangeMoved || vwapMoved || triggersChanged) &&
           this.lastRangeWatchTs !== ts;
@@ -3002,6 +3056,8 @@ export class Orchestrator {
               shortArm: rangeWatchPayload.shortArm,
               shortEntry: rangeWatchPayload.shortEntry,
               stopAnchor: rangeWatchPayload.stopAnchor,
+              mode: rangeWatchPayload.mode,
+              note: rangeWatchPayload.note,
               ts,
             },
             rangeWarnTags: Array.from(chopSignals)
@@ -3015,6 +3071,7 @@ export class Orchestrator {
             warnKey: rangeWarnKey,
             longEntry: rangeWatchPayload.longEntry,
             shortEntry: rangeWatchPayload.shortEntry,
+            mode: rangeWatchPayload.mode,
           };
         }
       } else if (decisionState === "WATCH" || decision.status !== "ARMED") {
