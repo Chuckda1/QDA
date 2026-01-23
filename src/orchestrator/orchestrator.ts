@@ -211,6 +211,23 @@ export class Orchestrator {
     warnKey: string;
     longEntry: string;
     shortEntry: string;
+    mode?: string;
+  } | null = null;
+  private rangeFrozen: {
+    low: number;
+    high: number;
+    vwap?: number;
+    longArm: string;
+    longEntry: string;
+    shortArm: string;
+    shortEntry: string;
+    stopAnchor: string;
+    mode: string;
+    note?: string;
+    buffer: number;
+    minWidth: number;
+    rangeWidth: number;
+    ts: number;
   } | null = null;
   private rangeModeActive: boolean = false;
   private rangeModeConsecutiveTrue: number = 0;
@@ -2555,11 +2572,13 @@ export class Orchestrator {
         hardWaitBlockers.length === 0 &&
         hardWaitReasons.length === 0 &&
         chopSignals.size >= 2;
+      const wasRangeModeActive = this.rangeModeActive;
       const rangeModeActive = this.updateRangeMode(rangeCondition, decisionState === "SIGNAL");
       if (!rangeModeActive) {
         this.lastRangeWatchKey = null;
         this.lastRangeWatchTs = null;
         this.lastRangeWatchMetrics = null;
+        this.rangeFrozen = null;
       }
 
       const decision = buildDecision({
@@ -2670,23 +2689,31 @@ export class Orchestrator {
             const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
             const rangeLow = Math.min(...rangeCandidates.map((candidate) => candidate.entryZone.low));
             const rangeHigh = Math.max(...rangeCandidates.map((candidate) => candidate.entryZone.high));
-            const longCandidate = rangeCandidates.find((candidate) => candidate.direction === "LONG");
-            const shortCandidate = rangeCandidates.find((candidate) => candidate.direction === "SHORT");
-            const longArm = longCandidate
-              ? `retest ${formatZone(longCandidate.entryZone)}`
-              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
-            const shortArm = shortCandidate
-              ? `retest ${formatZone(shortCandidate.entryZone)}`
-              : `retest ${rangeLow.toFixed(2)}-${rangeHigh.toFixed(2)}`;
-            const longEntry = longCandidate
-              ? `break&hold above ${longCandidate.entryZone.high.toFixed(2)}`
-              : `break&hold above ${rangeHigh.toFixed(2)}`;
-            const shortEntry = shortCandidate
-              ? `break&hold below ${shortCandidate.entryZone.low.toFixed(2)}`
-              : `break&hold below ${rangeLow.toFixed(2)}`;
-            const stopAnchor = `long < ${rangeLow.toFixed(2)} | short > ${rangeHigh.toFixed(2)} (armed)`;
-            return {
-              range: { low: rangeLow, high: rangeHigh },
+            const rangeWidth = rangeHigh - rangeLow;
+            const atr1m = indicators1m.atr ?? computeATR(this.recentBars1m, 14);
+            const minWidth = Math.max(0.25, 0.6 * (atr1m ?? 0));
+            const buffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
+            let displayLow = rangeLow;
+            let displayHigh = rangeHigh;
+            let mode = "NORMAL";
+            let note: string | undefined;
+            if (rangeWidth < minWidth) {
+              mode = "TIGHT";
+              note = "range too tight — waiting for expansion";
+              const microBars =
+                this.recentBars1m.length >= 20 ? this.recentBars1m.slice(-20) : this.recentBars5m.slice(-6);
+              if (microBars.length) {
+                displayHigh = Math.max(...microBars.map((bar) => bar.high));
+                displayLow = Math.min(...microBars.map((bar) => bar.low));
+              }
+            }
+            const longArm = `retest ${displayLow.toFixed(2)}-${displayHigh.toFixed(2)}`;
+            const shortArm = longArm;
+            const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
+            const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
+            const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
+            const computedRange = {
+              range: { low: displayLow, high: displayHigh },
               vwap: indicatorSnapshot.vwap,
               price: close,
               longArm,
@@ -2694,7 +2721,16 @@ export class Orchestrator {
               shortArm,
               shortEntry,
               stopAnchor,
+              mode,
+              note,
+              buffer,
+              minWidth,
+              rangeWidth,
             };
+            if (rangeModeActive && !wasRangeModeActive) {
+              this.rangeFrozen = { ...computedRange, ts };
+            }
+            return this.rangeFrozen ?? computedRange;
           })()
         : null;
       const isDev = process.env.NODE_ENV !== "production";
@@ -2742,6 +2778,7 @@ export class Orchestrator {
             Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
             rangeWatchPayload.longEntry,
             rangeWatchPayload.shortEntry,
+            rangeWatchPayload.mode ?? "",
             rangeWarnKey
           ].join("|")
         : null;
@@ -2850,7 +2887,8 @@ export class Orchestrator {
           !prior ||
           prior.longEntry !== rangeWatchPayload.longEntry ||
           prior.shortEntry !== rangeWatchPayload.shortEntry ||
-          prior.warnKey !== rangeWarnKey;
+          prior.warnKey !== rangeWarnKey ||
+          prior.mode !== rangeWatchPayload.mode;
         const shouldEmitRange =
           (rangeMoved || vwapMoved || triggersChanged) &&
           this.lastRangeWatchTs !== ts;
@@ -2883,6 +2921,8 @@ export class Orchestrator {
               shortArm: rangeWatchPayload.shortArm,
               shortEntry: rangeWatchPayload.shortEntry,
               stopAnchor: rangeWatchPayload.stopAnchor,
+              mode: rangeWatchPayload.mode,
+              note: rangeWatchPayload.note,
               ts,
             },
             rangeWarnTags: Array.from(chopSignals)
@@ -2896,6 +2936,7 @@ export class Orchestrator {
             warnKey: rangeWarnKey,
             longEntry: rangeWatchPayload.longEntry,
             shortEntry: rangeWatchPayload.shortEntry,
+            mode: rangeWatchPayload.mode,
           };
         }
       } else if (decisionState === "WATCH" || decision.status !== "ARMED") {

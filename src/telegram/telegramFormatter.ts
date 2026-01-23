@@ -105,25 +105,28 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     if (snapshot.range) {
       const time = formatEtTimeShort(snapshot.range.ts ?? snapshot.ts);
       const timeSuffix = time ? ` | ${time}` : "";
-      const header = `${snapshot.symbol} ⚪ RANGE | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
+      const modeLabel = snapshot.range.mode === "TIGHT" ? "CHOP" : "RANGE";
+      const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
       const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)}-${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
-      const longArm = `LONG ARM: ${snapshot.range.longArm ?? "n/a"}`;
-      const longEntry = `LONG ENTRY: ${snapshot.range.longEntry ?? "n/a"}`;
-      const shortArm = `SHORT ARM: ${snapshot.range.shortArm ?? "n/a"}`;
-      const shortEntry = `SHORT ENTRY: ${snapshot.range.shortEntry ?? "n/a"}`;
+      const bias = "BIAS: neutral range";
+      const breakout = `BREAKOUT: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
+      const breakdown = `BREAKDOWN: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
+      const arm = "ARM: retest range (bot creates play)";
       const stop = `STOP: ${snapshot.range.stopAnchor || "when armed"}`;
-      const next = "NEXT: wait for ARM → bot creates play";
+      const next = "NEXT: wait for break+hold → bot creates play";
+      const note = snapshot.range.note ? `NOTE: ${snapshot.range.note}` : undefined;
       const warnTags = formatWarnTags(snapshot.warnTags);
       const warn = warnTags ? `${warnTags.label}: ${warnTags.value}` : undefined;
       const lines = [
         header,
         rangeLine,
-        longArm,
-        longEntry,
-        shortArm,
-        shortEntry,
+        bias,
+        breakout,
+        breakdown,
+        arm,
         stop,
         next,
+        note,
         warn
       ].filter(nonEmpty);
       return { type: "WATCH", lines: lines.slice(0, 9), text: lines.slice(0, 9).join("\n") };

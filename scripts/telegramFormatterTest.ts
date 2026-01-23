@@ -160,8 +160,10 @@ assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing W
 assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
 assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("RANGE:")), "Range WATCH missing range line");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("LONG ARM:")), "Range WATCH missing long arm");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("SHORT ENTRY:")), "Range WATCH missing short entry");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BIAS:")), "Range WATCH missing bias line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BREAKOUT:")), "Range WATCH missing breakout line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BREAKDOWN:")), "Range WATCH missing breakdown line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("ARM:")), "Range WATCH missing arm line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("NEXT:")), "Range WATCH missing next line");
 assert.ok(
