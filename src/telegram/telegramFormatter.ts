@@ -110,9 +110,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
       const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)}-${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
       const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
-      const bias = "BIAS: neutral range";
-      const breakout = `BREAKOUT: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
-      const breakdown = `BREAKDOWN: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
+      const bias = `BIAS: ${snapshot.dir} (${snapshot.conf ?? "?"}%)`;
+      const planA = `PLAN A: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
+      const planB = `PLAN B: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
       const arm = "ARM: retest range (bot creates play)";
       const stop = `STOP: ${snapshot.range.stopAnchor || "when armed"}`;
       const next = "NEXT: wait for break+hold → bot creates play";
@@ -124,8 +124,8 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         rangeLine,
         vol,
         bias,
-        breakout,
-        breakdown,
+        planA,
+        planB,
         arm,
         stop,
         next,
