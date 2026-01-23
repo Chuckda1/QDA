@@ -131,7 +131,9 @@ const buildDataStaleUpdate = (event: DomainEvent, decisionState?: string): Teleg
       ? event.data.barTs
       : event.timestamp;
   const ageMs = Date.now() - dataTs;
-  const staleAfterMs = typeof event.data.staleAfterMs === "number" ? event.data.staleAfterMs : 90_000;
+  const barTf = event.data.barTf;
+  const defaultStaleAfterMs = barTf === "5m" ? 6 * 60 * 1000 : 90_000;
+  const staleAfterMs = typeof event.data.staleAfterMs === "number" ? event.data.staleAfterMs : defaultStaleAfterMs;
   if (!Number.isFinite(ageMs) || ageMs <= staleAfterMs) return null;
   const symbol = getSymbol(event);
   const dir = getDirection(event) ?? "LONG";

@@ -113,7 +113,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         : `CONTEXT_RANGE: n/a | VWAP ${formatPrice(snapshot.range.vwap)}`;
       const microLine = snapshot.range.microBox
         ? `MICRO_BOX: ${formatPrice(snapshot.range.microBox.low)}-${formatPrice(snapshot.range.microBox.high)}`
-        : "MICRO_BOX: n/a — waiting for consolidation";
+        : "MICRO_BOX: n/a — using CONTEXT rails";
       const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
       const rangeBias = snapshot.rangeBias?.bias ?? snapshot.dir;
       const rangeConf = snapshot.rangeBias?.confidence ?? snapshot.conf;

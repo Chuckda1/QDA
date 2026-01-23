@@ -4,7 +4,7 @@ import { buildTelegramAlert } from "../src/telegram/telegramFormatter.js";
 import { normalizeTelegramSnapshot } from "../src/telegram/telegramNormalizer.js";
 import { buildTelegramSignature } from "../src/telegram/telegramSignature.js";
 import { MessagePublisher } from "../src/telegram/messagePublisher.js";
-import { Orchestrator } from "../src/orchestrator/orchestrator.js";
+import { Orchestrator, buildChopPlan } from "../src/orchestrator/orchestrator.js";
 import { MessageGovernor } from "../src/governor/messageGovernor.js";
 import { isDecisionAlertEvent } from "../src/utils/decisionState.js";
 
@@ -487,5 +487,71 @@ const runPublisherFilterTest = async () => {
 };
 
 await runPublisherFilterTest();
+
+const makeBar = (ts: number, close: number, high: number, low: number) => ({
+  ts,
+  open: close,
+  high,
+  low,
+  close,
+  volume: 1000,
+});
+
+const baseTs = Date.parse("2026-01-21T19:00:00Z");
+const barsA = Array.from({ length: 10 }, (_, idx) => {
+  const ts = baseTs - (9 - idx) * 60_000;
+  const low = 688.1 + idx * 0.01;
+  const high = 688.9 + idx * 0.01;
+  const close = (low + high) / 2;
+  return makeBar(ts, close, high, low);
+});
+const barsB = Array.from({ length: 10 }, (_, idx) => {
+  const ts = baseTs - (9 - idx) * 60_000;
+  const low = 688.6 + idx * 0.01;
+  const high = 689.4 + idx * 0.01;
+  const close = (low + high) / 2;
+  return makeBar(ts, close, high, low);
+});
+
+const candidateBase = {
+  id: "test",
+  ts: baseTs,
+  symbol: "SPY",
+  direction: "LONG" as const,
+  pattern: "FOLLOW" as const,
+  triggerPrice: 688.5,
+  entryZone: { low: 688.3, high: 688.7 },
+  stop: 687.8,
+  targets: { t1: 689.2, t2: 689.6, t3: 690.0 },
+  rationale: [],
+  score: { alignment: 60, structure: 60, quality: 60, total: 60 },
+};
+
+const planA = buildChopPlan({
+  ts: baseTs,
+  close: 688.5,
+  indicatorSnapshot: { vwap: 688.6 },
+  rangeCandidates: [candidateBase],
+  recentBars1m: barsA,
+  recentBars5m: [],
+});
+const planB = buildChopPlan({
+  ts: baseTs,
+  close: 689.0,
+  indicatorSnapshot: { vwap: 688.9 },
+  rangeCandidates: [candidateBase],
+  recentBars1m: barsB,
+  recentBars5m: [],
+});
+
+assert.ok(!planA.microBox, "Micro box should be null for short history");
+assert.ok(planA.contextRange, "Context range should be present");
+assert.ok(planB.contextRange, "Context range should be present");
+assert.notEqual(planA.longEntry, planB.longEntry, "Plan rails must change with context range");
+assert.notEqual(planA.shortEntry, planB.shortEntry, "Plan rails must change with context range");
+const expectedLongA = `break&hold above ${(planA.contextRange!.high + planA.buffer).toFixed(2)}`;
+const expectedShortA = `break&hold below ${(planA.contextRange!.low - planA.buffer).toFixed(2)}`;
+assert.equal(planA.longEntry, expectedLongA, "Plan A should derive from context rails");
+assert.equal(planA.shortEntry, expectedShortA, "Plan B should derive from context rails");
 
 console.log("✅ Telegram formatter tests passed.");

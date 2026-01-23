@@ -304,6 +304,16 @@ function computeRangeBias(params: {
   const position = micro && width && width > 0 ? (params.price - micro.low) / width : 0.5;
   const aboveVwap = Number.isFinite(params.vwap) ? params.price > (params.vwap as number) : undefined;
 
+  if (!micro) {
+    if (slopeDir === "DOWN" && aboveVwap === false) {
+      return { bias: "SHORT", confidence: 55, note: "down momentum below VWAP" };
+    }
+    if (aboveVwap === true && slopeAtr >= 0.2) {
+      return { bias: "LONG", confidence: 55, note: "trend strength above VWAP" };
+    }
+    return { bias: "NEUTRAL", confidence: 50, note: "no micro box; neutral bias" };
+  }
+
   if (slopeDir === "DOWN" && aboveVwap === false) {
     return { bias: "SHORT", confidence: 60, note: "down momentum below VWAP" };
   }
@@ -317,6 +327,101 @@ function computeRangeBias(params: {
     return { bias: "LONG", confidence: 55, note: "near upper rail" };
   }
   return { bias: "NEUTRAL", confidence: 50, note: "mid-box / mixed momentum" };
+}
+
+export function buildChopPlan(params: {
+  ts: number;
+  close: number;
+  indicatorSnapshot: { vwap?: number };
+  atr1m?: number;
+  atr5m?: number;
+  rangeCandidates: SetupCandidate[];
+  recentBars1m: OHLCVBar[];
+  recentBars5m: OHLCVBar[];
+}): {
+  range: { low: number; high: number };
+  contextRange?: RangeBand;
+  microBox?: RangeBand;
+  longArm: string;
+  longEntry: string;
+  shortArm: string;
+  shortEntry: string;
+  stopAnchor: string;
+  mode: string;
+  note?: string;
+  buffer: number;
+  minWidth: number;
+  rangeWidth: number;
+  bias: { bias: Bias; confidence: number; note: string };
+} {
+  const rangeLow = Math.min(...params.rangeCandidates.map((candidate) => candidate.entryZone.low));
+  const rangeHigh = Math.max(...params.rangeCandidates.map((candidate) => candidate.entryZone.high));
+  const rangeWidth = rangeHigh - rangeLow;
+  const atr1m = params.atr1m ?? computeATR(params.recentBars1m, 14);
+  const atr5m = params.atr5m ?? computeATR(params.recentBars5m, 14);
+  const minWidth = Math.max(0.25, 0.6 * (atr1m ?? 0));
+  const buffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
+  const contextRange = computeContextRange({
+    ts: params.ts,
+    bars1m: params.recentBars1m,
+    bars5m: params.recentBars5m,
+  });
+  const microBox =
+    params.recentBars1m.length >= 20
+      ? findMicroBox({
+          bars: params.recentBars1m,
+          atr: atr1m ?? atr5m,
+          maxBars: 20,
+          minWindow: 5,
+          source: "1m",
+          ts: params.ts,
+        })
+      : findMicroBox({
+          bars: params.recentBars5m,
+          atr: atr5m ?? atr1m,
+          maxBars: 6,
+          minWindow: 3,
+          source: "5m",
+          ts: params.ts,
+        });
+  const planSource = microBox ?? contextRange ?? { low: rangeLow, high: rangeHigh };
+  let mode = "NORMAL";
+  let note: string | undefined;
+  if (rangeWidth < minWidth) {
+    mode = "TIGHT";
+    note = "range too tight — waiting for expansion";
+  }
+  const displayLow = planSource.low;
+  const displayHigh = planSource.high;
+  const longArm = `retest ${displayLow.toFixed(2)}-${displayHigh.toFixed(2)}`;
+  const shortArm = longArm;
+  const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
+  const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
+  const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
+  const bias = computeRangeBias({
+    price: params.close,
+    vwap: params.indicatorSnapshot.vwap,
+    microBox,
+    bars1m: params.recentBars1m,
+    bars5m: params.recentBars5m,
+    atr: atr1m ?? atr5m,
+  });
+  return {
+    range: { low: displayLow, high: displayHigh },
+    contextRange,
+    microBox,
+    longArm,
+    longEntry,
+    shortArm,
+    shortEntry,
+    stopAnchor,
+    mode,
+    note,
+    buffer,
+    minWidth,
+    rangeWidth,
+    bias,
+  };
 }
 
 const REGIME_15M_FAST_OPTIONS: Partial<RegimeOptions> = {
@@ -2917,92 +3022,40 @@ export class Orchestrator {
       const rangeWatchPayload = rangeModeActive
         ? (() => {
             const rangeCandidates = rankedCandidates.length ? rankedCandidates : setupCandidates;
-            const rangeLow = Math.min(...rangeCandidates.map((candidate) => candidate.entryZone.low));
-            const rangeHigh = Math.max(...rangeCandidates.map((candidate) => candidate.entryZone.high));
-            const rangeWidth = rangeHigh - rangeLow;
-            const atr1m = indicators1m.atr ?? computeATR(this.recentBars1m, 14);
-            const atr5m = indicators5m.atr ?? computeATR(this.recentBars5m, 14);
-            const minWidth = Math.max(0.25, 0.6 * (atr1m ?? 0));
-            const buffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
-            const contextRange = computeContextRange({
+            const plan = buildChopPlan({
               ts,
-              bars1m: this.recentBars1m,
-              bars5m: this.recentBars5m,
-            });
-            const microBox =
-              this.recentBars1m.length >= 20
-                ? findMicroBox({
-                    bars: this.recentBars1m,
-                    atr: atr1m ?? atr5m,
-                    maxBars: 20,
-                    minWindow: 5,
-                    source: "1m",
-                    ts,
-                  })
-                : findMicroBox({
-                    bars: this.recentBars5m,
-                    atr: atr5m ?? atr1m,
-                    maxBars: 6,
-                    minWindow: 3,
-                    source: "5m",
-                    ts,
-                  });
-            let displayLow = rangeLow;
-            let displayHigh = rangeHigh;
-            let mode = "NORMAL";
-            let note: string | undefined;
-            if (microBox) {
-              displayLow = microBox.low;
-              displayHigh = microBox.high;
-            }
-            if (rangeWidth < minWidth) {
-              mode = "TIGHT";
-              note = "range too tight — waiting for expansion";
-              if (!microBox) {
-                const microBars =
-                  this.recentBars1m.length >= 20 ? this.recentBars1m.slice(-20) : this.recentBars5m.slice(-6);
-                if (microBars.length) {
-                  displayHigh = Math.max(...microBars.map((bar) => bar.high));
-                  displayLow = Math.min(...microBars.map((bar) => bar.low));
-                }
-              }
-            }
-            const longArm = `retest ${displayLow.toFixed(2)}-${displayHigh.toFixed(2)}`;
-            const shortArm = longArm;
-            const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
-            const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
-            const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
-            const bias = computeRangeBias({
-              price: close,
-              vwap: indicatorSnapshot.vwap,
-              microBox: microBox ?? { low: displayLow, high: displayHigh },
-              bars1m: this.recentBars1m,
-              bars5m: this.recentBars5m,
-              atr: atr1m ?? atr5m,
+              close,
+              indicatorSnapshot,
+              atr1m: indicators1m.atr,
+              atr5m: indicators5m.atr,
+              rangeCandidates,
+              recentBars1m: this.recentBars1m,
+              recentBars5m: this.recentBars5m,
             });
             const computedRange = {
-              range: { low: displayLow, high: displayHigh },
+              range: plan.range,
               vwap: indicatorSnapshot.vwap,
               price: close,
-              contextRange,
-              microBox,
-              bias,
-              longArm,
-              longEntry,
-              shortArm,
-              shortEntry,
-              stopAnchor,
-              mode,
-              note,
-              buffer,
-              minWidth,
-              rangeWidth,
+              contextRange: plan.contextRange,
+              microBox: plan.microBox,
+              bias: plan.bias,
+              longArm: plan.longArm,
+              longEntry: plan.longEntry,
+              shortArm: plan.shortArm,
+              shortEntry: plan.shortEntry,
+              stopAnchor: plan.stopAnchor,
+              mode: plan.mode,
+              note: plan.note,
+              buffer: plan.buffer,
+              minWidth: plan.minWidth,
+              rangeWidth: plan.rangeWidth,
               ts,
             };
-            if (rangeModeActive && !wasRangeModeActive) {
+            if (rangeModeActive && !wasRangeModeActive && plan.mode !== "TIGHT") {
               this.rangeFrozen = computedRange;
             }
-            return this.rangeFrozen ?? computedRange;
+            const isChop = plan.mode === "TIGHT" || anchorRegime.regime === "CHOP";
+            return isChop ? computedRange : this.rangeFrozen ?? computedRange;
           })()
         : null;
       const modeState: ModeState = (() => {
@@ -3213,6 +3266,8 @@ export class Orchestrator {
           (rangeMoved || contextMoved || microMoved || vwapMoved || triggersChanged) &&
           this.lastRangeWatchTs !== ts;
         if (shouldEmitRange) {
+          const barTs = this.state.last1mTs ?? ts;
+          const barTf = this.state.last1mTs ? "1m" : "5m";
           events.push(this.ev("NO_ENTRY", ts, {
             playId: decision.decisionId,
             symbol: setupCandidate.symbol,
@@ -3221,6 +3276,8 @@ export class Orchestrator {
             decisionState: "WATCH",
             modeState,
             gateStatus,
+            barTs,
+            barTf,
             candidate: setupCandidate,
             decision: decisionSummary,
             volume: volumePayload,
