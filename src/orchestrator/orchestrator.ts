@@ -305,10 +305,12 @@ function computeRangeBias(params: {
   const aboveVwap = Number.isFinite(params.vwap) ? params.price > (params.vwap as number) : undefined;
 
   if (!micro) {
-    if (slopeDir === "DOWN" && aboveVwap === false) {
+    const impulseUp = slopeAtr >= 0.2;
+    const impulseDown = slopeAtr <= -0.2;
+    if (impulseDown && aboveVwap === false) {
       return { bias: "SHORT", confidence: 55, note: "down momentum below VWAP" };
     }
-    if (aboveVwap === true && slopeAtr >= 0.2) {
+    if (impulseUp && aboveVwap === true) {
       return { bias: "LONG", confidence: 55, note: "trend strength above VWAP" };
     }
     return { bias: "NEUTRAL", confidence: 50, note: "no micro box; neutral bias" };
@@ -350,6 +352,7 @@ export function buildChopPlan(params: {
   mode: string;
   note?: string;
   buffer: number;
+  atr1m?: number;
   minWidth: number;
   rangeWidth: number;
   bias: { bias: Bias; confidence: number; note: string };
@@ -397,7 +400,7 @@ export function buildChopPlan(params: {
   const shortArm = longArm;
   const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
   const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
-  const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
+  const stopAnchor = `long < ${(displayLow - buffer).toFixed(2)} | short > ${(displayHigh + buffer).toFixed(2)} (armed)`;
   const bias = computeRangeBias({
     price: params.close,
     vwap: params.indicatorSnapshot.vwap,
@@ -418,6 +421,7 @@ export function buildChopPlan(params: {
     mode,
     note,
     buffer,
+    atr1m,
     minWidth,
     rangeWidth,
     bias,
@@ -3047,6 +3051,7 @@ export class Orchestrator {
               mode: plan.mode,
               note: plan.note,
               buffer: plan.buffer,
+              atr1m: plan.atr1m,
               minWidth: plan.minWidth,
               rangeWidth: plan.rangeWidth,
               ts,
@@ -3299,6 +3304,8 @@ export class Orchestrator {
               contextRange: rangeWatchPayload.contextRange,
               microBox: rangeWatchPayload.microBox,
               bias: rangeWatchPayload.bias,
+              buffer: rangeWatchPayload.buffer,
+              atr1m: rangeWatchPayload.atr1m,
               longArm: rangeWatchPayload.longArm,
               longEntry: rangeWatchPayload.longEntry,
               shortArm: rangeWatchPayload.shortArm,

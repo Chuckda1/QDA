@@ -111,6 +111,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const contextLine = snapshot.range.contextRange
         ? `CONTEXT_RANGE: ${formatPrice(snapshot.range.contextRange.low)}-${formatPrice(snapshot.range.contextRange.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`
         : `CONTEXT_RANGE: n/a | VWAP ${formatPrice(snapshot.range.vwap)}`;
+      const bufferLine = Number.isFinite(snapshot.range.buffer)
+        ? `BUFFER: ${formatPrice(snapshot.range.buffer)} (ATR1m=${formatPrice(snapshot.range.atr1m)})`
+        : undefined;
       const microLine = snapshot.range.microBox
         ? `MICRO_BOX: ${formatPrice(snapshot.range.microBox.low)}-${formatPrice(snapshot.range.microBox.high)}`
         : "MICRO_BOX: n/a — using CONTEXT rails";
@@ -129,6 +132,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const lines = [
         header,
         contextLine,
+        bufferLine,
         microLine,
         vol,
         bias,

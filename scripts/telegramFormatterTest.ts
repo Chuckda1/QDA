@@ -553,5 +553,7 @@ const expectedLongA = `break&hold above ${(planA.contextRange!.high + planA.buff
 const expectedShortA = `break&hold below ${(planA.contextRange!.low - planA.buffer).toFixed(2)}`;
 assert.equal(planA.longEntry, expectedLongA, "Plan A should derive from context rails");
 assert.equal(planA.shortEntry, expectedShortA, "Plan B should derive from context rails");
+const expectedStopA = `long < ${(planA.contextRange!.low - planA.buffer).toFixed(2)} | short > ${(planA.contextRange!.high + planA.buffer).toFixed(2)} (armed)`;
+assert.equal(planA.stopAnchor, expectedStopA, "Stop rails should match plan rails + buffer");
 
 console.log("✅ Telegram formatter tests passed.");
