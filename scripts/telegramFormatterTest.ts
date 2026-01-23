@@ -3,6 +3,7 @@ import type { DomainEvent, TacticalSnapshot } from "../src/types.js";
 import { buildTelegramAlert } from "../src/telegram/telegramFormatter.js";
 import { normalizeTelegramSnapshot } from "../src/telegram/telegramNormalizer.js";
 import { buildTelegramSignature } from "../src/telegram/telegramSignature.js";
+import { MessagePublisher } from "../src/telegram/messagePublisher.js";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { MessageGovernor } from "../src/governor/messageGovernor.js";
 import { isDecisionAlertEvent } from "../src/utils/decisionState.js";
@@ -18,6 +19,12 @@ const watchEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
   decisionState: "WATCH",
+  gateStatus: {
+    pendingGate: "distance_to_VWAP <= 0.8 ATR (now 0.11)",
+    blockedReasons: [
+      "WAIT_FOR_PULLBACK: extended-from-mean (Price 1.35 above VWAP). Re-arm when distance_to_VWAP <= 0.8 * ATR."
+    ],
+  },
   price: 685.76,
   volume: { line: "LOW (0.62x) → 2 closes" },
   topPlay: {
@@ -127,6 +134,10 @@ assert.ok(watchAlert?.lines[2]?.startsWith("ENTRY:"), "WATCH entry line missing"
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("VOL:")), "WATCH volume line missing");
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("STOP PLAN:")), "WATCH stop plan line missing");
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("NEXT:")), "WATCH next line missing");
+assert.ok(
+  watchAlert?.lines.some((l) => l.includes("distance_to_VWAP <= 0.8 ATR (now 0.11)")),
+  "WATCH next line should use pending gate"
+);
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("WHY:")), "WATCH why line missing");
 const watchText = watchAlert?.lines.join(" ") ?? "";
 assert.ok(!watchText.includes("WAIT_FOR_PULLBACK"), "WATCH contains raw blocker text");
@@ -142,6 +153,8 @@ const rangeEvent = makeBaseEvent("NO_ENTRY", {
   range: {
     low: 689.2,
     high: 690.1,
+    contextRange: { low: 687.9, high: 691.4 },
+    microBox: { low: 689.4, high: 689.9 },
     vwap: 689.6,
     price: 689.7,
     longArm: "retest 689.40-689.70",
@@ -150,6 +163,7 @@ const rangeEvent = makeBaseEvent("NO_ENTRY", {
     shortEntry: "break&hold below 689.20",
     stopAnchor: "long < 689.20 | short > 690.10 (armed)",
     ts: Date.now(),
+    mode: "NORMAL",
   },
   rangeWarnTags: ["TRANSITION", "LOW_DENSITY", "TF_CONFLICT", "GUARDRAIL", "EXTENDED"],
 });
@@ -158,11 +172,12 @@ assert.ok(rangeSnapshot, "Range WATCH snapshot missing");
 assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
 const rangeAlert = buildTelegramAlert(rangeSnapshot!);
 assert.ok(rangeAlert, "Range WATCH alert missing");
-assert.ok(rangeAlert?.lines.length <= 9, "Range WATCH line count exceeded");
+assert.ok(rangeAlert?.lines.length <= 10, "Range WATCH line count exceeded");
 assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing WATCH");
 assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
 assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("RANGE:")), "Range WATCH missing range line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("CONTEXT_RANGE:")), "Range WATCH missing context range line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("MICRO_BOX:")), "Range WATCH missing micro box line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BIAS:")), "Range WATCH missing bias line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN A:")), "Range WATCH missing plan A line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN B:")), "Range WATCH missing plan B line");
@@ -173,6 +188,27 @@ assert.ok(
   rangeAlert?.lines.some((l) => l.includes("+1")),
   "Range WATCH warn tags should be capped"
 );
+
+const blockedEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "SHORT",
+  decisionState: "WATCH",
+  gateStatus: {
+    blockedReasons: ["WAIT_FOR_PULLBACK: extended-from-mean", "No reclaim signal"],
+  },
+  price: 683.12,
+  topPlay: {
+    entryZone: { low: 681.2, high: 682.4 },
+    stop: 684.8,
+    targets: { t1: 680.2, t2: 678.4, t3: 676.2 },
+  },
+  marketState: { permission: { mode: "NORMAL" }, tacticalSnapshot: { confidence: 60 }, dataReadiness: { ready: true } },
+  decision: { decisionState: "WATCH" },
+});
+const blockedSnapshot = normalizeTelegramSnapshot(blockedEvent);
+assert.ok(blockedSnapshot, "Blocked snapshot missing");
+const blockedAlert = buildTelegramAlert(blockedSnapshot!);
+assert.ok(blockedAlert?.lines.some((l) => l.startsWith("BLOCKED_BY:")), "Blocked watch should show BLOCKED_BY");
 
 const signalSnapshot = normalizeTelegramSnapshot(signalEvent);
 assert.ok(signalSnapshot, "SIGNAL snapshot missing");
@@ -393,5 +429,63 @@ assert.equal(s1.activeDirection, "LONG", "Initial direction should be LONG");
 assert.equal(s2.activeDirection, "LONG", "Debounce should block first flip");
 assert.equal(s3.activeDirection, "SHORT", "Debounce should allow second flip");
 assert.equal(s4.activeDirection, "SHORT", "Cooldown should block immediate re-flip");
+
+const runPublisherFilterTest = async () => {
+  const sent: string[] = [];
+  const bot = {
+    sendMessage: async (_chatId: number, text: string) => {
+      sent.push(text);
+      return Promise.resolve();
+    },
+    onText: () => {},
+    on: () => {},
+  };
+  const governor = new MessageGovernor();
+  governor.setMode("ACTIVE");
+  const publisher = new MessagePublisher(governor, bot as any, 0);
+  const rangeOnlyEvent = makeBaseEvent("NO_ENTRY", {
+    symbol: "SPY",
+    direction: "LONG",
+    decisionState: "WATCH",
+    modeState: "CHOP",
+    range: {
+      low: 689.2,
+      high: 690.1,
+      vwap: 689.6,
+      price: 689.7,
+      longArm: "retest 689.40-689.70",
+      longEntry: "break&hold above 690.10",
+      shortArm: "retest 689.60-689.90",
+      shortEntry: "break&hold below 689.20",
+      stopAnchor: "long < 689.20 | short > 690.10 (armed)",
+      ts: Date.now(),
+      mode: "NORMAL",
+    },
+  });
+  const directionalEvent = makeBaseEvent("PLAY_ARMED", {
+    play: {
+      symbol: "SPY",
+      direction: "LONG",
+      entryZone: { low: 452.1, high: 453.2 },
+      stop: 450.4,
+      targets: { t1: 455.0, t2: 456.9, t3: 459.2 },
+    },
+    decisionState: "SIGNAL",
+    modeState: "CHOP",
+    price: 685.9,
+    marketState: {
+      regime: "CHOP",
+      permission: { mode: "NORMAL" },
+      tacticalSnapshot: { confidence: 80 },
+      dataReadiness: { ready: true },
+    },
+    decision: { decisionState: "SIGNAL", metrics: { legitimacy: 65, followThrough: 62, riskAtr: 1.1 } },
+  });
+  await (publisher as any)._publishOrderedInternal([directionalEvent, rangeOnlyEvent]);
+  assert.equal(sent.length, 1, "Range mode should suppress directional card");
+  assert.ok(sent[0]?.includes("RANGE") || sent[0]?.includes("CHOP"), "Range card should be sent");
+};
+
+await runPublisherFilterTest();
 
 console.log("✅ Telegram formatter tests passed.");

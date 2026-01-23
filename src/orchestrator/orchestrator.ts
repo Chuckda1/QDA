@@ -1,8 +1,8 @@
-import type { Bias, BotState, Direction, DomainEvent, EntryPermission, Play, PotdBias, PotdMode, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, Direction, DomainEvent, EntryPermission, GateStatus, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
-import { getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
+import { etToUtcTimestamp, getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
@@ -169,6 +169,123 @@ function getDirectionConfidenceBand(confidence?: number): "LOW" | "MID" | "HIGH"
   return "LOW";
 }
 
+function buildEtDate(ts: number, offsetDays = 0): Date {
+  const etDateStr = getETDateString(new Date(ts));
+  const base = new Date(`${etDateStr}T00:00:00Z`);
+  base.setUTCDate(base.getUTCDate() + offsetDays);
+  return base;
+}
+
+function computeContextRange(params: { ts: number; bars1m: OHLCVBar[]; bars5m: OHLCVBar[] }): RangeBand | undefined {
+  const session = getMarketSessionLabel(new Date(params.ts));
+  const { hour, minute } = getETClock(new Date(params.ts));
+  const isBeforeOpen = hour < 9 || (hour === 9 && minute < 30);
+  const startDate = session === "RTH"
+    ? buildEtDate(params.ts)
+    : isBeforeOpen
+    ? buildEtDate(params.ts, -1)
+    : buildEtDate(params.ts);
+  const startTs = session === "RTH"
+    ? etToUtcTimestamp(9, 30, startDate)
+    : etToUtcTimestamp(16, 0, startDate);
+  const bars = params.bars1m.length ? params.bars1m : params.bars5m;
+  const window = bars.filter((bar) => bar.ts >= startTs && bar.ts <= params.ts);
+  if (!window.length) return undefined;
+  const high = Math.max(...window.map((bar) => bar.high));
+  const low = Math.min(...window.map((bar) => bar.low));
+  if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
+  return {
+    low,
+    high,
+    source: session === "RTH" ? "RTH" : "OVERNIGHT",
+    ts: params.ts,
+  };
+}
+
+function findMicroBox(params: {
+  bars: OHLCVBar[];
+  atr?: number;
+  maxBars: number;
+  minWindow: number;
+  source: "1m" | "5m";
+  ts: number;
+}): RangeBand | undefined {
+  const { atr } = params;
+  if (!Number.isFinite(atr) || (atr as number) <= 0) return undefined;
+  const threshold = 0.6 * (atr as number);
+  const recent = params.bars.slice(-params.maxBars);
+  if (recent.length < params.minWindow) return undefined;
+  let bestLow: number | undefined;
+  let bestHigh: number | undefined;
+  let bestRange = Number.POSITIVE_INFINITY;
+  for (let windowSize = params.minWindow; windowSize <= recent.length; windowSize += 1) {
+    for (let i = 0; i <= recent.length - windowSize; i += 1) {
+      const window = recent.slice(i, i + windowSize);
+      const high = Math.max(...window.map((bar) => bar.high));
+      const low = Math.min(...window.map((bar) => bar.low));
+      const width = high - low;
+      if (width <= threshold && width < bestRange) {
+        bestRange = width;
+        bestLow = low;
+        bestHigh = high;
+      }
+    }
+  }
+  if (bestLow === undefined || bestHigh === undefined) return undefined;
+  return { low: bestLow, high: bestHigh, source: params.source, ts: params.ts };
+}
+
+function computeGateStatus(params: {
+  entryPermission: EntryPermission;
+  blockerReasons: string[];
+  hardStopReasons: string[];
+  hardWaitReasons: string[];
+  softBlockerReasons: string[];
+  indicators: { atr?: number; vwap?: number };
+  price: number;
+  relVol?: number;
+  rearmVwapAtr: number;
+}): GateStatus {
+  const metrics: GateStatus["metrics"] = {
+    atr: params.indicators.atr,
+    vwap: params.indicators.vwap,
+    relVol: params.relVol,
+  };
+  if (Number.isFinite(params.indicators.vwap) && Number.isFinite(params.indicators.atr) && params.indicators.atr) {
+    const dist = Math.abs(params.price - (params.indicators.vwap as number));
+    metrics.distToVwap = dist;
+    metrics.distToVwapAtr = dist / (params.indicators.atr as number);
+  }
+  const blockedReasons = Array.from(
+    new Set([
+      ...params.hardStopReasons,
+      ...params.hardWaitReasons,
+      ...params.softBlockerReasons,
+      ...params.blockerReasons,
+    ])
+  ).filter((reason) => typeof reason === "string" && reason.length > 0);
+  let pendingGate: string | undefined;
+  if (params.entryPermission === "WAIT_FOR_PULLBACK") {
+    const pullbackMatch = blockedReasons
+      .map((reason) => reason.match(/Pullback depth\s+([\d.]+)\s+is less than minimum\s+([\d.]+)/i))
+      .find(Boolean);
+    if (pullbackMatch) {
+      const current = pullbackMatch[1];
+      const min = pullbackMatch[2];
+      pendingGate = `pullback depth >= ${min} ATR (now ${current})`;
+    } else if (blockedReasons.some((reason) => /No reclaim signal/i.test(reason))) {
+      pendingGate = "waiting on reclaim signal";
+    } else if (Number.isFinite(metrics?.distToVwapAtr)) {
+      pendingGate = `distance_to_VWAP <= ${params.rearmVwapAtr} ATR (now ${(metrics.distToVwapAtr as number).toFixed(2)})`;
+    }
+  }
+  return {
+    pendingGate,
+    blockedReasons: blockedReasons.length ? blockedReasons : undefined,
+    metrics,
+  };
+}
+
 const REGIME_15M_FAST_OPTIONS: Partial<RegimeOptions> = {
   minBars: 16,
   vwapPeriod: 12,
@@ -209,6 +326,10 @@ export class Orchestrator {
     low: number;
     high: number;
     vwap?: number;
+    contextLow?: number;
+    contextHigh?: number;
+    microLow?: number;
+    microHigh?: number;
     warnKey: string;
     longEntry: string;
     shortEntry: string;
@@ -218,6 +339,8 @@ export class Orchestrator {
     range: { low: number; high: number };
     vwap?: number;
     price: number;
+    contextRange?: RangeBand;
+    microBox?: RangeBand;
     longArm: string;
     longEntry: string;
     shortArm: string;
@@ -2006,6 +2129,7 @@ export class Orchestrator {
           direction: setupCandidate.direction,
           price: close,
           decisionState: "UPDATE",
+          modeState: anchorRegime.regime === "CHOP" ? "CHOP" : "TREND_ACTIVE",
           volume: volumePayload,
           update: {
             cause: `volume ${volumeInfo.label} (${volumeRelText}x)`,
@@ -2678,6 +2802,17 @@ export class Orchestrator {
       const riskAtr = atr
         ? Math.abs(((setupCandidate.entryZone.low + setupCandidate.entryZone.high) / 2) - setupCandidate.stop) / atr
         : undefined;
+      const gateStatus = computeGateStatus({
+        entryPermission,
+        blockerReasons,
+        hardStopReasons,
+        hardWaitReasons,
+        softBlockerReasons,
+        indicators: { atr: indicatorSnapshot.atr, vwap: indicatorSnapshot.vwap },
+        price: close,
+        relVol,
+        rearmVwapAtr: this.entryFilters.getRearmVwapDistanceAtr(),
+      });
       const decisionSummary = {
         decisionId: decision.decisionId,
         status: decision.status,
@@ -2752,20 +2887,50 @@ export class Orchestrator {
             const rangeHigh = Math.max(...rangeCandidates.map((candidate) => candidate.entryZone.high));
             const rangeWidth = rangeHigh - rangeLow;
             const atr1m = indicators1m.atr ?? computeATR(this.recentBars1m, 14);
+            const atr5m = indicators5m.atr ?? computeATR(this.recentBars5m, 14);
             const minWidth = Math.max(0.25, 0.6 * (atr1m ?? 0));
             const buffer = Math.max(0.03, 0.1 * (atr1m ?? 0));
+            const contextRange = computeContextRange({
+              ts,
+              bars1m: this.recentBars1m,
+              bars5m: this.recentBars5m,
+            });
+            const microBox =
+              this.recentBars1m.length >= 20
+                ? findMicroBox({
+                    bars: this.recentBars1m,
+                    atr: atr1m ?? atr5m,
+                    maxBars: 20,
+                    minWindow: 5,
+                    source: "1m",
+                    ts,
+                  })
+                : findMicroBox({
+                    bars: this.recentBars5m,
+                    atr: atr5m ?? atr1m,
+                    maxBars: 6,
+                    minWindow: 3,
+                    source: "5m",
+                    ts,
+                  });
             let displayLow = rangeLow;
             let displayHigh = rangeHigh;
             let mode = "NORMAL";
             let note: string | undefined;
+            if (microBox) {
+              displayLow = microBox.low;
+              displayHigh = microBox.high;
+            }
             if (rangeWidth < minWidth) {
               mode = "TIGHT";
               note = "range too tight — waiting for expansion";
-              const microBars =
-                this.recentBars1m.length >= 20 ? this.recentBars1m.slice(-20) : this.recentBars5m.slice(-6);
-              if (microBars.length) {
-                displayHigh = Math.max(...microBars.map((bar) => bar.high));
-                displayLow = Math.min(...microBars.map((bar) => bar.low));
+              if (!microBox) {
+                const microBars =
+                  this.recentBars1m.length >= 20 ? this.recentBars1m.slice(-20) : this.recentBars5m.slice(-6);
+                if (microBars.length) {
+                  displayHigh = Math.max(...microBars.map((bar) => bar.high));
+                  displayLow = Math.min(...microBars.map((bar) => bar.low));
+                }
               }
             }
             const longArm = `retest ${displayLow.toFixed(2)}-${displayHigh.toFixed(2)}`;
@@ -2777,6 +2942,8 @@ export class Orchestrator {
               range: { low: displayLow, high: displayHigh },
               vwap: indicatorSnapshot.vwap,
               price: close,
+              contextRange,
+              microBox,
               longArm,
               longEntry,
               shortArm,
@@ -2795,6 +2962,28 @@ export class Orchestrator {
             return this.rangeFrozen ?? computedRange;
           })()
         : null;
+      const modeState: ModeState = (() => {
+        if (rangeModeActive) {
+          if (decision.status === "ARMED") return "RANGE_ARMED";
+          if (rangeWatchPayload?.mode === "TIGHT" || anchorRegime.regime === "CHOP") return "CHOP";
+          return "RANGE";
+        }
+        if (wasRangeModeActive) return "RANGE_EXIT_WATCH";
+        if (anchorRegime.regime === "CHOP") return "CHOP";
+        return "TREND_ACTIVE";
+      })();
+      if (decisionState === "WATCH") {
+        console.log("[WATCH_VETO]", {
+          symbol,
+          ts,
+          price: close,
+          vwap: indicatorSnapshot.vwap,
+          atr: indicatorSnapshot.atr,
+          relVol,
+          modeState,
+          reasons: gateStatus.blockedReasons?.slice(0, 3) ?? [],
+        });
+      }
       const isDev = process.env.NODE_ENV !== "production";
       if (isDev && rangeModeActive && decisionState === "WATCH" && !rangeWatchPayload) {
         console.warn("[ONE_ENGINE_VIOLATION] range mode active without range payload", {
@@ -2838,6 +3027,12 @@ export class Orchestrator {
             rangeWatchPayload.range.low.toFixed(2),
             rangeWatchPayload.range.high.toFixed(2),
             Number.isFinite(rangeWatchPayload.vwap) ? rangeWatchPayload.vwap!.toFixed(2) : "na",
+            rangeWatchPayload.contextRange
+              ? `${rangeWatchPayload.contextRange.low.toFixed(2)}-${rangeWatchPayload.contextRange.high.toFixed(2)}`
+              : "no-context",
+            rangeWatchPayload.microBox
+              ? `${rangeWatchPayload.microBox.low.toFixed(2)}-${rangeWatchPayload.microBox.high.toFixed(2)}`
+              : "no-micro",
             rangeWatchPayload.longEntry,
             rangeWatchPayload.shortEntry,
             rangeWatchPayload.mode ?? "",
@@ -2938,6 +3133,26 @@ export class Orchestrator {
           !prior ||
           Math.abs(rangeWatchPayload.range.low - prior.low) >= rangeThreshold ||
           Math.abs(rangeWatchPayload.range.high - prior.high) >= rangeThreshold;
+        const contextMoved = (() => {
+          if (!prior) return true;
+          const current = rangeWatchPayload.contextRange;
+          if (!current && prior.contextLow === undefined && prior.contextHigh === undefined) return false;
+          if (!current || prior.contextLow === undefined || prior.contextHigh === undefined) return true;
+          return (
+            Math.abs(current.low - prior.contextLow) >= rangeThreshold ||
+            Math.abs(current.high - prior.contextHigh) >= rangeThreshold
+          );
+        })();
+        const microMoved = (() => {
+          if (!prior) return true;
+          const current = rangeWatchPayload.microBox;
+          if (!current && prior.microLow === undefined && prior.microHigh === undefined) return false;
+          if (!current || prior.microLow === undefined || prior.microHigh === undefined) return true;
+          return (
+            Math.abs(current.low - prior.microLow) >= rangeThreshold ||
+            Math.abs(current.high - prior.microHigh) >= rangeThreshold
+          );
+        })();
         const vwapMoved = (() => {
           const currentVwap = rangeWatchPayload.vwap;
           if (!prior) return true;
@@ -2952,7 +3167,7 @@ export class Orchestrator {
           prior.warnKey !== rangeWarnKey ||
           prior.mode !== rangeWatchPayload.mode;
         const shouldEmitRange =
-          (rangeMoved || vwapMoved || triggersChanged) &&
+          (rangeMoved || contextMoved || microMoved || vwapMoved || triggersChanged) &&
           this.lastRangeWatchTs !== ts;
         if (shouldEmitRange) {
           events.push(this.ev("NO_ENTRY", ts, {
@@ -2961,6 +3176,8 @@ export class Orchestrator {
             direction: setupCandidate.direction,
             price: close,
             decisionState: "WATCH",
+            modeState,
+            gateStatus,
             candidate: setupCandidate,
             decision: decisionSummary,
             volume: volumePayload,
@@ -2979,6 +3196,8 @@ export class Orchestrator {
               ...rangeWatchPayload.range,
               vwap: rangeWatchPayload.vwap,
               price: rangeWatchPayload.price,
+              contextRange: rangeWatchPayload.contextRange,
+              microBox: rangeWatchPayload.microBox,
               longArm: rangeWatchPayload.longArm,
               longEntry: rangeWatchPayload.longEntry,
               shortArm: rangeWatchPayload.shortArm,
@@ -2996,6 +3215,10 @@ export class Orchestrator {
             low: rangeWatchPayload.range.low,
             high: rangeWatchPayload.range.high,
             vwap: rangeWatchPayload.vwap,
+            contextLow: rangeWatchPayload.contextRange?.low,
+            contextHigh: rangeWatchPayload.contextRange?.high,
+            microLow: rangeWatchPayload.microBox?.low,
+            microHigh: rangeWatchPayload.microBox?.high,
             warnKey: rangeWarnKey,
             longEntry: rangeWatchPayload.longEntry,
             shortEntry: rangeWatchPayload.shortEntry,
@@ -3010,6 +3233,8 @@ export class Orchestrator {
           price: close,
           candidate: setupCandidate,
           decisionState,
+          modeState,
+          gateStatus,
           decision: decisionSummary,
           volume: volumePayload,
           marketState,
@@ -3043,6 +3268,9 @@ export class Orchestrator {
           play: decision.play,
           decision: decisionSummary,
           price: close,
+          decisionState: "SIGNAL",
+          modeState,
+          gateStatus,
           volume: volumePayload,
           marketState,
           timing: timingSnapshot,

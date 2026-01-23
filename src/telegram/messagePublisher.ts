@@ -216,10 +216,15 @@ export class MessagePublisher {
       }
     }
 
-    const hasRangeWatch = events.some((event) => event.type === "NO_ENTRY" && event.data?.range);
-    const decisionEvents = events.filter(
-      (event) => isDecisionAlertEvent(event) && !(hasRangeWatch && event.type !== "NO_ENTRY")
-    );
+    const rangeModes = new Set(["CHOP", "RANGE", "RANGE_ARMED", "RANGE_EXIT_WATCH"]);
+    const hasRangeMode = events.some((event) => rangeModes.has(event.data?.modeState));
+    const decisionEvents = events.filter((event) => {
+      if (!isDecisionAlertEvent(event)) return false;
+      if (hasRangeMode) {
+        return event.type === "NO_ENTRY" && event.data?.range;
+      }
+      return true;
+    });
     if (decisionEvents.length === 0) {
       console.log("[PUB] skipped batch: no decision alerts");
       return;

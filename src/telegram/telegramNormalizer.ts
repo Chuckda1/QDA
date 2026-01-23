@@ -19,6 +19,8 @@ export type TelegramSnapshot = {
     vwap?: number;
     price?: number;
     ts?: string;
+    contextRange?: { low: number; high: number };
+    microBox?: { low: number; high: number };
     longArm?: string;
     longEntry?: string;
     shortArm?: string;
@@ -119,6 +121,14 @@ const getPrice = (event: DomainEvent): number | undefined => {
 };
 
 const buildNextLine = (event: DomainEvent, reasons: string[], warnTags: string[]): string | undefined => {
+  const gateStatus = event.data.gateStatus as { pendingGate?: string; blockedReasons?: string[]; metrics?: { distToVwapAtr?: number } } | undefined;
+  if (gateStatus?.pendingGate) {
+    return gateStatus.pendingGate;
+  }
+  if (gateStatus?.blockedReasons && gateStatus.blockedReasons.length > 1) {
+    const top = gateStatus.blockedReasons.slice(0, 3).map(normalizeReason);
+    return `BLOCKED_BY: ${top.join(" | ")}`;
+  }
   const pullbackMatch = reasons
     .map((reason) => reason.match(/Pullback depth\s+([\d.]+)\s+is less than minimum\s+([\d.]+)/i))
     .find(Boolean);
@@ -132,7 +142,7 @@ const buildNextLine = (event: DomainEvent, reasons: string[], warnTags: string[]
     return "waiting on reclaim signal";
   }
 
-  const distToVwap = getDistToVwapAtr(event);
+  const distToVwap = gateStatus?.metrics?.distToVwapAtr ?? getDistToVwapAtr(event);
   if (warnTags.includes("EXTENDED") && isFiniteNumber(distToVwap)) {
     return `distance_to_VWAP <= ${REARM_VWAP_ATR} ATR (now ${distToVwap.toFixed(2)})`;
   }
@@ -619,6 +629,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           vwap: rangePayload.vwap,
           price: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
           ts: rangeTs,
+          contextRange: rangePayload.contextRange
+            ? { low: rangePayload.contextRange.low, high: rangePayload.contextRange.high }
+            : undefined,
+          microBox: rangePayload.microBox
+            ? { low: rangePayload.microBox.low, high: rangePayload.microBox.high }
+            : undefined,
           longArm: rangePayload.longArm,
           longEntry: rangePayload.longEntry,
           shortArm: rangePayload.shortArm,

@@ -2,6 +2,7 @@ export type Direction = "LONG" | "SHORT";
 export type Bias = "LONG" | "SHORT" | "NEUTRAL";
 export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
 export type EntryPermission = "ALLOWED" | "WAIT_FOR_PULLBACK" | "BLOCKED";
+export type ModeState = "CHOP" | "RANGE" | "RANGE_ARMED" | "RANGE_EXIT_WATCH" | "TREND_ACTIVE";
 export type PotdBias = "LONG" | "SHORT" | "NONE";
 export type PotdMode = "OFF" | "PRIOR" | "HARD";
 export type BotMode = "QUIET" | "ACTIVE";
@@ -110,6 +111,25 @@ export interface SetupCandidate {
     vwapRef?: number | null;
   };
 }
+
+export type RangeBand = {
+  low: number;
+  high: number;
+  source?: "RTH" | "OVERNIGHT" | "SESSION" | "1m" | "5m";
+  ts?: number;
+};
+
+export type GateStatus = {
+  pendingGate?: string;
+  blockedReasons?: string[];
+  metrics?: {
+    atr?: number;
+    vwap?: number;
+    distToVwap?: number;
+    distToVwapAtr?: number;
+    relVol?: number;
+  };
+};
 
 export type DomainEventType =
   | "PLAY_ARMED"

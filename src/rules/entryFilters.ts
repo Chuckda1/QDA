@@ -70,6 +70,10 @@ export class EntryFilters {
   private readonly rsiExhaustionShortThreshold = 30;
   private readonly rsiExhaustionVwapDistanceATR = 1.0;
 
+  public getRearmVwapDistanceAtr(): number {
+    return this.rearmVwapDistanceATR;
+  }
+
   /**
    * Check if a new play is allowed (all filters must pass)
    * Returns false if ANY filter blocks the entry

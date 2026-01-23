@@ -108,7 +108,12 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const timeSuffix = time ? ` | ${time}` : "";
       const modeLabel = snapshot.range.mode === "TIGHT" ? "CHOP" : "RANGE";
       const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
-      const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)}-${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
+      const contextLine = snapshot.range.contextRange
+        ? `CONTEXT_RANGE: ${formatPrice(snapshot.range.contextRange.low)}-${formatPrice(snapshot.range.contextRange.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`
+        : `CONTEXT_RANGE: n/a | VWAP ${formatPrice(snapshot.range.vwap)}`;
+      const microLine = snapshot.range.microBox
+        ? `MICRO_BOX: ${formatPrice(snapshot.range.microBox.low)}-${formatPrice(snapshot.range.microBox.high)}`
+        : "MICRO_BOX: n/a — waiting for consolidation";
       const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
       const bias = `BIAS: ${snapshot.dir} (${snapshot.conf ?? "?"}%)`;
       const planA = `PLAN A: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
@@ -121,7 +126,8 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const warn = warnTags ? `${warnTags.label}: ${warnTags.value}` : undefined;
       const lines = [
         header,
-        rangeLine,
+        contextLine,
+        microLine,
         vol,
         bias,
         planA,
@@ -132,7 +138,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         note,
         warn
       ].filter(nonEmpty);
-      return { type: "WATCH", lines: lines.slice(0, 9), text: lines.slice(0, 9).join("\n") };
+      return { type: "WATCH", lines: lines.slice(0, 10), text: lines.slice(0, 10).join("\n") };
     }
     const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
     const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk} | px ${px} | ${snapshot.ts ?? "n/a"}`;
@@ -140,7 +146,11 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
     const planStop = `STOP PLAN: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
     const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
-    const next = `NEXT: ${snapshot.next ?? "waiting on arm trigger"}`;
+    const nextText = snapshot.next ?? "waiting on arm trigger";
+    const next =
+      nextText.startsWith("BLOCKED_BY:") || nextText.startsWith("NEXT:")
+        ? nextText
+        : `NEXT: ${nextText}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
     const why = warnTags
       ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
