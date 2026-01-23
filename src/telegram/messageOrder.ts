@@ -24,6 +24,7 @@ const PRIORITY: Record<DomainEventType, number> = {
   PLAY_CANCELLED: 15,
   PLAY_CLOSED: 16,
   PREMARKET_UPDATE: 17,
+  VOLUME_UPDATE: 18,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
 };
 

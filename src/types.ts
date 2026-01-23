@@ -129,6 +129,7 @@ export type DomainEventType =
   | "PLAY_CANCELLED"
   | "PLAY_CLOSED"
   | "PREMARKET_UPDATE"
+  | "VOLUME_UPDATE"
   | "PLAN_OF_DAY";
 
 export interface DomainEvent {

@@ -19,6 +19,7 @@ const watchEvent = makeBaseEvent("NO_ENTRY", {
   direction: "LONG",
   decisionState: "WATCH",
   price: 685.76,
+  volume: { line: "LOW (0.62x) → 2 closes" },
   topPlay: {
     symbol: "SPY",
     direction: "LONG",
@@ -60,6 +61,7 @@ const signalEvent = makeBaseEvent("PLAY_ARMED", {
   },
   decisionState: "SIGNAL",
   price: 685.9,
+  volume: { line: "NORMAL (1.05x) → 2 closes" },
   marketState: {
     regime: "TREND_UP",
     permission: { mode: "NORMAL" },
@@ -114,7 +116,7 @@ assert.ok(watchSnapshot, "WATCH snapshot missing");
 const watchAlert = buildTelegramAlert(watchSnapshot!);
 assert.ok(watchAlert, "WATCH alert missing");
 assert.equal(watchAlert?.type, "WATCH");
-assert.ok(watchAlert?.lines.length <= 6, "WATCH line count exceeded");
+assert.ok(watchAlert?.lines.length <= 7, "WATCH line count exceeded");
 assert.ok(watchAlert?.text.includes("\n"), "WATCH missing newline separators");
 assert.ok(!watchAlert?.text.includes("\\n"), "WATCH contains literal \\n");
 assert.ok(watchAlert?.lines[0]?.includes("WATCH"), "WATCH header missing status");
@@ -122,9 +124,10 @@ assert.ok(watchAlert?.lines[0]?.includes("px"), "WATCH header missing px");
 assert.ok(/ET$/.test(watchAlert?.lines[0] ?? ""), "WATCH header missing ET timestamp");
 assert.ok(watchAlert?.lines[1]?.startsWith("ARM:"), "WATCH arm line missing");
 assert.ok(watchAlert?.lines[2]?.startsWith("ENTRY:"), "WATCH entry line missing");
-assert.ok(watchAlert?.lines[3]?.startsWith("STOP PLAN:"), "WATCH stop plan line missing");
-assert.ok(watchAlert?.lines[4]?.startsWith("NEXT:"), "WATCH next line missing");
-assert.ok(watchAlert?.lines[5]?.startsWith("WHY:"), "WATCH why line missing");
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("VOL:")), "WATCH volume line missing");
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("STOP PLAN:")), "WATCH stop plan line missing");
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("NEXT:")), "WATCH next line missing");
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("WHY:")), "WATCH why line missing");
 const watchText = watchAlert?.lines.join(" ") ?? "";
 assert.ok(!watchText.includes("WAIT_FOR_PULLBACK"), "WATCH contains raw blocker text");
 assert.ok(!watchText.includes("extended-from-mean"), "WATCH contains raw blocker text");
@@ -176,7 +179,7 @@ assert.ok(signalSnapshot, "SIGNAL snapshot missing");
 const signalAlert = buildTelegramAlert(signalSnapshot!);
 assert.ok(signalAlert, "SIGNAL alert missing");
 assert.equal(signalAlert?.type, "SIGNAL");
-assert.ok(signalAlert?.lines.length <= 6, "SIGNAL line count exceeded");
+assert.ok(signalAlert?.lines.length <= 7, "SIGNAL line count exceeded");
 assert.ok(signalAlert?.text.includes("\n"), "SIGNAL missing newline separators");
 assert.ok(!signalAlert?.text.includes("\\n"), "SIGNAL contains literal \\n");
 assert.ok(signalAlert?.lines[0]?.includes("SIGNAL"), "SIGNAL header missing status");
@@ -186,7 +189,8 @@ assert.ok(signalAlert?.lines[1]?.startsWith("ENTRY:"), "SIGNAL entry line missin
 assert.ok(signalAlert?.lines[2]?.startsWith("STOP:"), "SIGNAL stop line missing");
 assert.ok(signalAlert?.lines[3]?.startsWith("TP1:"), "SIGNAL TP1 line missing");
 assert.ok(signalAlert?.lines[4]?.startsWith("SIZE:"), "SIGNAL size line missing");
-assert.ok(signalAlert?.lines[5]?.startsWith("WHY:"), "SIGNAL why line missing");
+assert.ok(signalAlert?.lines.some((l) => l.startsWith("VOL:")), "SIGNAL volume line missing");
+assert.ok(signalAlert?.lines.some((l) => l.startsWith("WHY:")), "SIGNAL why line missing");
 assert.ok(!/WAIT_FOR_|arming_failed|entry_filter|BLOCKED|SETUP CANDIDATES/i.test(signalAlert?.text ?? ""), "SIGNAL contains raw blocker token");
 assert.ok(signalAlert?.lines[0]?.includes("✅"), "SIGNAL header missing emoji");
 

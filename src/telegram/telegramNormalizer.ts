@@ -1,5 +1,6 @@
 import type { Direction, DomainEvent } from "../types.js";
 import { getDecisionState } from "../utils/decisionState.js";
+import { volumePolicy } from "../utils/volumePolicy.js";
 
 export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
 
@@ -11,6 +12,7 @@ export type TelegramSnapshot = {
   risk: string;
   px?: number;
   ts?: string;
+  volumeLine?: string;
   range?: {
     low: number;
     high: number;
@@ -435,6 +437,33 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const ts = formatEtTimestamp(event.timestamp);
   const next = buildNextLine(event, reasons, warnTags);
   const chaseAllowed = entryMode === "MOMENTUM" && !warnTags.includes("EXTENDED") && !warnTags.includes("RISK_ATR");
+  let volumeLine = typeof event.data.volume?.line === "string" ? event.data.volume.line : undefined;
+  if (!volumeLine && relVol !== undefined) {
+    const policy = volumePolicy(relVol);
+    const suffix = policy.requiresRetest ? " + retest" : policy.allowOneBarBreakout ? " ok" : "";
+    volumeLine = `${policy.label} (${relVol.toFixed(2)}x) → ${policy.confirmBarsRequired} closes${suffix}`;
+  }
+
+  if (event.type === "VOLUME_UPDATE") {
+    const update = event.data.update ?? {};
+    const cause = update.cause ?? `volume ${event.data.volume?.label ?? event.data.volume?.regime ?? "update"}`;
+    const nextLine = update.next ?? "confirm with price + volume";
+    return {
+      type: "UPDATE",
+      symbol,
+      dir,
+      conf,
+      risk,
+      px,
+      ts,
+      update: {
+        cause,
+        next: nextLine,
+        ts,
+        price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+      },
+    };
+  }
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
@@ -451,6 +480,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      volumeLine,
       update: {
         cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
         next: `levels ${levels}${arm}`,
@@ -543,6 +573,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      volumeLine,
       entryTrigger: buildEntryTrigger(entryZone, dir),
       entryTriggerTf: indicatorTf,
       stop,
@@ -579,6 +610,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        volumeLine,
         px: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
         ts: rangeTs,
         range: {
@@ -656,6 +688,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        volumeLine,
         px,
         ts,
         armCondition: hardArm,
@@ -701,6 +734,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         dir,
         conf,
         risk,
+        volumeLine,
         px,
         ts,
         armCondition: derivedArm,
@@ -751,6 +785,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       dir,
       conf,
       risk,
+      volumeLine,
       px,
       ts,
       armCondition: derivedArm,

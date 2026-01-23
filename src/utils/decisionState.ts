@@ -25,6 +25,7 @@ const DECISION_ALERT_EVENT_TYPES = new Set<DomainEventType>([
   "NO_ENTRY",
   "LLM_COACH_UPDATE",
   "PREMARKET_UPDATE",
+  "VOLUME_UPDATE",
   "PLAN_OF_DAY"
 ]);
 

@@ -13,6 +13,7 @@ import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
 import { requiresDecisionState } from "../utils/decisionState.js";
+import { volumePolicy } from "../utils/volumePolicy.js";
 import {
   buildDecision,
   buildNoEntryDecision,
@@ -229,6 +230,8 @@ export class Orchestrator {
     rangeWidth: number;
     ts: number;
   } | null = null;
+  private lastVolumeRegime: string | null = null;
+  private lastVolumeRegimeTs: number | null = null;
   private rangeModeActive: boolean = false;
   private rangeModeConsecutiveTrue: number = 0;
   private rangeModeConsecutiveFalse: number = 0;
@@ -1901,6 +1904,19 @@ export class Orchestrator {
       else if (isLowVol) volumeWarnings.push(`LOW_VOL: ${volumeNote}`);
       if (isVolSpike) volumeWarnings.push(`VOL_SPIKE: ${volumeNote}`);
       if (isClimaxVol) volumeWarnings.push(`CLIMAX_VOL: ${volumeNote}`);
+      const volumeInfo = volumePolicy(relVol);
+      const volumeRelText = relVol !== undefined ? relVol.toFixed(2) : "n/a";
+      const volumeSuffix = volumeInfo.requiresRetest ? " + retest" : volumeInfo.allowOneBarBreakout ? " ok" : "";
+      const volumeLine = `${volumeInfo.label} (${volumeRelText}x) → ${volumeInfo.confirmBarsRequired} closes${volumeSuffix}`;
+      const volumePayload = {
+        regime: volumeInfo.regime,
+        label: volumeInfo.label,
+        relVol,
+        confirmBarsRequired: volumeInfo.confirmBarsRequired,
+        allowOneBarBreakout: volumeInfo.allowOneBarBreakout,
+        requiresRetest: volumeInfo.requiresRetest,
+        line: volumeLine,
+      };
       const volumeCap = isThinTape ? 70 : isLowVol ? 85 : isClimaxVol ? 90 : undefined;
       const structureAligned =
         (tacticalSnapshot.activeDirection === "LONG" && anchorRegime.structure === "BULLISH") ||
@@ -1983,6 +1999,22 @@ export class Orchestrator {
         structure: anchorRegime.structure,
         volume: candidateVolume
       };
+
+      if (this.state.mode === "ACTIVE" && this.lastVolumeRegime !== volumeInfo.regime && this.lastVolumeRegimeTs !== ts) {
+        events.push(this.ev("VOLUME_UPDATE", ts, {
+          symbol,
+          direction: setupCandidate.direction,
+          price: close,
+          decisionState: "UPDATE",
+          volume: volumePayload,
+          update: {
+            cause: `volume ${volumeInfo.label} (${volumeRelText}x)`,
+            next: `confirm ${volumeInfo.confirmBarsRequired} closes${volumeInfo.requiresRetest ? " + retest" : ""}`,
+          },
+        }));
+        this.lastVolumeRegime = volumeInfo.regime;
+        this.lastVolumeRegimeTs = ts;
+      }
 
       const ruleScores = {
         tacticalSnapshot,
@@ -2499,6 +2531,30 @@ export class Orchestrator {
         baseBlockers.softBlockers.push("guardrail");
         baseBlockers.softReasons.push(reason);
       }
+      const volumeConfirmOk = (() => {
+        const bars1m = this.recentBars1m;
+        const entryZone = setupCandidate.entryZone;
+        if (!entryZone || !bars1m.length) return true;
+        if (bars1m.length < volumeInfo.confirmBarsRequired) return false;
+        const threshold = setupCandidate.direction === "LONG" ? entryZone.high : entryZone.low;
+        const recent = bars1m.slice(-volumeInfo.confirmBarsRequired);
+        const priceConfirmed = recent.every((bar) =>
+          setupCandidate.direction === "LONG" ? bar.close > threshold : bar.close < threshold
+        );
+        if (!priceConfirmed) return false;
+        const volumeConfirmed =
+          relVol === undefined ? true : relVol >= 0.9 || volumeInfo.regime === "VOL_SPIKE" || volumeInfo.regime === "CLIMAX_VOL";
+        if (!volumeConfirmed) return false;
+        if (!volumeInfo.requiresRetest) return true;
+        let lastRetestIdx = -1;
+        for (let i = 0; i < bars1m.length; i += 1) {
+          const closeNow = bars1m[i]!.close;
+          if (closeNow >= entryZone.low && closeNow <= entryZone.high) {
+            lastRetestIdx = i;
+          }
+        }
+        return lastRetestIdx !== -1 && lastRetestIdx < bars1m.length - volumeInfo.confirmBarsRequired;
+      })();
       const chopSignals = new Set<string>();
       if (anchorRegime.regime === "CHOP") chopSignals.add("CHOP");
       if (shockMode) chopSignals.add("SHOCK");
@@ -2562,6 +2618,11 @@ export class Orchestrator {
         : "SIGNAL";
       const lowVolRequiresWatch = (isThinTape || isLowVol) && !isVolSpike;
       if (decisionState === "SIGNAL" && lowVolRequiresWatch) {
+        decisionState = "WATCH";
+      }
+      if (decisionState === "SIGNAL" && !volumeConfirmOk) {
+        baseBlockers.softBlockers.push("guardrail");
+        baseBlockers.softReasons.push(`VOLUME_CONFIRM: ${volumeLine}`);
         decisionState = "WATCH";
       }
       const rangeCondition =
@@ -2902,6 +2963,7 @@ export class Orchestrator {
             decisionState: "WATCH",
             candidate: setupCandidate,
             decision: decisionSummary,
+            volume: volumePayload,
             marketState,
             timing: timingSnapshot,
             topPlay,
@@ -2949,6 +3011,7 @@ export class Orchestrator {
           candidate: setupCandidate,
           decisionState,
           decision: decisionSummary,
+          volume: volumePayload,
           marketState,
           timing: timingSnapshot,
           topPlay,
@@ -2980,6 +3043,7 @@ export class Orchestrator {
           play: decision.play,
           decision: decisionSummary,
           price: close,
+          volume: volumePayload,
           marketState,
           timing: timingSnapshot,
           topPlay,

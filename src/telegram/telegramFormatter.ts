@@ -7,8 +7,8 @@ export type TelegramAlert = {
 };
 
 const MAX_LINES: Record<TelegramSnapshotType, number> = {
-  SIGNAL: 6,
-  WATCH: 6,
+  SIGNAL: 7,
+  WATCH: 7,
   UPDATE: 3,
   MANAGE: 4,
 };
@@ -93,11 +93,12 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const stop = `STOP: ${formatPrice(snapshot.stop)} | INVALID: ${snapshot.invalidation ?? "n/a"}`;
     const tp = `TP1: ${formatPrice(snapshot.tp1)} | TP2: ${formatPrice(snapshot.tp2)} | MGMT: SL→BE after TP1`;
     const size = `SIZE: ${(snapshot.sizeMultiplier ?? 1).toFixed(2)}x | MODE: ${snapshot.entryMode ?? "PULLBACK"}`;
+    const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
     const warnTags = formatWarnTags(snapshot.warnTags);
     const why = warnTags
       ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
       : `WHY: ${snapshot.why ?? "n/a"}`;
-    const lines = enforceLineLimit("SIGNAL", [header, entry, stop, tp, size, why].filter(nonEmpty));
+    const lines = enforceLineLimit("SIGNAL", [header, entry, stop, tp, size, vol, why].filter(nonEmpty));
     return { type: "SIGNAL", lines, text: lines.join("\n") };
   }
 
@@ -108,6 +109,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const modeLabel = snapshot.range.mode === "TIGHT" ? "CHOP" : "RANGE";
       const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
       const rangeLine = `RANGE: ${formatPrice(snapshot.range.low)}-${formatPrice(snapshot.range.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`;
+      const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
       const bias = "BIAS: neutral range";
       const breakout = `BREAKOUT: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
       const breakdown = `BREAKDOWN: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
@@ -120,6 +122,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const lines = [
         header,
         rangeLine,
+        vol,
         bias,
         breakout,
         breakdown,
@@ -136,12 +139,13 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const arm = `ARM: ${snapshot.armCondition ?? "n/a"} (creates play)`;
     const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
     const planStop = `STOP PLAN: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
+    const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
     const next = `NEXT: ${snapshot.next ?? "waiting on arm trigger"}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
     const why = warnTags
       ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
       : `WHY: ${snapshot.why ?? "n/a"}`;
-    const lines = enforceLineLimit("WATCH", [header, arm, entry, planStop, next, why].filter(nonEmpty));
+    const lines = enforceLineLimit("WATCH", [header, arm, entry, vol, planStop, next, why].filter(nonEmpty));
     return { type: "WATCH", lines, text: lines.join("\n") };
   }
 

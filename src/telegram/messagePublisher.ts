@@ -216,7 +216,10 @@ export class MessagePublisher {
       }
     }
 
-    const decisionEvents = events.filter((event) => isDecisionAlertEvent(event));
+    const hasRangeWatch = events.some((event) => event.type === "NO_ENTRY" && event.data?.range);
+    const decisionEvents = events.filter(
+      (event) => isDecisionAlertEvent(event) && !(hasRangeWatch && event.type !== "NO_ENTRY")
+    );
     if (decisionEvents.length === 0) {
       console.log("[PUB] skipped batch: no decision alerts");
       return;
