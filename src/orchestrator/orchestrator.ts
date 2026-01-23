@@ -2239,8 +2239,8 @@ export class Orchestrator {
         ...(setupCandidate.warningFlags ?? []),
         ...(setupCandidate.flags ?? [])
       ]);
-      const isThinTape = volumeFlags.has("THIN_TAPE") || (relVol !== undefined && relVol < 0.45);
-      const isLowVol = volumeFlags.has("LOW_VOL") || (relVol !== undefined && relVol < 0.7);
+      const isThinTape = volumeFlags.has("THIN_TAPE") || (relVol !== undefined && relVol < 0.7);
+      const isLowVol = false;
       const isVolSpike = volumeFlags.has("VOL_SPIKE") || (relVol !== undefined && relVol >= 1.5);
       const isClimaxVol = volumeFlags.has("CLIMAX_VOL") || (relVol !== undefined && relVol >= 2.5);
       const volumeNote = relVol !== undefined ? `relVol=${relVol.toFixed(2)}` : "relVol=n/a";
@@ -2249,17 +2249,26 @@ export class Orchestrator {
       else if (isLowVol) volumeWarnings.push(`LOW_VOL: ${volumeNote}`);
       if (isVolSpike) volumeWarnings.push(`VOL_SPIKE: ${volumeNote}`);
       if (isClimaxVol) volumeWarnings.push(`CLIMAX_VOL: ${volumeNote}`);
-      const volumeInfo = volumePolicy(relVol);
+      const volumeRegime =
+        relVol === undefined ? "UNKNOWN" : relVol < 0.7 ? "THIN_TAPE" : relVol > 1.5 ? "HEAVY" : "NORMAL";
+      const confirmBarsRequired = volumeRegime === "HEAVY" ? 1 : 2;
+      const requiresRetest = volumeRegime === "THIN_TAPE";
       const volumeRelText = relVol !== undefined ? relVol.toFixed(2) : "n/a";
-      const volumeSuffix = volumeInfo.requiresRetest ? " + retest" : volumeInfo.allowOneBarBreakout ? " ok" : "";
-      const volumeLine = `${volumeInfo.label} (${volumeRelText}x) → ${volumeInfo.confirmBarsRequired} closes${volumeSuffix}`;
+      const volumeRule = relVol === undefined
+        ? "missing relVol"
+        : `${confirmBarsRequired} closes${requiresRetest ? " + retest" : ""}`;
+      const volumeLine =
+        relVol === undefined
+          ? "UNKNOWN (missing relVol) -> downgrade to WATCH"
+          : `relVol=${volumeRelText} (${volumeRegime}) | rule=${volumeRule}`;
       const volumePayload = {
-        regime: volumeInfo.regime,
-        label: volumeInfo.label,
+        regime: volumeRegime,
+        label: volumeRegime,
         relVol,
-        confirmBarsRequired: volumeInfo.confirmBarsRequired,
-        allowOneBarBreakout: volumeInfo.allowOneBarBreakout,
-        requiresRetest: volumeInfo.requiresRetest,
+        confirmBarsRequired,
+        requiresRetest,
+        closesMet: 0,
+        retestOk: !requiresRetest,
         line: volumeLine,
       };
       const volumeCap = isThinTape ? 70 : isLowVol ? 85 : isClimaxVol ? 90 : undefined;
@@ -2345,7 +2354,7 @@ export class Orchestrator {
         volume: candidateVolume
       };
 
-      if (this.state.mode === "ACTIVE" && this.lastVolumeRegime !== volumeInfo.regime && this.lastVolumeRegimeTs !== ts) {
+      if (this.state.mode === "ACTIVE" && this.lastVolumeRegime !== volumeRegime && this.lastVolumeRegimeTs !== ts) {
         events.push(this.ev("VOLUME_UPDATE", ts, {
           symbol,
           direction: setupCandidate.direction,
@@ -2354,11 +2363,11 @@ export class Orchestrator {
           modeState: anchorRegime.regime === "CHOP" ? "CHOP" : "TREND_ACTIVE",
           volume: volumePayload,
           update: {
-            cause: `volume ${volumeInfo.label} (${volumeRelText}x)`,
-            next: `confirm ${volumeInfo.confirmBarsRequired} closes${volumeInfo.requiresRetest ? " + retest" : ""}`,
+            cause: `volume ${volumeRegime} (${volumeRelText}x)`,
+            next: `confirm ${confirmBarsRequired} closes${requiresRetest ? " + retest" : ""}`,
           },
         }));
-        this.lastVolumeRegime = volumeInfo.regime;
+        this.lastVolumeRegime = volumeRegime;
         this.lastVolumeRegimeTs = ts;
       }
 
@@ -2879,28 +2888,35 @@ export class Orchestrator {
         baseBlockers.softBlockers.push("guardrail");
         baseBlockers.softReasons.push(reason);
       }
-      if (isThinTape || isLowVol) {
-        const reason = isThinTape
-          ? `THIN_TAPE: ${volumeNote} require 3 closes`
-          : `LOW_VOL: ${volumeNote} require 2 closes`;
-        baseBlockers.softBlockers.push("guardrail");
-        baseBlockers.softReasons.push(reason);
-      }
+      const volumeGateReasons: string[] = [];
       const volumeConfirmOk = (() => {
         const bars1m = this.recentBars1m;
         const entryZone = setupCandidate.entryZone;
-        if (!entryZone || !bars1m.length) return true;
-        if (bars1m.length < volumeInfo.confirmBarsRequired) return false;
+        if (!entryZone || !bars1m.length) return false;
+        if (relVol === undefined) {
+          volumeGateReasons.push("VOLUME_UNKNOWN: relVol missing");
+          return false;
+        }
+        if (bars1m.length < confirmBarsRequired) {
+          volumeGateReasons.push(`NEED_${confirmBarsRequired}_CLOSES: bars=${bars1m.length}`);
+          return false;
+        }
         const threshold = setupCandidate.direction === "LONG" ? entryZone.high : entryZone.low;
-        const recent = bars1m.slice(-volumeInfo.confirmBarsRequired);
-        const priceConfirmed = recent.every((bar) =>
-          setupCandidate.direction === "LONG" ? bar.close > threshold : bar.close < threshold
-        );
-        if (!priceConfirmed) return false;
-        const volumeConfirmed =
-          relVol === undefined ? true : relVol >= 0.9 || volumeInfo.regime === "VOL_SPIKE" || volumeInfo.regime === "CLIMAX_VOL";
-        if (!volumeConfirmed) return false;
-        if (!volumeInfo.requiresRetest) return true;
+        let closesMet = 0;
+        for (let i = bars1m.length - 1; i >= 0; i -= 1) {
+          const closeNow = bars1m[i]!.close;
+          const ok = setupCandidate.direction === "LONG" ? closeNow > threshold : closeNow < threshold;
+          if (!ok) break;
+          closesMet += 1;
+        }
+        volumePayload.closesMet = closesMet;
+        if (closesMet < confirmBarsRequired) {
+          volumeGateReasons.push(`NEED_${confirmBarsRequired}_CLOSES: ${closesMet}/${confirmBarsRequired}`);
+          return false;
+        }
+        if (!requiresRetest) {
+          return true;
+        }
         let lastRetestIdx = -1;
         for (let i = 0; i < bars1m.length; i += 1) {
           const closeNow = bars1m[i]!.close;
@@ -2908,8 +2924,21 @@ export class Orchestrator {
             lastRetestIdx = i;
           }
         }
-        return lastRetestIdx !== -1 && lastRetestIdx < bars1m.length - volumeInfo.confirmBarsRequired;
+        const retestOk = lastRetestIdx !== -1 && lastRetestIdx < bars1m.length - confirmBarsRequired;
+        volumePayload.retestOk = retestOk;
+        if (!retestOk) {
+          volumeGateReasons.push("NEED_RETEST");
+          return false;
+        }
+        return true;
       })();
+      if (relVol !== undefined && volumeRegime === "THIN_TAPE") {
+        volumeGateReasons.push(`LOW_VOLUME: relVol=${relVol.toFixed(2)} < 0.70`);
+      }
+      if (!volumeConfirmOk && volumeGateReasons.length) {
+        baseBlockers.softBlockers.push("guardrail");
+        baseBlockers.softReasons.push(...volumeGateReasons);
+      }
       const chopSignals = new Set<string>();
       if (anchorRegime.regime === "CHOP") chopSignals.add("CHOP");
       if (shockMode) chopSignals.add("SHOCK");
@@ -2971,10 +3000,6 @@ export class Orchestrator {
         : hasHardBlockers || softBlockers.length
         ? "WATCH"
         : "SIGNAL";
-      const lowVolRequiresWatch = (isThinTape || isLowVol) && !isVolSpike;
-      if (decisionState === "SIGNAL" && lowVolRequiresWatch) {
-        decisionState = "WATCH";
-      }
       if (decisionState === "SIGNAL" && !volumeConfirmOk) {
         baseBlockers.softBlockers.push("guardrail");
         baseBlockers.softReasons.push(`VOLUME_CONFIRM: ${volumeLine}`);

@@ -327,10 +327,8 @@ export class SetupEngine {
       const flags = new Set(candidate.flags ?? []);
       if (extendedFromMean !== undefined && extendedFromMean >= 1) flags.add("EXTENDED");
       if (reclaimSignal === "NONE") flags.add("WEAK_RECLAIM");
-      if (relVolume !== undefined && relVolume < 0.45) {
+      if (relVolume !== undefined && relVolume < 0.7) {
         flags.add("THIN_TAPE");
-      } else if (relVolume !== undefined && relVolume < 0.7) {
-        flags.add("LOW_VOL");
       }
       if (relVolume !== undefined && relVolume >= 1.5) flags.add("VOL_SPIKE");
       if (relVolume !== undefined && relVolume >= 2.5) flags.add("CLIMAX_VOL");

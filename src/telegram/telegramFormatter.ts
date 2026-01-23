@@ -8,7 +8,7 @@ export type TelegramAlert = {
 
 const MAX_LINES: Record<TelegramSnapshotType, number> = {
   SIGNAL: 7,
-  WATCH: 7,
+  WATCH: 8,
   UPDATE: 3,
   MANAGE: 4,
 };
@@ -120,6 +120,8 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
       const rangeBias = snapshot.rangeBias?.bias ?? snapshot.dir;
       const rangeConf = snapshot.rangeBias?.confidence ?? snapshot.conf;
+      const status = snapshot.status ?? "WATCH";
+      const statusLine = `STATUS: ${status}`;
       const bias = `BIAS: ${rangeBias} (${rangeConf ?? "?"}%)`;
       const location = snapshot.range.location
         ? `LOCATION: ${snapshot.range.location.zone} (pos=${snapshot.range.location.pos})`
@@ -128,17 +130,21 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const activeLine = `ACTIVE_SIDE: ${activeSide}`;
       const planA =
         activeSide === "LONG_ONLY"
-          ? `PLAN: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`
+          ? `PLAN${status === "WATCH" ? " (IF/WHEN gates pass)" : ""}: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`
           : "LONG disabled (not at range low)";
       const planB =
         activeSide === "SHORT_ONLY"
-          ? `PLAN: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`
+          ? `PLAN${status === "WATCH" ? " (IF/WHEN gates pass)" : ""}: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`
           : activeSide === "NONE"
           ? "MID zone: wait for breakout confirmation"
           : "SHORT disabled (not at range high)";
-      const arm = "ARM: retest range (bot creates play)";
+      const arm =
+        status === "SIGNAL" && snapshot.volumeRetestOk !== false
+          ? "ARM: retest range (bot creates play)"
+          : undefined;
       const stop = `STOP: ${snapshot.range.stopAnchor || "when armed"}`;
-      const next = "NEXT: wait for break+hold → bot creates play";
+      const blockedBy = snapshot.blockedBy?.length ? `BLOCKED_BY: ${snapshot.blockedBy.join(" | ")}` : undefined;
+      const gates = snapshot.gates;
       const note = snapshot.range.note ? `NOTE: ${snapshot.range.note}` : undefined;
       const warnTags = formatWarnTags(snapshot.warnTags);
       const warn = warnTags ? `${warnTags.label}: ${warnTags.value}` : undefined;
@@ -148,18 +154,20 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         bufferLine,
         microLine,
         vol,
+        statusLine,
         location,
         bias,
         activeLine,
         planA,
         planB,
-        arm,
+        blockedBy,
+        gates,
         stop,
-        next,
+        arm,
         note,
         warn
       ].filter(nonEmpty);
-      return { type: "WATCH", lines: lines.slice(0, 12), text: lines.slice(0, 12).join("\n") };
+      return { type: "WATCH", lines: lines.slice(0, 14), text: lines.slice(0, 14).join("\n") };
     }
     const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
     const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk} | px ${px} | ${snapshot.ts ?? "n/a"}`;
@@ -167,16 +175,23 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
     const planStop = `STOP PLAN: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
     const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
+    const blockedBy = snapshot.blockedBy?.length ? `BLOCKED_BY: ${snapshot.blockedBy.join(" | ")}` : undefined;
+    const gates = snapshot.gates;
     const nextText = snapshot.next ?? "waiting on arm trigger";
     const next =
-      nextText.startsWith("BLOCKED_BY:") || nextText.startsWith("NEXT:")
+      blockedBy || gates
+        ? undefined
+        : nextText.startsWith("BLOCKED_BY:") || nextText.startsWith("NEXT:")
         ? nextText
         : `NEXT: ${nextText}`;
     const warnTags = formatWarnTags(snapshot.warnTags);
     const why = warnTags
       ? `WHY: ${snapshot.why ?? "n/a"} | ${warnTags.label}: ${warnTags.value}`
       : `WHY: ${snapshot.why ?? "n/a"}`;
-    const lines = enforceLineLimit("WATCH", [header, arm, entry, vol, planStop, next, why].filter(nonEmpty));
+    const lines = enforceLineLimit(
+      "WATCH",
+      [header, arm, entry, vol, planStop, blockedBy, gates, next, why].filter(nonEmpty)
+    );
     return { type: "WATCH", lines, text: lines.join("\n") };
   }
 

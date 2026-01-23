@@ -14,6 +14,10 @@ export type TelegramSnapshot = {
   ts?: string;
   modeState?: string;
   volumeLine?: string;
+  status?: "WATCH" | "SIGNAL";
+  blockedBy?: string[];
+  gates?: string;
+  volumeRetestOk?: boolean;
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
     low: number;
@@ -124,6 +128,24 @@ const getPrice = (event: DomainEvent): number | undefined => {
     event.data.topPlay?.triggerPrice ??
     event.data.play?.entryPrice;
   return isFiniteNumber(px) ? px : undefined;
+};
+
+const buildGatesLine = (event: DomainEvent): string | undefined => {
+  const gates: string[] = [];
+  const volume = event.data.volume;
+  if (volume) {
+    const rel = Number.isFinite(volume.relVol) ? volume.relVol.toFixed(2) : "n/a";
+    const regime = volume.regime ?? volume.label ?? "UNKNOWN";
+    gates.push(`relVol=${rel} ${regime}`);
+    if (Number.isFinite(volume.confirmBarsRequired)) {
+      const closes = Number.isFinite(volume.closesMet) ? volume.closesMet : 0;
+      gates.push(`closes=${closes}/${volume.confirmBarsRequired}`);
+    }
+    if (volume.requiresRetest) {
+      gates.push(`retest=${volume.retestOk ? "ok" : "no"}`);
+    }
+  }
+  return gates.length ? `GATES: ${gates.join(", ")}` : undefined;
 };
 
 const buildDataStaleUpdate = (event: DomainEvent, decisionState?: string): TelegramSnapshot | null => {
@@ -491,6 +513,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const px = getPrice(event);
   const ts = formatEtTimestamp(event.timestamp);
   const next = buildNextLine(event, reasons, warnTags);
+  const blockedBy = event.data.gateStatus?.blockedReasons?.slice(0, 3);
+  const gatesLine = buildGatesLine(event);
   const chaseAllowed = entryMode === "MOMENTUM" && !warnTags.includes("EXTENDED") && !warnTags.includes("RISK_ATR");
   let volumeLine = typeof event.data.volume?.line === "string" ? event.data.volume.line : undefined;
   if (!volumeLine && relVol !== undefined) {
@@ -672,6 +696,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         conf,
         risk,
         volumeLine,
+        status: decisionState === "SIGNAL" ? "SIGNAL" : "WATCH",
+        blockedBy,
+        gates: gatesLine,
+        volumeRetestOk: event.data.volume?.retestOk,
         px: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
         ts: rangeTs,
         modeState: event.data.modeState,
@@ -768,6 +796,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         conf,
         risk,
         volumeLine,
+        status: decisionState === "SIGNAL" ? "SIGNAL" : "WATCH",
+        blockedBy,
+        gates: gatesLine,
+        volumeRetestOk: event.data.volume?.retestOk,
         px,
         ts,
         armCondition: hardArm,
@@ -814,6 +846,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         conf,
         risk,
         volumeLine,
+        status: decisionState === "SIGNAL" ? "SIGNAL" : "WATCH",
+        blockedBy,
+        gates: gatesLine,
+        volumeRetestOk: event.data.volume?.retestOk,
         px,
         ts,
         armCondition: derivedArm,
@@ -865,6 +901,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       conf,
       risk,
       volumeLine,
+      status: decisionState === "SIGNAL" ? "SIGNAL" : "WATCH",
+      blockedBy,
+      gates: gatesLine,
+      volumeRetestOk: event.data.volume?.retestOk,
       px,
       ts,
       armCondition: derivedArm,

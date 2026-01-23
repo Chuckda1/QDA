@@ -123,7 +123,7 @@ assert.ok(watchSnapshot, "WATCH snapshot missing");
 const watchAlert = buildTelegramAlert(watchSnapshot!);
 assert.ok(watchAlert, "WATCH alert missing");
 assert.equal(watchAlert?.type, "WATCH");
-assert.ok(watchAlert?.lines.length <= 7, "WATCH line count exceeded");
+assert.ok(watchAlert?.lines.length <= 8, "WATCH line count exceeded");
 assert.ok(watchAlert?.text.includes("\n"), "WATCH missing newline separators");
 assert.ok(!watchAlert?.text.includes("\\n"), "WATCH contains literal \\n");
 assert.ok(watchAlert?.lines[0]?.includes("WATCH"), "WATCH header missing status");
@@ -133,23 +133,28 @@ assert.ok(watchAlert?.lines[1]?.startsWith("ARM:"), "WATCH arm line missing");
 assert.ok(watchAlert?.lines[2]?.startsWith("ENTRY:"), "WATCH entry line missing");
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("VOL:")), "WATCH volume line missing");
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("STOP PLAN:")), "WATCH stop plan line missing");
-assert.ok(watchAlert?.lines.some((l) => l.startsWith("NEXT:")), "WATCH next line missing");
-assert.ok(
-  watchAlert?.lines.some((l) => l.includes("distance_to_VWAP <= 0.8 ATR (now 0.11)")),
-  "WATCH next line should use pending gate"
-);
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("BLOCKED_BY:")), "WATCH blocked line missing");
+assert.ok(watchAlert?.lines.some((l) => l.startsWith("GATES:")), "WATCH gates line missing");
 assert.ok(watchAlert?.lines.some((l) => l.startsWith("WHY:")), "WATCH why line missing");
 const watchText = watchAlert?.lines.join(" ") ?? "";
-assert.ok(!watchText.includes("WAIT_FOR_PULLBACK"), "WATCH contains raw blocker text");
-assert.ok(!watchText.includes("extended-from-mean"), "WATCH contains raw blocker text");
-assert.ok(!watchText.includes("RISK_CAP"), "WATCH contains raw blocker text");
-assert.ok(!/WAIT_FOR_|arming_failed|entry_filter|BLOCKED|SETUP CANDIDATES/i.test(watchText), "WATCH contains raw blocker token");
 assert.ok(/^[A-Z]+/.test(watchAlert?.lines[0] ?? ""), "WATCH header malformed");
 
 const rangeEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   direction: "LONG",
   decisionState: "WATCH",
+  gateStatus: {
+    blockedReasons: ["LOW_VOLUME: relVol=0.50 < 0.70", "NEED_2_CLOSES: 1/2", "NEED_RETEST"],
+  },
+  volume: {
+    regime: "THIN_TAPE",
+    relVol: 0.5,
+    confirmBarsRequired: 2,
+    closesMet: 1,
+    requiresRetest: true,
+    retestOk: false,
+    line: "relVol=0.50 (THIN_TAPE) | rule=2 closes + retest",
+  },
   range: {
     low: 689.2,
     high: 690.1,
@@ -174,22 +179,53 @@ assert.ok(rangeSnapshot, "Range WATCH snapshot missing");
 assert.ok(rangeSnapshot?.range, "Range WATCH missing range payload");
 const rangeAlert = buildTelegramAlert(rangeSnapshot!);
 assert.ok(rangeAlert, "Range WATCH alert missing");
-assert.ok(rangeAlert?.lines.length <= 12, "Range WATCH line count exceeded");
+assert.ok(rangeAlert?.lines.length <= 14, "Range WATCH line count exceeded");
 assert.ok(rangeAlert?.lines[0]?.includes("WATCH"), "Range WATCH header missing WATCH");
 assert.ok(rangeAlert?.lines[0]?.includes("RANGE"), "Range WATCH header missing RANGE");
 assert.ok(rangeAlert?.lines[0]?.includes("ET"), "Range WATCH header missing ET time");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("CONTEXT_RANGE:")), "Range WATCH missing context range line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("MICRO_BOX:")), "Range WATCH missing micro box line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STATUS:")), "Range WATCH missing status line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BIAS:")), "Range WATCH missing bias line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("ACTIVE_SIDE:")), "Range WATCH missing active side line");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN:")), "Range WATCH missing plan line");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("ARM:")), "Range WATCH missing arm line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("PLAN")), "Range WATCH missing plan line");
 assert.ok(rangeAlert?.lines.some((l) => l.startsWith("STOP:")), "Range WATCH missing stop anchor");
-assert.ok(rangeAlert?.lines.some((l) => l.startsWith("NEXT:")), "Range WATCH missing next line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("BLOCKED_BY:")), "Range WATCH missing blocked line");
+assert.ok(rangeAlert?.lines.some((l) => l.startsWith("GATES:")), "Range WATCH missing gates line");
 assert.ok(
   rangeAlert?.lines.some((l) => l.includes("+1")),
   "Range WATCH warn tags should be capped"
 );
+
+const lowVolEvent = makeBaseEvent("NO_ENTRY", {
+  symbol: "SPY",
+  direction: "LONG",
+  decisionState: "WATCH",
+  gateStatus: {
+    blockedReasons: ["LOW_VOLUME: relVol=0.45 < 0.70", "NEED_2_CLOSES: 1/2"],
+  },
+  volume: {
+    regime: "THIN_TAPE",
+    relVol: 0.45,
+    confirmBarsRequired: 2,
+    closesMet: 1,
+    requiresRetest: true,
+    retestOk: false,
+    line: "relVol=0.45 (THIN_TAPE) | rule=2 closes + retest",
+  },
+  topPlay: {
+    entryZone: { low: 688.0, high: 688.4 },
+    stop: 687.6,
+    targets: { t1: 689.0, t2: 689.4, t3: 690.0 },
+  },
+  marketState: { permission: { mode: "NORMAL" }, tacticalSnapshot: { confidence: 70 }, dataReadiness: { ready: true } },
+  decision: { decisionState: "WATCH" },
+});
+const lowVolSnapshot = normalizeTelegramSnapshot(lowVolEvent);
+assert.ok(lowVolSnapshot, "Low volume snapshot missing");
+const lowVolAlert = buildTelegramAlert(lowVolSnapshot!);
+assert.ok(lowVolAlert?.lines.some((l) => l.startsWith("BLOCKED_BY:")), "Low volume should be blocked");
+assert.ok(lowVolAlert?.lines.some((l) => l.includes("LOW_VOLUME")), "Low volume blocker missing");
 
 const blockedEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
