@@ -22,6 +22,8 @@ export type TelegramSnapshot = {
     shortArm?: string;
     shortEntry?: string;
     stopAnchor?: string;
+    mode?: "NORMAL" | "TIGHT";
+    note?: string;
   };
   entryTrigger?: string;
   entryTriggerTf?: string;
@@ -590,6 +592,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           shortArm: rangePayload.shortArm,
           shortEntry: rangePayload.shortEntry,
           stopAnchor: rangePayload.stopAnchor,
+          mode: rangePayload.mode,
+          note: rangePayload.note,
         },
         warnTags: Array.isArray(event.data.rangeWarnTags)
           ? event.data.rangeWarnTags.filter((tag: unknown) => typeof tag === "string")

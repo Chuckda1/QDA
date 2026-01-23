@@ -45,6 +45,8 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
         snapshot.range.shortArm ?? "",
         snapshot.range.shortEntry ?? "",
         snapshot.range.stopAnchor ?? "",
+        snapshot.range.mode ?? "",
+        snapshot.range.note ?? "",
         (snapshot.warnTags ?? []).join(","),
       ].join("|");
     }
