@@ -1915,8 +1915,32 @@ export class Orchestrator {
       const indicatorTfSummary = `INDICATORS: emaStack(1m=${emaStack1m},5m=${emaStack5m}) vwapSide(1m=${vwapSide1m},5m=${vwapSide5m})`;
       console.log(`[5m] ${indicatorTfSummary}`);
 
+      const candidateVolume = setupCandidate.featureBundle?.volume;
+      const relVol = candidateVolume?.relVolume;
+      const volumeFlags = new Set([
+        ...(setupCandidate.warningFlags ?? []),
+        ...(setupCandidate.flags ?? [])
+      ]);
+      const isThinTape = volumeFlags.has("THIN_TAPE") || (relVol !== undefined && relVol < 0.45);
+      const isLowVol = volumeFlags.has("LOW_VOL") || (relVol !== undefined && relVol < 0.7);
+      const isVolSpike = volumeFlags.has("VOL_SPIKE") || (relVol !== undefined && relVol >= 1.5);
+      const volumeNote = relVol !== undefined ? `relVol=${relVol.toFixed(2)}` : "relVol=n/a";
+      const volumeWarnings: string[] = [];
+      if (isThinTape) volumeWarnings.push(`THIN_TAPE: ${volumeNote}`);
+      else if (isLowVol) volumeWarnings.push(`LOW_VOL: ${volumeNote}`);
+      if (isVolSpike) volumeWarnings.push(`VOL_SPIKE: ${volumeNote}`);
+      const volumeCap = isThinTape ? 70 : isLowVol ? 85 : undefined;
+      if (volumeCap !== undefined && tacticalSnapshot.confidence > volumeCap) {
+        tacticalSnapshot = {
+          ...tacticalSnapshot,
+          confidence: volumeCap,
+          reasons: [...(tacticalSnapshot.reasons ?? []), `volume cap=${volumeCap}`]
+        };
+      }
+
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
+        ...volumeWarnings,
         dirWarning,
         confirmWarning,
         regimeWarning,
@@ -1947,7 +1971,8 @@ export class Orchestrator {
         ema9_1m: indicators1m.ema9,
         ema20_1m: indicators1m.ema20,
         vwapSlope: anchorRegime.vwapSlope,
-        structure: anchorRegime.structure
+        structure: anchorRegime.structure,
+        volume: candidateVolume
       };
 
       const ruleScores = {
@@ -2114,6 +2139,25 @@ export class Orchestrator {
           rankedCandidateIds: llmVerify.rankedCandidateIds,
           note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
         };
+        if (llmSummary) {
+          const volFlags = new Set(llmSummary.flags ?? []);
+          if (isThinTape) volFlags.add("THIN_TAPE");
+          if (isLowVol) volFlags.add("LOW_VOL");
+          if (isVolSpike) volFlags.add("VOL_SPIKE");
+          llmSummary.flags = Array.from(volFlags);
+
+          const cap = isThinTape ? 70 : isLowVol ? 85 : undefined;
+          if (cap !== undefined) {
+            llmSummary.probability = Math.min(llmSummary.probability ?? cap, cap);
+            llmSummary.followThroughProb = Math.min(llmSummary.followThroughProb ?? cap, cap);
+            llmSummary.note = [llmSummary.note, `volume cap=${cap}`].filter(Boolean).join(" | ");
+          } else if (relVol !== undefined && relVol < 0.9) {
+            if (llmSummary.probability >= 100) llmSummary.probability = 95;
+            if (llmSummary.followThroughProb && llmSummary.followThroughProb >= 100) {
+              llmSummary.followThroughProb = 95;
+            }
+          }
+        }
         this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
 
         if (llmVerify.action === "PASS") {
@@ -2322,6 +2366,14 @@ export class Orchestrator {
       ruleScores.entryPermission = filterResult.permission ?? "ALLOWED";
       ruleScores.entryFilters = { warnings: filterResult.warnings ?? [] };
 
+      if (isThinTape || isLowVol) {
+        const reason = isThinTape
+          ? `THIN_TAPE: ${volumeNote} require 3 closes`
+          : `LOW_VOL: ${volumeNote} require 2 closes`;
+        baseBlockers.softBlockers.push("guardrail");
+        baseBlockers.softReasons.push(reason);
+      }
+
       if (filterResult.permission === "WAIT_FOR_PULLBACK") {
         setupCandidate.stage = "EARLY";
         setupCandidate.holdReason = filterResult.reason ?? "WAIT_FOR_PULLBACK";
@@ -2493,11 +2545,15 @@ export class Orchestrator {
 
       const hasHardBlockers = hardStopBlockers.length || hardWaitBlockers.length;
       const hasTimeCutoff = hardStopBlockers.includes("time_window");
-      const decisionState = hasTimeCutoff
+      let decisionState = hasTimeCutoff
         ? "UPDATE"
         : hasHardBlockers || softBlockers.length
         ? "WATCH"
         : "SIGNAL";
+      const lowVolRequiresWatch = (isThinTape || isLowVol) && !isVolSpike;
+      if (decisionState === "SIGNAL" && lowVolRequiresWatch) {
+        decisionState = "WATCH";
+      }
       const rangeCondition =
         decisionState === "WATCH" &&
         readinessOk &&
@@ -2771,6 +2827,7 @@ export class Orchestrator {
             symbol: setupCandidate.symbol,
             price: close,
             decisionState: "WATCH",
+            candidate: setupCandidate,
             decision: decisionSummary,
             marketState,
             timing: timingSnapshot,
@@ -2802,6 +2859,7 @@ export class Orchestrator {
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
           price: close,
+          candidate: setupCandidate,
           decisionState,
           decision: decisionSummary,
           marketState,

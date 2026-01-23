@@ -182,6 +182,10 @@ const extractReclaimCondition = (reason: string, dir: Direction): string | undef
 
 const buildWarnTags = (event: DomainEvent, reasons: string[], blockers: string[]): string[] => {
   const tags: string[] = [];
+  const candidateFlags = new Set([
+    ...(event.data.candidate?.warningFlags ?? []),
+    ...(event.data.candidate?.flags ?? [])
+  ]);
   if (isExtendedFromMean(event, reasons)) tags.push("EXTENDED");
   if (reasons.some((reason) => /RISK_CAP/i.test(reason))) tags.push("RISK_ATR");
   if (reasons.some((reason) => /No reclaim signal/i.test(reason))) tags.push("RECLAIM");
@@ -191,6 +195,10 @@ const buildWarnTags = (event: DomainEvent, reasons: string[], blockers: string[]
   if (reasons.some((reason) => /TIMEFRAME_CONFLICT/i.test(reason))) tags.push("TF_CONFLICT");
   if (reasons.some((reason) => /LOW_CANDIDATE_DENSITY/i.test(reason))) tags.push("LOW_DENSITY");
   if (isDataNotReady(event, reasons)) tags.push("DATA");
+  if (candidateFlags.has("LOW_VOL")) tags.push("LOW_VOL");
+  if (candidateFlags.has("THIN_TAPE")) tags.push("THIN_TAPE");
+  if (candidateFlags.has("VOL_SPIKE")) tags.push("VOL_SPIKE");
+  if (candidateFlags.has("CLIMAX_VOL")) tags.push("CLIMAX_VOL");
 
   for (const blocker of blockers) {
     if (blocker === "guardrail") tags.push("GUARDRAIL");
@@ -223,6 +231,8 @@ const deriveSizeMultiplier = (warnTags: string[]): number => {
   if (warnTags.includes("COOLDOWN")) multiplier = Math.min(multiplier, 0.7);
   if (warnTags.includes("LOW_CONTEXT")) multiplier = Math.min(multiplier, 0.7);
   if (warnTags.includes("GUARDRAIL")) multiplier = Math.min(multiplier, 0.7);
+  if (warnTags.includes("LOW_VOL")) multiplier = Math.min(multiplier, 0.5);
+  if (warnTags.includes("THIN_TAPE")) multiplier = Math.min(multiplier, 0.25);
   return Math.max(0.25, Math.round(multiplier * 100) / 100);
 };
 
@@ -250,7 +260,7 @@ const buildArmCondition = (event: DomainEvent, dir: Direction, reasons: string[]
   return parts.length ? unique(parts).join(" OR ") : undefined;
 };
 
-const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[]): string => {
+const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[], warnTags: string[]): string => {
   const timingPhase = event.data.timing?.phase ?? event.data.timing?.state;
   const regime = event.data.marketState?.regime;
   const regimeLabel = regime === "TREND_UP" || regime === "TREND_DOWN" ? "trend" : regime === "CHOP" ? "chop" : "trend";
@@ -277,6 +287,11 @@ const buildWhy = (event: DomainEvent, dir: Direction, reasons: string[]): string
 
   if (isExtendedFromMean(event, reasons)) {
     return `${regimeLabel} ${dirLabel}, impulse but extended`;
+  }
+  if (warnTags.includes("THIN_TAPE")) {
+    whyParts.push("thin tape: low participation");
+  } else if (warnTags.includes("LOW_VOL")) {
+    whyParts.push("low participation");
   }
 
   return `${regimeLabel} ${dirLabel}, ${whyParts.join(", ")}`;
@@ -359,7 +374,17 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const entryMode = deriveEntryMode(event, reasons, warnTags);
   const sizeMultiplier = deriveSizeMultiplier(warnTags);
   const armCondition = buildArmCondition(event, fallbackDir, reasons, warnTags);
-  const why = buildWhy(event, fallbackDir, reasons);
+  const why = buildWhy(event, fallbackDir, reasons, warnTags);
+  const relVol = event.data.candidate?.featureBundle?.volume?.relVolume;
+  let cappedConf = conf;
+  if (warnTags.includes("THIN_TAPE") && cappedConf !== undefined) {
+    cappedConf = Math.min(cappedConf, 70);
+  } else if (warnTags.includes("LOW_VOL") && cappedConf !== undefined) {
+    cappedConf = Math.min(cappedConf, 85);
+  }
+  if (cappedConf !== undefined && cappedConf >= 100 && relVol !== undefined && relVol < 0.9) {
+    cappedConf = 95;
+  }
 
   if (event.type === "PREMARKET_UPDATE") {
     const premarket = event.data.premarket ?? {};
@@ -372,7 +397,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "UPDATE",
       symbol,
       dir: fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       update: {
         cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
@@ -391,7 +416,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "MANAGE",
       symbol,
       dir: fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       update: {
         cause: `LLM ${action}${urgency}`,
@@ -436,7 +461,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         event,
         symbol,
         dir,
-        conf,
+        conf: cappedConf,
         risk,
         reason: "range watch missing range bounds",
       });
@@ -445,7 +470,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "WATCH",
       symbol,
       dir: fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       range: {
         low: rangeLow,
@@ -468,7 +493,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       event,
       symbol,
       dir,
-      conf,
+      conf: cappedConf,
       risk,
       reason: "missing direction",
     });
@@ -483,7 +508,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "UPDATE",
       symbol,
       dir: fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       update: {
         fromSide: lastSignal === "LONG" || lastSignal === "SHORT" ? lastSignal : undefined,
@@ -504,7 +529,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         event,
         symbol,
         dir,
-        conf,
+        conf: cappedConf,
         risk,
         reason: "signal missing entry/stop/targets",
       });
@@ -513,7 +538,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "SIGNAL",
       symbol,
       dir: dir ?? fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       entryTrigger: buildEntryTrigger(entryZone, dir ?? fallbackDir),
       entryTriggerTf: indicatorTf,
@@ -538,7 +563,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
             type: "UPDATE",
             symbol,
             dir: dir ?? fallbackDir,
-            conf,
+            conf: cappedConf,
             risk,
             update: {
               cause: "readiness not met",
@@ -552,7 +577,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           event,
           symbol,
           dir,
-          conf,
+          conf: cappedConf,
           risk,
           reason: "watch missing ARM",
         });
@@ -561,7 +586,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         type: "WATCH",
         symbol,
         dir: dir ?? fallbackDir,
-        conf,
+        conf: cappedConf,
         risk,
         armCondition: hardArm,
         entryRule: "pullback only (NO chase)",
@@ -585,7 +610,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           type: "UPDATE",
           symbol,
           dir: dir ?? fallbackDir,
-          conf,
+          conf: cappedConf,
           risk,
           update: {
             cause: "readiness not met",
@@ -599,7 +624,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         event,
         symbol,
         dir,
-        conf,
+        conf: cappedConf,
         risk,
         reason: "watch missing ARM",
       });
@@ -608,7 +633,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "WATCH",
       symbol,
       dir: dir ?? fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       armCondition: derivedArm,
       entryRule,
@@ -626,7 +651,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       type: "MANAGE",
       symbol,
       dir: dir ?? fallbackDir,
-      conf,
+      conf: cappedConf,
       risk,
       update: {
         fromSide: dir,

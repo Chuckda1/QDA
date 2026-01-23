@@ -6,6 +6,7 @@ import { buildTelegramSignature } from "../src/telegram/telegramSignature.js";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { MessageGovernor } from "../src/governor/messageGovernor.js";
 import { isDecisionAlertEvent } from "../src/utils/decisionState.js";
+import { SetupEngine } from "../src/rules/setupEngine.js";
 
 const makeBaseEvent = (type: DomainEvent["type"], data: Record<string, any>): DomainEvent => ({
   type,
@@ -181,6 +182,36 @@ const premarketSnapshot = normalizeTelegramSnapshot(premarketEvent);
 assert.ok(premarketSnapshot, "Premarket snapshot missing");
 assert.equal(premarketSnapshot?.type, "UPDATE", "Premarket should produce UPDATE");
 
+const thinVolEvent = makeBaseEvent("PLAY_ARMED", {
+  play: {
+    symbol: "SPY",
+    direction: "LONG",
+    entryZone: { low: 452.1, high: 453.2 },
+    stop: 450.4,
+    targets: { t1: 455.0, t2: 456.9, t3: 459.2 },
+  },
+  decisionState: "SIGNAL",
+  candidate: {
+    symbol: "SPY",
+    direction: "LONG",
+    warningFlags: ["THIN_TAPE"],
+    featureBundle: { volume: { relVolume: 0.4 } },
+  },
+  marketState: {
+    permission: { mode: "NORMAL" },
+    tacticalSnapshot: { confidence: 100 },
+    dataReadiness: { ready: true },
+  },
+  timing: { phase: "IMPULSE" },
+});
+const thinVolSnapshot = normalizeTelegramSnapshot(thinVolEvent);
+assert.ok(thinVolSnapshot, "Thin volume snapshot missing");
+assert.equal(thinVolSnapshot?.type, "SIGNAL", "Thin volume should still produce SIGNAL snapshot");
+assert.ok((thinVolSnapshot?.conf ?? 0) <= 70, "Thin volume should cap confidence");
+const thinVolAlert = buildTelegramAlert(thinVolSnapshot!);
+assert.ok(thinVolAlert?.text.includes("THIN_TAPE"), "Thin volume warn tag missing");
+assert.ok(thinVolAlert?.text.toLowerCase().includes("low participation"), "Thin volume WHY missing");
+
 const rangeWatchEvent = makeBaseEvent("NO_ENTRY", {
   symbol: "SPY",
   decisionState: "WATCH",
@@ -347,5 +378,35 @@ assert.equal(s1.activeDirection, "LONG", "Initial direction should be LONG");
 assert.equal(s2.activeDirection, "LONG", "Debounce should block first flip");
 assert.equal(s3.activeDirection, "SHORT", "Debounce should allow second flip");
 assert.equal(s4.activeDirection, "SHORT", "Cooldown should block immediate re-flip");
+
+const setupEngine = new SetupEngine();
+const now = Date.now();
+const bars = Array.from({ length: 20 }, (_, idx) => ({
+  ts: now + idx * 60000,
+  open: 100 + idx * 0.1,
+  high: 100.2 + idx * 0.1,
+  low: 99.8 + idx * 0.1,
+  close: 100 + idx * 0.1,
+  volume: 1000 + idx * 25
+}));
+const earlyResult = setupEngine.findSetup({
+  ts: now,
+  symbol: "SPY",
+  currentPrice: bars[bars.length - 1]!.close,
+  bars,
+  regime: { regime: "TREND_UP", structure: "BULLISH", vwapSlope: "UP", atrSlope: 0.1, reasons: [] } as any,
+  macroBias: "LONG",
+  directionInference: { direction: "LONG", confidence: 80, reasons: [] },
+  tacticalBias: { bias: "LONG", tier: "CLEAR" } as any,
+  indicators: { tf: "5m", atr: 1.2, ema9: 100.5, ema20: 100.2, vwap: 100.1 }
+});
+const earlyCandidate = earlyResult.candidates?.[0] ?? earlyResult.candidate;
+assert.ok(earlyCandidate, "Early candidate missing");
+assert.ok(earlyCandidate?.featureBundle?.volume, "Candidate volume bundle missing");
+assert.equal(
+  typeof earlyCandidate?.featureBundle?.volume?.relVolume,
+  "number",
+  "relVolume should be populated"
+);
 
 console.log("✅ Telegram formatter tests passed.");
