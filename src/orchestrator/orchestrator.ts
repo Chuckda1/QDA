@@ -1469,7 +1469,7 @@ export class Orchestrator {
         confirmBars: tacticalPrimaryTf === "1m" && this.recentBars5m.length >= 6 ? this.recentBars5m : undefined,
         confirmIndicators: tacticalPrimaryTf === "1m" ? indicators5m : undefined,
       });
-      const tacticalSnapshot =
+      let tacticalSnapshot =
         tacticalPrimaryTf === "1m" ? this.applyTacticalDebounce(tacticalRaw, ts) : tacticalRaw;
       const dirInf = {
         direction: tacticalSnapshot.activeDirection === "NEUTRAL" ? undefined : tacticalSnapshot.activeDirection,
@@ -1551,6 +1551,7 @@ export class Orchestrator {
         symbol,
         currentPrice: close,
         bars: this.recentBars5m,
+        volumeBars: this.recentBars1m,
         regime: anchorRegime,
         macroBias: macroBiasInfo.bias,
         directionInference: dirInf,
@@ -1867,6 +1868,34 @@ export class Orchestrator {
         }
       }
 
+      const candidateVolume = setupCandidate.featureBundle?.volume;
+      const relVol = candidateVolume?.relVolume;
+      const volumeFlags = new Set([
+        ...(setupCandidate.warningFlags ?? []),
+        ...(setupCandidate.flags ?? [])
+      ]);
+      const isThinTape = volumeFlags.has("THIN_TAPE") || (relVol !== undefined && relVol < 0.45);
+      const isLowVol = volumeFlags.has("LOW_VOL") || (relVol !== undefined && relVol < 0.7);
+      const isVolSpike = volumeFlags.has("VOL_SPIKE") || (relVol !== undefined && relVol >= 1.5);
+      const isClimaxVol = volumeFlags.has("CLIMAX_VOL") || (relVol !== undefined && relVol >= 2.5);
+      const volumeNote = relVol !== undefined ? `relVol=${relVol.toFixed(2)}` : "relVol=n/a";
+      const volumeWarnings: string[] = [];
+      if (isThinTape) volumeWarnings.push(`THIN_TAPE: ${volumeNote}`);
+      else if (isLowVol) volumeWarnings.push(`LOW_VOL: ${volumeNote}`);
+      if (isVolSpike) volumeWarnings.push(`VOL_SPIKE: ${volumeNote}`);
+      if (isClimaxVol) volumeWarnings.push(`CLIMAX_VOL: ${volumeNote}`);
+      const volumeCap = isThinTape ? 70 : isLowVol ? 85 : isClimaxVol ? 90 : undefined;
+      const structureAligned =
+        (tacticalSnapshot.activeDirection === "LONG" && anchorRegime.structure === "BULLISH") ||
+        (tacticalSnapshot.activeDirection === "SHORT" && anchorRegime.structure === "BEARISH");
+      if (volumeCap !== undefined && tacticalSnapshot.confidence > volumeCap && (!structureAligned || volumeCap < 90)) {
+        tacticalSnapshot = {
+          ...tacticalSnapshot,
+          confidence: volumeCap,
+          reasons: [...(tacticalSnapshot.reasons ?? []), `volume cap=${volumeCap}`]
+        };
+      }
+
       const dirWarning = `Tactical direction: ${tacticalSnapshot.activeDirection} (confidence=${tacticalSnapshot.confidence}%, tf=${tacticalSnapshot.indicatorTf}) | ${tacticalSnapshot.reasons.join(" | ")}`;
       const confirmWarning = tacticalSnapshot.confirm
         ? `Tactical confirm (5m): ${tacticalSnapshot.confirm.bias} (${tacticalSnapshot.confirm.confidence}%) | ${tacticalSnapshot.confirm.reasons.join(" | ")}`
@@ -1903,6 +1932,7 @@ export class Orchestrator {
 
       const llmWarnings = [
         ...(filterResult.warnings ?? []),
+        ...volumeWarnings,
         dirWarning,
         confirmWarning,
         regimeWarning,
@@ -1933,7 +1963,8 @@ export class Orchestrator {
         ema9_1m: indicators1m.ema9,
         ema20_1m: indicators1m.ema20,
         vwapSlope: anchorRegime.vwapSlope,
-        structure: anchorRegime.structure
+        structure: anchorRegime.structure,
+        volume: candidateVolume
       };
 
       const ruleScores = {
@@ -2100,6 +2131,26 @@ export class Orchestrator {
           rankedCandidateIds: llmVerify.rankedCandidateIds,
           note: llmRulesOnly ? "rules-only" : llmTimedOut ? "timeout" : undefined
         };
+        if (llmSummary) {
+          const volFlags = new Set(llmSummary.flags ?? []);
+          if (isThinTape) volFlags.add("THIN_TAPE");
+          if (isLowVol) volFlags.add("LOW_VOL");
+          if (isVolSpike) volFlags.add("VOL_SPIKE");
+          if (isClimaxVol) volFlags.add("CLIMAX_VOL");
+          llmSummary.flags = Array.from(volFlags);
+
+          const cap = isThinTape ? 70 : isLowVol ? 85 : isClimaxVol && !structureAligned ? 90 : undefined;
+          if (cap !== undefined) {
+            llmSummary.probability = Math.min(llmSummary.probability ?? cap, cap);
+            llmSummary.followThroughProb = Math.min(llmSummary.followThroughProb ?? cap, cap);
+            llmSummary.note = [llmSummary.note, `volume cap=${cap}`].filter(Boolean).join(" | ");
+          } else if (relVol !== undefined && relVol < 0.9) {
+            if (llmSummary.probability !== undefined && llmSummary.probability >= 100) llmSummary.probability = 95;
+            if (llmSummary.followThroughProb !== undefined && llmSummary.followThroughProb >= 100) {
+              llmSummary.followThroughProb = 95;
+            }
+          }
+        }
         this.state.lastLLMDecision = `VERIFY:${llmVerify.action}${llmTimedOut ? " (timeout)" : ""}${llmRulesOnly ? " (rules-only)" : ""}`;
 
         if (llmVerify.action === "PASS") {
@@ -2424,6 +2475,13 @@ export class Orchestrator {
         baseBlockers.softBlockers.push("guardrail");
         baseBlockers.softReasons.push(reason);
       }
+      if (isThinTape || isLowVol) {
+        const reason = isThinTape
+          ? `THIN_TAPE: ${volumeNote} require 3 closes`
+          : `LOW_VOL: ${volumeNote} require 2 closes`;
+        baseBlockers.softBlockers.push("guardrail");
+        baseBlockers.softReasons.push(reason);
+      }
       const chopSignals = new Set<string>();
       if (anchorRegime.regime === "CHOP") chopSignals.add("CHOP");
       if (shockMode) chopSignals.add("SHOCK");
@@ -2480,11 +2538,15 @@ export class Orchestrator {
 
       const hasHardBlockers = hardStopBlockers.length || hardWaitBlockers.length;
       const hasTimeCutoff = hardStopBlockers.includes("time_window");
-      const decisionState = hasTimeCutoff
+      let decisionState = hasTimeCutoff
         ? "UPDATE"
         : hasHardBlockers || softBlockers.length
         ? "WATCH"
         : "SIGNAL";
+      const lowVolRequiresWatch = (isThinTape || isLowVol) && !isVolSpike;
+      if (decisionState === "SIGNAL" && lowVolRequiresWatch) {
+        decisionState = "WATCH";
+      }
       const rangeCondition =
         decisionState === "WATCH" &&
         readinessOk &&
@@ -2799,6 +2861,7 @@ export class Orchestrator {
             direction: setupCandidate.direction,
             price: close,
             decisionState: "WATCH",
+            candidate: setupCandidate,
             decision: decisionSummary,
             marketState,
             timing: timingSnapshot,
@@ -2841,6 +2904,7 @@ export class Orchestrator {
           symbol: setupCandidate.symbol,
           direction: setupCandidate.direction,
           price: close,
+          candidate: setupCandidate,
           decisionState,
           decision: decisionSummary,
           marketState,

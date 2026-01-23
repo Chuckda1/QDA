@@ -224,6 +224,19 @@ export class LLMService {
       };
     }
     const { symbol, direction, entryZone, stop, targets, score, grade, confidence, currentPrice, warnings, indicatorSnapshot, recentBars, ruleScores, setupCandidate, candidates } = context;
+    const volume = setupCandidate?.featureBundle?.volume;
+    const relVol = volume?.relVolume;
+    const volumeFlags = Array.from(
+      new Set(
+        [
+          ...(setupCandidate?.warningFlags ?? []),
+          ...(setupCandidate?.flags ?? [])
+        ].filter((flag) => ["LOW_VOL", "THIN_TAPE", "VOL_SPIKE", "CLIMAX_VOL"].includes(flag))
+      )
+    );
+    const volumeLine = `- Volume: relVol=${relVol !== undefined ? relVol.toFixed(2) : "n/a"}${
+      volumeFlags.length ? ` (${volumeFlags.join(", ")})` : ""
+    }`;
     
     // Calculate risk/reward for LLM
     const entryMid = (entryZone.low + entryZone.high) / 2;
@@ -263,7 +276,8 @@ SETUP DETAILS:
 - Current Price: $${currentPrice.toFixed(2)}
 - Risk: $${risk.toFixed(2)} per share
 - Reward to T1: $${rewardT1.toFixed(2)} per share
-- R-multiple to T1: ${rrT1.toFixed(2)}R${warningsSection}
+- R-multiple to T1: ${rrT1.toFixed(2)}R
+${volumeLine}${warningsSection}
 
 MARKET SNAPSHOT + RULE OUTPUTS (JSON):
 \`\`\`json
@@ -283,6 +297,12 @@ Step 3b) Validate the setupCandidate: do the proposed levels/pattern make sense 
 Step 4) Assess legitimacy (0-100): How valid is this setup overall? Consider all factors: indicators, structure, context, warnings.
 
 Step 5) Assess probability (0-100): Likelihood price reaches T1? Use the indicators and recent price action to inform this.
+
+Step 5b) Volume rule (mandatory):
+  - If relVol < 0.70, never output probability=100. Cap probability <= 85.
+  - If relVol < 0.45 (THIN_TAPE), cap probability <= 70.
+  - If CLIMAX_VOL and structure is not aligned, cap probability <= 90.
+  - Only allow probability=100 when relVol >= 0.90 OR VOL_SPIKE confirms impulse direction.
 
 Step 6) Recommend action: GO_ALL_IN | SCALP | WAIT | PASS
   - If the best candidate is counter to the Tactical Snapshot, prefer WAIT/PASS and call it out explicitly.
@@ -356,13 +376,34 @@ Respond in EXACT JSON format:
         try {
           const parsed = JSON.parse(jsonMatch[0]);
           // Map probability to followThroughProb for backward compatibility
-          const probability = parsed.probability ?? parsed.followThroughProb ?? 60;
+          let probability = parsed.probability ?? parsed.followThroughProb ?? 60;
+          let followThroughProb = parsed.followThroughProb ?? probability;
+          const allowHundred =
+            relVol === undefined ? true : relVol >= 0.9 || volumeFlags.includes("VOL_SPIKE");
+          const structure = indicatorSnapshot?.structure;
+          const structureAligned =
+            (direction === "LONG" && structure === "BULLISH") || (direction === "SHORT" && structure === "BEARISH");
+          const maxProb =
+            relVol !== undefined && relVol < 0.45
+              ? 70
+              : relVol !== undefined && relVol < 0.7
+              ? 85
+              : volumeFlags.includes("CLIMAX_VOL") && !structureAligned
+              ? 90
+              : undefined;
+          if (maxProb !== undefined) {
+            probability = Math.min(probability, maxProb);
+            followThroughProb = Math.min(followThroughProb, maxProb);
+          } else if (!allowHundred) {
+            if (probability >= 100) probability = 95;
+            if (followThroughProb >= 100) followThroughProb = 95;
+          }
           return {
             biasDirection: parsed.biasDirection || "NEUTRAL",
             agreement: Math.max(0, Math.min(100, parsed.agreement ?? 50)),
             legitimacy: Math.max(0, Math.min(100, parsed.legitimacy || 70)),
             probability: Math.max(0, Math.min(100, probability)),
-            followThroughProb: Math.max(0, Math.min(100, probability)), // Backward compatibility
+            followThroughProb: Math.max(0, Math.min(100, followThroughProb)), // Backward compatibility
             action: parsed.action || "SCALP",
             reasoning: parsed.reasoning || "Setup analyzed",
             plan: parsed.plan || "Enter on pullback to entry zone. Tight stop. Target T1.",

@@ -188,6 +188,36 @@ assert.ok(signalAlert?.lines[5]?.startsWith("WHY:"), "SIGNAL why line missing");
 assert.ok(!/WAIT_FOR_|arming_failed|entry_filter|BLOCKED|SETUP CANDIDATES/i.test(signalAlert?.text ?? ""), "SIGNAL contains raw blocker token");
 assert.ok(signalAlert?.lines[0]?.includes("✅"), "SIGNAL header missing emoji");
 
+const thinVolEvent = makeBaseEvent("PLAY_ARMED", {
+  play: {
+    symbol: "SPY",
+    direction: "LONG",
+    entryZone: { low: 452.1, high: 453.2 },
+    stop: 450.4,
+    targets: { t1: 455.0, t2: 456.9, t3: 459.2 },
+  },
+  decisionState: "SIGNAL",
+  candidate: {
+    symbol: "SPY",
+    direction: "LONG",
+    warningFlags: ["THIN_TAPE"],
+    featureBundle: { volume: { relVolume: 0.4 } },
+  },
+  marketState: {
+    permission: { mode: "NORMAL" },
+    tacticalSnapshot: { confidence: 100 },
+    dataReadiness: { ready: true },
+  },
+  timing: { phase: "IMPULSE" },
+});
+const thinVolSnapshot = normalizeTelegramSnapshot(thinVolEvent);
+assert.ok(thinVolSnapshot, "Thin volume snapshot missing");
+assert.equal(thinVolSnapshot?.type, "SIGNAL", "Thin volume should still produce SIGNAL snapshot");
+assert.ok((thinVolSnapshot?.conf ?? 0) <= 70, "Thin volume should cap confidence");
+const thinVolAlert = buildTelegramAlert(thinVolSnapshot!);
+assert.ok(thinVolAlert?.text.includes("THIN_TAPE"), "Thin volume warn tag missing");
+assert.ok(thinVolAlert?.text.toLowerCase().includes("low participation"), "Thin volume WHY missing");
+
 const updateSnapshot = normalizeTelegramSnapshot(updateEvent);
 assert.ok(updateSnapshot, "UPDATE snapshot missing");
 const updateAlert = buildTelegramAlert(updateSnapshot!);

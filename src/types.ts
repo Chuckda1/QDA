@@ -95,8 +95,12 @@ export interface SetupCandidate {
       tacticalBias?: "LONG" | "SHORT" | "NONE";
     };
     volume?: {
+      volNow?: number;
+      volSma20?: number;
       relVolume?: number;
       impulseVolVsPullbackVol?: number;
+      volTrend?: number;
+      dollarVol?: number;
     };
   };
   flags?: string[]; // e.g. ["CHOP_OVERRIDE"]

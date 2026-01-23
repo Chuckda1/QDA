@@ -10,6 +10,7 @@ export interface SetupEngineContext {
   symbol: string;
   currentPrice: number;
   bars: OHLCVBar[];
+  volumeBars?: OHLCVBar[];
   regime: RegimeResult;
   macroBias?: Bias;
   directionInference: DirectionInference;
@@ -96,13 +97,27 @@ function recentSwingLow(bars: OHLCVBar[], lookback: number): number {
   return Math.min(...window.map(b => b.low));
 }
 
-function computeRelVolume(bars: OHLCVBar[], lookback: number): number | undefined {
+function computeVolSma(bars: OHLCVBar[], lookback: number): number | undefined {
   if (bars.length < lookback) return undefined;
   const window = bars.slice(-lookback);
   const avg = window.reduce((sum, b) => sum + (b.volume ?? 0), 0) / window.length;
-  const last = window[window.length - 1]!;
-  if (avg <= 0) return undefined;
+  return avg > 0 ? avg : undefined;
+}
+
+function computeRelVolume(bars: OHLCVBar[], lookback: number): number | undefined {
+  if (bars.length < lookback) return undefined;
+  const avg = computeVolSma(bars, lookback);
+  const last = bars[bars.length - 1]!;
+  if (!avg || avg <= 0) return undefined;
   return (last.volume ?? 0) / avg;
+}
+
+function computeVolTrend(bars: OHLCVBar[], lookback: number, shiftBars: number): number | undefined {
+  if (bars.length < lookback + shiftBars) return undefined;
+  const current = computeVolSma(bars, lookback);
+  const past = computeVolSma(bars.slice(0, -shiftBars), lookback);
+  if (!current || !past || past <= 0) return undefined;
+  return (current - past) / past;
 }
 
 function computeImpulseVolRatio(bars: OHLCVBar[]): number | undefined {
@@ -171,8 +186,13 @@ export class SetupEngine {
     }
 
     const chaseRisk = vwap !== undefined ? Math.abs(currentPrice - vwap) > 0.8 * atr : false;
-    const relVolume = computeRelVolume(bars, 20);
-    const impulseVolVsPullbackVol = computeImpulseVolRatio(bars);
+    const volumeBars = ctx.volumeBars ?? bars;
+    const volSma20 = computeVolSma(volumeBars, 20);
+    const volNow = volumeBars.length ? (volumeBars[volumeBars.length - 1]!.volume ?? 0) : undefined;
+    const relVolume = computeRelVolume(volumeBars, 20);
+    const impulseVolVsPullbackVol = computeImpulseVolRatio(volumeBars);
+    const volTrend = computeVolTrend(volumeBars, 20, 5);
+    const dollarVol = volNow !== undefined ? volNow * currentPrice : undefined;
     const vwapSlopeAtr = computeVwapSlopeAtr(bars, 30, 6, atr);
     const ema9SlopeAtr = computeEmaSlopeAtr(closes, 9, 6, atr);
     const ema20SlopeAtr = computeEmaSlopeAtr(closes, 20, 6, atr);
@@ -296,14 +316,24 @@ export class SetupEngine {
           tacticalBias: ctx.tacticalBias?.bias ?? "NONE",
         },
         volume: {
+          volNow: volNow !== undefined ? Number(volNow.toFixed(0)) : undefined,
+          volSma20: volSma20 !== undefined ? Number(volSma20.toFixed(0)) : undefined,
           relVolume: relVolume !== undefined ? Number(relVolume.toFixed(2)) : undefined,
           impulseVolVsPullbackVol: impulseVolVsPullbackVol !== undefined ? Number(impulseVolVsPullbackVol.toFixed(2)) : undefined,
+          volTrend: volTrend !== undefined ? Number(volTrend.toFixed(2)) : undefined,
+          dollarVol: dollarVol !== undefined ? Number(dollarVol.toFixed(0)) : undefined,
         },
       };
       const flags = new Set(candidate.flags ?? []);
       if (extendedFromMean !== undefined && extendedFromMean >= 1) flags.add("EXTENDED");
       if (reclaimSignal === "NONE") flags.add("WEAK_RECLAIM");
-      if (relVolume !== undefined && relVolume < 0.7) flags.add("LOW_RVOL");
+      if (relVolume !== undefined && relVolume < 0.45) {
+        flags.add("THIN_TAPE");
+      } else if (relVolume !== undefined && relVolume < 0.7) {
+        flags.add("LOW_VOL");
+      }
+      if (relVolume !== undefined && relVolume >= 1.5) flags.add("VOL_SPIKE");
+      if (relVolume !== undefined && relVolume >= 2.5) flags.add("CLIMAX_VOL");
       if (candidate.featureBundle.timing?.barsSinceImpulse && candidate.featureBundle.timing.barsSinceImpulse > 6) {
         flags.add("LATE_ENTRY");
       }
@@ -585,8 +615,14 @@ export class SetupEngine {
   }
 
   private buildEarlyCandidates(ctx: SetupEngineContext, holdReason: string): SetupCandidate[] {
-    const { ts, symbol, currentPrice, directionInference, tacticalBias, indicators } = ctx;
+    const { ts, symbol, currentPrice, directionInference, tacticalBias, indicators, bars, volumeBars } = ctx;
     const fallbackRisk = indicators.atr && indicators.atr > 0 ? indicators.atr * 0.5 : Math.max(0.1, currentPrice * 0.001);
+    const volBars = volumeBars ?? bars;
+    const volNow = volBars?.length ? (volBars[volBars.length - 1]!.volume ?? 0) : undefined;
+    const volSma20 = volBars ? computeVolSma(volBars, 20) : undefined;
+    const relVolume = volBars ? computeRelVolume(volBars, 20) : undefined;
+    const volTrend = volBars ? computeVolTrend(volBars, 20, 5) : undefined;
+    const dollarVol = volNow !== undefined ? volNow * currentPrice : undefined;
     const directions: Direction[] = [];
     if (directionInference.direction) {
       directions.push(directionInference.direction);
@@ -623,7 +659,16 @@ export class SetupEngine {
           rationale: [`EARLY idea (${pattern})`, holdReason],
           score: { alignment: 20, structure: 20, quality: 25, total: 20 },
           flags: ["EARLY_IDEA"],
-          warningFlags: ["EARLY_IDEA"]
+          warningFlags: ["EARLY_IDEA"],
+          featureBundle: {
+            volume: {
+              volNow: volNow !== undefined ? Number(volNow.toFixed(0)) : undefined,
+              volSma20: volSma20 !== undefined ? Number(volSma20.toFixed(0)) : undefined,
+              relVolume: relVolume !== undefined ? Number(relVolume.toFixed(2)) : undefined,
+              volTrend: volTrend !== undefined ? Number(volTrend.toFixed(2)) : undefined,
+              dollarVol: dollarVol !== undefined ? Number(dollarVol.toFixed(0)) : undefined,
+            },
+          },
         });
         if (candidates.length >= 6) return candidates;
       }
