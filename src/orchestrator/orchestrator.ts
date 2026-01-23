@@ -492,6 +492,7 @@ export class Orchestrator {
     mode: string;
     note?: string;
     buffer: number;
+    atr1m?: number;
     minWidth: number;
     rangeWidth: number;
     ts: number;
