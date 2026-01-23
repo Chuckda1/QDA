@@ -1,4 +1,4 @@
-import type { Direction, DomainEvent } from "../types.js";
+import type { Bias, Direction, DomainEvent } from "../types.js";
 import { getDecisionState } from "../utils/decisionState.js";
 import { volumePolicy } from "../utils/volumePolicy.js";
 
@@ -12,7 +12,9 @@ export type TelegramSnapshot = {
   risk: string;
   px?: number;
   ts?: string;
+  modeState?: string;
   volumeLine?: string;
+  rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
     low: number;
     high: number;
@@ -118,6 +120,39 @@ const getPrice = (event: DomainEvent): number | undefined => {
     event.data.topPlay?.triggerPrice ??
     event.data.play?.entryPrice;
   return isFiniteNumber(px) ? px : undefined;
+};
+
+const buildDataStaleUpdate = (event: DomainEvent, decisionState?: string): TelegramSnapshot | null => {
+  if (!decisionState || !["WATCH", "SIGNAL"].includes(decisionState)) return null;
+  const dataTs =
+    typeof event.data.lastBarTs === "number"
+      ? event.data.lastBarTs
+      : typeof event.data.barTs === "number"
+      ? event.data.barTs
+      : event.timestamp;
+  const ageMs = Date.now() - dataTs;
+  const staleAfterMs = typeof event.data.staleAfterMs === "number" ? event.data.staleAfterMs : 90_000;
+  if (!Number.isFinite(ageMs) || ageMs <= staleAfterMs) return null;
+  const symbol = getSymbol(event);
+  const dir = getDirection(event) ?? "LONG";
+  const risk = getRiskMode(event);
+  const px = getPrice(event);
+  const ts = formatEtTimestamp(Date.now());
+  const ageSec = Math.round(ageMs / 1000);
+  return {
+    type: "UPDATE",
+    symbol,
+    dir,
+    risk,
+    px,
+    ts,
+    update: {
+      cause: `data stale (${ageSec}s)`,
+      next: "wait for fresh bars",
+      ts,
+      price: px,
+    },
+  };
 };
 
 const buildNextLine = (event: DomainEvent, reasons: string[], warnTags: string[]): string | undefined => {
@@ -402,6 +437,7 @@ const buildHardArmCondition = (reasons: string[]): string => {
 export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot | null {
   const symbol = getSymbol(event);
   const dir = getDirection(event);
+  const decisionState = getDecisionState(event);
   if (!dir) return null;
   let conf = getTacticalConfidence(event);
   const risk = getRiskMode(event);
@@ -421,7 +457,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const hardWaitBlockers = event.data.hardWaitBlockers ?? decision?.hardWaitBlockers ?? [];
   const hardStopReasons = event.data.hardStopReasons ?? decision?.hardStopReasons ?? [];
   const hardWaitReasons = event.data.hardWaitReasons ?? decision?.hardWaitReasons ?? [];
-  const decisionState = getDecisionState(event);
+  const staleUpdate = buildDataStaleUpdate(event, decisionState);
+  if (staleUpdate) {
+    return staleUpdate;
+  }
   const reasons = [...blockerReasons, ...softBlockerReasons, ...hardBlockerReasons, ...hardStopReasons, ...hardWaitReasons].map(normalizeReason);
   const warnTags = buildWarnTags(event, reasons, [...blockers, ...softBlockers]);
   const entryMode = deriveEntryMode(event, reasons, warnTags);
@@ -466,6 +505,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      modeState: event.data.modeState,
       update: {
         cause,
         next: nextLine,
@@ -490,6 +530,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      modeState: event.data.modeState,
       volumeLine,
       update: {
         cause: `${kind === "PREMARKET_BRIEF" ? "premarket brief" : "premarket bias"} ${bias}${confText}`,
@@ -512,6 +553,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      modeState: event.data.modeState,
       warnTags: warnTags.length ? warnTags : undefined,
       update: {
         cause: `LLM ${action}${urgency}`,
@@ -614,6 +656,9 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
           : typeof rangePayload.ts === "string"
           ? rangePayload.ts
           : ts;
+      const rangeBias = rangePayload.bias;
+      const bias = rangeBias?.bias ?? (rangePayload.mode === "TIGHT" ? "NEUTRAL" : undefined);
+      const biasConf = rangeBias?.confidence ?? (bias ? 50 : conf);
       return {
         type: "WATCH",
         symbol,
@@ -623,6 +668,14 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         volumeLine,
         px: isFiniteNumber(rangePayload.price) ? rangePayload.price : px,
         ts: rangeTs,
+        modeState: event.data.modeState,
+        rangeBias: bias
+          ? {
+              bias,
+              confidence: biasConf,
+              note: rangeBias?.note,
+            }
+          : undefined,
         range: {
           low: rangePayload.low,
           high: rangePayload.high,

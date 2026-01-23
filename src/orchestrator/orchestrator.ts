@@ -286,6 +286,39 @@ function computeGateStatus(params: {
   };
 }
 
+function computeRangeBias(params: {
+  price: number;
+  vwap?: number;
+  microBox?: RangeBand;
+  bars1m: OHLCVBar[];
+  bars5m: OHLCVBar[];
+  atr?: number;
+}): { bias: Bias; confidence: number; note: string } {
+  const bars = params.bars1m.length >= 5 ? params.bars1m.slice(-5) : params.bars5m.slice(-3);
+  const slope = bars.length >= 2 ? bars[bars.length - 1]!.close - bars[0]!.close : 0;
+  const atr = params.atr && params.atr > 0 ? params.atr : undefined;
+  const slopeAtr = atr ? slope / atr : 0;
+  const slopeDir = slopeAtr > 0.1 ? "UP" : slopeAtr < -0.1 ? "DOWN" : "FLAT";
+  const micro = params.microBox;
+  const width = micro ? micro.high - micro.low : undefined;
+  const position = micro && width && width > 0 ? (params.price - micro.low) / width : 0.5;
+  const aboveVwap = Number.isFinite(params.vwap) ? params.price > (params.vwap as number) : undefined;
+
+  if (slopeDir === "DOWN" && aboveVwap === false) {
+    return { bias: "SHORT", confidence: 60, note: "down momentum below VWAP" };
+  }
+  if (slopeDir === "UP" && aboveVwap === true) {
+    return { bias: "LONG", confidence: 60, note: "up momentum above VWAP" };
+  }
+  if (position <= 0.25 && slopeDir !== "UP") {
+    return { bias: "SHORT", confidence: 55, note: "near lower rail" };
+  }
+  if (position >= 0.75 && slopeDir !== "DOWN") {
+    return { bias: "LONG", confidence: 55, note: "near upper rail" };
+  }
+  return { bias: "NEUTRAL", confidence: 50, note: "mid-box / mixed momentum" };
+}
+
 const REGIME_15M_FAST_OPTIONS: Partial<RegimeOptions> = {
   minBars: 16,
   vwapPeriod: 12,
@@ -341,6 +374,7 @@ export class Orchestrator {
     price: number;
     contextRange?: RangeBand;
     microBox?: RangeBand;
+    bias?: { bias: Bias; confidence: number; note: string };
     longArm: string;
     longEntry: string;
     shortArm: string;
@@ -2938,12 +2972,21 @@ export class Orchestrator {
             const longEntry = `break&hold above ${(displayHigh + buffer).toFixed(2)}`;
             const shortEntry = `break&hold below ${(displayLow - buffer).toFixed(2)}`;
             const stopAnchor = `long < ${displayLow.toFixed(2)} | short > ${displayHigh.toFixed(2)} (armed)`;
+            const bias = computeRangeBias({
+              price: close,
+              vwap: indicatorSnapshot.vwap,
+              microBox: microBox ?? { low: displayLow, high: displayHigh },
+              bars1m: this.recentBars1m,
+              bars5m: this.recentBars5m,
+              atr: atr1m ?? atr5m,
+            });
             const computedRange = {
               range: { low: displayLow, high: displayHigh },
               vwap: indicatorSnapshot.vwap,
               price: close,
               contextRange,
               microBox,
+              bias,
               longArm,
               longEntry,
               shortArm,
@@ -3198,6 +3241,7 @@ export class Orchestrator {
               price: rangeWatchPayload.price,
               contextRange: rangeWatchPayload.contextRange,
               microBox: rangeWatchPayload.microBox,
+              bias: rangeWatchPayload.bias,
               longArm: rangeWatchPayload.longArm,
               longEntry: rangeWatchPayload.longEntry,
               shortArm: rangeWatchPayload.shortArm,

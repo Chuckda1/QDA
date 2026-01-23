@@ -115,7 +115,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         ? `MICRO_BOX: ${formatPrice(snapshot.range.microBox.low)}-${formatPrice(snapshot.range.microBox.high)}`
         : "MICRO_BOX: n/a — waiting for consolidation";
       const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
-      const bias = `BIAS: ${snapshot.dir} (${snapshot.conf ?? "?"}%)`;
+      const rangeBias = snapshot.rangeBias?.bias ?? snapshot.dir;
+      const rangeConf = snapshot.rangeBias?.confidence ?? snapshot.conf;
+      const bias = `BIAS: ${rangeBias} (${rangeConf ?? "?"}%)`;
       const planA = `PLAN A: ${snapshot.range.longEntry ?? "n/a"} → bias LONG`;
       const planB = `PLAN B: ${snapshot.range.shortEntry ?? "n/a"} → bias SHORT`;
       const arm = "ARM: retest range (bot creates play)";

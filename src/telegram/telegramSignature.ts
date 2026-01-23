@@ -35,8 +35,15 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
 
   if (snapshot.type === "WATCH") {
     if (snapshot.range) {
+      const rangeBase = [
+        snapshot.type,
+        snapshot.symbol,
+        snapshot.risk,
+        snapshot.modeState ?? "",
+        snapshot.volumeLine ?? "",
+      ];
       return [
-        ...base,
+        ...rangeBase,
         snapshot.range.low ?? "",
         snapshot.range.high ?? "",
         snapshot.range.vwap ?? "",
