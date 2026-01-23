@@ -214,9 +214,9 @@ export class Orchestrator {
     mode?: string;
   } | null = null;
   private rangeFrozen: {
-    low: number;
-    high: number;
+    range: { low: number; high: number };
     vwap?: number;
+    price: number;
     longArm: string;
     longEntry: string;
     shortArm: string;
@@ -2726,9 +2726,10 @@ export class Orchestrator {
               buffer,
               minWidth,
               rangeWidth,
+              ts,
             };
             if (rangeModeActive && !wasRangeModeActive) {
-              this.rangeFrozen = { ...computedRange, ts };
+              this.rangeFrozen = computedRange;
             }
             return this.rangeFrozen ?? computedRange;
           })()
