@@ -1,3 +1,6 @@
+import type { DomainEventType, RangeBand } from "./legacy/types.js";
+
+export type { DomainEventType, RangeBand } from "./legacy/types.js";
 export type Direction = "LONG" | "SHORT";
 export type Bias = "LONG" | "SHORT" | "NEUTRAL";
 export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";
@@ -119,13 +122,6 @@ export interface SetupCandidate {
   };
 }
 
-export type RangeBand = {
-  low: number;
-  high: number;
-  source?: "RTH" | "OVERNIGHT" | "SESSION" | "1m" | "5m";
-  ts?: number;
-};
-
 export type GateStatus = {
   pendingGate?: string;
   blockedReasons?: string[];
@@ -149,28 +145,6 @@ export type DataFreshness = {
   session: string;
   lastTradePx?: number;
 };
-
-export type DomainEventType =
-  | "PLAY_ARMED"
-  | "ENTRY_WINDOW_OPENED"
-  | "TIMING_COACH"
-  | "LLM_VERIFY"
-  | "LLM_PICK"
-  | "SCORECARD"
-  | "SETUP_CANDIDATES"
-  | "SETUP_SUMMARY"
-  | "NO_ENTRY"
-  | "TRADE_PLAN"
-  | "ARMED_COACH"
-  | "LLM_COACH_UPDATE"
-  | "PLAY_ENTERED"
-  | "PLAY_SIZED_UP"
-  | "PLAY_CANCELLED"
-  | "PLAY_CLOSED"
-  | "PREMARKET_UPDATE"
-  | "VOLUME_UPDATE"
-  | "PLAN_OF_DAY"
-  | "MIND_STATE_UPDATED";
 
 export interface DomainEvent {
   type: DomainEventType;

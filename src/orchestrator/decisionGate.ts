@@ -1,19 +1,7 @@
+import type { DecisionBlocker } from "../legacy/types.js";
 import type { Play, SetupCandidate, TradeAction } from "../types.js";
 
 export type DecisionStatus = "NO_SETUP" | "BLOCKED" | "LLM_PASS" | "ARMED";
-export type DecisionBlocker =
-  | "no_active_play"
-  | "arming_failed"
-  | "expired"
-  | "cooldown"
-  | "guardrail"
-  | "chop"
-  | "low_probability"
-  | "datafeed"
-  | "data_stale"
-  | "time_window"
-  | "entry_filter";
-
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";
   agreement?: number;
