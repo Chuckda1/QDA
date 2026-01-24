@@ -11,6 +11,7 @@ const MAX_LINES: Record<TelegramSnapshotType, number> = {
   WATCH: 8,
   UPDATE: 3,
   MANAGE: 4,
+  MIND: 6,
 };
 
 const formatPrice = (value?: number): string => (Number.isFinite(value) ? (value as number).toFixed(2) : "n/a");
@@ -230,6 +231,18 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const warn = warnTags ? `${warnTags.label}: ${warnTags.value}` : undefined;
     const lines = enforceLineLimit("MANAGE", [header, cause, next, warn].filter(nonEmpty));
     return { type: "MANAGE", lines, text: lines.join("\n") };
+  }
+
+  if (snapshot.type === "MIND") {
+    const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
+    const header = `MIND_STATE: ${snapshot.symbol} | px ${px} | ${snapshot.ts ?? "n/a"}`;
+    const indicators = snapshot.indicators
+      ? `INDICATORS: ${JSON.stringify(snapshot.indicators)}`
+      : "INDICATORS: n/a";
+    const mind = snapshot.mindState ? `MIND: ${JSON.stringify(snapshot.mindState)}` : "MIND: n/a";
+    const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
+    const lines = enforceLineLimit("MIND", [header, indicators, mind, vol].filter(nonEmpty));
+    return { type: "MIND", lines, text: lines.join("\n") };
   }
 
   return null;

@@ -1021,6 +1021,7 @@ export class Orchestrator {
   ): Promise<DomainEvent[]> {
     const snapshot = this.buildSnapshot(input, timeframe);
     const events: DomainEvent[] = [];
+    const botMode = (process.env.BOT_MODE || "").toLowerCase();
 
     // Update state
     this.state.session = getMarketSessionLabel(new Date(input.ts));
@@ -1034,6 +1035,21 @@ export class Orchestrator {
       this.state.last15mTs = input.ts;
     }
 
+    if (botMode === "minimal") {
+      if (timeframe === "5m") {
+        this.trackMinimalBar(snapshot, "5m");
+        return events;
+      }
+      if (timeframe !== "1m") {
+        return events;
+      }
+      return await this.handleMinimal1m(snapshot);
+    }
+
+    if (process.env.BOT_MODE === "minimal") {
+      throw new Error("LEGACY PATH EXECUTED IN MINIMAL MODE");
+    }
+
     // Branch by timeframe
     if (timeframe === "1m") {
       events.push(...await this.handle1m(snapshot));
@@ -1044,6 +1060,188 @@ export class Orchestrator {
     }
 
     return events;
+  }
+
+  private trackMinimalBar(snapshot: TickSnapshot, tf: "1m" | "5m"): void {
+    const { ts, close, open, high, low, volume } = snapshot;
+    if (high === undefined || low === undefined) {
+      console.warn(`[MINIMAL] missing OHLC high/low for ${tf} bar ts=${ts}`);
+      return;
+    }
+    const safeOpen = open ?? close;
+    const safeVol = volume ?? 0;
+    const bar = { ts, open: safeOpen, high, low, close, volume: safeVol };
+    if (tf === "1m") {
+      this.recentBars1m.push(bar);
+      if (this.recentBars1m.length > 80) this.recentBars1m.shift();
+    } else {
+      this.recentBars5m.push(bar);
+      if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+    }
+  }
+
+  private computeRelVol(bars: OHLCVBar[], window = 20): number | undefined {
+    if (bars.length < 5) return undefined;
+    const slice = bars.slice(-window);
+    const volumes = slice.map((bar) => bar.volume).filter((v) => Number.isFinite(v)) as number[];
+    if (volumes.length < 5) return undefined;
+    const avg = volumes.reduce((sum, v) => sum + v, 0) / volumes.length;
+    if (!Number.isFinite(avg) || avg <= 0) return undefined;
+    const latest = volumes[volumes.length - 1];
+    return latest / avg;
+  }
+
+  private buildImpulseContext(bars: OHLCVBar[]): {
+    direction: "UP" | "DOWN" | "FLAT";
+    move: number;
+    range: number;
+    bars: number;
+  } | undefined {
+    if (bars.length < 4) return undefined;
+    const tail = bars.slice(-8);
+    const opens = tail.map((bar) => bar.open);
+    const closes = tail.map((bar) => bar.close);
+    const highs = tail.map((bar) => bar.high);
+    const lows = tail.map((bar) => bar.low);
+    const firstOpen = opens[0] ?? closes[0];
+    const lastClose = closes[closes.length - 1];
+    if (!Number.isFinite(firstOpen) || !Number.isFinite(lastClose)) return undefined;
+    const move = lastClose - firstOpen;
+    const range = Math.max(...highs) - Math.min(...lows);
+    const direction = move > 0.02 ? "UP" : move < -0.02 ? "DOWN" : "FLAT";
+    return { direction, move, range, bars: tail.length };
+  }
+
+  private buildRangeContext(params: {
+    ts: number;
+    price: number;
+    bars1m: OHLCVBar[];
+    bars5m: OHLCVBar[];
+    atr?: number;
+  }): {
+    contextRange?: RangeBand;
+    microBox?: RangeBand;
+    location?: { zone: "LOW" | "MID" | "HIGH"; pos: number };
+  } {
+    const contextRange = computeContextRange({
+      ts: params.ts,
+      bars1m: params.bars1m,
+      bars5m: params.bars5m,
+    });
+    const microBox = params.atr
+      ? findMicroBox({
+          bars: params.bars1m.length ? params.bars1m : params.bars5m,
+          atr: params.atr,
+          maxBars: params.bars1m.length ? 20 : 6,
+          minWindow: params.bars1m.length ? 5 : 3,
+          source: params.bars1m.length ? "1m" : "5m",
+          ts: params.ts,
+        })
+      : undefined;
+    const range = microBox ?? contextRange;
+    let location: { zone: "LOW" | "MID" | "HIGH"; pos: number } | undefined;
+    if (range) {
+      const width = range.high - range.low;
+      if (width > 0) {
+        const pos = Math.max(0, Math.min(1, (params.price - range.low) / width));
+        const zone = pos <= 0.33 ? "LOW" : pos >= 0.67 ? "HIGH" : "MID";
+        location = { zone, pos: Number(pos.toFixed(2)) };
+      }
+    }
+    return { contextRange, microBox, location };
+  }
+
+  private computeSwingPoints(bars: OHLCVBar[], lookback: number): { high: number; low: number } | undefined {
+    if (bars.length < Math.max(3, lookback)) return undefined;
+    const window = bars.slice(-lookback);
+    const highs = window.map((bar) => bar.high);
+    const lows = window.map((bar) => bar.low);
+    const high = Math.max(...highs);
+    const low = Math.min(...lows);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
+    return { high, low };
+  }
+
+  private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const { ts, symbol, close } = snapshot;
+    this.trackMinimalBar(snapshot, "1m");
+
+    const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
+    const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
+    const relVol = this.computeRelVol(this.recentBars1m);
+    const volumePolicySnapshot = relVol !== undefined ? volumePolicy(relVol) : undefined;
+    const volumeLine =
+      relVol !== undefined && volumePolicySnapshot
+        ? `${volumePolicySnapshot.label} (${relVol.toFixed(2)}x)`
+        : undefined;
+    const indicators = {
+      vwap1m: indicators1m.vwap,
+      atr1m: indicators1m.atr,
+      rsi14_1m: indicators1m.rsi14,
+      vwap5m: indicators5m?.vwap,
+      atr5m: indicators5m?.atr,
+      rsi14_5m: indicators5m?.rsi14,
+      relVol,
+    };
+    const recent5mBars = this.recentBars5m.slice(-12).map((bar) => ({
+      ts: bar.ts,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+    const impulseContext = this.buildImpulseContext(this.recentBars1m);
+    const rangeContext = this.buildRangeContext({
+      ts,
+      price: close,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+      atr: indicators1m.atr ?? indicators5m?.atr,
+    });
+    const swingPoints =
+      this.computeSwingPoints(this.recentBars5m, 12) ??
+      this.computeSwingPoints(this.recentBars1m, 20);
+    const mindState = this.llmService
+      ? await this.llmService.getMindState({
+          symbol,
+          price: close,
+          indicators,
+          relVol,
+          freshness: this.buildFreshness(ts),
+          recent5mBars,
+          impulseContext,
+          rangeContext,
+          swingPoints,
+        })
+      : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
+
+    this.state.mindState = mindState;
+    this.state.lastLLMCallAt = ts;
+    this.state.lastLLMDecision = mindState.summary;
+
+    const direction = mindState.bias;
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts}`);
+
+    return [
+      {
+        type: "MIND_STATE_UPDATED",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: {
+          timestamp: ts,
+          symbol,
+          price: close,
+          direction,
+          indicators,
+          mindState,
+          volume: {
+            relVol,
+            line: volumeLine,
+          },
+        },
+      },
+    ];
   }
 
   private buildSnapshot(input: TickInput, timeframe: "1m" | "5m" | "15m"): TickSnapshot {

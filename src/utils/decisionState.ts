@@ -26,7 +26,8 @@ const DECISION_ALERT_EVENT_TYPES = new Set<DomainEventType>([
   "LLM_COACH_UPDATE",
   "PREMARKET_UPDATE",
   "VOLUME_UPDATE",
-  "PLAN_OF_DAY"
+  "PLAN_OF_DAY",
+  "MIND_STATE_UPDATED"
 ]);
 
 export const getDecisionState = (event: DomainEvent): DecisionState | undefined => {
@@ -44,6 +45,7 @@ export const isInternalEventType = (type: DomainEventType): boolean => INTERNAL_
 
 export const isDecisionAlertEvent = (event: DomainEvent): boolean => {
   if (event.type === "PLAN_OF_DAY") return true;
+  if (event.type === "MIND_STATE_UPDATED") return true;
   if (isInternalEventType(event.type)) return false;
   return isActionableDecisionState(getDecisionState(event));
 };

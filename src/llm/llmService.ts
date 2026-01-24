@@ -156,6 +156,13 @@ export interface ArmedCoachingResponse {
   urgency: "LOW" | "MEDIUM" | "HIGH";
 }
 
+export interface MindStateResponse {
+  summary: string;
+  bias?: "LONG" | "SHORT" | "NEUTRAL";
+  conviction?: number;
+  notes?: string[];
+}
+
 export class LLMService {
   private apiKey: string;
   private baseUrl: string;
@@ -877,5 +884,74 @@ Respond in this EXACT JSON format:
       reasoning: content.substring(0, 200),
       urgency
     };
+  }
+
+  async getMindState(context: {
+    symbol: string;
+    price: number;
+    indicators: Record<string, any>;
+    relVol?: number;
+    freshness?: Record<string, any>;
+    recent5mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+    impulseContext?: Record<string, any>;
+    rangeContext?: Record<string, any>;
+    swingPoints?: { high: number; low: number };
+  }): Promise<MindStateResponse> {
+    if (!this.enabled) {
+      return {
+        summary: "LLM disabled: using placeholder mind state.",
+        bias: "NEUTRAL",
+        conviction: 50,
+        notes: [],
+      };
+    }
+    const prompt = `You are summarizing a market mind-state for ${context.symbol}.
+Price: ${context.price.toFixed(2)}
+Indicators: ${JSON.stringify(context.indicators)}
+relVol: ${context.relVol ?? "n/a"}
+freshness: ${JSON.stringify(context.freshness ?? {})}
+recent5mBars: ${JSON.stringify(context.recent5mBars ?? [])}
+impulseContext: ${JSON.stringify(context.impulseContext ?? {})}
+rangeContext: ${JSON.stringify(context.rangeContext ?? {})}
+swingPoints: ${JSON.stringify(context.swingPoints ?? {})}
+
+Return JSON only:
+{
+  "summary": "short sentence",
+  "bias": "LONG|SHORT|NEUTRAL",
+  "conviction": 0-100,
+  "notes": ["..."]
+}`;
+    const payload = {
+      model: this.model,
+      messages: [
+        { role: "system", content: "Return JSON only. No markdown." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
+    };
+    const start = Date.now();
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const duration = Date.now() - start;
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`[LLM] MindState error (${duration}ms):`, response.status, error);
+      return { summary: "LLM error", bias: "NEUTRAL", conviction: 0 };
+    }
+    const json = await response.json();
+    const content = json?.choices?.[0]?.message?.content ?? "{}";
+    try {
+      return JSON.parse(content);
+    } catch (err) {
+      console.error("[LLM] MindState parse error:", err);
+      return { summary: "LLM parse error", bias: "NEUTRAL", conviction: 0 };
+    }
   }
 }

@@ -85,6 +85,18 @@ export function buildTelegramSignature(snapshot: TelegramSnapshot): string {
     ].join("|");
   }
 
+  if (snapshot.type === "MIND") {
+    return [
+      snapshot.type,
+      snapshot.symbol,
+      snapshot.px ?? "",
+      snapshot.ts ?? "",
+      snapshot.volumeLine ?? "",
+      snapshot.indicators ? JSON.stringify(snapshot.indicators) : "",
+      snapshot.mindState ? JSON.stringify(snapshot.mindState) : "",
+    ].join("|");
+  }
+
   if (snapshot.type === "MANAGE" && snapshot.update) {
     return [
       ...base,

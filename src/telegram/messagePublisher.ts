@@ -18,12 +18,15 @@ export class MessagePublisher {
     suppressedByThrottle: 0,
     publishedByException: 0,
   };
+  private readonly botMode: string;
 
   constructor(
     private governor: MessageGovernor,
     private bot: TelegramBotLike,
     private chatId: number
-  ) {}
+  ) {
+    this.botMode = (process.env.BOT_MODE || "").toLowerCase();
+  }
 
   /**
    * Publish event through MessageGovernor (single choke point)
@@ -168,6 +171,20 @@ export class MessagePublisher {
    * Internal publish method (called from queue)
    */
   private async _publishOrderedInternal(events: DomainEvent[]): Promise<void> {
+    if (this.botMode === "minimal") {
+      const minimalEvents = events.filter((event) => event.type === "MIND_STATE_UPDATED");
+      if (minimalEvents.length === 0) {
+        console.log("[PUB] skipped batch: no MIND_STATE_UPDATED");
+        return;
+      }
+      for (const event of minimalEvents) {
+        const sent = await this.publishWithControls(event);
+        if (!sent) {
+          console.log("[PUB] skipped MIND_STATE_UPDATED (blocked by governor)");
+        }
+      }
+      return;
+    }
     // Track state for invariant checks
     const seenPlayIds = new Set<string>();
     const seenLLMVerify = new Set<string>();

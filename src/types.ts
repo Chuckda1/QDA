@@ -169,7 +169,8 @@ export type DomainEventType =
   | "PLAY_CLOSED"
   | "PREMARKET_UPDATE"
   | "VOLUME_UPDATE"
-  | "PLAN_OF_DAY";
+  | "PLAN_OF_DAY"
+  | "MIND_STATE_UPDATED";
 
 export interface DomainEvent {
   type: DomainEventType;
@@ -317,4 +318,5 @@ export interface BotState {
   lastLLMCallAt?: number;
   lastLLMDecision?: string;
   timingState?: TimingStateContext;
+  mindState?: Record<string, any>;
 }

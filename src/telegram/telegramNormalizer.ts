@@ -2,7 +2,7 @@ import type { Bias, Direction, DomainEvent } from "../types.js";
 import { getDecisionState } from "../utils/decisionState.js";
 import { volumePolicy } from "../utils/volumePolicy.js";
 
-export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
+export type TelegramSnapshotType = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE" | "MIND";
 
 export type TelegramSnapshot = {
   type: TelegramSnapshotType;
@@ -18,6 +18,8 @@ export type TelegramSnapshot = {
   blockedBy?: string[];
   gates?: string;
   volumeRetestOk?: boolean;
+  mindState?: Record<string, any>;
+  indicators?: Record<string, any>;
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
     low: number;
@@ -542,6 +544,20 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         ts,
         price: event.data.price ?? event.data.close ?? event.data.entryPrice,
       },
+    };
+  }
+
+  if (event.type === "MIND_STATE_UPDATED") {
+    return {
+      type: "MIND",
+      symbol,
+      dir,
+      risk,
+      px,
+      ts,
+      indicators: event.data.indicators,
+      mindState: event.data.mindState,
+      volumeLine,
     };
   }
 
