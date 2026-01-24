@@ -812,7 +812,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
         conf,
         risk,
         volumeLine,
-        status: decisionState === "SIGNAL" ? "SIGNAL" : "WATCH",
+        status: "WATCH",
         blockedBy,
         gates: gatesLine,
         volumeRetestOk: event.data.volume?.retestOk,

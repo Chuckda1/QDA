@@ -10,6 +10,7 @@ export type DecisionBlocker =
   | "chop"
   | "low_probability"
   | "datafeed"
+  | "data_stale"
   | "time_window"
   | "entry_filter";
 
