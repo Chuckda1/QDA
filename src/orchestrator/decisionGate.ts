@@ -1,15 +1,19 @@
 import type { Play, SetupCandidate, TradeAction } from "../types.js";
 
 export type DecisionStatus = "NO_SETUP" | "BLOCKED" | "LLM_PASS" | "ARMED";
+/** @deprecated Legacy-only. Do not use in minimal mode. */
 export type DecisionBlocker =
-  | "no_active_play"
-  | "arming_failed"
-  | "data_stale"
-  | "warmup_incomplete"
-  | "missing_bars"
-  | "invalid_stop"
-  | "time_cutoff"
-  | "fatal_error";
+  | "datafeed"
+  | "expired"
+  | "cooldown"
+  | "guardrail"
+  | "time_window"
+  | "entry_filter"
+  | "chop"
+  | "range"
+  | "news"
+  | "risk_lock"
+  | "unknown";
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";
   agreement?: number;
