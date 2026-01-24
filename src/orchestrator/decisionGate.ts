@@ -1,7 +1,15 @@
 import type { Play, SetupCandidate, TradeAction } from "../types.js";
 
 export type DecisionStatus = "NO_SETUP" | "BLOCKED" | "LLM_PASS" | "ARMED";
-export type { DecisionBlocker } from "../legacy/types.js";
+export type DecisionBlocker =
+  | "no_active_play"
+  | "arming_failed"
+  | "data_stale"
+  | "warmup_incomplete"
+  | "missing_bars"
+  | "invalid_stop"
+  | "time_cutoff"
+  | "fatal_error";
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";
   agreement?: number;
