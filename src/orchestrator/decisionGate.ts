@@ -45,6 +45,12 @@ export type DecisionRulesSnapshot = {
   ruleScores: Record<string, any>;
 };
 
+function assertNotMinimalMode(): void {
+  if (process.env.BOT_MODE === "minimal") {
+    throw new Error("[MINIMAL MODE GUARD] decisionGate executed in minimal mode");
+  }
+}
+
 export type DecisionSummary = {
   decisionId: string;
   status: DecisionStatus;
@@ -73,6 +79,7 @@ export type DecisionGateInputs = {
 };
 
 export function buildDecision(inputs: DecisionGateInputs): AuthoritativeDecision {
+  assertNotMinimalMode();
   const {
     ts,
     symbol,
@@ -167,6 +174,7 @@ export function buildNoEntryDecision(params: {
   candidate?: SetupCandidate;
   llm?: DecisionLlmSummary;
 }): AuthoritativeDecision {
+  assertNotMinimalMode();
   const decisionId = `${params.symbol}_${params.ts}_${params.candidate?.id ?? "none"}`;
   const blockers: DecisionBlocker[] = [params.reason];
   const blockerReasons = params.reasonDetail ? [params.reasonDetail] : [];
