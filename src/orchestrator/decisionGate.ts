@@ -13,7 +13,11 @@ export type DecisionBlocker =
   | "range"
   | "news"
   | "risk_lock"
-  | "unknown";
+  | "unknown"
+  // legacy compatibility (DO NOT REMOVE YET)
+  | "arming_failed"
+  | "data_stale"
+  | "no_active_play";
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";
   agreement?: number;
