@@ -1,4 +1,5 @@
 import type { Play, SetupCandidate, TradeAction } from "../../types.js";
+import type { DecisionBlocker } from "../../legacy/legacyTypes.js";
 
 export type DecisionStatus = "NO_SETUP" | "BLOCKED" | "LLM_PASS" | "ARMED";
 /** @deprecated Legacy-only. Do not use in minimal mode. */
@@ -32,7 +33,7 @@ export type DecisionRulesSnapshot = {
 
 function assertNotMinimalMode(): void {
   if (process.env.BOT_MODE === "minimal") {
-    throw new Error("[MINIMAL MODE GUARD] decisionGate executed in minimal mode");
+    throw new Error("[MINIMAL MODE GUARD] legacy_disabled decisionGate executed");
   }
 }
 
