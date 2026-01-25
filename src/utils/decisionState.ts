@@ -1,10 +1,11 @@
-import type { DomainEvent, DomainEventType } from "../types.js";
+import type { DomainEvent } from "../types.js";
+import type { LegacyDecisionState, LegacyDomainEventType } from "../legacy/legacyTypes.js";
 
-export type DecisionState = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
+export type DecisionState = LegacyDecisionState;
 
 const DECISION_STATES = new Set<DecisionState>(["SIGNAL", "WATCH", "UPDATE", "MANAGE"]);
 
-const INTERNAL_EVENT_TYPES = new Set<DomainEventType>([
+const INTERNAL_EVENT_TYPES = new Set<LegacyDomainEventType>([
   "SETUP_CANDIDATES",
   "LLM_VERIFY",
   "LLM_PICK",
@@ -16,7 +17,7 @@ const INTERNAL_EVENT_TYPES = new Set<DomainEventType>([
   "ARMED_COACH"
 ]);
 
-const DECISION_ALERT_EVENT_TYPES = new Set<DomainEventType>([
+const DECISION_ALERT_EVENT_TYPES = new Set<LegacyDomainEventType>([
   "PLAY_ARMED",
   "PLAY_ENTERED",
   "PLAY_SIZED_UP",

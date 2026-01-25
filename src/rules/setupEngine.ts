@@ -148,6 +148,12 @@ function computeVwapSlopeAtr(bars: OHLCVBar[], vwapPeriod: number, lookbackBars:
   return (now - past) / atr;
 }
 
+function assertNotMinimalModeLegacy(entry: string): void {
+  if (process.env.BOT_MODE === "minimal") {
+    throw new Error(`[MINIMAL MODE GUARD] ${entry} executed in minimal mode`);
+  }
+}
+
 /**
  * SetupEngine: Deterministic pattern detection for trading setups
  * 
@@ -162,6 +168,7 @@ export class SetupEngine {
    * Returns best-scoring candidate if patterns exist, otherwise returns reason for rejection
    */
   findSetup(ctx: SetupEngineContext): SetupEngineResult {
+    assertNotMinimalModeLegacy("SetupEngine.findSetup");
     const { ts, symbol, currentPrice, bars, regime, directionInference, indicators } = ctx;
     const baseReasons: string[] = [];
 

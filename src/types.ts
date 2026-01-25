@@ -1,6 +1,7 @@
-import type { DomainEventType, RangeBand } from "./legacy/types.js";
+import type { LegacyDomainEventType, RangeBand } from "./legacy/legacyTypes.js";
 
-export type { DomainEventType, RangeBand } from "./legacy/types.js";
+export type { RangeBand } from "./legacy/legacyTypes.js";
+export type DomainEventType = LegacyDomainEventType;
 export type Direction = "LONG" | "SHORT";
 export type Bias = "LONG" | "SHORT" | "NEUTRAL";
 export type Regime = "TREND_UP" | "TREND_DOWN" | "CHOP" | "TRANSITION";

@@ -8,7 +8,7 @@ import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
 import { computeMacroBias, computeRegime, type RegimeOptions } from "../rules/regimeRules.js";
 import { computeATR, computeBollingerBands, computeEMA, computeRSI, computeSessionVWAP, computeVWAP, type OHLCVBar } from "../utils/indicators.js";
-import { SetupEngine, type SetupEngineResult } from "../rules/setupEngine.js";
+import { SetupEngine, type SetupEngineResult } from "../legacy_disabled/rules/setupEngine.js";
 import type { SetupCandidate } from "../types.js";
 import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
@@ -21,7 +21,7 @@ import {
   type DecisionBlocker,
   type DecisionLlmSummary,
   type DecisionRulesSnapshot
-} from "./decisionGate.js";
+} from "../legacy_disabled/orchestrator/decisionGate.js";
 
 type SetupDiagnosticsSnapshot = {
   ts: number;
@@ -395,6 +395,12 @@ function computeRangeRails(params: {
   };
 }
 
+function assertNotMinimalModeLegacy(entry: string): void {
+  if (process.env.BOT_MODE === "minimal") {
+    throw new Error(`[MINIMAL MODE GUARD] ${entry} executed in minimal mode`);
+  }
+}
+
 export function buildChopPlan(params: {
   ts: number;
   close: number;
@@ -423,6 +429,7 @@ export function buildChopPlan(params: {
   activeSide: "LONG_ONLY" | "SHORT_ONLY" | "NONE";
   location: { zone: "LOW" | "MID" | "HIGH"; pos: number };
 } {
+  assertNotMinimalModeLegacy("buildChopPlan");
   const rails = computeRangeRails({
     ts: params.ts,
     rangeCandidates: params.rangeCandidates,
@@ -1037,18 +1044,23 @@ export class Orchestrator {
 
     if (botMode === "minimal") {
       if (timeframe === "5m") {
+        console.log(`[TICK] branch=MINIMAL tf=5m ts=${input.ts}`);
         this.trackMinimalBar(snapshot, "5m");
         return events;
       }
       if (timeframe !== "1m") {
+        console.log(`[TICK] branch=MINIMAL tf=${timeframe} ts=${input.ts}`);
         return events;
       }
+      console.log(`[TICK] branch=MINIMAL tf=1m ts=${input.ts}`);
       return await this.handleMinimal1m(snapshot);
     }
 
     if (process.env.BOT_MODE === "minimal") {
       throw new Error("LEGACY PATH EXECUTED IN MINIMAL MODE");
     }
+
+    console.log(`[TICK] branch=LEGACY tf=${timeframe} ts=${input.ts}`);
 
     // Branch by timeframe
     if (timeframe === "1m") {
@@ -1165,6 +1177,7 @@ export class Orchestrator {
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     this.trackMinimalBar(snapshot, "1m");
+    console.log(`[MINIMAL] handler=handleMinimal1m symbol=${symbol} ts=${ts}`);
 
     const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
@@ -1268,6 +1281,7 @@ export class Orchestrator {
    * Handle 1m bars: Entry detection + close-based stop checks
    */
   private async handle1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    assertNotMinimalModeLegacy("handle1m");
     const events: DomainEvent[] = [];
     const { ts, symbol, close, high, low, open, volume } = snapshot;
     const buildTacticalInference = () => {
@@ -1854,6 +1868,7 @@ export class Orchestrator {
    * Handle 15m bars: update regime + macro bias anchor (with hysteresis)
    */
   private async handle15m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    assertNotMinimalModeLegacy("handle15m");
     const { ts, close, open, high, low, volume } = snapshot;
 
     if (high !== undefined && low !== undefined) {
@@ -1947,6 +1962,7 @@ export class Orchestrator {
    * 2. LLM_COACH_UPDATE: If play is entered (position management)
    */
   private async handle5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    assertNotMinimalModeLegacy("handle5m");
     const events: DomainEvent[] = [];
     const { ts, symbol, close, open, high, low, volume } = snapshot;
 
@@ -3777,6 +3793,7 @@ export class Orchestrator {
    * Provides pre-entry commentary without pretending we're in a position
    */
   private async handleArmedCoaching(snapshot: TickSnapshot, play: Play, events: DomainEvent[]): Promise<DomainEvent[]> {
+    assertNotMinimalModeLegacy("handleArmedCoaching");
     const { ts, symbol, close } = snapshot;
 
     // Check cache: armedCoachCacheKey = playId + "_armed_" + snapshot.ts
@@ -3871,6 +3888,7 @@ export class Orchestrator {
    * This is the existing LLM_COACH_UPDATE logic
    */
   private async handleManageCoaching(snapshot: TickSnapshot, play: Play, events: DomainEvent[]): Promise<DomainEvent[]> {
+    assertNotMinimalModeLegacy("handleManageCoaching");
     const { ts, symbol, close } = snapshot;
 
     // Build telemetry packet (rules math)

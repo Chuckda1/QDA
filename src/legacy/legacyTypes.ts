@@ -1,17 +1,23 @@
 export type DecisionBlocker =
-  | "no_active_play"
-  | "arming_failed"
+  | "datafeed"
   | "expired"
   | "cooldown"
   | "guardrail"
-  | "chop"
-  | "low_probability"
-  | "datafeed"
-  | "data_stale"
   | "time_window"
-  | "entry_filter";
+  | "entry_filter"
+  | "chop"
+  | "range"
+  | "news"
+  | "risk_lock"
+  | "unknown"
+  // legacy compatibility (DO NOT REMOVE YET)
+  | "arming_failed"
+  | "data_stale"
+  | "no_active_play";
 
-export type DomainEventType =
+export type LegacyDecisionState = "SIGNAL" | "WATCH" | "UPDATE" | "MANAGE";
+
+export type LegacyDomainEventType =
   | "PLAY_ARMED"
   | "ENTRY_WINDOW_OPENED"
   | "TIMING_COACH"
