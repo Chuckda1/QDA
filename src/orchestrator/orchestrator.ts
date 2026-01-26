@@ -1434,7 +1434,7 @@ export class Orchestrator {
     });
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
-    const snapshot: MinimalLLMSnapshot = {
+    const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
       lastPrice: close,
@@ -1468,7 +1468,7 @@ export class Orchestrator {
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
           mode: "MIND_5M_CLOSE",
-          snapshot,
+          snapshot: llmSnapshot,
         })
       : { mindState: fallbackMindState5m, valid: false };
 
@@ -1507,7 +1507,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
-          extras: snapshot.extras,
+          extras: llmSnapshot.extras,
         },
       },
     ];
@@ -1529,7 +1529,7 @@ export class Orchestrator {
     });
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
-    const snapshot: MinimalLLMSnapshot = {
+    const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
       lastPrice: close,
@@ -1563,7 +1563,7 @@ export class Orchestrator {
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
           mode: "EXEC_FORMING_5M",
-          snapshot,
+          snapshot: llmSnapshot,
         })
       : { mindState: fallbackMindState1m, valid: false };
 
@@ -1602,7 +1602,7 @@ export class Orchestrator {
           mode: "EXEC_FORMING_5M",
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
-          extras: snapshot.extras,
+          extras: llmSnapshot.extras,
         },
       },
     ];

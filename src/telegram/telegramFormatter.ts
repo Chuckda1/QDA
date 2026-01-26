@@ -267,17 +267,20 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const invalidLines = invalidations.length
       ? invalidations.slice(0, 2).map((item) => `- ${item}`)
       : ["- n/a"];
-    const lines = enforceLineLimit("MIND", [
-      `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
-      `BIAS: ${bias} | STATE: ${state} | ACTION: ${action} | CONF: ${confidence}`,
-      `WAITING_FOR: ${waitingFor}`,
-      lastClosed,
-      formingLine,
-      "INVALID_IF:",
-      ...invalidLines,
-      levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
-      extraParts.length ? `EXTRAS: ${extraParts.join(" | ")}` : undefined,
-    ]);
+    const lines = enforceLineLimit(
+      "MIND",
+      [
+        `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
+        `BIAS: ${bias} | STATE: ${state} | ACTION: ${action} | CONF: ${confidence}`,
+        `WAITING_FOR: ${waitingFor}`,
+        lastClosed,
+        formingLine,
+        "INVALID_IF:",
+        ...invalidLines,
+        levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
+        extraParts.length ? `EXTRAS: ${extraParts.join(" | ")}` : undefined,
+      ].filter(nonEmpty)
+    );
     return { type: "MIND", lines, text: lines.join("\n") };
   }
 
