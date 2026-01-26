@@ -1411,7 +1411,9 @@ export class Orchestrator {
     }
     const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
     const bias =
-      typeof mindState.trend === "string"
+      typeof mindState.direction === "string"
+        ? mindState.direction
+        : typeof mindState.trend === "string"
         ? mindState.trend
         : typeof mindState.bias === "string"
         ? mindState.bias
@@ -1540,11 +1542,9 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      trend: this.state.activeMind?.bias ?? "UNKNOWN",
-      entry: "WAIT",
+      direction: (this.state.activeMind?.bias ?? "none").toString().toLowerCase(),
+      confidence: 0,
       reason: "LLM unavailable",
-      levels: null,
-      notes: [],
     };
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMinimalMindState(llmSnapshot)
@@ -1565,11 +1565,15 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
+      typeof mindState.reason === "string"
+        ? mindState.reason
+        : typeof mindState.direction === "string"
+        ? mindState.direction
+        : undefined;
 
-    const direction = mindState.trend;
+    const direction = mindState.direction;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1697,11 +1701,9 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      trend: this.state.activeMind?.bias ?? "UNKNOWN",
-      entry: "WAIT",
+      direction: (this.state.activeMind?.bias ?? "none").toString().toLowerCase(),
+      confidence: 0,
       reason: "LLM unavailable",
-      levels: null,
-      notes: [],
     };
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMinimalMindState(llmSnapshot)
@@ -1722,11 +1724,15 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
+      typeof mindState.reason === "string"
+        ? mindState.reason
+        : typeof mindState.direction === "string"
+        ? mindState.direction
+        : undefined;
 
-    const direction = mindState.trend;
+    const direction = mindState.direction;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 
