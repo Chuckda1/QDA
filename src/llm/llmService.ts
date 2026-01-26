@@ -957,7 +957,12 @@ Definitions:
 - RESET = "I can’t trust the thesis right now." Pause until next 5m close.
 - INVALID = "This thesis is wrong." Only if a predefined invalidation condition is breached.
 - Only 5m (mode=MIND_5M_CLOSE) can form/flip thesis or mindId.
-- 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
+- 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
+
+EXEC_1M prompt:
+- Given activeMind bias + thesis, has price pulled back enough against it?
+- Is there confirmation to enter now?
+- If not, what exactly are we waiting for?
 
 Return JSON only:
 {
@@ -980,6 +985,7 @@ Rules:
 - If mode=MIND_5M_CLOSE: invalidation_conditions must be a non-empty array.
 - If mode=EXEC_1M: bias must remain unchanged unless action is RESET or INVALID.
 - If action=INVALID: invalidation_reason must reference an item in activeMind.invalidation_conditions.
+- For EXEC_1M: waiting_for must be a single, concrete condition.
 `;
     const payload = {
       model: this.model,
