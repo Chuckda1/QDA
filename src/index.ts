@@ -21,6 +21,27 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const HAS_OPENAI_KEY = !!process.env.OPENAI_API_KEY;
 const SYMBOLS = process.env.SYMBOLS || "SPY";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "not_set";
+const BOT_MODE = (process.env.BOT_MODE || "").toLowerCase();
+
+const parseWarmupBars = (value: string | undefined, fallback: number): number => {
+  const parsed = parseInt(value ?? "", 10);
+  if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  return fallback;
+};
+
+const WARMUP_1M_BARS = parseWarmupBars(process.env.WARMUP_1M_BARS, 60);
+const WARMUP_5M_BARS = parseWarmupBars(process.env.WARMUP_5M_BARS, 30);
+
+let markWarmupReady: (() => void) | null = null;
+const warmupReady = new Promise<void>((resolve) => {
+  markWarmupReady = resolve;
+});
+const resolveWarmupReady = (): void => {
+  if (markWarmupReady) {
+    markWarmupReady();
+    markWarmupReady = null;
+  }
+};
 
 // Print startup inventory
 console.log("=== STAGE 0 STARTUP INVENTORY ===");
@@ -28,7 +49,10 @@ console.log(`BUILD_ID: ${BUILD_ID}`);
 console.log(`NODE_ENV: ${NODE_ENV}`);
 console.log(`ENTRY_MODE: ${ENTRY_MODE}`);
 console.log(`OPENAI_API_KEY: ${HAS_OPENAI_KEY}`);
+console.log(`BOT_MODE: ${BOT_MODE || "default"}`);
 console.log(`SYMBOLS: ${SYMBOLS}`);
+console.log(`WARMUP_1M_BARS: ${WARMUP_1M_BARS}`);
+console.log(`WARMUP_5M_BARS: ${WARMUP_5M_BARS}`);
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
 console.log("=================================");
 
@@ -151,24 +175,26 @@ const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
 scheduler.start();
 
 // One-shot minimal tick (startup confirmation)
-if ((process.env.BOT_MODE || "").toLowerCase() === "minimal") {
-  setTimeout(async () => {
-    try {
-      const now = Date.now();
-      await orch.processTick({
-        ts: now,
-        symbol,
-        close: 500,
-        open: 499,
-        high: 501,
-        low: 498,
-        volume: 1000,
-      }, "1m");
-      console.log("[MINIMAL] one-shot tick injected");
-    } catch (err: any) {
-      console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
-    }
-  }, 1500);
+if (BOT_MODE === "minimal") {
+  warmupReady.then(() => {
+    setTimeout(async () => {
+      try {
+        const now = Date.now();
+        await orch.processTick({
+          ts: now,
+          symbol,
+          close: 500,
+          open: 499,
+          high: 501,
+          low: 498,
+          volume: 1000,
+        }, "1m");
+        console.log("[MINIMAL] one-shot tick injected");
+      } catch (err: any) {
+        console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
+      }
+    }, 1500);
+  });
 }
 setInterval(() => {
   logStructuredPulse(orch, governor, symbol);
@@ -276,16 +302,14 @@ if (alpacaKey && alpacaSecret) {
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
       const agg5mFrom1m = new BarAggregator(5);
       const agg15mFrom5m = new BarAggregator(15);
-      const warmup5mBars = Math.max(0, parseInt(process.env.WARMUP_5M_BARS || "30", 10));
-      const warmup1mBars = Math.max(0, parseInt(process.env.WARMUP_1M_BARS || "60", 10));
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
 
       // Warmup: fetch 5m and 1m separately, then aggregate 15m from 5m
       try {
-        if (warmup5mBars > 0) {
-          console.log(`[${instanceId}] Warmup: fetching ${warmup5mBars}x 5m bars for ${symbol}...`);
-          const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", warmup5mBars);
+        if (WARMUP_5M_BARS > 0) {
+          console.log(`[${instanceId}] Warmup: fetching ${WARMUP_5M_BARS}x 5m bars for ${symbol}...`);
+          const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", WARMUP_5M_BARS);
           for (const bar of bars5m) {
             await orch.processTick({
               ts: bar.ts,
@@ -311,9 +335,9 @@ if (alpacaKey && alpacaSecret) {
           }
         }
 
-        if (warmup1mBars > 0) {
-          console.log(`[${instanceId}] Warmup: fetching ${warmup1mBars}x 1m bars for ${symbol}...`);
-          const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", warmup1mBars);
+        if (WARMUP_1M_BARS > 0) {
+          console.log(`[${instanceId}] Warmup: fetching ${WARMUP_1M_BARS}x 1m bars for ${symbol}...`);
+          const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", WARMUP_1M_BARS);
           for (const bar of bars1m) {
             await orch.processTick({
               ts: bar.ts,
@@ -328,6 +352,8 @@ if (alpacaKey && alpacaSecret) {
         }
       } catch (warmupError: any) {
         console.warn(`[${instanceId}] Warmup failed: ${warmupError?.message || String(warmupError)}`);
+      } finally {
+        resolveWarmupReady();
       }
       
       // Use WebSocket for real-time bars (preferred)
@@ -441,11 +467,13 @@ if (alpacaKey && alpacaSecret) {
       }
     } catch (error: any) {
       console.error("Alpaca feed error:", error.message);
+      resolveWarmupReady();
     }
   })().catch(err => console.error("Alpaca feed initialization error:", err));
 } else {
   console.log(`[${instanceId}] ⚠️  No Alpaca credentials - bot running without market data feed`);
   console.log(`[${instanceId}]    Wire your own data source or set ALPACA_API_KEY and ALPACA_API_SECRET`);
+  resolveWarmupReady();
 }
 
 // Option 2: Wire your own data source here

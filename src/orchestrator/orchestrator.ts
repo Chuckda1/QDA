@@ -1666,10 +1666,16 @@ export class Orchestrator {
   private logReadyGate(ts: number): void {
     if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
     this.lastReadyLogTs = ts;
-    const ready1m = this.recentBars1m.length >= 30;
-    const ready5m = this.recentBars5m.length >= 15;
+    const bars1m = this.recentBars1m.length;
+    const bars5m = this.recentBars5m.length;
+    const readyRSI1m = bars1m >= 15;
+    const readyATR1m = bars1m >= 15;
+    const readyVWAP1m = bars1m >= 30;
+    const readyRSI5m = bars5m >= 15;
+    const readyATR5m = bars5m >= 15;
+    const readyVWAP5m = bars5m >= 30;
     console.log(
-      `[MINIMAL] READY gate 1m=${ready1m} 5m=${ready5m} bars1m=${this.recentBars1m.length} bars5m=${this.recentBars5m.length}`
+      `[MINIMAL] READY gate bars1m=${bars1m} bars5m=${bars5m} RSI1m=${readyRSI1m} ATR1m=${readyATR1m} VWAP1m=${readyVWAP1m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} VWAP5m=${readyVWAP5m}`
     );
   }
 
