@@ -234,14 +234,22 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   }
 
   if (snapshot.type === "MIND") {
-    const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
-    const header = `MIND_STATE: ${snapshot.symbol} | px ${px} | ${snapshot.ts ?? "n/a"}`;
-    const indicators = snapshot.indicators
-      ? `INDICATORS: ${JSON.stringify(snapshot.indicators)}`
-      : "INDICATORS: n/a";
-    const mind = snapshot.mindState ? `MIND: ${JSON.stringify(snapshot.mindState)}` : "MIND: n/a";
-    const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
-    const lines = enforceLineLimit("MIND", [header, indicators, mind, vol].filter(nonEmpty));
+    const mind = snapshot.mindState ?? {};
+    const bias = mind.bias ?? "n/a";
+    const thesisState = mind.thesisState ?? "n/a";
+    const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
+    const action = mind.action ?? "n/a";
+    const waitingFor = mind.waiting_for ?? "n/a";
+    const invalidation =
+      Array.isArray(mind.invalidation_conditions) && mind.invalidation_conditions.length > 0
+        ? mind.invalidation_conditions[0]
+        : "n/a";
+    const lines = enforceLineLimit("MIND", [
+      `MIND: ${snapshot.symbol} ${bias} | ${thesisState} | conf ${confidence}`,
+      `WAIT: ${waitingFor}`,
+      `INVALID if: ${invalidation}`,
+      `EXEC: ${action}`,
+    ]);
     return { type: "MIND", lines, text: lines.join("\n") };
   }
 

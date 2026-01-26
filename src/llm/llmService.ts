@@ -958,6 +958,8 @@ Definitions:
 - INVALID = "This thesis is wrong." Only if a predefined invalidation condition is breached.
 - Only 5m (mode=MIND_5M_CLOSE) can form/flip thesis or mindId.
 - 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
+- RESET requires thesisState=FLAT or SUSPENDED and no bias flip.
+- INVALID requires thesisState=INVALID and must reference an invalidation_conditions entry.
 
 EXEC_1M prompt:
 - Given activeMind bias + thesis, has price pulled back enough against it?
