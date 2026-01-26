@@ -1256,6 +1256,20 @@ export class Orchestrator {
       this.computeSwingPoints(this.recentBars5m, 12) ??
       this.computeSwingPoints(this.recentBars1m, 20);
     const previousMindState = this.state.mindState;
+    const fallbackMindState5m: Record<string, any> = {
+      summary: "LLM unavailable",
+      mindId: this.state.activeMind?.mindId,
+      bias: this.state.activeMind?.bias ?? "NEUTRAL",
+      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      action: "HOLD",
+      confidence: 0,
+      because: "LLM unavailable",
+      waiting_for: "LLM enabled",
+      invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
+      reset_reason: "",
+      invalidation_reason: "",
+      notes: [],
+    };
     const mindState = this.llmService
       ? await this.llmService.getMindState({
           mode: "MIND_5M_CLOSE",
@@ -1271,7 +1285,7 @@ export class Orchestrator {
           previousMindState,
           activeMind: this.state.activeMind,
         })
-      : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
+      : fallbackMindState5m;
     const nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
 
     this.state.mindState = mindState;
@@ -1355,6 +1369,20 @@ export class Orchestrator {
       volume: bar.volume,
     }));
     const previousMindState = this.state.mindState;
+    const fallbackMindState1m: Record<string, any> = {
+      summary: "LLM unavailable",
+      mindId: this.state.activeMind?.mindId,
+      bias: this.state.activeMind?.bias ?? "NEUTRAL",
+      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      action: "HOLD",
+      confidence: 0,
+      because: "LLM unavailable",
+      waiting_for: "LLM enabled",
+      invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
+      reset_reason: "",
+      invalidation_reason: "",
+      notes: [],
+    };
     const mindState = this.llmService
       ? await this.llmService.getMindState({
           mode: "EXEC_1M",
@@ -1374,7 +1402,7 @@ export class Orchestrator {
           previousMindState,
           activeMind: this.state.activeMind,
         })
-      : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
+      : fallbackMindState1m;
     const rawAction = typeof mindState.action === "string" ? mindState.action.toUpperCase() : "HOLD";
     const action = ["HOLD", "ARM", "ENTER", "RESET", "INVALID", "SUSPEND"].includes(rawAction) ? rawAction : "HOLD";
     const activeMind = this.state.activeMind;
