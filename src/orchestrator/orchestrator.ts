@@ -247,22 +247,24 @@ function buildIndicatorSnapshot(params: {
 }
 
 function buildMinimalIndicatorSummary(snapshot: Record<string, any>): {
-  vwap_1m?: number;
-  vwap_5m?: number;
-  rsi_1m?: number;
-  rsi_5m?: number;
-  atr_1m?: number;
-  atr_5m?: number;
-  relVol?: number;
+  vwap_1m: number | null;
+  vwap_5m: number | null;
+  rsi_1m: number | null;
+  rsi_5m: number | null;
+  atr_1m: number | null;
+  atr_5m: number | null;
+  relVol: number | null;
 } {
+  const toNumberOrNull = (value: unknown): number | null =>
+    Number.isFinite(value) ? (value as number) : null;
   return {
-    vwap_1m: snapshot?.vwap?.["1m"],
-    vwap_5m: snapshot?.vwap?.["5m"],
-    rsi_1m: snapshot?.rsi14?.["1m"],
-    rsi_5m: snapshot?.rsi14?.["5m"],
-    atr_1m: snapshot?.atr14?.["1m"],
-    atr_5m: snapshot?.atr14?.["5m"],
-    relVol: snapshot?.volume?.relVol,
+    vwap_1m: toNumberOrNull(snapshot?.vwap?.["1m"]),
+    vwap_5m: toNumberOrNull(snapshot?.vwap?.["5m"]),
+    rsi_1m: toNumberOrNull(snapshot?.rsi14?.["1m"]),
+    rsi_5m: toNumberOrNull(snapshot?.rsi14?.["5m"]),
+    atr_1m: toNumberOrNull(snapshot?.atr14?.["1m"]),
+    atr_5m: toNumberOrNull(snapshot?.atr14?.["5m"]),
+    relVol: toNumberOrNull(snapshot?.volume?.relVol),
   };
 }
 
@@ -1383,6 +1385,10 @@ export class Orchestrator {
 
     const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
+    const indicators = { ...indicators1m, ...indicators5m };
+    console.log("[MINIMAL] indicators1m", indicators1m);
+    console.log("[MINIMAL] indicators5m", indicators5m);
+    console.log("[MINIMAL] indicators merged", indicators);
     const relVol = this.computeRelVol(this.recentBars1m);
     const indicatorSnapshot = buildIndicatorSnapshot({
       price: close,
@@ -1478,6 +1484,10 @@ export class Orchestrator {
 
     const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
+    const indicators = { ...indicators1m, ...(indicators5m ?? {}) };
+    console.log("[MINIMAL] indicators1m", indicators1m);
+    console.log("[MINIMAL] indicators5m", indicators5m ?? {});
+    console.log("[MINIMAL] indicators merged", indicators);
     const relVol = this.computeRelVol(this.recentBars1m);
     const volumePolicySnapshot = relVol !== undefined ? volumePolicy(relVol) : undefined;
     const volumeLine =
