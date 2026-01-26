@@ -53,8 +53,20 @@ console.log(`BOT_MODE: ${BOT_MODE || "default"}`);
 console.log(`SYMBOLS: ${SYMBOLS}`);
 console.log(`WARMUP_1M_BARS: ${WARMUP_1M_BARS}`);
 console.log(`WARMUP_5M_BARS: ${WARMUP_5M_BARS}`);
+if (process.env.WARMUP_1M_BARS || process.env.WARMUP_5M_BARS) {
+  console.log(`WARMUP_1M_BARS_ENV: ${process.env.WARMUP_1M_BARS ?? "unset"}`);
+  console.log(`WARMUP_5M_BARS_ENV: ${process.env.WARMUP_5M_BARS ?? "unset"}`);
+}
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
 console.log("=================================");
+
+if (BOT_MODE === "minimal") {
+  if (WARMUP_1M_BARS < 60 || WARMUP_5M_BARS < 30) {
+    console.warn(
+      `[${instanceId}] Warmup below recommended defaults: 1m=${WARMUP_1M_BARS} (rec 60) 5m=${WARMUP_5M_BARS} (rec 30)`
+    );
+  }
+}
 
 // STAGE 3: Structured pulse tracker
 let bars1mCount = 0;

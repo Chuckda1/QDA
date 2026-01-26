@@ -1238,16 +1238,26 @@ export class Orchestrator {
 
   private trackMinimalBar(snapshot: TickSnapshot, tf: "1m" | "5m"): void {
     const { ts, close, open, high, low, volume } = snapshot;
-    if (high === undefined || low === undefined) {
-      console.warn(`[MINIMAL] missing OHLC high/low for ${tf} bar ts=${ts}`);
-      return;
+    let safeHigh = high;
+    let safeLow = low;
+    if (safeHigh === undefined || safeLow === undefined) {
+      if (Number.isFinite(close)) {
+        console.warn(`[MINIMAL] missing OHLC high/low for ${tf} bar ts=${ts}; using close`);
+        safeHigh = safeHigh ?? close;
+        safeLow = safeLow ?? close;
+      } else {
+        console.warn(`[MINIMAL] missing OHLC high/low and close for ${tf} bar ts=${ts}`);
+        return;
+      }
     }
     const safeOpen = open ?? close;
     const safeVol = volume ?? 0;
-    const bar = { ts, open: safeOpen, high, low, close, volume: safeVol };
+    const bar = { ts, open: safeOpen, high: safeHigh, low: safeLow, close, volume: safeVol };
     if (tf === "1m") {
       this.recentBars1m.push(bar);
       if (this.recentBars1m.length > 80) this.recentBars1m.shift();
+      const last1mTs = this.recentBars1m[this.recentBars1m.length - 1]?.ts;
+      console.log(`[MINIMAL] recentBars1m.length=${this.recentBars1m.length} last1mTs=${last1mTs ?? "n/a"}`);
     } else {
       this.recentBars5m.push(bar);
       if (this.recentBars5m.length > 120) this.recentBars5m.shift();
