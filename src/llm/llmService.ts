@@ -158,8 +158,16 @@ export interface ArmedCoachingResponse {
 
 export interface MindStateResponse {
   summary: string;
+  mindId?: string;
   bias?: "LONG" | "SHORT" | "NEUTRAL";
-  conviction?: number;
+  thesisState?: "FLAT" | "THESIS_FORMED" | "PULLBACK_WAIT" | "ARMED" | "ENTERED" | "INVALID";
+  action?: "HOLD" | "ARM" | "ENTER" | "RESET" | "INVALID" | "SUSPEND";
+  confidence?: number;
+  because?: string;
+  waiting_for?: string;
+  invalidation_conditions?: string[];
+  reset_reason?: string;
+  invalidation_reason?: string;
   notes?: string[];
 }
 
@@ -917,7 +925,14 @@ Respond in this EXACT JSON format:
       return {
         summary: "LLM disabled: using placeholder mind state.",
         bias: "NEUTRAL",
-        conviction: 50,
+        thesisState: "FLAT",
+        action: "HOLD",
+        confidence: 50,
+        because: "LLM disabled",
+        waiting_for: "LLM enabled",
+        invalidation_conditions: [],
+        reset_reason: "",
+        invalidation_reason: "",
         notes: [],
       };
     }
@@ -987,7 +1002,18 @@ Rules:
     if (!response.ok) {
       const error = await response.text();
       console.error(`[LLM] MindState error (${duration}ms):`, response.status, error);
-      return { summary: "LLM error", bias: "NEUTRAL", conviction: 0 };
+      return {
+        summary: "LLM error",
+        bias: "NEUTRAL",
+        thesisState: "FLAT",
+        action: "HOLD",
+        confidence: 0,
+        because: "LLM error",
+        waiting_for: "LLM recovery",
+        invalidation_conditions: [],
+        reset_reason: "",
+        invalidation_reason: "",
+      };
     }
     const json = await response.json();
     const content = json?.choices?.[0]?.message?.content ?? "{}";
@@ -995,7 +1021,18 @@ Rules:
       return JSON.parse(content);
     } catch (err) {
       console.error("[LLM] MindState parse error:", err);
-      return { summary: "LLM parse error", bias: "NEUTRAL", conviction: 0 };
+      return {
+        summary: "LLM parse error",
+        bias: "NEUTRAL",
+        thesisState: "FLAT",
+        action: "HOLD",
+        confidence: 0,
+        because: "LLM parse error",
+        waiting_for: "valid JSON response",
+        invalidation_conditions: [],
+        reset_reason: "",
+        invalidation_reason: "",
+      };
     }
   }
 }
