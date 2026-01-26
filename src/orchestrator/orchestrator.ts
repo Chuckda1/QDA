@@ -1199,7 +1199,7 @@ export class Orchestrator {
         return events;
       }
       console.log(`[TICK] branch=MINIMAL tf=1m ts=${input.ts}`);
-      return await this.handleMinimal1m(snapshot);
+      return await this.handleMinimalForming5m(snapshot);
     }
 
     if (process.env.BOT_MODE === "minimal") {
@@ -1477,10 +1477,10 @@ export class Orchestrator {
     ];
   }
 
-  private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+  private async handleMinimalForming5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     this.trackMinimalBar(snapshot, "1m");
-    console.log(`[MINIMAL] handler=handleMinimal1m symbol=${symbol} ts=${ts}`);
+    console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
     const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
@@ -1606,16 +1606,13 @@ export class Orchestrator {
   private logReadyGate(ts: number): void {
     if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
     this.lastReadyLogTs = ts;
-    const bars1m = this.recentBars1m.length;
     const bars5m = this.recentBars5m.length;
-    const readyRSI1m = bars1m >= 15;
-    const readyATR1m = bars1m >= 15;
-    const readyVWAP1m = bars1m >= 30;
     const readyRSI5m = bars5m >= 15;
     const readyATR5m = bars5m >= 15;
+    const readyEma20_5m = bars5m >= 20;
     const readyVWAP5m = bars5m >= 30;
     console.log(
-      `[MINIMAL] READY gate bars1m=${bars1m} bars5m=${bars5m} RSI1m=${readyRSI1m} ATR1m=${readyATR1m} VWAP1m=${readyVWAP1m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} VWAP5m=${readyVWAP5m}`
+      `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m=${readyVWAP5m}`
     );
   }
 
