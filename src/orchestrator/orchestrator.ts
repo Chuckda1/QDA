@@ -1405,10 +1405,15 @@ export class Orchestrator {
       };
     }
     const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
-    const bias = typeof mindState.bias === "string" ? mindState.bias : undefined;
+    const bias =
+      typeof mindState.trend === "string"
+        ? mindState.trend
+        : typeof mindState.bias === "string"
+        ? mindState.bias
+        : undefined;
     const thesisState =
-      typeof mindState.thesisState === "string"
-        ? mindState.thesisState
+      typeof mindState.entry === "string"
+        ? mindState.entry
         : typeof mindState.state === "string"
         ? mindState.state
         : undefined;
@@ -1467,13 +1472,9 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      bias: this.state.activeMind?.bias ?? "UNKNOWN",
-      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
-      action: "HOLD",
-      confidence: 0,
-      because: "LLM unavailable",
-      waiting_for: "LLM enabled",
-      invalid_if: this.state.activeMind?.invalidation_conditions ?? [],
+      trend: this.state.activeMind?.bias ?? "UNKNOWN",
+      entry: "WAIT",
+      reason: "LLM unavailable",
       levels: null,
       notes: [],
     };
@@ -1496,11 +1497,11 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : undefined;
+      typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
 
-    const direction = mindState.bias;
+    const direction = mindState.trend ?? mindState.bias;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1565,13 +1566,9 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      bias: this.state.activeMind?.bias ?? "UNKNOWN",
-      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
-      action: "HOLD",
-      confidence: 0,
-      because: "LLM unavailable",
-      waiting_for: "LLM enabled",
-      invalid_if: this.state.activeMind?.invalidation_conditions ?? [],
+      trend: this.state.activeMind?.bias ?? "UNKNOWN",
+      entry: "WAIT",
+      reason: "LLM unavailable",
       levels: null,
       notes: [],
     };
@@ -1594,11 +1591,11 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : undefined;
+      typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
 
-    const direction = mindState.bias;
+    const direction = mindState.trend ?? mindState.bias;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 

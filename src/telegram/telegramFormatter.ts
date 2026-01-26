@@ -235,17 +235,10 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
 
   if (snapshot.type === "MIND") {
     const mind = snapshot.mindState ?? {};
-    const bias = mind.bias ?? "n/a";
-    const state = mind.thesisState ?? "n/a";
-    const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
-    const action = mind.action ?? "n/a";
-    const waitingFor = mind.waiting_for ?? "n/a";
+    const trend = mind.trend ?? mind.bias ?? "n/a";
+    const entry = mind.entry ?? mind.state ?? "n/a";
+    const reason = mind.reason ?? mind.because ?? "n/a";
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
-    const invalidations = Array.isArray(mind.invalid_if)
-      ? mind.invalid_if.filter((item: unknown) => typeof item === "string" && item.length > 0)
-      : Array.isArray(mind.invalidation_conditions)
-      ? mind.invalidation_conditions.filter((item: unknown) => typeof item === "string" && item.length > 0)
-      : [];
     const levels = snapshot.levels ?? mind.levels;
     const levelParts = levels
       ? [
@@ -271,20 +264,15 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       Number.isFinite(extras.atr14_5m) ? `ATR5m=${formatPrice(extras.atr14_5m as number)}` : undefined,
       Number.isFinite(extras.relVol5m) ? `RV5m=${(extras.relVol5m as number).toFixed(2)}x` : undefined,
     ].filter((part): part is string => Boolean(part));
-    const invalidLines = invalidations.length
-      ? invalidations.slice(0, 2).map((item) => `- ${item}`)
-      : ["- n/a"];
     const lines = enforceLineLimit(
       "MIND",
       [
         `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
-        `BIAS: ${bias} | STATE: ${state} | ACTION: ${action} | CONF: ${confidence}`,
-        `WAITING_FOR: ${waitingFor}`,
+        `TREND: ${trend} | ENTRY: ${entry}`,
+        `REASON: ${reason}`,
         lastClosed,
         lastBarLine,
         formingLine,
-        "INVALID_IF:",
-        ...invalidLines,
         levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
         extraParts.length ? `EXTRAS: ${extraParts.join(" | ")}` : undefined,
       ].filter(nonEmpty)

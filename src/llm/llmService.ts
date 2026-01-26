@@ -158,13 +158,9 @@ export interface ArmedCoachingResponse {
 
 export interface MinimalMindStateResponse {
   mindId: string;
-  bias: string;
-  state: string;
-  action: string;
-  confidence: number;
-  because: string;
-  waiting_for: string;
-  invalid_if: string[];
+  trend: string;
+  entry: string;
+  reason: string;
   levels?: { key: string[]; support: number[]; resistance: number[] } | null;
   notes: string[];
 }
@@ -202,34 +198,21 @@ export class LLMService {
   private normalizeMinimalMindState(input: any): MinimalMindStateResponse | null {
     if (!input || typeof input !== "object") return null;
     const mindId = typeof input.mindId === "string" ? input.mindId : "";
-    const bias = typeof input.bias === "string" ? input.bias : "";
-    const state = typeof input.state === "string" ? input.state : "";
-    const action = typeof input.action === "string" ? input.action : "";
-    if (!Number.isFinite(input.confidence)) {
-      return null;
-    }
-    const confidence = Number(input.confidence);
-    const because = typeof input.because === "string" ? input.because : "";
-    const waitingFor = typeof input.waiting_for === "string" ? input.waiting_for : "";
-    const invalidIf = Array.isArray(input.invalid_if)
-      ? input.invalid_if.filter((item: unknown) => typeof item === "string")
-      : [];
+    const trend = typeof input.trend === "string" ? input.trend : "";
+    const entry = typeof input.entry === "string" ? input.entry : "";
+    const reason = typeof input.reason === "string" ? input.reason : "";
     const levels = input.levels && typeof input.levels === "object" ? input.levels : null;
     const notes = Array.isArray(input.notes)
       ? input.notes.filter((n: unknown) => typeof n === "string")
       : [];
-    if (!bias || !state || !action || !because || !waitingFor) {
+    if (!trend || !entry || !reason) {
       return null;
     }
     return {
       mindId,
-      bias,
-      state,
-      action,
-      confidence,
-      because,
-      waiting_for: waitingFor,
-      invalid_if: invalidIf,
+      trend,
+      entry,
+      reason,
       levels: levels
         ? {
             key: Array.isArray(levels.key) ? levels.key.filter((k: unknown) => typeof k === "string") : [],
@@ -944,15 +927,9 @@ Respond in this EXACT JSON format:
   async getMinimalMindState(snapshot: MinimalLLMSnapshot): Promise<MinimalMindStateResult> {
     const fallback: MinimalMindStateResponse = {
       mindId: typeof snapshot.activeMind?.mindId === "string" ? snapshot.activeMind.mindId : "unknown",
-      bias: typeof snapshot.activeMind?.bias === "string" ? snapshot.activeMind.bias : "NEUTRAL",
-      state: typeof snapshot.activeMind?.thesisState === "string" ? snapshot.activeMind.thesisState : "UNKNOWN",
-      action: "HOLD",
-      confidence: 0,
-      because: "LLM unavailable",
-      waiting_for: "LLM enabled",
-      invalid_if: Array.isArray(snapshot.activeMind?.invalidation_conditions)
-        ? snapshot.activeMind.invalidation_conditions
-        : [],
+      trend: typeof snapshot.activeMind?.bias === "string" ? snapshot.activeMind.bias : "UNKNOWN",
+      entry: "WAIT",
+      reason: "LLM unavailable",
       levels: null,
       notes: ["invalid_response"],
     };
@@ -975,13 +952,9 @@ activeMind: ${JSON.stringify(snapshot.activeMind ?? {})}
 Return JSON only:
 {
   "mindId": "string",
-  "bias": "LONG|SHORT|NEUTRAL|string",
-  "state": "string",
-  "action": "HOLD|ARM|ENTER|EXIT|RESET|INVALID|string",
-  "confidence": 0-100,
-  "because": "1-2 lines",
-  "waiting_for": "short actionable",
-  "invalid_if": ["..."],
+  "trend": "up|down|range|string",
+  "entry": "good|chase|wait|string",
+  "reason": "1-2 lines",
   "levels": { "key": [string], "support": [number], "resistance": [number] } | null,
   "notes": ["..."]
 }
@@ -990,8 +963,8 @@ Rules:
 - All fields above are REQUIRED in every response.
 - Do not ignore forming5m. Use it for intra-candle updates.
 - closed5m is a rolling window of recent bars. Use it to infer trend and structure.
-- Do not reset bias/state just because mode changes or a new 5m bar starts.
-- If context is thin, say so in summary or because, but still return a valid JSON.`;
+- Do not reset trend/entry just because mode changes or a new 5m bar starts.
+- If context is thin, say so in reason, but still return a valid JSON.`;
     const payload = {
       model: this.model,
       messages: [
