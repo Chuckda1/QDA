@@ -246,6 +246,26 @@ function buildIndicatorSnapshot(params: {
   };
 }
 
+function buildMinimalIndicatorSummary(snapshot: Record<string, any>): {
+  vwap_1m?: number;
+  vwap_5m?: number;
+  rsi_1m?: number;
+  rsi_5m?: number;
+  atr_1m?: number;
+  atr_5m?: number;
+  relVol?: number;
+} {
+  return {
+    vwap_1m: snapshot?.vwap?.["1m"],
+    vwap_5m: snapshot?.vwap?.["5m"],
+    rsi_1m: snapshot?.rsi14?.["1m"],
+    rsi_5m: snapshot?.rsi14?.["5m"],
+    atr_1m: snapshot?.atr14?.["1m"],
+    atr_5m: snapshot?.atr14?.["5m"],
+    relVol: snapshot?.volume?.relVol,
+  };
+}
+
 function buildTacticalSnapshot(params: {
   bars: OHLCVBar[];
   indicators: ReturnType<typeof buildIndicatorSet>;
@@ -1410,7 +1430,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: indicatorSnapshot,
+          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
@@ -1442,7 +1462,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: indicatorSnapshot,
+          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
@@ -1523,7 +1543,7 @@ export class Orchestrator {
           mode: "EXEC_1M",
           symbol,
           price: close,
-          indicators: indicatorSnapshot,
+          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
           relVol,
           freshness: this.buildFreshness(ts),
           closed5mBars,

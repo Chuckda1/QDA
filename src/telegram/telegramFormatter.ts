@@ -244,13 +244,13 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       ? mind.invalidation_conditions.filter((item: unknown) => typeof item === "string" && item.length > 0)
       : [];
     const indicators = snapshot.indicators ?? {};
-    const vwap1m = indicators.vwap?.["1m"];
-    const vwap5m = indicators.vwap?.["5m"];
-    const rsi1m = indicators.rsi14?.["1m"];
-    const rsi5m = indicators.rsi14?.["5m"];
-    const atr1m = indicators.atr14?.["1m"];
-    const atr5m = indicators.atr14?.["5m"];
-    const relVol = indicators.volume?.relVol;
+    const vwap1m = indicators.vwap_1m ?? indicators.vwap?.["1m"];
+    const vwap5m = indicators.vwap_5m ?? indicators.vwap?.["5m"];
+    const rsi1m = indicators.rsi_1m ?? indicators.rsi14?.["1m"];
+    const rsi5m = indicators.rsi_5m ?? indicators.rsi14?.["5m"];
+    const atr1m = indicators.atr_1m ?? indicators.atr14?.["1m"];
+    const atr5m = indicators.atr_5m ?? indicators.atr14?.["5m"];
+    const relVol = indicators.relVol ?? indicators.volume?.relVol;
     const indicatorLine = [
       `VWAP(1m=${formatPrice(vwap1m)},5m=${formatPrice(vwap5m)})`,
       `RSI(1m=${Number.isFinite(rsi1m) ? Math.round(rsi1m) : "n/a"},5m=${Number.isFinite(rsi5m) ? Math.round(rsi5m) : "n/a"})`,

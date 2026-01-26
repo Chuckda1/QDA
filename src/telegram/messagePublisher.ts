@@ -178,6 +178,12 @@ export class MessagePublisher {
         return;
       }
       for (const event of minimalEvents) {
+        const indicatorPayload = event.data?.indicators;
+        const indicatorKeys =
+          indicatorPayload && typeof indicatorPayload === "object" ? Object.keys(indicatorPayload) : [];
+        console.log(
+          `[PUB][MINIMAL] event=${event.type} mode=${event.data?.mode ?? "n/a"} indicatorsKeys=${indicatorKeys.length ? indicatorKeys.join(",") : "none"} indicators=${JSON.stringify(indicatorPayload ?? null)}`
+        );
         const sent = await this.publishWithControls(event);
         if (!sent) {
           console.log("[PUB] skipped MIND_STATE_UPDATED (blocked by governor)");
