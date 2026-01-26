@@ -103,11 +103,69 @@ function computeEmaSlopePct(closes: number[], period: number, lookbackBars: numb
   return ((emaNow - emaPast) / emaPast) * 100;
 }
 
+function computeEmaSeries(closes: number[], period: number): number[] | undefined {
+  if (closes.length < period) return undefined;
+  const series: number[] = Array(closes.length).fill(undefined as unknown as number);
+  let sum = 0;
+  for (let i = 0; i < period; i++) {
+    sum += closes[i]!;
+  }
+  let ema = sum / period;
+  series[period - 1] = ema;
+  const multiplier = 2 / (period + 1);
+  for (let i = period; i < closes.length; i++) {
+    ema = (closes[i]! - ema) * multiplier + ema;
+    series[i] = ema;
+  }
+  return series;
+}
+
+function computeMacd(closes: number[]): { line: number; signal: number; histogram: number } | undefined {
+  const ema12 = computeEmaSeries(closes, 12);
+  const ema26 = computeEmaSeries(closes, 26);
+  if (!ema12 || !ema26) return undefined;
+  const macdValues: number[] = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (Number.isFinite(ema12[i]) && Number.isFinite(ema26[i])) {
+      macdValues.push(ema12[i]! - ema26[i]!);
+    }
+  }
+  if (macdValues.length < 9) return undefined;
+  const signalSeries = computeEmaSeries(macdValues, 9);
+  if (!signalSeries) return undefined;
+  const line = macdValues[macdValues.length - 1]!;
+  const signal = signalSeries[signalSeries.length - 1]!;
+  if (!Number.isFinite(line) || !Number.isFinite(signal)) return undefined;
+  return { line, signal, histogram: line - signal };
+}
+
+function computeAvgVolume(bars: OHLCVBar[], window = 20): number | undefined {
+  if (!bars.length) return undefined;
+  const slice = bars.slice(-window);
+  const vols = slice.map((bar) => bar.volume).filter((v) => Number.isFinite(v)) as number[];
+  if (vols.length < 3) return undefined;
+  const avg = vols.reduce((sum, v) => sum + v, 0) / vols.length;
+  return Number.isFinite(avg) && avg > 0 ? avg : undefined;
+}
+
+function computeBollingerSnapshot(
+  closes: number[],
+  price: number
+): { width: number; position: number } | undefined {
+  const bb = computeBollingerBands(closes, 20, 2);
+  if (!bb) return undefined;
+  const width = bb.upper - bb.lower;
+  if (!Number.isFinite(width) || width <= 0) return undefined;
+  const pos = Math.max(0, Math.min(1, (price - bb.lower) / width));
+  return { width, position: Number(pos.toFixed(2)) };
+}
+
 function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
   tf: "1m" | "5m";
   vwap?: number;
   ema9?: number;
   ema20?: number;
+  ema50?: number;
   atr?: number;
   rsi14?: number;
 } {
@@ -117,8 +175,70 @@ function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
     vwap: bars.length >= 30 ? computeSessionVWAP(bars) : undefined,
     ema9: closes.length >= 9 ? computeEMA(closes.slice(-60), 9) : undefined,
     ema20: closes.length >= 20 ? computeEMA(closes.slice(-80), 20) : undefined,
+    ema50: closes.length >= 50 ? computeEMA(closes.slice(-120), 50) : undefined,
     atr: bars.length >= 15 ? computeATR(bars, 14) : undefined,
     rsi14: closes.length >= 15 ? computeRSI(closes, 14) : undefined,
+  };
+}
+
+function buildIndicatorSnapshot(params: {
+  price: number;
+  bars1m: OHLCVBar[];
+  bars5m: OHLCVBar[];
+  indicators1m: ReturnType<typeof buildIndicatorSet>;
+  indicators5m: ReturnType<typeof buildIndicatorSet> | undefined;
+  relVol?: number;
+}): Record<string, any> {
+  const closes1m = params.bars1m.map((bar) => bar.close);
+  const closes5m = params.bars5m.map((bar) => bar.close);
+  const macd1m = closes1m.length >= 26 ? computeMacd(closes1m) : undefined;
+  const macd5m = closes5m.length >= 26 ? computeMacd(closes5m) : undefined;
+  const bb1m = computeBollingerSnapshot(closes1m, params.price);
+  const bb5m = computeBollingerSnapshot(closes5m, params.price);
+  const avgVol1m = computeAvgVolume(params.bars1m);
+  const avgVol5m = computeAvgVolume(params.bars5m);
+  const currentVol1m = params.bars1m.length ? params.bars1m[params.bars1m.length - 1]?.volume : undefined;
+  const currentVol5m = params.bars5m.length ? params.bars5m[params.bars5m.length - 1]?.volume : undefined;
+  const vwap1m = params.indicators1m.vwap;
+  const vwap5m = params.indicators5m?.vwap;
+  const distPct1m =
+    Number.isFinite(vwap1m) && vwap1m !== 0 ? ((params.price - vwap1m) / vwap1m) * 100 : undefined;
+  const distPct5m =
+    Number.isFinite(vwap5m) && vwap5m !== 0 ? ((params.price - vwap5m) / vwap5m) * 100 : undefined;
+  return {
+    vwap: { "1m": vwap1m, "5m": vwap5m },
+    vwapDistancePct: { "1m": distPct1m, "5m": distPct5m },
+    rsi14: { "1m": params.indicators1m.rsi14, "5m": params.indicators5m?.rsi14 },
+    atr14: { "1m": params.indicators1m.atr, "5m": params.indicators5m?.atr },
+    ema: {
+      "1m": {
+        ema9: params.indicators1m.ema9,
+        ema20: params.indicators1m.ema20,
+        ema50: params.indicators1m.ema50,
+        slope9: computeEmaSlopePct(closes1m, 9, 5),
+        slope20: computeEmaSlopePct(closes1m, 20, 5),
+        slope50: computeEmaSlopePct(closes1m, 50, 5),
+      },
+      "5m": {
+        ema9: params.indicators5m?.ema9,
+        ema20: params.indicators5m?.ema20,
+        ema50: params.indicators5m?.ema50,
+        slope9: computeEmaSlopePct(closes5m, 9, 3),
+        slope20: computeEmaSlopePct(closes5m, 20, 3),
+        slope50: computeEmaSlopePct(closes5m, 50, 3),
+      },
+    },
+    macd: { "1m": macd1m, "5m": macd5m },
+    bollinger: { "1m": bb1m, "5m": bb5m },
+    volume: {
+      relVol: params.relVol,
+      current: { "1m": currentVol1m, "5m": currentVol5m },
+      average: { "1m": avgVol1m, "5m": avgVol5m },
+      ratio: {
+        "1m": Number.isFinite(currentVol1m) && avgVol1m ? currentVol1m / avgVol1m : undefined,
+        "5m": Number.isFinite(currentVol5m) && avgVol5m ? currentVol5m / avgVol5m : undefined,
+      },
+    },
   };
 }
 
@@ -1237,8 +1357,17 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
+    const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
     const relVol = this.computeRelVol(this.recentBars1m);
+    const indicatorSnapshot = buildIndicatorSnapshot({
+      price: close,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+      indicators1m,
+      indicators5m,
+      relVol,
+    });
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1277,9 +1406,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: indicators5m,
-          indicators5m,
-          relVol,
+          indicatorSnapshot,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
@@ -1311,7 +1438,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: indicators5m,
+          indicators: indicatorSnapshot,
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
@@ -1333,15 +1460,14 @@ export class Orchestrator {
       relVol !== undefined && volumePolicySnapshot
         ? `${volumePolicySnapshot.label} (${relVol.toFixed(2)}x)`
         : undefined;
-    const indicators = {
-      vwap1m: indicators1m.vwap,
-      atr1m: indicators1m.atr,
-      rsi14_1m: indicators1m.rsi14,
-      vwap5m: indicators5m?.vwap,
-      atr5m: indicators5m?.atr,
-      rsi14_5m: indicators5m?.rsi14,
+    const indicatorSnapshot = buildIndicatorSnapshot({
+      price: close,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+      indicators1m,
+      indicators5m,
       relVol,
-    };
+    });
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1393,9 +1519,7 @@ export class Orchestrator {
           mode: "EXEC_1M",
           symbol,
           price: close,
-          indicators,
-          indicators1m,
-          indicators5m: indicators5m ?? {},
+          indicators: indicatorSnapshot,
           relVol,
           freshness: this.buildFreshness(ts),
           closed5mBars,
@@ -1415,6 +1539,12 @@ export class Orchestrator {
     if (activeMind?.bias && mindState.bias && mindState.bias !== activeMind.bias && !["RESET", "INVALID"].includes(action)) {
       console.log(`[MINIMAL] ignored_bias_flip_1m from=${mindState.bias} to=${activeMind.bias}`);
       normalizedMindState = { ...normalizedMindState, bias: activeMind.bias };
+    }
+    if (Array.isArray(activeMind?.invalidation_conditions)) {
+      normalizedMindState = {
+        ...normalizedMindState,
+        invalidation_conditions: activeMind.invalidation_conditions,
+      };
     }
     if (action === "INVALID" && !this.validateInvalidation(mindState, activeMind)) {
       console.log("[MINIMAL] invalid_invalid: invalidation_reason does not match activeMind.invalidation_conditions");
@@ -1447,7 +1577,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators,
+          indicators: indicatorSnapshot,
           mindState: normalizedMindState,
           activeMind: nextActiveMind,
           mode: "EXEC_1M",

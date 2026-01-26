@@ -240,15 +240,32 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
     const action = mind.action ?? "n/a";
     const waitingFor = mind.waiting_for ?? "n/a";
-    const invalidation =
-      Array.isArray(mind.invalidation_conditions) && mind.invalidation_conditions.length > 0
-        ? mind.invalidation_conditions[0]
-        : "n/a";
+    const invalidations = Array.isArray(mind.invalidation_conditions)
+      ? mind.invalidation_conditions.filter((item: unknown) => typeof item === "string" && item.length > 0)
+      : [];
+    const indicators = snapshot.indicators ?? {};
+    const vwap1m = indicators.vwap?.["1m"];
+    const vwap5m = indicators.vwap?.["5m"];
+    const rsi1m = indicators.rsi14?.["1m"];
+    const rsi5m = indicators.rsi14?.["5m"];
+    const atr1m = indicators.atr14?.["1m"];
+    const atr5m = indicators.atr14?.["5m"];
+    const relVol = indicators.volume?.relVol;
+    const indicatorLine = [
+      `VWAP(1m=${formatPrice(vwap1m)},5m=${formatPrice(vwap5m)})`,
+      `RSI(1m=${Number.isFinite(rsi1m) ? Math.round(rsi1m) : "n/a"},5m=${Number.isFinite(rsi5m) ? Math.round(rsi5m) : "n/a"})`,
+      `ATR(1m=${formatPrice(atr1m)},5m=${formatPrice(atr5m)})`,
+      `RV=${Number.isFinite(relVol) ? (relVol as number).toFixed(2) : "n/a"}x`,
+    ].join(" ");
+    const invalidLines = invalidations.length
+      ? invalidations.slice(0, 2).map((item) => `- ${item}`)
+      : ["- n/a"];
     const lines = enforceLineLimit("MIND", [
-      `MIND: ${snapshot.symbol} ${bias} | ${thesisState} | conf ${confidence}`,
-      `WAIT: ${waitingFor}`,
-      `INVALID if: ${invalidation}`,
-      `EXEC: ${action}`,
+      `BIAS: ${bias} | STATE: ${thesisState} | ACTION: ${action} | CONF: ${confidence}`,
+      `WAITING_FOR: ${waitingFor}`,
+      "INVALID_IF:",
+      ...invalidLines,
+      `IND: ${indicatorLine}`,
     ]);
     return { type: "MIND", lines, text: lines.join("\n") };
   }

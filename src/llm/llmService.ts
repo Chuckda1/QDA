@@ -960,10 +960,14 @@ Definitions:
 - 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
 - RESET requires thesisState=FLAT or SUSPENDED and no bias flip.
 - INVALID requires thesisState=INVALID and must reference an invalidation_conditions entry.
+- INVALID means thesis broken by a 5m-defined condition (ex: "5m close below X", "VWAP reclaim lost + lower low", "break of range rail and hold").
+- RESET means thesis is stale/unclear/regime changed/data quality issue, but not hard invalidation.
 
-EXEC_1M prompt:
-- Given activeMind bias + thesis, has price pulled back enough against it?
-- Is there confirmation to enter now?
+EXEC_1M prompt (state machine: THESIS → ARMED → ENTER):
+- Treat activeMind as the locked thesis. Do not change bias or thesis; only advance or pause.
+- Answer only:
+  1) Has price pulled back against the thesis enough to ARM?
+  2) Is this the entry moment to ENTER now?
 - If not, what exactly are we waiting for?
 
 Return JSON only:
@@ -988,6 +992,7 @@ Rules:
 - If mode=EXEC_1M: bias must remain unchanged unless action is RESET or INVALID.
 - If action=INVALID: invalidation_reason must reference an item in activeMind.invalidation_conditions.
 - For EXEC_1M: waiting_for must be a single, concrete condition.
+- For EXEC_1M: invalidation_conditions must mirror activeMind.invalidation_conditions (do not invent new ones).
 `;
     const payload = {
       model: this.model,
