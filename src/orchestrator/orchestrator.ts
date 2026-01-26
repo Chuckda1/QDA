@@ -160,7 +160,11 @@ function computeBollingerSnapshot(
   return { width, position: Number(pos.toFixed(2)) };
 }
 
-function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
+function buildIndicatorSet(
+  bars: OHLCVBar[],
+  tf: "1m" | "5m",
+  options?: { vwapMinBars?: number }
+): {
   tf: "1m" | "5m";
   vwap?: number;
   ema9?: number;
@@ -170,9 +174,10 @@ function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
   rsi14?: number;
 } {
   const closes = bars.map((b) => b.close);
+  const vwapMinBars = options?.vwapMinBars ?? 30;
   return {
     tf,
-    vwap: bars.length >= 30 ? computeSessionVWAP(bars) : undefined,
+    vwap: bars.length >= vwapMinBars ? computeSessionVWAP(bars) : undefined,
     ema9: closes.length >= 9 ? computeEMA(closes.slice(-60), 9) : undefined,
     ema20: closes.length >= 20 ? computeEMA(closes.slice(-80), 20) : undefined,
     ema50: closes.length >= 50 ? computeEMA(closes.slice(-120), 50) : undefined,
@@ -1394,7 +1399,7 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
+    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 2 });
     console.log("[MINIMAL] indicators5m", indicators5m);
     this.logReadyGate(ts);
     const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
@@ -1482,7 +1487,9 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
-    const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
+    const indicators5m = this.recentBars5m.length >= 6
+      ? buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 2 })
+      : undefined;
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
     this.logReadyGate(ts);
     const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
@@ -1610,9 +1617,10 @@ export class Orchestrator {
     const readyRSI5m = bars5m >= 15;
     const readyATR5m = bars5m >= 15;
     const readyEma20_5m = bars5m >= 20;
+    const readyVWAP5mPartial = bars5m >= 2;
     const readyVWAP5m = bars5m >= 30;
     console.log(
-      `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m=${readyVWAP5m}`
+      `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m_partial=${readyVWAP5mPartial} VWAP5m=${readyVWAP5m}`
     );
   }
 
