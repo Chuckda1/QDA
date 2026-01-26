@@ -1045,8 +1045,7 @@ export class Orchestrator {
     if (botMode === "minimal") {
       if (timeframe === "5m") {
         console.log(`[TICK] branch=MINIMAL tf=5m ts=${input.ts}`);
-        this.trackMinimalBar(snapshot, "5m");
-        return events;
+        return await this.handleMinimal5m(snapshot);
       }
       if (timeframe !== "1m") {
         console.log(`[TICK] branch=MINIMAL tf=${timeframe} ts=${input.ts}`);
@@ -1202,6 +1201,98 @@ export class Orchestrator {
     return { high, low };
   }
 
+  private extractActiveMind(mindState?: Record<string, any>): BotState["activeMind"] | undefined {
+    if (!mindState || typeof mindState !== "object") return undefined;
+    if (mindState.activeMind && typeof mindState.activeMind === "object") {
+      const { mindId, bias, thesisState, invalidation_conditions } = mindState.activeMind as Record<string, any>;
+      return {
+        mindId: typeof mindId === "string" ? mindId : undefined,
+        bias: bias === "LONG" || bias === "SHORT" || bias === "NEUTRAL" ? bias : undefined,
+        thesisState: typeof thesisState === "string" ? thesisState : undefined,
+        invalidation_conditions: Array.isArray(invalidation_conditions) ? invalidation_conditions : undefined,
+      };
+    }
+    const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
+    const bias = mindState.bias === "LONG" || mindState.bias === "SHORT" || mindState.bias === "NEUTRAL" ? mindState.bias : undefined;
+    const thesisState = typeof mindState.thesisState === "string" ? mindState.thesisState : undefined;
+    const invalidation_conditions = Array.isArray(mindState.invalidation_conditions)
+      ? mindState.invalidation_conditions
+      : undefined;
+    if (!mindId && !bias && !thesisState && !invalidation_conditions) return undefined;
+    return { mindId, bias, thesisState, invalidation_conditions };
+  }
+
+  private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const { ts, symbol, close } = snapshot;
+    this.trackMinimalBar(snapshot, "5m");
+    console.log(`[MINIMAL] handler=handleMinimal5m symbol=${symbol} ts=${ts}`);
+
+    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
+    const relVol = this.computeRelVol(this.recentBars1m);
+    const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
+      ts: bar.ts,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+    const rangeContext = this.buildRangeContext({
+      ts,
+      price: close,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+      atr: indicators5m.atr,
+    });
+    const swingPoints =
+      this.computeSwingPoints(this.recentBars5m, 12) ??
+      this.computeSwingPoints(this.recentBars1m, 20);
+    const previousMindState = this.state.mindState;
+    const mindState = this.llmService
+      ? await this.llmService.getMindState({
+          mode: "MIND_5M_CLOSE",
+          symbol,
+          price: close,
+          indicators: indicators5m,
+          indicators5m,
+          relVol,
+          freshness: this.buildFreshness(ts),
+          closed5mBars,
+          rangeContext,
+          swingPoints,
+          previousMindState,
+          activeMind: this.state.activeMind,
+        })
+      : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
+    const nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+
+    this.state.mindState = mindState;
+    this.state.activeMind = nextActiveMind;
+    this.state.lastLLMCallAt = ts;
+    this.state.lastLLMDecision = mindState.summary;
+
+    const direction = mindState.bias;
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
+
+    return [
+      {
+        type: "MIND_STATE_UPDATED",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: {
+          timestamp: ts,
+          symbol,
+          price: close,
+          direction,
+          indicators: indicators5m,
+          mindState,
+          activeMind: nextActiveMind,
+          mode: "MIND_5M_CLOSE",
+        },
+      },
+    ];
+  }
+
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     this.trackMinimalBar(snapshot, "1m");
@@ -1247,27 +1338,44 @@ export class Orchestrator {
     const swingPoints =
       this.computeSwingPoints(this.recentBars5m, 12) ??
       this.computeSwingPoints(this.recentBars1m, 20);
+    const recent1mBars = this.recentBars1m.slice(-12).map((bar) => ({
+      ts: bar.ts,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+    const previousMindState = this.state.mindState;
     const mindState = this.llmService
       ? await this.llmService.getMindState({
+          mode: "EXEC_1M",
           symbol,
           price: close,
           indicators,
+          indicators1m,
+          indicators5m: indicators5m ?? {},
           relVol,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           forming5mBar,
+          recent1mBars,
           impulseContext,
           rangeContext,
           swingPoints,
+          previousMindState,
+          activeMind: this.state.activeMind,
         })
       : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
+    const nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
 
     this.state.mindState = mindState;
+    this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision = mindState.summary;
 
     const direction = mindState.bias;
-    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts}`);
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_1M`);
 
     return [
       {
@@ -1281,6 +1389,8 @@ export class Orchestrator {
           direction,
           indicators,
           mindState,
+          activeMind: nextActiveMind,
+          mode: "EXEC_1M",
           volume: {
             relVol,
             line: volumeLine,

@@ -319,4 +319,10 @@ export interface BotState {
   lastLLMDecision?: string;
   timingState?: TimingStateContext;
   mindState?: Record<string, any>;
+  activeMind?: {
+    mindId?: string;
+    bias?: Bias;
+    thesisState?: string;
+    invalidation_conditions?: string[];
+  };
 }

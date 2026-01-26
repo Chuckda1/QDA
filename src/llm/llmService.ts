@@ -887,9 +887,12 @@ Respond in this EXACT JSON format:
   }
 
   async getMindState(context: {
+    mode?: "MIND_5M_CLOSE" | "EXEC_1M";
     symbol: string;
     price: number;
     indicators: Record<string, any>;
+    indicators1m?: Record<string, any>;
+    indicators5m?: Record<string, any>;
     relVol?: number;
     freshness?: Record<string, any>;
     closed5mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
@@ -903,9 +906,12 @@ Respond in this EXACT JSON format:
       close: number;
       volume: number;
     } | null;
+    recent1mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
     impulseContext?: Record<string, any>;
     rangeContext?: Record<string, any>;
     swingPoints?: { high: number; low: number };
+    previousMindState?: Record<string, any>;
+    activeMind?: Record<string, any>;
   }): Promise<MindStateResponse> {
     if (!this.enabled) {
       return {
@@ -916,21 +922,39 @@ Respond in this EXACT JSON format:
       };
     }
     const prompt = `You are summarizing a market mind-state for ${context.symbol}.
+mode: ${context.mode ?? "EXEC_1M"}
 Price: ${context.price.toFixed(2)}
 Indicators: ${JSON.stringify(context.indicators)}
+indicators1m: ${JSON.stringify(context.indicators1m ?? {})}
+indicators5m: ${JSON.stringify(context.indicators5m ?? {})}
 relVol: ${context.relVol ?? "n/a"}
 freshness: ${JSON.stringify(context.freshness ?? {})}
 closed5mBars: ${JSON.stringify(context.closed5mBars ?? [])}
 forming5mBar: ${JSON.stringify(context.forming5mBar ?? null)}
+recent1mBars: ${JSON.stringify(context.recent1mBars ?? [])}
 impulseContext: ${JSON.stringify(context.impulseContext ?? {})}
 rangeContext: ${JSON.stringify(context.rangeContext ?? {})}
 swingPoints: ${JSON.stringify(context.swingPoints ?? {})}
+previousMindState: ${JSON.stringify(context.previousMindState ?? {})}
+activeMind: ${JSON.stringify(context.activeMind ?? {})}
+
+Definitions:
+- RESET = "I can’t trust the thesis right now." Pause until next 5m close.
+- INVALID = "This thesis is wrong." Only if a predefined invalidation condition is breached.
+- Only 5m (mode=MIND_5M_CLOSE) can form/flip thesis or mindId.
+- 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
 
 Return JSON only:
 {
   "summary": "short sentence",
+  "mindId": "uuid",
   "bias": "LONG|SHORT|NEUTRAL",
-  "conviction": 0-100,
+  "thesisState": "FLAT|THESIS_FORMED|PULLBACK_WAIT|ARMED|ENTERED|INVALID",
+  "action": "HOLD|ARM|ENTER|RESET|INVALID",
+  "confidence": 0-100,
+  "invalidation_conditions": ["..."],
+  "reset_reason": "",
+  "invalidation_reason": "",
   "notes": ["..."]
 }`;
     const payload = {
