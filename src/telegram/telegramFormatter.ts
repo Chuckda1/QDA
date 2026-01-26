@@ -240,28 +240,28 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
     const action = mind.action ?? "n/a";
     const waitingFor = mind.waiting_for ?? "n/a";
+    const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
     const invalidations = Array.isArray(mind.invalidation_conditions)
       ? mind.invalidation_conditions.filter((item: unknown) => typeof item === "string" && item.length > 0)
       : [];
     const indicators = snapshot.indicators ?? {};
-    const vwap1m = indicators.vwap1m ?? indicators.vwap_1m ?? indicators.vwap?.["1m"];
     const vwap5m = indicators.vwap5m ?? indicators.vwap_5m ?? indicators.vwap?.["5m"];
-    const rsi1m = indicators.rsi14_1m ?? indicators.rsi_1m ?? indicators.rsi14?.["1m"];
+    const vwapPartial = indicators.vwap_isPartial === true;
     const rsi5m = indicators.rsi14_5m ?? indicators.rsi_5m ?? indicators.rsi14?.["5m"];
-    const atr1m = indicators.atr14_1m ?? indicators.atr_1m ?? indicators.atr14?.["1m"];
     const atr5m = indicators.atr14_5m ?? indicators.atr_5m ?? indicators.atr14?.["5m"];
-    const relVol = indicators.relVol1m ?? indicators.relVol ?? indicators.volume?.relVol;
+    const ema20_5m = indicators.ema20_5m ?? indicators.ema20_5m ?? indicators.ema20?.["5m"];
+    const vwapLabel = `${formatPrice(vwap5m)}${vwapPartial ? "*" : ""}`;
     const indicatorLine = [
-      `VWAP(1m=${formatPrice(vwap1m)},5m=${formatPrice(vwap5m)})`,
-      `RSI(1m=${Number.isFinite(rsi1m) ? Math.round(rsi1m) : "n/a"},5m=${Number.isFinite(rsi5m) ? Math.round(rsi5m) : "n/a"})`,
-      `ATR(1m=${formatPrice(atr1m)},5m=${formatPrice(atr5m)})`,
-      `RV=${Number.isFinite(relVol) ? (relVol as number).toFixed(2) : "n/a"}x`,
+      `VWAP5m=${vwapLabel}`,
+      `RSI5m=${Number.isFinite(rsi5m) ? Math.round(rsi5m) : "n/a"}`,
+      `ATR5m=${formatPrice(atr5m)}`,
+      `EMA20_5m=${formatPrice(ema20_5m)}`,
     ].join(" ");
     const invalidLines = invalidations.length
       ? invalidations.slice(0, 2).map((item) => `- ${item}`)
       : ["- n/a"];
     const lines = enforceLineLimit("MIND", [
-      `BIAS: ${bias} | STATE: ${thesisState} | ACTION: ${action} | CONF: ${confidence}`,
+      `BIAS: ${bias} | STATE: ${thesisState} | ACTION: ${action} | CONF: ${confidence} | px ${price}`,
       `WAITING_FOR: ${waitingFor}`,
       "INVALID_IF:",
       ...invalidLines,

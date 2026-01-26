@@ -167,6 +167,7 @@ function buildIndicatorSet(
 ): {
   tf: "1m" | "5m";
   vwap?: number;
+  vwapIsPartial?: boolean;
   ema9?: number;
   ema20?: number;
   ema50?: number;
@@ -175,9 +176,12 @@ function buildIndicatorSet(
 } {
   const closes = bars.map((b) => b.close);
   const vwapMinBars = options?.vwapMinBars ?? 30;
+  const vwap = bars.length >= vwapMinBars ? computeSessionVWAP(bars) : undefined;
+  const vwapIsPartial = vwap !== undefined && bars.length < 30;
   return {
     tf,
-    vwap: bars.length >= vwapMinBars ? computeSessionVWAP(bars) : undefined,
+    vwap,
+    vwapIsPartial,
     ema9: closes.length >= 9 ? computeEMA(closes.slice(-60), 9) : undefined,
     ema20: closes.length >= 20 ? computeEMA(closes.slice(-80), 20) : undefined,
     ema50: closes.length >= 50 ? computeEMA(closes.slice(-120), 50) : undefined,
@@ -251,25 +255,43 @@ function buildIndicatorSnapshot(params: {
   };
 }
 
-function buildMinimalIndicatorSummary(
-  indicators5m: ReturnType<typeof buildIndicatorSet> | undefined
-): {
+function buildMinimalIndicatorSummary(params: {
+  indicators5m?: ReturnType<typeof buildIndicatorSet>;
+  price: number;
+  sessionRange?: RangeBand;
+  swingPoints?: { high: number; low: number };
+}): {
   vwap5m: number | null;
+  vwap_isPartial: boolean;
   rsi14_5m: number | null;
   atr14_5m: number | null;
   ema9_5m: number | null;
   ema20_5m: number | null;
   ema50_5m: number | null;
+  distanceFromVWAPPct: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  lastSwingHigh: number | null;
+  lastSwingLow: number | null;
 } {
   const toNumberOrNull = (value: unknown): number | null =>
     Number.isFinite(value) ? (value as number) : null;
+  const vwap = params.indicators5m?.vwap;
+  const distanceFromVWAPPct =
+    Number.isFinite(vwap) && vwap !== 0 ? ((params.price - (vwap as number)) / (vwap as number)) * 100 : null;
   return {
-    vwap5m: toNumberOrNull(indicators5m?.vwap),
-    rsi14_5m: toNumberOrNull(indicators5m?.rsi14),
-    atr14_5m: toNumberOrNull(indicators5m?.atr),
-    ema9_5m: toNumberOrNull(indicators5m?.ema9),
-    ema20_5m: toNumberOrNull(indicators5m?.ema20),
-    ema50_5m: toNumberOrNull(indicators5m?.ema50),
+    vwap5m: toNumberOrNull(vwap),
+    vwap_isPartial: params.indicators5m?.vwapIsPartial ?? false,
+    rsi14_5m: toNumberOrNull(params.indicators5m?.rsi14),
+    atr14_5m: toNumberOrNull(params.indicators5m?.atr),
+    ema9_5m: toNumberOrNull(params.indicators5m?.ema9),
+    ema20_5m: toNumberOrNull(params.indicators5m?.ema20),
+    ema50_5m: toNumberOrNull(params.indicators5m?.ema50),
+    distanceFromVWAPPct: Number.isFinite(distanceFromVWAPPct) ? Number(distanceFromVWAPPct.toFixed(2)) : null,
+    sessionHigh: toNumberOrNull(params.sessionRange?.high),
+    sessionLow: toNumberOrNull(params.sessionRange?.low),
+    lastSwingHigh: toNumberOrNull(params.swingPoints?.high),
+    lastSwingLow: toNumberOrNull(params.swingPoints?.low),
   };
 }
 
@@ -1399,10 +1421,26 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 2 });
+    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 5 });
     console.log("[MINIMAL] indicators5m", indicators5m);
     this.logReadyGate(ts);
-    const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
+    if (!Number.isFinite(indicators5m.vwap)) {
+      this.logVwapDiagnostics(ts);
+    }
+    const swingPoints =
+      this.computeSwingPoints(this.recentBars5m, 12) ??
+      this.computeSwingPoints(this.recentBars1m, 20);
+    const sessionRange = computeContextRange({
+      ts,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+    });
+    const minimalIndicators = buildMinimalIndicatorSummary({
+      indicators5m,
+      price: close,
+      sessionRange,
+      swingPoints,
+    });
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1418,9 +1456,14 @@ export class Orchestrator {
       bars5m: this.recentBars5m,
       atr: indicators5m.atr,
     });
-    const swingPoints =
-      this.computeSwingPoints(this.recentBars5m, 12) ??
-      this.computeSwingPoints(this.recentBars1m, 20);
+    const recent1mBars = this.recentBars1m.slice(-20).map((bar) => ({
+      ts: bar.ts,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
       summary: "LLM unavailable",
@@ -1444,6 +1487,7 @@ export class Orchestrator {
           indicators: minimalIndicators,
           freshness: this.buildFreshness(ts),
           closed5mBars,
+          recent1mBars,
           rangeContext,
           swingPoints,
           previousMindState,
@@ -1460,6 +1504,9 @@ export class Orchestrator {
     const direction = mindState.bias;
     console.log(
       `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+    );
+    console.log(
+      `[MINIMAL][5M_CLOSE] bars5m=${this.recentBars5m.length} vwap=${Number.isFinite(minimalIndicators.vwap5m) ? minimalIndicators.vwap5m?.toFixed(2) : "n/a"} partial=${minimalIndicators.vwap_isPartial} sessionHigh=${Number.isFinite(minimalIndicators.sessionHigh) ? minimalIndicators.sessionHigh?.toFixed(2) : "n/a"} sessionLow=${Number.isFinite(minimalIndicators.sessionLow) ? minimalIndicators.sessionLow?.toFixed(2) : "n/a"} lastSwingHigh=${Number.isFinite(minimalIndicators.lastSwingHigh) ? minimalIndicators.lastSwingHigh?.toFixed(2) : "n/a"} lastSwingLow=${Number.isFinite(minimalIndicators.lastSwingLow) ? minimalIndicators.lastSwingLow?.toFixed(2) : "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1488,11 +1535,22 @@ export class Orchestrator {
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
     const indicators5m = this.recentBars5m.length >= 6
-      ? buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 2 })
+      ? buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 5 })
       : undefined;
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
     this.logReadyGate(ts);
-    const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
+    const swingPoints = this.computeSwingPoints(this.recentBars5m, 12);
+    const sessionRange = computeContextRange({
+      ts,
+      bars1m: this.recentBars1m,
+      bars5m: this.recentBars5m,
+    });
+    const minimalIndicators = buildMinimalIndicatorSummary({
+      indicators5m,
+      price: close,
+      sessionRange,
+      swingPoints,
+    });
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1505,7 +1563,14 @@ export class Orchestrator {
     if (forming5mBar) {
       console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
     }
-    const swingPoints = this.computeSwingPoints(this.recentBars5m, 12);
+    const recent1mBars = this.recentBars1m.slice(-20).map((bar) => ({
+      ts: bar.ts,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       summary: "LLM unavailable",
@@ -1530,6 +1595,7 @@ export class Orchestrator {
           freshness: this.buildFreshness(ts),
           closed5mBars,
           forming5mBar,
+          recent1mBars,
           swingPoints,
           previousMindState,
           activeMind: this.state.activeMind,
@@ -1621,6 +1687,25 @@ export class Orchestrator {
     const readyVWAP5m = bars5m >= 30;
     console.log(
       `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m_partial=${readyVWAP5mPartial} VWAP5m=${readyVWAP5m}`
+    );
+  }
+
+  private logVwapDiagnostics(ts: number): void {
+    const bars = this.recentBars5m;
+    if (bars.length === 0) return;
+    const lastTs = bars[bars.length - 1]!.ts;
+    const lastDate = new Date(lastTs);
+    const sessionStartTs = etToUtcTimestamp(9, 30, lastDate);
+    const sessionEndTs = etToUtcTimestamp(16, 0, lastDate);
+    let sessionBars = 0;
+    let sessionVolume = 0;
+    for (const bar of bars) {
+      if (bar.ts < sessionStartTs || bar.ts >= sessionEndTs) continue;
+      sessionBars += 1;
+      sessionVolume += bar.volume ?? 0;
+    }
+    console.log(
+      `[MINIMAL] VWAP_DIAG ts=${ts} sessionBars=${sessionBars} sessionVol=${Math.round(sessionVolume)} last5mTs=${lastTs}`
     );
   }
 
