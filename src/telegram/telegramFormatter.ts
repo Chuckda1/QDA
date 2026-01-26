@@ -236,35 +236,62 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
 
   if (snapshot.type === "MIND") {
     const mind = snapshot.mindState ?? {};
-    const direction = mind.direction ?? mind.trend ?? mind.bias ?? "n/a";
-    const confidence = Number.isFinite(mind.confidence) ? `${Math.round(mind.confidence)}%` : "n/a";
-    const reason = mind.reason ?? mind.because ?? "n/a";
-    const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
-    const botState = snapshot.botState ?? "n/a";
-    const waitFor = snapshot.waitFor ? snapshot.waitFor.replace(/_/g, " ") : undefined;
-    const session = snapshot.sessionRegime ? `SESSION: ${snapshot.sessionRegime}` : undefined;
-    const entry = Number.isFinite(snapshot.entry) ? `entry ${formatPrice(snapshot.entry as number)}` : undefined;
-    const stop = Number.isFinite(snapshot.stop) ? `stop ${formatPrice(snapshot.stop as number)}` : undefined;
-    const targets =
-      Array.isArray(snapshot.targets) && snapshot.targets.length > 0
-        ? `targets ${snapshot.targets.map((t) => formatPrice(t)).join(",")}`
-        : undefined;
-    const tradeLine = [entry, stop, targets].filter(Boolean).join(" | ");
-    const enterLine =
-      botState === "IN_TRADE" && Number.isFinite(snapshot.entry)
-        ? `ENTER ${direction.toUpperCase()} @ ${formatPrice(snapshot.entry as number)}`
-        : undefined;
+    const thesisDirectionRaw = snapshot.thesis?.direction ?? mind.direction ?? mind.trend ?? mind.bias ?? "none";
+    const thesisDirection =
+      typeof thesisDirectionRaw === "string"
+        ? thesisDirectionRaw.toLowerCase()
+        : "none";
+    const thesisConfidenceRaw = snapshot.thesis?.confidence ?? mind.confidence;
+    const thesisConfidence = Number.isFinite(thesisConfidenceRaw) ? `${Math.round(thesisConfidenceRaw)}%` : "n/a";
+    const botState = snapshot.botState ?? "WAITING_FOR_THESIS";
+    const state =
+      botState === "IN_TRADE"
+        ? "IN_TRADE"
+        : botState === "WAITING_FOR_ENTRY"
+        ? "WAIT_TRIGGER"
+        : "WAIT_PULLBACK";
+    const waitForRaw = snapshot.waitFor ?? "";
+    let waitingFor = "n/a";
+    if (waitForRaw) {
+      if (waitForRaw.startsWith("collecting_5m_bars_")) {
+        waitingFor = "collecting 5m bars";
+      } else if (waitForRaw.startsWith("pending_")) {
+        const parts = waitForRaw.split("_");
+        const dir = parts[1] ?? "none";
+        const count = parts[2] ?? "0";
+        waitingFor = `confirm ${dir} (${count}/2)`;
+      } else if (waitForRaw === "waiting_for_thesis") {
+        waitingFor = "thesis from LLM";
+      } else if (waitForRaw === "waiting_for_pullback") {
+        waitingFor = "pullback";
+      } else if (waitForRaw === "waiting_for_break_above_pullback_high") {
+        waitingFor = "break above pullback";
+      } else if (waitForRaw === "waiting_for_break_below_pullback_low") {
+        waitingFor = "break below pullback";
+      } else if (waitForRaw === "llm_no_direction") {
+        waitingFor = "LLM direction";
+      } else if (waitForRaw === "llm_unavailable") {
+        waitingFor = "LLM unavailable";
+      } else if (waitForRaw === "llm_invalid") {
+        waitingFor = "LLM valid response";
+      } else if (waitForRaw.startsWith("lunch_confidence_below_")) {
+        waitingFor = "lunch confidence";
+      } else if (waitForRaw === "open_watch_no_entries") {
+        waitingFor = "open watch";
+      } else if (waitForRaw === "in_trade") {
+        waitingFor = "manage trade";
+      } else if (waitForRaw === "market_closed") {
+        waitingFor = "market open";
+      } else {
+        waitingFor = waitForRaw.replace(/_/g, " ");
+      }
+    }
     const lines = enforceLineLimit(
       "MIND",
       [
-        `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
-        `BIAS: ${direction} | CONF: ${confidence}`,
-        `STATE: ${botState}`,
-        session,
-        waitFor ? `WAIT: ${waitFor}` : undefined,
-        enterLine,
-        tradeLine ? `TRADE: ${tradeLine}` : undefined,
-        `REASON: ${reason}`,
+        `THESIS: ${thesisDirection} (${thesisConfidence})`,
+        `STATE: ${state}`,
+        `WAITING_FOR: ${waitingFor}`,
       ].filter(nonEmpty)
     );
     return { type: "MIND", lines, text: lines.join("\n") };

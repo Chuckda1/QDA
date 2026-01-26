@@ -181,7 +181,9 @@ export type SwingPoint = {
 export type MinimalLLMSnapshot = {
   symbol: string;
   nowTs: number;
-  closed5m: RawBar[];
+  closed5mBars: RawBar[];
+  forming5mBar?: Forming5mBar | null;
+  recent1mBars?: RawBar[];
 };
 
 export type DomainEventType =
@@ -378,10 +380,12 @@ export type MinimalExecutionPhase =
 
 export type MinimalExecutionState = {
   phase: MinimalExecutionPhase;
-  thesisDirection?: "long" | "short";
+  thesisDirection?: "long" | "short" | "none";
   thesisConfidence?: number;
   thesisPrice?: number;
   thesisTs?: number;
+  pendingDirection?: "long" | "short" | "none";
+  pendingCount?: number;
   pullbackHigh?: number;
   pullbackLow?: number;
   pullbackTs?: number;

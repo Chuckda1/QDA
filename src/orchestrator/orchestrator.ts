@@ -904,6 +904,7 @@ export class Orchestrator {
       minimalExecution: {
         phase: "WAITING_FOR_THESIS",
         waitReason: "waiting_for_thesis",
+        pendingCount: 0,
       }
     };
   }
@@ -1410,7 +1411,7 @@ export class Orchestrator {
 
   private getMinimalExecutionState(): MinimalExecutionState {
     if (!this.state.minimalExecution) {
-      this.state.minimalExecution = { phase: "WAITING_FOR_THESIS", waitReason: "waiting_for_thesis" };
+      this.state.minimalExecution = { phase: "WAITING_FOR_THESIS", waitReason: "waiting_for_thesis", pendingCount: 0 };
     }
     return this.state.minimalExecution;
   }
@@ -1419,7 +1420,66 @@ export class Orchestrator {
     this.state.minimalExecution = {
       phase: "WAITING_FOR_THESIS",
       waitReason,
+      thesisDirection: undefined,
+      thesisConfidence: undefined,
+      thesisPrice: undefined,
+      thesisTs: undefined,
+      pendingDirection: undefined,
+      pendingCount: 0,
+      pullbackHigh: undefined,
+      pullbackLow: undefined,
+      pullbackTs: undefined,
+      entryPrice: undefined,
+      entryTs: undefined,
+      stopPrice: undefined,
+      targets: undefined,
     };
+  }
+
+  private clearMinimalTradeState(exec: MinimalExecutionState): void {
+    exec.pullbackHigh = undefined;
+    exec.pullbackLow = undefined;
+    exec.pullbackTs = undefined;
+    exec.entryPrice = undefined;
+    exec.entryTs = undefined;
+    exec.stopPrice = undefined;
+    exec.targets = undefined;
+  }
+
+  private applyThesisLock(
+    exec: MinimalExecutionState,
+    nextDirection: "long" | "short" | "none",
+    confidence: number
+  ): { accepted: boolean; flipped: boolean; pending: boolean } {
+    const currentDirection = exec.thesisDirection ?? "none";
+    if (nextDirection === currentDirection) {
+      exec.thesisDirection = nextDirection;
+      exec.thesisConfidence = confidence;
+      exec.pendingDirection = undefined;
+      exec.pendingCount = 0;
+      return { accepted: true, flipped: false, pending: false };
+    }
+    if (confidence >= 75) {
+      exec.thesisDirection = nextDirection;
+      exec.thesisConfidence = confidence;
+      exec.pendingDirection = undefined;
+      exec.pendingCount = 0;
+      return { accepted: true, flipped: true, pending: false };
+    }
+    if (exec.pendingDirection === nextDirection) {
+      exec.pendingCount = (exec.pendingCount ?? 0) + 1;
+    } else {
+      exec.pendingDirection = nextDirection;
+      exec.pendingCount = 1;
+    }
+    if ((exec.pendingCount ?? 0) >= 2) {
+      exec.thesisDirection = nextDirection;
+      exec.thesisConfidence = confidence;
+      exec.pendingDirection = undefined;
+      exec.pendingCount = 0;
+      return { accepted: true, flipped: true, pending: false };
+    }
+    return { accepted: false, flipped: false, pending: true };
   }
 
   private computeMinimalTargets(direction: "long" | "short", entry: number, stop: number): number[] {
@@ -1528,98 +1588,7 @@ export class Orchestrator {
       this.resetMinimalExecution("market_closed");
       return events;
     }
-
-    const closed5mBars = buildClosed5mBars(this.recentBars5m, this.minimalLlmBars);
-    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const exec = this.getMinimalExecutionState();
-    let mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
-    let valid = false;
-
-    if (exec.phase === "WAITING_FOR_THESIS") {
-      if (closed5mBars.length < this.minimalLlmBars) {
-        exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
-      } else if (this.llmService) {
-        const llmSnapshot: MinimalLLMSnapshot = {
-          symbol,
-          nowTs: ts,
-          closed5m: closed5mBars,
-        };
-        const result = await this.llmService.getMinimalMindState(llmSnapshot);
-        mindState = result.mindState;
-        valid = result.valid;
-        if (!mindState.mindId) {
-          mindState.mindId = randomUUID();
-        }
-        this.state.mindState = mindState;
-        this.state.activeMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
-        this.state.lastLLMCallAt = ts;
-        this.state.lastLLMDecision = mindState.reason ?? mindState.direction;
-
-        if (valid && mindState.direction !== "none" && mindState.confidence >= this.minimalLlmConfidence) {
-          exec.phase = "WAITING_FOR_PULLBACK";
-          exec.thesisDirection = mindState.direction;
-          exec.thesisConfidence = mindState.confidence;
-          exec.thesisPrice = lastClosed5m?.close ?? close;
-          exec.thesisTs = ts;
-          exec.pullbackHigh = undefined;
-          exec.pullbackLow = undefined;
-          exec.pullbackTs = undefined;
-          exec.entryPrice = undefined;
-          exec.entryTs = undefined;
-          exec.stopPrice = undefined;
-          exec.targets = undefined;
-          exec.waitReason = "waiting_for_pullback";
-        } else {
-          exec.waitReason =
-            mindState.direction === "none"
-              ? "llm_no_direction"
-              : `confidence_below_${this.minimalLlmConfidence}`;
-        }
-      } else {
-        exec.waitReason = "llm_unavailable";
-      }
-    }
-
-    this.state.minimalExecution = exec;
-
-    const direction =
-      mindState.direction === "long" ? "LONG" : mindState.direction === "short" ? "SHORT" : undefined;
-    console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
-    );
-    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=THESIS_5M`);
-
-    return [
-      ...events,
-      {
-        type: "MIND_STATE_UPDATED",
-        timestamp: ts,
-        instanceId: this.instanceId,
-        data: {
-          timestamp: ts,
-          symbol,
-          price: close,
-          direction,
-          mindState,
-          activeMind: this.state.activeMind,
-          mode: "THESIS_5M",
-          sessionRegime: regime.regime,
-          closed5mBarsCount: closed5mBars.length,
-          lastClosed5mBar: lastClosed5m,
-          botState: exec.phase,
-          waitFor: exec.waitReason ?? null,
-          thesis: {
-            direction: exec.thesisDirection ?? null,
-            confidence: exec.thesisConfidence ?? null,
-            price: exec.thesisPrice ?? null,
-            ts: exec.thesisTs ?? null,
-          },
-          entry: exec.entryPrice ?? null,
-          stop: exec.stopPrice ?? null,
-          targets: exec.targets ?? null,
-        },
-      },
-    ];
+    return events;
   }
 
   private async handleMinimalForming5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
@@ -1647,12 +1616,72 @@ export class Orchestrator {
       return events;
     }
 
+    const closed5mBars = buildClosed5mBars(this.recentBars5m, this.minimalLlmBars);
+    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
+    const forming5mBar = this.buildForming5mBar(ts);
     const exec = this.getMinimalExecutionState();
+    let mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
+    let valid = false;
+
+    if (this.llmService) {
+      if (closed5mBars.length < this.minimalLlmBars) {
+        if (exec.phase === "WAITING_FOR_THESIS") {
+          exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
+        }
+      } else {
+        const recent1mBars =
+          forming5mBar || this.recentBars1m.length === 0 ? undefined : this.recentBars1m.slice(-10);
+        const llmSnapshot: MinimalLLMSnapshot = {
+          symbol,
+          nowTs: ts,
+          closed5mBars,
+          forming5mBar,
+          recent1mBars,
+        };
+        const result = await this.llmService.getMinimalMindState(llmSnapshot);
+        mindState = result.mindState;
+        valid = result.valid;
+        if (!mindState.mindId) {
+          mindState.mindId = randomUUID();
+        }
+        this.state.mindState = mindState;
+        this.state.activeMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+        this.state.lastLLMCallAt = ts;
+        this.state.lastLLMDecision = mindState.reason ?? mindState.direction;
+
+        if (valid && exec.phase !== "IN_TRADE") {
+          const prevDirection = exec.thesisDirection ?? "none";
+          const update = this.applyThesisLock(exec, mindState.direction, mindState.confidence);
+          if (update.accepted) {
+            exec.thesisPrice = lastClosed5m?.close ?? close;
+            exec.thesisTs = ts;
+            if (exec.thesisDirection === "none") {
+              exec.phase = "WAITING_FOR_THESIS";
+              exec.waitReason = "llm_no_direction";
+              this.clearMinimalTradeState(exec);
+            } else if (update.flipped || prevDirection !== exec.thesisDirection || exec.phase === "WAITING_FOR_THESIS") {
+              exec.phase = "WAITING_FOR_PULLBACK";
+              exec.waitReason = "waiting_for_pullback";
+              this.clearMinimalTradeState(exec);
+            }
+          } else if (exec.phase === "WAITING_FOR_THESIS") {
+            const pendingDir = exec.pendingDirection ?? "none";
+            const pendingCount = exec.pendingCount ?? 0;
+            exec.waitReason = `pending_${pendingDir}_${pendingCount}`;
+          }
+        } else if (!valid && exec.phase === "WAITING_FOR_THESIS") {
+          exec.waitReason = "llm_invalid";
+        }
+      }
+    } else if (exec.phase === "WAITING_FOR_THESIS") {
+      exec.waitReason = "llm_unavailable";
+    }
+
     const bars1m = this.recentBars1m;
     const current = bars1m[bars1m.length - 1];
     const previous = bars1m[bars1m.length - 2];
 
-    if (current && exec.thesisDirection) {
+    if (current && exec.thesisDirection && exec.thesisDirection !== "none") {
       const allowEntries =
         regime.regime !== "OPEN_WATCH" &&
         (regime.regime !== "LUNCH_CHOP" || (exec.thesisConfidence ?? 0) >= this.minimalLunchConfidence);
@@ -1738,7 +1767,7 @@ export class Orchestrator {
       }
     }
 
-    const mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
+    mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
     const direction =
       mindState.direction === "long" ? "LONG" : mindState.direction === "short" ? "SHORT" : undefined;
 
@@ -1762,6 +1791,8 @@ export class Orchestrator {
           activeMind: this.state.activeMind,
           mode: "EXECUTION",
           sessionRegime: regime.regime,
+          closed5mBarsCount: closed5mBars.length,
+          lastClosed5mBar: lastClosed5m,
           botState: exec.phase,
           waitFor: exec.waitReason ?? null,
           thesis: {

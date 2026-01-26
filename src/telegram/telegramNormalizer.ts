@@ -20,6 +20,7 @@ export type TelegramSnapshot = {
   gates?: string;
   volumeRetestOk?: boolean;
   mindState?: Record<string, any>;
+  thesis?: { direction?: string | null; confidence?: number | null };
   botState?: string;
   waitFor?: string | null;
   sessionRegime?: string;
@@ -599,6 +600,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       ts,
       mode: event.data.mode,
       mindState: event.data.mindState,
+      thesis: event.data.thesis,
       botState: event.data.botState,
       waitFor: event.data.waitFor,
       sessionRegime: event.data.sessionRegime,

@@ -922,13 +922,38 @@ Respond in this EXACT JSON format:
     if (!this.enabled) {
       return { mindState: fallback, valid: false };
     }
-    const bars = snapshot.closed5m.map((bar: { open: number; high: number; low: number; close: number; volume: number }) => ({
-      o: bar.open,
-      h: bar.high,
-      l: bar.low,
-      c: bar.close,
-      v: bar.volume,
-    }));
+    const closed5mBars = snapshot.closed5mBars.map(
+      (bar: { open: number; high: number; low: number; close: number; volume: number }) => ({
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume,
+      })
+    );
+    const forming5mBar = snapshot.forming5mBar
+      ? {
+          open: snapshot.forming5mBar.open,
+          high: snapshot.forming5mBar.high,
+          low: snapshot.forming5mBar.low,
+          close: snapshot.forming5mBar.close,
+          volume: snapshot.forming5mBar.volume,
+        }
+      : null;
+    const recent1mBars = snapshot.recent1mBars?.length
+      ? snapshot.recent1mBars.slice(-10).map((bar) => ({
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume,
+        }))
+      : undefined;
+    const llmInput = {
+      closed5mBars,
+      forming5mBar,
+      ...(recent1mBars ? { recent1mBars } : {}),
+    };
     const prompt = `You are a trading assistant.
 You receive only recent OHLCV bars.
 Your job is to infer short-term directional bias from price action alone.
@@ -947,7 +972,8 @@ Rules:
 - Do NOT invent indicators.
 - If direction is unclear, return "none".
 
-bars: ${JSON.stringify(bars)}`;
+LLM input:
+${JSON.stringify(llmInput)}`;
     const payload = {
       model: this.model,
       messages: [
