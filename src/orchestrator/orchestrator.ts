@@ -247,40 +247,24 @@ function buildIndicatorSnapshot(params: {
 }
 
 function buildMinimalIndicatorSummary(
-  indicators1m: ReturnType<typeof buildIndicatorSet>,
-  indicators5m: ReturnType<typeof buildIndicatorSet> | undefined,
-  relVol?: number
+  indicators5m: ReturnType<typeof buildIndicatorSet> | undefined
 ): {
-  vwap1m: number | null;
   vwap5m: number | null;
-  rsi14_1m: number | null;
   rsi14_5m: number | null;
-  atr14_1m: number | null;
   atr14_5m: number | null;
-  ema9_1m: number | null;
-  ema20_1m: number | null;
-  ema50_1m: number | null;
   ema9_5m: number | null;
   ema20_5m: number | null;
   ema50_5m: number | null;
-  relVol1m: number | null;
 } {
   const toNumberOrNull = (value: unknown): number | null =>
     Number.isFinite(value) ? (value as number) : null;
   return {
-    vwap1m: toNumberOrNull(indicators1m.vwap),
     vwap5m: toNumberOrNull(indicators5m?.vwap),
-    rsi14_1m: toNumberOrNull(indicators1m.rsi14),
     rsi14_5m: toNumberOrNull(indicators5m?.rsi14),
-    atr14_1m: toNumberOrNull(indicators1m.atr),
     atr14_5m: toNumberOrNull(indicators5m?.atr),
-    ema9_1m: toNumberOrNull(indicators1m.ema9),
-    ema20_1m: toNumberOrNull(indicators1m.ema20),
-    ema50_1m: toNumberOrNull(indicators1m.ema50),
     ema9_5m: toNumberOrNull(indicators5m?.ema9),
     ema20_5m: toNumberOrNull(indicators5m?.ema20),
     ema50_5m: toNumberOrNull(indicators5m?.ema50),
-    relVol1m: toNumberOrNull(relVol),
   };
 }
 
@@ -1410,22 +1394,10 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
-    const indicators = { ...indicators1m, ...indicators5m };
-    console.log("[MINIMAL] indicators1m", indicators1m);
     console.log("[MINIMAL] indicators5m", indicators5m);
-    console.log("[MINIMAL] indicators merged", indicators);
     this.logReadyGate(ts);
-    const relVol = this.computeRelVol(this.recentBars1m);
-    const indicatorSnapshot = buildIndicatorSnapshot({
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      indicators1m,
-      indicators5m,
-      relVol,
-    });
+    const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1464,7 +1436,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
+          indicators: minimalIndicators,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
@@ -1496,7 +1468,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
+          indicators: minimalIndicators,
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
@@ -1510,27 +1482,10 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimal1m symbol=${symbol} ts=${ts}`);
 
-    const indicators1m = buildIndicatorSet(this.recentBars1m, "1m");
     const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
-    const indicators = { ...indicators1m, ...(indicators5m ?? {}) };
-    console.log("[MINIMAL] indicators1m", indicators1m);
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
-    console.log("[MINIMAL] indicators merged", indicators);
     this.logReadyGate(ts);
-    const relVol = this.computeRelVol(this.recentBars1m);
-    const volumePolicySnapshot = relVol !== undefined ? volumePolicy(relVol) : undefined;
-    const volumeLine =
-      relVol !== undefined && volumePolicySnapshot
-        ? `${volumePolicySnapshot.label} (${relVol.toFixed(2)}x)`
-        : undefined;
-    const indicatorSnapshot = buildIndicatorSnapshot({
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      indicators1m,
-      indicators5m,
-      relVol,
-    });
+    const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1543,25 +1498,7 @@ export class Orchestrator {
     if (forming5mBar) {
       console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
     }
-    const impulseContext = this.buildImpulseContext(this.recentBars1m);
-    const rangeContext = this.buildRangeContext({
-      ts,
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      atr: indicators1m.atr ?? indicators5m?.atr,
-    });
-    const swingPoints =
-      this.computeSwingPoints(this.recentBars5m, 12) ??
-      this.computeSwingPoints(this.recentBars1m, 20);
-    const recent1mBars = this.recentBars1m.slice(-12).map((bar) => ({
-      ts: bar.ts,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-      volume: bar.volume,
-    }));
+    const swingPoints = this.computeSwingPoints(this.recentBars5m, 12);
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       summary: "LLM unavailable",
@@ -1579,17 +1516,13 @@ export class Orchestrator {
     };
     const mindState = this.llmService
       ? await this.llmService.getMindState({
-          mode: "EXEC_1M",
+          mode: "EXEC_FORMING_5M",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
-          relVol,
+          indicators: minimalIndicators,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           forming5mBar,
-          recent1mBars,
-          impulseContext,
-          rangeContext,
           swingPoints,
           previousMindState,
           activeMind: this.state.activeMind,
@@ -1626,9 +1559,9 @@ export class Orchestrator {
 
     const direction = normalizedMindState.bias;
     console.log(
-      `[MINIMAL][EXEC_1M] mind=${normalizedMindState.mindId ?? "n/a"} bias=${normalizedMindState.bias ?? "n/a"} state=${normalizedMindState.thesisState ?? "n/a"} action=${normalizedMindState.action ?? "n/a"} conf=${Number.isFinite(normalizedMindState.confidence) ? normalizedMindState.confidence : "n/a"} wait=${normalizedMindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${normalizedMindState.mindId ?? "n/a"} bias=${normalizedMindState.bias ?? "n/a"} state=${normalizedMindState.thesisState ?? "n/a"} action=${normalizedMindState.action ?? "n/a"} conf=${Number.isFinite(normalizedMindState.confidence) ? normalizedMindState.confidence : "n/a"} wait=${normalizedMindState.waiting_for ?? "n/a"}`
     );
-    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_1M`);
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 
     return [
       {
@@ -1640,14 +1573,11 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: indicatorSnapshot,
+          indicators: minimalIndicators,
           mindState: normalizedMindState,
           activeMind: nextActiveMind,
-          mode: "EXEC_1M",
-          volume: {
-            relVol,
-            line: volumeLine,
-          },
+          mode: "EXEC_FORMING_5M",
+          forming5mBar,
         },
       },
     ];

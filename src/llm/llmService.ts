@@ -895,7 +895,7 @@ Respond in this EXACT JSON format:
   }
 
   async getMindState(context: {
-    mode?: "MIND_5M_CLOSE" | "EXEC_1M";
+    mode?: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
     symbol: string;
     price: number;
     indicators: Record<string, any>;
@@ -937,7 +937,7 @@ Respond in this EXACT JSON format:
       };
     }
     const prompt = `You are summarizing a market mind-state for ${context.symbol}.
-mode: ${context.mode ?? "EXEC_1M"}
+mode: ${context.mode ?? "EXEC_FORMING_5M"}
 Price: ${context.price.toFixed(2)}
 Indicators: ${JSON.stringify(context.indicators)}
 indicators1m: ${JSON.stringify(context.indicators1m ?? {})}
@@ -957,14 +957,15 @@ Definitions:
 - RESET = "I can’t trust the thesis right now." Pause until next 5m close.
 - INVALID = "This thesis is wrong." Only if a predefined invalidation condition is breached.
 - Only 5m (mode=MIND_5M_CLOSE) can form/flip thesis or mindId.
-- 1m (mode=EXEC_1M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
+- Forming 5m (mode=EXEC_FORMING_5M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
 - RESET requires thesisState=FLAT or SUSPENDED and no bias flip.
 - INVALID requires thesisState=INVALID and must reference an invalidation_conditions entry.
 - INVALID means thesis broken by a 5m-defined condition (ex: "5m close below X", "VWAP reclaim lost + lower low", "break of range rail and hold").
 - RESET means thesis is stale/unclear/regime changed/data quality issue, but not hard invalidation.
 
-EXEC_1M prompt (state machine: THESIS → ARMED → ENTER):
+EXEC_FORMING_5M prompt (state machine: THESIS → ARMED → ENTER):
 - Treat activeMind as the locked thesis. Do not change bias or thesis; only advance or pause.
+- Use forming5mBar + closed5mBars + indicators (5m) to decide.
 - Answer only:
   1) Has price pulled back against the thesis enough to ARM?
   2) Is this the entry moment to ENTER now?
@@ -989,10 +990,10 @@ Return JSON only:
 Rules:
 - All fields above are REQUIRED in every response.
 - If mode=MIND_5M_CLOSE: invalidation_conditions must be a non-empty array.
-- If mode=EXEC_1M: bias must remain unchanged unless action is RESET or INVALID.
+- If mode=EXEC_FORMING_5M: bias must remain unchanged unless action is RESET or INVALID.
 - If action=INVALID: invalidation_reason must reference an item in activeMind.invalidation_conditions.
-- For EXEC_1M: waiting_for must be a single, concrete condition.
-- For EXEC_1M: invalidation_conditions must mirror activeMind.invalidation_conditions (do not invent new ones).
+- For EXEC_FORMING_5M: waiting_for must be a single, concrete condition.
+- For EXEC_FORMING_5M: invalidation_conditions must mirror activeMind.invalidation_conditions (do not invent new ones).
 `;
     const payload = {
       model: this.model,
