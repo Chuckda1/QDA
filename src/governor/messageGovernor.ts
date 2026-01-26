@@ -111,6 +111,14 @@ export class MessageGovernor {
   shouldSend(event: DomainEvent, bot: TelegramBotLike, chatId: number): boolean {
     // Always allow /status replies (handled separately, not through events)
     
+    if ((process.env.BOT_MODE || "").toLowerCase() === "minimal") {
+      const allowed = event.type === "MIND_STATE_UPDATED";
+      if (!allowed) {
+        console.log(`[GOV] minimal deny event=${event.type}`);
+      }
+      return allowed;
+    }
+
     if (event.type === "PLAN_OF_DAY") {
       const key = this.getDedupeKey(event);
       if (this.hasDedupe(key) || this.hasSentPlanToday(new Date(event.timestamp))) {

@@ -1234,6 +1234,8 @@ export class Orchestrator {
     const { ts, symbol, close } = snapshot;
     this.trackMinimalBar(snapshot, "5m");
     console.log(`[MINIMAL] handler=handleMinimal5m symbol=${symbol} ts=${ts}`);
+    const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
+    console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
     const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
     const relVol = this.computeRelVol(this.recentBars1m);
