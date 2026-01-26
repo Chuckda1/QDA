@@ -1294,6 +1294,9 @@ export class Orchestrator {
     this.state.lastLLMDecision = mindState.summary;
 
     const direction = mindState.bias;
+    console.log(
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+    );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
     return [
@@ -1427,6 +1430,9 @@ export class Orchestrator {
     this.state.lastLLMDecision = normalizedMindState.summary;
 
     const direction = normalizedMindState.bias;
+    console.log(
+      `[MINIMAL][EXEC_1M] mind=${normalizedMindState.mindId ?? "n/a"} bias=${normalizedMindState.bias ?? "n/a"} state=${normalizedMindState.thesisState ?? "n/a"} action=${normalizedMindState.action ?? "n/a"} conf=${Number.isFinite(normalizedMindState.confidence) ? normalizedMindState.confidence : "n/a"} wait=${normalizedMindState.waiting_for ?? "n/a"}`
+    );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_1M`);
 
     return [
