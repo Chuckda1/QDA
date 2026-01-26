@@ -91,7 +91,8 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const entryTf = snapshot.entryTriggerTf ? `${snapshot.entryTriggerTf} close` : "1m close";
     const chase = snapshot.chaseAllowed ? "YES" : "NO";
     const entry = `ENTRY: ${snapshot.entryTrigger ?? "n/a"} (${entryTf}) | CHASE: ${chase}`;
-    const stop = `STOP: ${formatPrice(snapshot.stop)} | INVALID: ${snapshot.invalidation ?? "n/a"}`;
+    const stopPrice = Number.isFinite(snapshot.stop) ? formatPrice(snapshot.stop as number) : "n/a";
+    const stop = `STOP: ${stopPrice} | INVALID: ${snapshot.invalidation ?? "n/a"}`;
     const tp = `TP1: ${formatPrice(snapshot.tp1)} | TP2: ${formatPrice(snapshot.tp2)} | MGMT: SL→BE after TP1`;
     const size = `SIZE: ${(snapshot.sizeMultiplier ?? 1).toFixed(2)}x | MODE: ${snapshot.entryMode ?? "PULLBACK"}`;
     const vol = snapshot.volumeLine ? `VOL: ${snapshot.volumeLine}` : undefined;
@@ -241,6 +242,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
     const botState = snapshot.botState ?? "n/a";
     const waitFor = snapshot.waitFor ? snapshot.waitFor.replace(/_/g, " ") : undefined;
+    const session = snapshot.sessionRegime ? `SESSION: ${snapshot.sessionRegime}` : undefined;
     const entry = Number.isFinite(snapshot.entry) ? `entry ${formatPrice(snapshot.entry as number)}` : undefined;
     const stop = Number.isFinite(snapshot.stop) ? `stop ${formatPrice(snapshot.stop as number)}` : undefined;
     const targets =
@@ -258,6 +260,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
         `BIAS: ${direction} | CONF: ${confidence}`,
         `STATE: ${botState}`,
+        session,
         waitFor ? `WAIT: ${waitFor}` : undefined,
         enterLine,
         tradeLine ? `TRADE: ${tradeLine}` : undefined,

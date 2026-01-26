@@ -914,7 +914,7 @@ Respond in this EXACT JSON format:
 
   async getMinimalMindState(snapshot: MinimalLLMSnapshot): Promise<MinimalMindStateResult> {
     const fallback: MinimalMindStateResponse = {
-      mindId: typeof snapshot.activeMind?.mindId === "string" ? snapshot.activeMind.mindId : undefined,
+      mindId: undefined,
       direction: "none",
       confidence: 0,
       reason: "LLM unavailable",
@@ -922,7 +922,7 @@ Respond in this EXACT JSON format:
     if (!this.enabled) {
       return { mindState: fallback, valid: false };
     }
-    const bars = (snapshot.closed5mBars ?? snapshot.closed5m).map((bar) => ({
+    const bars = snapshot.closed5m.map((bar: { open: number; high: number; low: number; close: number; volume: number }) => ({
       o: bar.open,
       h: bar.high,
       l: bar.low,

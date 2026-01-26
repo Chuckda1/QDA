@@ -22,13 +22,13 @@ export type TelegramSnapshot = {
   mindState?: Record<string, any>;
   botState?: string;
   waitFor?: string | null;
+  sessionRegime?: string;
   indicators?: Record<string, any>;
   formingProgress?: number | null;
   lastClosed5mTs?: string;
   lastClosed5mBar?: { ts: number; open: number; high: number; low: number; close: number; volume: number } | null;
   levels?: { entry: number | null; stop: number | null; targets: number[] };
   entry?: number | null;
-  stop?: number | null;
   targets?: number[] | null;
   extras?: { rsi14_5m?: number | null; atr14_5m?: number | null; relVol5m?: number | null };
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
@@ -558,6 +558,28 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     };
   }
 
+  if (event.type === "SESSION_UPDATE") {
+    const update = event.data ?? {};
+    const cause = `SESSION MODE: ${update.sessionRegime ?? "UNKNOWN"}`;
+    const nextLine = update.note ?? "monitor session";
+    return {
+      type: "UPDATE",
+      symbol,
+      dir: dir ?? "LONG",
+      conf,
+      risk,
+      px,
+      ts,
+      modeState: event.data.modeState,
+      update: {
+        cause,
+        next: nextLine,
+        ts,
+        price: event.data.price ?? event.data.close ?? event.data.entryPrice,
+      },
+    };
+  }
+
   if (event.type === "MIND_STATE_UPDATED") {
     const lastClosed5mTs =
       typeof event.data.lastClosed5mTs === "number" ? formatEtTimestamp(event.data.lastClosed5mTs) : undefined;
@@ -579,6 +601,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       mindState: event.data.mindState,
       botState: event.data.botState,
       waitFor: event.data.waitFor,
+      sessionRegime: event.data.sessionRegime,
       formingProgress,
       lastClosed5mTs,
       lastClosed5mBar,

@@ -204,7 +204,8 @@ export type DomainEventType =
   | "PREMARKET_UPDATE"
   | "VOLUME_UPDATE"
   | "PLAN_OF_DAY"
-  | "MIND_STATE_UPDATED";
+  | "MIND_STATE_UPDATED"
+  | "SESSION_UPDATE";
 
 export interface DomainEvent {
   type: DomainEventType;
@@ -360,6 +361,13 @@ export interface BotState {
     invalidation_conditions?: string[];
   };
   minimalExecution?: MinimalExecutionState;
+  marketRegime?: {
+    isRTH: boolean;
+    isPremarket: boolean;
+    isAfterHours: boolean;
+    regime: "CLOSED" | "OPEN_WATCH" | "MORNING_TREND" | "LUNCH_CHOP" | "POWER_HOUR";
+    nowEt: string;
+  };
 }
 
 export type MinimalExecutionPhase =

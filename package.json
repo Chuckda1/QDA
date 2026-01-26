@@ -12,6 +12,7 @@
     "test:llm": "node node_modules/tsx/dist/cli.mjs scripts/mockLLMTest.ts",
     "test:stop": "node node_modules/tsx/dist/cli.mjs scripts/verifyStopLogic.ts",
     "test:one-engine": "node node_modules/tsx/dist/cli.mjs scripts/oneEngineInvariantTest.ts",
+    "test:regime": "node node_modules/tsx/dist/cli.mjs scripts/marketRegimeTest.ts",
     "replay:decisions": "node node_modules/tsx/dist/cli.mjs scripts/decisionAlertReplay.ts"
   },
   "dependencies": {

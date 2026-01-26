@@ -133,3 +133,52 @@ export function getMarketSessionLabel(date: Date = new Date()): "RTH" | "OFF_HOU
   if (isWeekday && cur >= rthStart && cur < rthEnd) return "RTH";
   return "OFF_HOURS";
 }
+
+export function getMarketRegime(
+  now: Date,
+  tz: string = "America/New_York"
+): {
+  isRTH: boolean;
+  isPremarket: boolean;
+  isAfterHours: boolean;
+  regime: "CLOSED" | "OPEN_WATCH" | "MORNING_TREND" | "LUNCH_CHOP" | "POWER_HOUR";
+  nowEt: string;
+  tz: string;
+} {
+  const { hour, minute, weekday } = getETParts(now);
+  const isWeekday = weekday >= 1 && weekday <= 5;
+  const cur = hour * 60 + minute;
+  const nowEt = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+
+  const preStart = 4 * 60;
+  const rthStart = 9 * 60 + 30;
+  const openWatchEnd = 9 * 60 + 40;
+  const lunchStart = 12 * 60;
+  const lunchEnd = 13 * 60;
+  const powerHourStart = 14 * 60;
+  const rthEnd = 16 * 60;
+  const afterEnd = 20 * 60;
+
+  const isPremarket = isWeekday && cur >= preStart && cur < rthStart;
+  const isRTH = isWeekday && cur >= rthStart && cur < rthEnd;
+  const isAfterHours = isWeekday && cur >= rthEnd && cur < afterEnd;
+
+  if (!isWeekday || cur < preStart || cur >= afterEnd) {
+    return { isRTH, isPremarket, isAfterHours, regime: "CLOSED", nowEt, tz };
+  }
+
+  if (!isRTH) {
+    return { isRTH, isPremarket, isAfterHours, regime: "CLOSED", nowEt, tz };
+  }
+
+  if (cur < openWatchEnd) {
+    return { isRTH, isPremarket, isAfterHours, regime: "OPEN_WATCH", nowEt, tz };
+  }
+  if (cur >= lunchStart && cur < lunchEnd) {
+    return { isRTH, isPremarket, isAfterHours, regime: "LUNCH_CHOP", nowEt, tz };
+  }
+  if (cur >= powerHourStart && cur < rthEnd) {
+    return { isRTH, isPremarket, isAfterHours, regime: "POWER_HOUR", nowEt, tz };
+  }
+  return { isRTH, isPremarket, isAfterHours, regime: "MORNING_TREND", nowEt, tz };
+}

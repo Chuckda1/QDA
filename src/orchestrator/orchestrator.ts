@@ -3,7 +3,7 @@ import type { LLMService } from "../llm/llmService.js";
 import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
-import { etToUtcTimestamp, getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
+import { etToUtcTimestamp, getETClock, getETDateString, getMarketRegime, getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
@@ -800,6 +800,7 @@ export class Orchestrator {
   private readonly autoAllInOnHighProb: boolean;
   private readonly minimalLlmBars: number;
   private readonly minimalLlmConfidence: number;
+  private readonly minimalLunchConfidence: number;
 
   // POTD config (soft prior by default)
   private potdBias: PotdBias;
@@ -853,6 +854,7 @@ export class Orchestrator {
     this.autoAllInOnHighProb = process.env.AUTO_ALL_IN_ON_HIGH_PROB !== "false";
     this.minimalLlmBars = parseInt(process.env.MINIMAL_LLM_BARS || "30", 10);
     this.minimalLlmConfidence = parseInt(process.env.MINIMAL_LLM_CONFIDENCE || "60", 10);
+    this.minimalLunchConfidence = parseInt(process.env.MINIMAL_LUNCH_CONFIDENCE || "75", 10);
 
     // Load POTD config from env vars
     const potdBiasRaw = (process.env.POTD_BIAS || "NONE").toUpperCase();
@@ -1428,6 +1430,36 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  private updateMarketRegime(ts: number): { regime: ReturnType<typeof getMarketRegime>; changed: boolean } {
+    const regime = getMarketRegime(new Date(ts));
+    const previous = this.state.marketRegime?.regime;
+    const changed = previous !== regime.regime;
+    this.state.marketRegime = regime;
+    console.log(`[REGIME] isRTH=${regime.isRTH} regime=${regime.regime} nowET=${regime.nowEt}`);
+    return { regime, changed };
+  }
+
+  private buildSessionUpdateEvent(params: {
+    ts: number;
+    symbol: string;
+    regime: ReturnType<typeof getMarketRegime>;
+    note: string;
+  }): DomainEvent {
+    return {
+      type: "SESSION_UPDATE",
+      timestamp: params.ts,
+      instanceId: this.instanceId,
+      data: {
+        timestamp: params.ts,
+        symbol: params.symbol,
+        sessionRegime: params.regime.regime,
+        isRTH: params.regime.isRTH,
+        nowEt: params.regime.nowEt,
+        note: params.note,
+      },
+    };
+  }
+
   private extractActiveMind(mindState?: Record<string, any>): BotState["activeMind"] | undefined {
     if (!mindState || typeof mindState !== "object") return undefined;
     if (mindState.activeMind && typeof mindState.activeMind === "object") {
@@ -1477,6 +1509,25 @@ export class Orchestrator {
     console.log(`[MINIMAL] handler=handleMinimal5m symbol=${symbol} ts=${ts}`);
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
+    const events: DomainEvent[] = [];
+    const { regime, changed } = this.updateMarketRegime(ts);
+    if (changed) {
+      const note =
+        regime.regime === "OPEN_WATCH"
+          ? "observe only (no entries)"
+          : regime.regime === "LUNCH_CHOP"
+          ? "entries restricted"
+          : regime.regime === "POWER_HOUR"
+          ? "entries allowed"
+          : regime.regime === "MORNING_TREND"
+          ? "entries allowed"
+          : "market closed";
+      events.push(this.buildSessionUpdateEvent({ ts, symbol, regime, note }));
+    }
+    if (!regime.isRTH) {
+      this.resetMinimalExecution("market_closed");
+      return events;
+    }
 
     const closed5mBars = buildClosed5mBars(this.recentBars5m, this.minimalLlmBars);
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
@@ -1539,6 +1590,7 @@ export class Orchestrator {
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=THESIS_5M`);
 
     return [
+      ...events,
       {
         type: "MIND_STATE_UPDATED",
         timestamp: ts,
@@ -1551,6 +1603,7 @@ export class Orchestrator {
           mindState,
           activeMind: this.state.activeMind,
           mode: "THESIS_5M",
+          sessionRegime: regime.regime,
           closed5mBarsCount: closed5mBars.length,
           lastClosed5mBar: lastClosed5m,
           botState: exec.phase,
@@ -1574,15 +1627,39 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
+    const events: DomainEvent[] = [];
+    const { regime, changed } = this.updateMarketRegime(ts);
+    if (changed) {
+      const note =
+        regime.regime === "OPEN_WATCH"
+          ? "observe only (no entries)"
+          : regime.regime === "LUNCH_CHOP"
+          ? "entries restricted"
+          : regime.regime === "POWER_HOUR"
+          ? "entries allowed"
+          : regime.regime === "MORNING_TREND"
+          ? "entries allowed"
+          : "market closed";
+      events.push(this.buildSessionUpdateEvent({ ts, symbol, regime, note }));
+    }
+    if (!regime.isRTH) {
+      this.resetMinimalExecution("market_closed");
+      return events;
+    }
+
     const exec = this.getMinimalExecutionState();
     const bars1m = this.recentBars1m;
     const current = bars1m[bars1m.length - 1];
     const previous = bars1m[bars1m.length - 2];
 
     if (current && exec.thesisDirection) {
+      const allowEntries =
+        regime.regime !== "OPEN_WATCH" &&
+        (regime.regime !== "LUNCH_CHOP" || (exec.thesisConfidence ?? 0) >= this.minimalLunchConfidence);
       if (exec.phase === "WAITING_FOR_PULLBACK" && previous) {
-        const isBearish = current.close < current.open;
-        const isBullish = current.close > current.open;
+        const open = current.open ?? current.close;
+        const isBearish = current.close < open;
+        const isBullish = current.close > open;
         const lowerLow = current.low < previous.low;
         const higherHigh = current.high > previous.high;
 
@@ -1604,12 +1681,19 @@ export class Orchestrator {
       } else if (exec.phase === "WAITING_FOR_ENTRY") {
         if (exec.thesisDirection === "long" && exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
           if (current.close > exec.pullbackHigh) {
+            if (!allowEntries) {
+              exec.waitReason =
+                regime.regime === "OPEN_WATCH"
+                  ? "open_watch_no_entries"
+                  : `lunch_confidence_below_${this.minimalLunchConfidence}`;
+            } else {
             exec.entryPrice = current.close;
             exec.entryTs = ts;
             exec.stopPrice = exec.pullbackLow;
             exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
             exec.phase = "IN_TRADE";
             exec.waitReason = "in_trade";
+            }
           }
         } else if (
           exec.thesisDirection === "short" &&
@@ -1617,12 +1701,19 @@ export class Orchestrator {
           exec.pullbackLow !== undefined
         ) {
           if (current.close < exec.pullbackLow) {
+            if (!allowEntries) {
+              exec.waitReason =
+                regime.regime === "OPEN_WATCH"
+                  ? "open_watch_no_entries"
+                  : `lunch_confidence_below_${this.minimalLunchConfidence}`;
+            } else {
             exec.entryPrice = current.close;
             exec.entryTs = ts;
             exec.stopPrice = exec.pullbackHigh;
             exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
             exec.phase = "IN_TRADE";
             exec.waitReason = "in_trade";
+            }
           }
         } else {
           exec.phase = "WAITING_FOR_PULLBACK";
@@ -1657,6 +1748,7 @@ export class Orchestrator {
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXECUTION`);
 
     return [
+      ...events,
       {
         type: "MIND_STATE_UPDATED",
         timestamp: ts,
@@ -1669,6 +1761,7 @@ export class Orchestrator {
           mindState,
           activeMind: this.state.activeMind,
           mode: "EXECUTION",
+          sessionRegime: regime.regime,
           botState: exec.phase,
           waitFor: exec.waitReason ?? null,
           thesis: {
