@@ -179,6 +179,10 @@ export type MinimalLLMSnapshot = {
   closed5m: RawBar[];
   lastClosed5mTs?: number | null;
   lastClosed5m?: RawBar | null;
+  swings?: {
+    highs: Array<{ ts: number; price: number }>;
+    lows: Array<{ ts: number; price: number }>;
+  };
   forming5m: Forming5mBar | null;
   extras?: {
     rsi14_5m?: number | null;

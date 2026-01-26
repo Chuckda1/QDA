@@ -159,6 +159,7 @@ export interface ArmedCoachingResponse {
 export interface MinimalMindStateResponse {
   mindId: string;
   trend: string;
+  structure: string;
   entry: string;
   reason: string;
   levels?: { key: string[]; support: number[]; resistance: number[] } | null;
@@ -199,18 +200,20 @@ export class LLMService {
     if (!input || typeof input !== "object") return null;
     const mindId = typeof input.mindId === "string" ? input.mindId : "";
     const trend = typeof input.trend === "string" ? input.trend : "";
+    const structure = typeof input.structure === "string" ? input.structure : "";
     const entry = typeof input.entry === "string" ? input.entry : "";
     const reason = typeof input.reason === "string" ? input.reason : "";
     const levels = input.levels && typeof input.levels === "object" ? input.levels : null;
     const notes = Array.isArray(input.notes)
       ? input.notes.filter((n: unknown) => typeof n === "string")
       : [];
-    if (!trend || !entry || !reason) {
+    if (!trend || !structure || !entry || !reason) {
       return null;
     }
     return {
       mindId,
       trend,
+      structure,
       entry,
       reason,
       levels: levels
@@ -928,6 +931,7 @@ Respond in this EXACT JSON format:
     const fallback: MinimalMindStateResponse = {
       mindId: typeof snapshot.activeMind?.mindId === "string" ? snapshot.activeMind.mindId : "unknown",
       trend: typeof snapshot.activeMind?.bias === "string" ? snapshot.activeMind.bias : "UNKNOWN",
+      structure: "UNKNOWN",
       entry: "WAIT",
       reason: "LLM unavailable",
       levels: null,
@@ -943,6 +947,7 @@ nowTs: ${snapshot.nowTs}
 session: ${JSON.stringify(snapshot.session)}
 lastClosed5mTs: ${snapshot.lastClosed5mTs ?? "n/a"}
 lastClosed5m: ${JSON.stringify(snapshot.lastClosed5m ?? null)}
+swings: ${JSON.stringify(snapshot.swings ?? { highs: [], lows: [] })}
 closed5m: ${JSON.stringify(snapshot.closed5m)}
 forming5m: ${JSON.stringify(snapshot.forming5m)}
 extras: ${JSON.stringify(snapshot.extras ?? {})}
@@ -953,7 +958,8 @@ Return JSON only:
 {
   "mindId": "string",
   "trend": "up|down|range|string",
-  "entry": "good|chase|wait|string",
+  "structure": "intact|weakening|broken|string",
+  "entry": "yes|wait|string",
   "reason": "1-2 lines",
   "levels": { "key": [string], "support": [number], "resistance": [number] } | null,
   "notes": ["..."]
@@ -964,6 +970,11 @@ Rules:
 - Do not ignore forming5m. Use it for intra-candle updates.
 - closed5m is a rolling window of recent bars. Use it to infer trend and structure.
 - Do not reset trend/entry just because mode changes or a new 5m bar starts.
+- Market structure rules (OHLC only):
+  - UPTREND: higher swing highs + higher swing lows.
+  - DOWNTREND: lower swing highs + lower swing lows.
+  - REVERSAL requires a swing in the opposite direction AND a break of prior structure.
+  - Avoid countertrend entries unless structure is broken.
 - If context is thin, say so in reason, but still return a valid JSON.`;
     const payload = {
       model: this.model,

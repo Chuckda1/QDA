@@ -236,6 +236,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   if (snapshot.type === "MIND") {
     const mind = snapshot.mindState ?? {};
     const trend = mind.trend ?? mind.bias ?? "n/a";
+    const structure = mind.structure ?? "n/a";
     const entry = mind.entry ?? mind.state ?? "n/a";
     const reason = mind.reason ?? mind.because ?? "n/a";
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
@@ -268,7 +269,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       "MIND",
       [
         `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
-        `TREND: ${trend} | ENTRY: ${entry}`,
+        `TREND: ${trend} | STRUCTURE: ${structure} | ENTRY: ${entry}`,
         `REASON: ${reason}`,
         lastClosed,
         lastBarLine,

@@ -1322,6 +1322,36 @@ export class Orchestrator {
     return { startTs, endTs, progressMinutes, open, high, low, close, volume };
   }
 
+  private extractSwings(bars: OHLCVBar[]): { highs: Array<{ ts: number; price: number }>; lows: Array<{ ts: number; price: number }> } {
+    if (bars.length < 5) return { highs: [], lows: [] };
+    const highs: Array<{ ts: number; price: number }> = [];
+    const lows: Array<{ ts: number; price: number }> = [];
+    for (let i = 2; i < bars.length - 2; i += 1) {
+      const h = bars[i].high;
+      const l = bars[i].low;
+      if (
+        h > bars[i - 1].high &&
+        h > bars[i - 2].high &&
+        h > bars[i + 1].high &&
+        h > bars[i + 2].high
+      ) {
+        highs.push({ ts: bars[i].ts, price: h });
+      }
+      if (
+        l < bars[i - 1].low &&
+        l < bars[i - 2].low &&
+        l < bars[i + 1].low &&
+        l < bars[i + 2].low
+      ) {
+        lows.push({ ts: bars[i].ts, price: l });
+      }
+    }
+    return {
+      highs: highs.slice(-2),
+      lows: lows.slice(-2),
+    };
+  }
+
   private buildImpulseContext(bars: OHLCVBar[]): {
     direction: "UP" | "DOWN" | "FLAT";
     move: number;
@@ -1451,6 +1481,7 @@ export class Orchestrator {
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
+    const swings = this.extractSwings(closed5mBars);
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
@@ -1460,6 +1491,7 @@ export class Orchestrator {
       closed5m: closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
+      swings,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
@@ -1545,6 +1577,7 @@ export class Orchestrator {
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
+    const swings = this.extractSwings(closed5mBars);
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
@@ -1554,6 +1587,7 @@ export class Orchestrator {
       closed5m: closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
+      swings,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
