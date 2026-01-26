@@ -1,4 +1,4 @@
-import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalLLMSnapshot, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
@@ -187,6 +187,52 @@ function buildIndicatorSet(
     ema50: closes.length >= 50 ? computeEMA(closes.slice(-120), 50) : undefined,
     atr: bars.length >= 15 ? computeATR(bars, 14) : undefined,
     rsi14: closes.length >= 15 ? computeRSI(closes, 14) : undefined,
+  };
+}
+
+function computeSessionContext(ts: number): { isRTH: boolean; sessionStartTs: number; tz: "America/New_York" } {
+  const dt = new Date(ts);
+  const sessionLabel = getMarketSessionLabel(dt);
+  const sessionStartTs = etToUtcTimestamp(9, 30, dt);
+  return {
+    isRTH: sessionLabel === "RTH",
+    sessionStartTs,
+    tz: "America/New_York",
+  };
+}
+
+function buildClosed5mBars(bars: OHLCVBar[], limit = 60): Array<{
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}> {
+  return bars.slice(-limit).map((bar) => ({
+    ts: bar.ts,
+    open: bar.open ?? bar.close,
+    high: bar.high,
+    low: bar.low,
+    close: bar.close,
+    volume: bar.volume ?? 0,
+  }));
+}
+
+function computeVolumeExtras(params: {
+  closed5mBars: Array<{ volume: number }>;
+  forming5mBar?: { volume: number } | null;
+  window?: number;
+}): { relVol5m: number | null; volNow5m: number | null; volAvg5m: number | null } {
+  const window = params.window ?? 20;
+  const vols = params.closed5mBars.slice(-window).map((bar) => bar.volume).filter((v) => Number.isFinite(v));
+  const volAvg = vols.length >= 5 ? vols.reduce((sum, v) => sum + v, 0) / vols.length : null;
+  const volNow = Number.isFinite(params.forming5mBar?.volume) ? (params.forming5mBar as { volume: number }).volume : null;
+  const relVol = volNow !== null && volAvg && volAvg > 0 ? volNow / volAvg : null;
+  return {
+    relVol5m: relVol !== null ? Number(relVol.toFixed(2)) : null,
+    volNow5m: volNow,
+    volAvg5m: volAvg !== null ? Number(volAvg.toFixed(2)) : null,
   };
 }
 
@@ -1347,22 +1393,17 @@ export class Orchestrator {
   private extractActiveMind(mindState?: Record<string, any>): BotState["activeMind"] | undefined {
     if (!mindState || typeof mindState !== "object") return undefined;
     if (mindState.activeMind && typeof mindState.activeMind === "object") {
-      const { mindId, bias, thesisState, state, invalidation_conditions } = mindState.activeMind as Record<string, any>;
+      const { mindId, bias, thesisState, invalidation_conditions } = mindState.activeMind as Record<string, any>;
       return {
         mindId: typeof mindId === "string" ? mindId : undefined,
         bias: bias === "LONG" || bias === "SHORT" || bias === "NEUTRAL" ? bias : undefined,
-        thesisState: typeof state === "string" ? state : typeof thesisState === "string" ? thesisState : undefined,
+        thesisState: typeof thesisState === "string" ? thesisState : undefined,
         invalidation_conditions: Array.isArray(invalidation_conditions) ? invalidation_conditions : undefined,
       };
     }
     const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
     const bias = mindState.bias === "LONG" || mindState.bias === "SHORT" || mindState.bias === "NEUTRAL" ? mindState.bias : undefined;
-    const thesisState =
-      typeof mindState.state === "string"
-        ? mindState.state
-        : typeof mindState.thesisState === "string"
-        ? mindState.thesisState
-        : undefined;
+    const thesisState = typeof mindState.thesisState === "string" ? mindState.thesisState : undefined;
     const invalidation_conditions = Array.isArray(mindState.invalidation_conditions)
       ? mindState.invalidation_conditions
       : undefined;
@@ -1385,69 +1426,69 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const relVol = this.computeRelVol(this.recentBars5m);
-    const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
-      ts: bar.ts,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-      volume: bar.volume,
-    }));
+    const closed5mBars = buildClosed5mBars(this.recentBars5m, 60);
     const forming5mBar = this.buildForming5mBar(ts);
+    const extras = computeVolumeExtras({
+      closed5mBars,
+      forming5mBar: forming5mBar ?? undefined,
+    });
+    const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
+    const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
+    const snapshot: MinimalLLMSnapshot = {
+      mode: "MIND_5M_CLOSE",
+      symbol,
+      lastPrice: close,
+      nowTs: ts,
+      session: computeSessionContext(ts),
+      closed5mBars,
+      forming5mBar,
+      extras: {
+        ...extras,
+        rsi14_5m,
+        atr14_5m,
+      },
+      previousMindState: this.state.mindState,
+      activeMind: this.state.activeMind,
+    };
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
+      summary: "LLM unavailable",
       mindId: this.state.activeMind?.mindId,
-      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      command: "HOLD",
+      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      action: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
-      waiting_for: "valid LLM response",
+      waiting_for: "LLM enabled",
       invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      levels: { entry: null, stop: null, targets: [] },
+      reset_reason: "",
+      invalidation_reason: "",
       notes: [],
     };
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
-          symbol,
-          price: close,
-          relVol,
-          meta: {
-            nowTs: ts,
-            symbol,
-            barsCount5m: this.recentBars5m.length,
-            formingProgress: forming5mBar?.progressMinutes ?? null,
-          },
-          freshness: this.buildFreshness(ts),
-          closed5mBars: this.recentBars5m.slice(-60),
-          forming5mBar,
-          previousMindState,
-          activeMind: this.state.activeMind,
+          mode: "MIND_5M_CLOSE",
+          snapshot,
         })
       : { mindState: fallbackMindState5m, valid: false };
 
     if (!valid) {
       console.error("[MINIMAL] MindState invalid: using HOLD fallback");
     }
-    const command = mindState.command;
+    const command = mindState.action;
     let nextActiveMind = this.state.activeMind;
     if (valid) {
-      if (command === "RESET" || command === "INVALID") {
-        nextActiveMind = undefined;
-      } else {
-        nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
-      }
+      nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
     this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = `${mindState.command}:${mindState.state}`;
+    this.state.lastLLMDecision = mindState.summary;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} command=${mindState.command ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1464,9 +1505,9 @@ export class Orchestrator {
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
-          lastClosed5mTs: closed5mBars[closed5mBars.length - 1]?.ts,
+          closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
-          forming5mBar,
+          extras: snapshot.extras,
         },
       },
     ];
@@ -1477,72 +1518,72 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
-    const relVol = this.computeRelVol(this.recentBars5m);
-    const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
-      ts: bar.ts,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-      volume: bar.volume,
-    }));
+    const closed5mBars = buildClosed5mBars(this.recentBars5m, 60);
     const forming5mBar = this.buildForming5mBar(ts);
     if (forming5mBar) {
       console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
     }
+    const extras = computeVolumeExtras({
+      closed5mBars,
+      forming5mBar: forming5mBar ?? undefined,
+    });
+    const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
+    const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
+    const snapshot: MinimalLLMSnapshot = {
+      mode: "EXEC_FORMING_5M",
+      symbol,
+      lastPrice: close,
+      nowTs: ts,
+      session: computeSessionContext(ts),
+      closed5mBars,
+      forming5mBar,
+      extras: {
+        ...extras,
+        rsi14_5m,
+        atr14_5m,
+      },
+      previousMindState: this.state.mindState,
+      activeMind: this.state.activeMind,
+    };
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
+      summary: "LLM unavailable",
       mindId: this.state.activeMind?.mindId,
-      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      command: "HOLD",
+      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      action: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
-      waiting_for: "valid LLM response",
+      waiting_for: "LLM enabled",
       invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      levels: { entry: null, stop: null, targets: [] },
+      reset_reason: "",
+      invalidation_reason: "",
       notes: [],
     };
     const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
-          symbol,
-          price: close,
-          relVol,
-          meta: {
-            nowTs: ts,
-            symbol,
-            barsCount5m: this.recentBars5m.length,
-            formingProgress: forming5mBar?.progressMinutes ?? null,
-          },
-          freshness: this.buildFreshness(ts),
-          closed5mBars: this.recentBars5m.slice(-60),
-          forming5mBar,
-          previousMindState,
-          activeMind: this.state.activeMind,
+          mode: "EXEC_FORMING_5M",
+          snapshot,
         })
       : { mindState: fallbackMindState1m, valid: false };
 
     if (!valid) {
       console.error("[MINIMAL] MindState invalid: using HOLD fallback");
     }
-    const command = mindState.command;
+    const command = mindState.action;
     let nextActiveMind = this.state.activeMind;
     if (valid) {
-      if (command === "RESET" || command === "INVALID") {
-        nextActiveMind = undefined;
-      } else {
-        nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
-      }
+      nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
     this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = `${mindState.command}:${mindState.state}`;
+    this.state.lastLLMDecision = mindState.summary;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} command=${mindState.command ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 
@@ -1559,9 +1600,9 @@ export class Orchestrator {
           mindState,
           activeMind: nextActiveMind,
           mode: "EXEC_FORMING_5M",
-          lastClosed5mTs: closed5mBars[closed5mBars.length - 1]?.ts,
+          closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
-          forming5mBar,
+          extras: snapshot.extras,
         },
       },
     ];

@@ -150,6 +150,45 @@ export type DataFreshness = {
   lastTradePx?: number;
 };
 
+export type RawBar = {
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type Forming5mBar = {
+  startTs: number;
+  endTs: number;
+  progressMinutes: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type MinimalLLMSnapshot = {
+  mode: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
+  symbol: string;
+  lastPrice: number;
+  nowTs: number;
+  session: { isRTH: boolean; sessionStartTs: number; tz: "America/New_York" };
+  closed5mBars: RawBar[];
+  forming5mBar: Forming5mBar | null;
+  extras?: {
+    rsi14_5m?: number | null;
+    atr14_5m?: number | null;
+    relVol5m?: number | null;
+    volNow5m?: number | null;
+    volAvg5m?: number | null;
+  };
+  previousMindState?: Record<string, any>;
+  activeMind?: Record<string, any>;
+};
+
 export type DomainEventType =
   | "PLAY_ARMED"
   | "ENTRY_WINDOW_OPENED"

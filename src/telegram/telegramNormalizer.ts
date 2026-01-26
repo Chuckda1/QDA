@@ -12,6 +12,7 @@ export type TelegramSnapshot = {
   risk: string;
   px?: number;
   ts?: string;
+  mode?: string;
   modeState?: string;
   volumeLine?: string;
   status?: "WATCH" | "SIGNAL";
@@ -23,6 +24,7 @@ export type TelegramSnapshot = {
   formingProgress?: number | null;
   lastClosed5mTs?: string;
   levels?: { entry: number | null; stop: number | null; targets: number[] };
+  extras?: { rsi14_5m?: number | null; atr14_5m?: number | null; relVol5m?: number | null };
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
     low: number;
@@ -563,10 +565,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
+      mode: event.data.mode,
       mindState: event.data.mindState,
       formingProgress,
       lastClosed5mTs,
       levels,
+      extras: event.data.extras,
     };
   }
 

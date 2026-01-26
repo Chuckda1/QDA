@@ -236,9 +236,9 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   if (snapshot.type === "MIND") {
     const mind = snapshot.mindState ?? {};
     const bias = mind.bias ?? "n/a";
-    const state = mind.state ?? mind.thesisState ?? "n/a";
+    const state = mind.thesisState ?? "n/a";
     const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
-    const command = mind.command ?? mind.action ?? "n/a";
+    const action = mind.action ?? "n/a";
     const waitingFor = mind.waiting_for ?? "n/a";
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
     const invalidations = Array.isArray(mind.invalidation_conditions)
@@ -258,17 +258,25 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       Number.isFinite(snapshot.formingProgress) ? `${snapshot.formingProgress}/5` : undefined;
     const lastClosed = snapshot.lastClosed5mTs ? `LAST5M: ${snapshot.lastClosed5mTs}` : undefined;
     const formingLine = formingProgress ? `FORMING: ${formingProgress}` : undefined;
+    const extras = snapshot.extras ?? {};
+    const extraParts = [
+      Number.isFinite(extras.rsi14_5m) ? `RSI5m=${Math.round(extras.rsi14_5m as number)}` : undefined,
+      Number.isFinite(extras.atr14_5m) ? `ATR5m=${formatPrice(extras.atr14_5m as number)}` : undefined,
+      Number.isFinite(extras.relVol5m) ? `RV5m=${(extras.relVol5m as number).toFixed(2)}x` : undefined,
+    ].filter((part): part is string => Boolean(part));
     const invalidLines = invalidations.length
       ? invalidations.slice(0, 2).map((item) => `- ${item}`)
       : ["- n/a"];
     const lines = enforceLineLimit("MIND", [
-      `BIAS: ${bias} | STATE: ${state} | CMD: ${command} | CONF: ${confidence} | px ${price}`,
+      `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
+      `BIAS: ${bias} | STATE: ${state} | ACTION: ${action} | CONF: ${confidence}`,
       `WAITING_FOR: ${waitingFor}`,
       lastClosed,
       formingLine,
       "INVALID_IF:",
       ...invalidLines,
       levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
+      extraParts.length ? `EXTRAS: ${extraParts.join(" | ")}` : undefined,
     ]);
     return { type: "MIND", lines, text: lines.join("\n") };
   }
