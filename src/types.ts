@@ -203,12 +203,29 @@ export type MinimalLLMSnapshot = {
   session: { isRTH: boolean; etNow: string; sessionDate: string };
   lastPrice: number | null;
   closed5m: RawBar[];
+  closed5mBars?: RawBar[];
   lastClosed5mTs?: number | null;
   lastClosed5m?: RawBar | null;
   swings5m?: Array<{ t: number; p: number; k: "HIGH" | "LOW"; i: number }>;
   structure?: MinimalStructure;
   entrySignal?: MinimalEntrySignal;
   forming5m: Forming5mBar | null;
+  forming5mBar?: {
+    bucketStart: number;
+    progress: number;
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    v: number;
+  } | null;
+  meta?: {
+    closed5mCount: number;
+    swingsCount: number;
+    lastClosedTs: number | null;
+    formingStartTs: number | null;
+    nowTs: number;
+  };
   extras?: {
     rsi14_5m?: number | null;
     atr14_5m?: number | null;

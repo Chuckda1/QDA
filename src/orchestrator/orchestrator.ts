@@ -1492,6 +1492,8 @@ export class Orchestrator {
           };
         })()
       : null;
+    const lastClosedTs = lastClosed5m?.ts ?? null;
+    const formingStartTs = forming5mBar?.startTs ?? null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
@@ -1499,12 +1501,31 @@ export class Orchestrator {
       nowTs: ts,
       session: computeSessionContext(ts),
       closed5m: closed5mBars,
+      closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
       swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
       structure: structurePayload,
       entrySignal: entrySignal ?? undefined,
       forming5m: forming5mBar ?? null,
+      forming5mBar: forming5mBar
+        ? {
+            bucketStart: forming5mBar.startTs,
+            progress: forming5mBar.progressMinutes,
+            o: forming5mBar.open,
+            h: forming5mBar.high,
+            l: forming5mBar.low,
+            c: forming5mBar.close,
+            v: forming5mBar.volume,
+          }
+        : null,
+      meta: {
+        closed5mCount: closed5mBars.length,
+        swingsCount: swingPoints.length,
+        lastClosedTs,
+        formingStartTs,
+        nowTs: ts,
+      },
       extras: {
         ...extras,
         rsi14_5m,
@@ -1513,6 +1534,9 @@ export class Orchestrator {
       previousMindState: this.state.mindState,
       activeMind: this.state.activeMind,
     };
+    console.log(
+      `[MINIMAL][DEBUG] barsSent=${closed5mBars.length} lastClosedTs=${lastClosedTs ?? "n/a"} formingStartTs=${formingStartTs ?? "n/a"} swingsCount=${swingPoints.length} lastSwingHigh=${lastHigh?.price ?? "n/a"} lastSwingLow=${lastLow?.price ?? "n/a"}`
+    );
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
@@ -1625,6 +1649,8 @@ export class Orchestrator {
           };
         })()
       : null;
+    const lastClosedTs = lastClosed5m?.ts ?? null;
+    const formingStartTs = forming5mBar?.startTs ?? null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
@@ -1632,12 +1658,31 @@ export class Orchestrator {
       nowTs: ts,
       session: computeSessionContext(ts),
       closed5m: closed5mBars,
+      closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
       swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
       structure: structurePayload,
       entrySignal: entrySignal ?? undefined,
       forming5m: forming5mBar ?? null,
+      forming5mBar: forming5mBar
+        ? {
+            bucketStart: forming5mBar.startTs,
+            progress: forming5mBar.progressMinutes,
+            o: forming5mBar.open,
+            h: forming5mBar.high,
+            l: forming5mBar.low,
+            c: forming5mBar.close,
+            v: forming5mBar.volume,
+          }
+        : null,
+      meta: {
+        closed5mCount: closed5mBars.length,
+        swingsCount: swingPoints.length,
+        lastClosedTs,
+        formingStartTs,
+        nowTs: ts,
+      },
       extras: {
         ...extras,
         rsi14_5m,
@@ -1646,6 +1691,9 @@ export class Orchestrator {
       previousMindState: this.state.mindState,
       activeMind: this.state.activeMind,
     };
+    console.log(
+      `[MINIMAL][DEBUG] barsSent=${closed5mBars.length} lastClosedTs=${lastClosedTs ?? "n/a"} formingStartTs=${formingStartTs ?? "n/a"} swingsCount=${swingPoints.length} lastSwingHigh=${lastHigh?.price ?? "n/a"} lastSwingLow=${lastLow?.price ?? "n/a"}`
+    );
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",

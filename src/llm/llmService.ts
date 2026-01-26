@@ -1022,21 +1022,23 @@ Respond in this EXACT JSON format:
       symbol: snapshot.symbol,
       ts: snapshot.nowTs,
       mode: snapshot.mode,
-      bars5m_closed: snapshot.closed5m,
-      bar5m_forming: snapshot.forming5m
-        ? {
-            bucketStart: snapshot.forming5m.startTs,
-            progress: snapshot.forming5m.progressMinutes,
-            o: snapshot.forming5m.open,
-            h: snapshot.forming5m.high,
-            l: snapshot.forming5m.low,
-            c: snapshot.forming5m.close,
-            v: snapshot.forming5m.volume,
-          }
-        : null,
+      bars5m_closed: snapshot.closed5mBars ?? snapshot.closed5m,
+      bar5m_forming: snapshot.forming5mBar
+        ?? (snapshot.forming5m
+          ? {
+              bucketStart: snapshot.forming5m.startTs,
+              progress: snapshot.forming5m.progressMinutes,
+              o: snapshot.forming5m.open,
+              h: snapshot.forming5m.high,
+              l: snapshot.forming5m.low,
+              c: snapshot.forming5m.close,
+              v: snapshot.forming5m.volume,
+            }
+          : null),
       swings5m: snapshot.swings5m ?? [],
       structure: snapshot.structure ?? null,
       entrySignal: snapshot.entrySignal ?? null,
+      meta: snapshot.meta ?? null,
       session: snapshot.session,
       lastPrice: snapshot.lastPrice ?? null,
       previousMindState: snapshot.previousMindState ?? {},
