@@ -23,6 +23,7 @@ export type TelegramSnapshot = {
   indicators?: Record<string, any>;
   formingProgress?: number | null;
   lastClosed5mTs?: string;
+  lastClosed5mBar?: { ts: number; open: number; high: number; low: number; close: number; volume: number } | null;
   levels?: { entry: number | null; stop: number | null; targets: number[] };
   extras?: { rsi14_5m?: number | null; atr14_5m?: number | null; relVol5m?: number | null };
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
@@ -558,6 +559,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     const formingProgress =
       Number.isFinite(event.data.formingProgress) ? Number(event.data.formingProgress) : undefined;
     const levels = event.data.mindState?.levels ?? event.data.levels;
+    const lastClosed5mBar =
+      event.data.lastClosed5mBar && typeof event.data.lastClosed5mBar === "object"
+        ? event.data.lastClosed5mBar
+        : undefined;
     return {
       type: "MIND",
       symbol,
@@ -569,6 +574,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       mindState: event.data.mindState,
       formingProgress,
       lastClosed5mTs,
+      lastClosed5mBar,
       levels,
       extras: event.data.extras,
     };

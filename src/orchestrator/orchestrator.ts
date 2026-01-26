@@ -1,8 +1,9 @@
 import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalLLMSnapshot, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
+import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
-import { etToUtcTimestamp, getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
+import { getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
@@ -190,14 +191,16 @@ function buildIndicatorSet(
   };
 }
 
-function computeSessionContext(ts: number): { isRTH: boolean; sessionStartTs: number; tz: "America/New_York" } {
+function computeSessionContext(ts: number): { isRTH: boolean; etNow: string; sessionDate: string } {
   const dt = new Date(ts);
   const sessionLabel = getMarketSessionLabel(dt);
-  const sessionStartTs = etToUtcTimestamp(9, 30, dt);
+  const { hour, minute } = getETClock(dt);
+  const etNow = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  const sessionDate = getETDateString(dt);
   return {
     isRTH: sessionLabel === "RTH",
-    sessionStartTs,
-    tz: "America/New_York",
+    etNow,
+    sessionDate,
   };
 }
 
@@ -1396,16 +1399,23 @@ export class Orchestrator {
       const { mindId, bias, thesisState, invalidation_conditions } = mindState.activeMind as Record<string, any>;
       return {
         mindId: typeof mindId === "string" ? mindId : undefined,
-        bias: bias === "LONG" || bias === "SHORT" || bias === "NEUTRAL" ? bias : undefined,
+        bias: typeof bias === "string" ? bias : undefined,
         thesisState: typeof thesisState === "string" ? thesisState : undefined,
         invalidation_conditions: Array.isArray(invalidation_conditions) ? invalidation_conditions : undefined,
       };
     }
     const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
-    const bias = mindState.bias === "LONG" || mindState.bias === "SHORT" || mindState.bias === "NEUTRAL" ? mindState.bias : undefined;
-    const thesisState = typeof mindState.thesisState === "string" ? mindState.thesisState : undefined;
+    const bias = typeof mindState.bias === "string" ? mindState.bias : undefined;
+    const thesisState =
+      typeof mindState.thesisState === "string"
+        ? mindState.thesisState
+        : typeof mindState.state === "string"
+        ? mindState.state
+        : undefined;
     const invalidation_conditions = Array.isArray(mindState.invalidation_conditions)
       ? mindState.invalidation_conditions
+      : Array.isArray(mindState.invalid_if)
+      ? mindState.invalid_if
       : undefined;
     if (!mindId && !bias && !thesisState && !invalidation_conditions) return undefined;
     return { mindId, bias, thesisState, invalidation_conditions };
@@ -1434,14 +1444,15 @@ export class Orchestrator {
     });
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
+    const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
-      lastPrice: close,
+      lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
       nowTs: ts,
       session: computeSessionContext(ts),
-      closed5mBars,
-      forming5mBar,
+      closed5m: closed5mBars,
+      forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
         rsi14_5m,
@@ -1452,43 +1463,41 @@ export class Orchestrator {
     };
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
-      summary: "LLM unavailable",
-      mindId: this.state.activeMind?.mindId,
+      mindId: this.state.activeMind?.mindId ?? "",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       action: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
       waiting_for: "LLM enabled",
-      invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      reset_reason: "",
-      invalidation_reason: "",
+      invalid_if: this.state.activeMind?.invalidation_conditions ?? [],
+      levels: null,
       notes: [],
     };
     const { mindState, valid } = this.llmService
-      ? await this.llmService.getMindState({
-          mode: "MIND_5M_CLOSE",
-          snapshot: llmSnapshot,
-        })
+      ? await this.llmService.getMinimalMindState(llmSnapshot)
       : { mindState: fallbackMindState5m, valid: false };
 
     if (!valid) {
       console.error("[MINIMAL] MindState invalid: using HOLD fallback");
     }
-    const command = mindState.action;
     let nextActiveMind = this.state.activeMind;
     if (valid) {
+      if (!mindState.mindId) {
+        mindState.mindId = randomUUID();
+      }
       nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
     this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = mindState.summary;
+    this.state.lastLLMDecision =
+      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : null;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1508,6 +1517,7 @@ export class Orchestrator {
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
           extras: llmSnapshot.extras,
+          lastClosed5mBar: closed5mBars[closed5mBars.length - 1] ?? null,
         },
       },
     ];
@@ -1529,14 +1539,15 @@ export class Orchestrator {
     });
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
+    const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
-      lastPrice: close,
+      lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
       nowTs: ts,
       session: computeSessionContext(ts),
-      closed5mBars,
-      forming5mBar,
+      closed5m: closed5mBars,
+      forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
         rsi14_5m,
@@ -1547,43 +1558,41 @@ export class Orchestrator {
     };
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
-      summary: "LLM unavailable",
-      mindId: this.state.activeMind?.mindId,
+      mindId: this.state.activeMind?.mindId ?? "",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
+      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       action: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
       waiting_for: "LLM enabled",
-      invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      reset_reason: "",
-      invalidation_reason: "",
+      invalid_if: this.state.activeMind?.invalidation_conditions ?? [],
+      levels: null,
       notes: [],
     };
     const { mindState, valid } = this.llmService
-      ? await this.llmService.getMindState({
-          mode: "EXEC_FORMING_5M",
-          snapshot: llmSnapshot,
-        })
+      ? await this.llmService.getMinimalMindState(llmSnapshot)
       : { mindState: fallbackMindState1m, valid: false };
 
     if (!valid) {
       console.error("[MINIMAL] MindState invalid: using HOLD fallback");
     }
-    const command = mindState.action;
     let nextActiveMind = this.state.activeMind;
     if (valid) {
+      if (!mindState.mindId) {
+        mindState.mindId = randomUUID();
+      }
       nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
     this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = mindState.summary;
+    this.state.lastLLMDecision =
+      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : null;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 
@@ -1603,6 +1612,7 @@ export class Orchestrator {
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
           extras: llmSnapshot.extras,
+          lastClosed5mBar: closed5mBars[closed5mBars.length - 1] ?? null,
         },
       },
     ];

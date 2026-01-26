@@ -156,23 +156,21 @@ export interface ArmedCoachingResponse {
   urgency: "LOW" | "MEDIUM" | "HIGH";
 }
 
-export interface MindStateResponse {
-  summary: string;
-  mindId?: string;
-  bias?: "LONG" | "SHORT" | "NEUTRAL";
-  thesisState?: string;
-  action?: "HOLD" | "ARM" | "ENTER" | "RESET" | "INVALID" | "SUSPEND";
-  confidence?: number;
-  because?: string;
-  waiting_for?: string;
-  invalidation_conditions?: string[];
-  reset_reason?: string;
-  invalidation_reason?: string;
-  notes?: string[];
+export interface MinimalMindStateResponse {
+  mindId: string;
+  bias: string;
+  state: string;
+  action: string;
+  confidence: number;
+  because: string;
+  waiting_for: string;
+  invalid_if: string[];
+  levels?: { key: string[]; support: number[]; resistance: number[] } | null;
+  notes: string[];
 }
 
-export type MindStateResult = {
-  mindState: MindStateResponse;
+export type MinimalMindStateResult = {
+  mindState: MinimalMindStateResponse;
   valid: boolean;
 };
 
@@ -201,57 +199,43 @@ export class LLMService {
     }
   }
 
-  private normalizeMindState(input: any): MindStateResponse | null {
+  private normalizeMinimalMindState(input: any): MinimalMindStateResponse | null {
     if (!input || typeof input !== "object") return null;
-    const summary = typeof input.summary === "string" ? input.summary : undefined;
-    const mindId = typeof input.mindId === "string" ? input.mindId : undefined;
-    const bias = input.bias === "LONG" || input.bias === "SHORT" || input.bias === "NEUTRAL" ? input.bias : undefined;
-    const thesisState = typeof input.thesisState === "string" ? input.thesisState : undefined;
-    const action =
-      input.action === "HOLD" ||
-      input.action === "ARM" ||
-      input.action === "ENTER" ||
-      input.action === "RESET" ||
-      input.action === "INVALID" ||
-      input.action === "SUSPEND"
-        ? input.action
-        : undefined;
+    const mindId = typeof input.mindId === "string" ? input.mindId : "";
+    const bias = typeof input.bias === "string" ? input.bias : "";
+    const state = typeof input.state === "string" ? input.state : "";
+    const action = typeof input.action === "string" ? input.action : "";
     const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : undefined;
-    const because = typeof input.because === "string" ? input.because : undefined;
-    const waitingFor = typeof input.waiting_for === "string" ? input.waiting_for : undefined;
-    const invalidation = Array.isArray(input.invalidation_conditions)
-      ? input.invalidation_conditions.filter((item: unknown) => typeof item === "string")
-      : undefined;
-    const resetReason = typeof input.reset_reason === "string" ? input.reset_reason : "";
-    const invalidationReason = typeof input.invalidation_reason === "string" ? input.invalidation_reason : "";
+    const because = typeof input.because === "string" ? input.because : "";
+    const waitingFor = typeof input.waiting_for === "string" ? input.waiting_for : "";
+    const invalidIf = Array.isArray(input.invalid_if)
+      ? input.invalid_if.filter((item: unknown) => typeof item === "string")
+      : [];
+    const levels = input.levels && typeof input.levels === "object" ? input.levels : null;
     const notes = Array.isArray(input.notes)
       ? input.notes.filter((n: unknown) => typeof n === "string")
       : [];
-    if (
-      !summary ||
-      !mindId ||
-      !bias ||
-      !thesisState ||
-      !action ||
-      !Number.isFinite(confidence) ||
-      !because ||
-      !waitingFor ||
-      !invalidation
-    ) {
+    if (!bias || !state || !action || !Number.isFinite(confidence) || !because || !waitingFor) {
       return null;
     }
     return {
-      summary,
       mindId,
       bias,
-      thesisState,
+      state,
       action,
       confidence,
       because,
       waiting_for: waitingFor,
-      invalidation_conditions: invalidation,
-      reset_reason: resetReason,
-      invalidation_reason: invalidationReason,
+      invalid_if: invalidIf,
+      levels: levels
+        ? {
+            key: Array.isArray(levels.key) ? levels.key.filter((k: unknown) => typeof k === "string") : [],
+            support: Array.isArray(levels.support) ? levels.support.filter((v: unknown) => Number.isFinite(v)) : [],
+            resistance: Array.isArray(levels.resistance)
+              ? levels.resistance.filter((v: unknown) => Number.isFinite(v))
+              : [],
+          }
+        : null,
       notes,
     };
   }
@@ -954,60 +938,52 @@ Respond in this EXACT JSON format:
     };
   }
 
-  async getMindState(context: {
-    mode: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
-    snapshot: MinimalLLMSnapshot;
-  }): Promise<MindStateResult> {
-    const { snapshot } = context;
-    const fallback: MindStateResponse = {
-      summary: "LLM unavailable",
+  async getMinimalMindState(snapshot: MinimalLLMSnapshot): Promise<MinimalMindStateResult> {
+    const fallback: MinimalMindStateResponse = {
       mindId: typeof snapshot.activeMind?.mindId === "string" ? snapshot.activeMind.mindId : "unknown",
-      bias: snapshot.activeMind?.bias ?? "NEUTRAL",
-      thesisState: typeof snapshot.activeMind?.thesisState === "string" ? snapshot.activeMind.thesisState : "FLAT",
+      bias: typeof snapshot.activeMind?.bias === "string" ? snapshot.activeMind.bias : "NEUTRAL",
+      state: typeof snapshot.activeMind?.thesisState === "string" ? snapshot.activeMind.thesisState : "UNKNOWN",
       action: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
       waiting_for: "LLM enabled",
-      invalidation_conditions: Array.isArray(snapshot.activeMind?.invalidation_conditions)
+      invalid_if: Array.isArray(snapshot.activeMind?.invalidation_conditions)
         ? snapshot.activeMind.invalidation_conditions
         : [],
-      reset_reason: "",
-      invalidation_reason: "",
-      notes: [],
+      levels: null,
+      notes: ["invalid_response"],
     };
     if (!this.enabled) {
       return { mindState: fallback, valid: false };
     }
     const prompt = `You are reading a 5-minute chart for ${snapshot.symbol}. Return JSON only.
-mode: ${context.mode}
-lastPrice: ${snapshot.lastPrice.toFixed(2)}
+mode: ${snapshot.mode}
+lastPrice: ${snapshot.lastPrice ?? "n/a"}
 nowTs: ${snapshot.nowTs}
 session: ${JSON.stringify(snapshot.session)}
-closed5mBars: ${JSON.stringify(snapshot.closed5mBars)}
-forming5mBar: ${JSON.stringify(snapshot.forming5mBar)}
+closed5m: ${JSON.stringify(snapshot.closed5m)}
+forming5m: ${JSON.stringify(snapshot.forming5m)}
 extras: ${JSON.stringify(snapshot.extras ?? {})}
 previousMindState: ${JSON.stringify(snapshot.previousMindState ?? {})}
 activeMind: ${JSON.stringify(snapshot.activeMind ?? {})}
 
 Return JSON only:
 {
-  "summary": "short sentence",
-  "mindId": "uuid",
-  "bias": "LONG|SHORT|NEUTRAL",
-  "thesisState": "string (LLM-defined)",
-  "action": "HOLD|ARM|ENTER|RESET|INVALID|SUSPEND",
+  "mindId": "string",
+  "bias": "LONG|SHORT|NEUTRAL|string",
+  "state": "string",
+  "action": "HOLD|ARM|ENTER|EXIT|RESET|INVALID|string",
   "confidence": 0-100,
   "because": "1-2 lines",
-  "waiting_for": "short, actionable",
-  "invalidation_conditions": ["..."],
-  "reset_reason": "",
-  "invalidation_reason": "",
+  "waiting_for": "short actionable",
+  "invalid_if": ["..."],
+  "levels": { "key": [string], "support": [number], "resistance": [number] } | null,
   "notes": ["..."]
 }
 
 Rules:
 - All fields above are REQUIRED in every response.
-- Do not ignore forming5mBar. Use it for intra-candle updates.
+- Do not ignore forming5m. Use it for intra-candle updates.
 - If context is thin, say so in summary or because, but still return a valid JSON.`;
     const payload = {
       model: this.model,
@@ -1036,7 +1012,7 @@ Rules:
     const content = json?.choices?.[0]?.message?.content ?? "{}";
     try {
       const parsed = JSON.parse(content);
-      const normalized = this.normalizeMindState(parsed);
+      const normalized = this.normalizeMinimalMindState(parsed);
       if (!normalized) {
         console.error("[LLM] MindState invalid schema:", content);
         return { mindState: { ...fallback, because: "LLM invalid schema" }, valid: false };

@@ -186,21 +186,24 @@ const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
 // Start scheduler
 scheduler.start();
 
-// One-shot minimal tick (startup confirmation)
-if (BOT_MODE === "minimal") {
+// Optional one-shot minimal tick (debug only)
+if (BOT_MODE === "minimal" && process.env.MINIMAL_ONE_SHOT_TICK === "true") {
   warmupReady.then(() => {
     setTimeout(async () => {
       try {
         const now = Date.now();
-        await orch.processTick({
-          ts: now,
-          symbol,
-          close: 500,
-          open: 499,
-          high: 501,
-          low: 498,
-          volume: 1000,
-        }, "1m");
+        await orch.processTick(
+          {
+            ts: now,
+            symbol,
+            close: 500,
+            open: 499,
+            high: 501,
+            low: 498,
+            volume: 1000,
+          },
+          "1m"
+        );
         console.log("[MINIMAL] one-shot tick injected");
       } catch (err: any) {
         console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
@@ -319,47 +322,51 @@ if (alpacaKey && alpacaSecret) {
 
       // Warmup: fetch 5m and 1m separately, then aggregate 15m from 5m
       try {
-        if (WARMUP_5M_BARS > 0) {
-          console.log(`[${instanceId}] Warmup: fetching ${WARMUP_5M_BARS}x 5m bars for ${symbol}...`);
-          const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", WARMUP_5M_BARS);
-          for (const bar of bars5m) {
-            await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close,
-              open: bar.open,
-              high: bar.high,
-              low: bar.low,
-              volume: bar.volume
-            }, "5m");
-            const bar15m = agg15mFrom5m.push1m(bar);
-            if (bar15m) {
+        if (BOT_MODE === "minimal") {
+          console.log(`[${instanceId}] Warmup: skipped for minimal mode (live bars only).`);
+        } else {
+          if (WARMUP_5M_BARS > 0) {
+            console.log(`[${instanceId}] Warmup: fetching ${WARMUP_5M_BARS}x 5m bars for ${symbol}...`);
+            const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", WARMUP_5M_BARS);
+            for (const bar of bars5m) {
               await orch.processTick({
-                ts: bar15m.ts,
-                symbol: bar15m.symbol,
-                close: bar15m.close,
-                open: bar15m.open,
-                high: bar15m.high,
-                low: bar15m.low,
-                volume: bar15m.volume
-              }, "15m");
+                ts: bar.ts,
+                symbol: bar.symbol,
+                close: bar.close,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                volume: bar.volume
+              }, "5m");
+              const bar15m = agg15mFrom5m.push1m(bar);
+              if (bar15m) {
+                await orch.processTick({
+                  ts: bar15m.ts,
+                  symbol: bar15m.symbol,
+                  close: bar15m.close,
+                  open: bar15m.open,
+                  high: bar15m.high,
+                  low: bar15m.low,
+                  volume: bar15m.volume
+                }, "15m");
+              }
             }
           }
-        }
 
-        if (WARMUP_1M_BARS > 0) {
-          console.log(`[${instanceId}] Warmup: fetching ${WARMUP_1M_BARS}x 1m bars for ${symbol}...`);
-          const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", WARMUP_1M_BARS);
-          for (const bar of bars1m) {
-            await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close,
-              open: bar.open,
-              high: bar.high,
-              low: bar.low,
-              volume: bar.volume
-            }, "1m");
+          if (WARMUP_1M_BARS > 0) {
+            console.log(`[${instanceId}] Warmup: fetching ${WARMUP_1M_BARS}x 1m bars for ${symbol}...`);
+            const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", WARMUP_1M_BARS);
+            for (const bar of bars1m) {
+              await orch.processTick({
+                ts: bar.ts,
+                symbol: bar.symbol,
+                close: bar.close,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                volume: bar.volume
+              }, "1m");
+            }
           }
         }
       } catch (warmupError: any) {

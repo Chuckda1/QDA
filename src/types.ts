@@ -173,11 +173,11 @@ export type Forming5mBar = {
 export type MinimalLLMSnapshot = {
   mode: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
   symbol: string;
-  lastPrice: number;
   nowTs: number;
-  session: { isRTH: boolean; sessionStartTs: number; tz: "America/New_York" };
-  closed5mBars: RawBar[];
-  forming5mBar: Forming5mBar | null;
+  session: { isRTH: boolean; etNow: string; sessionDate: string };
+  lastPrice: number | null;
+  closed5m: RawBar[];
+  forming5m: Forming5mBar | null;
   extras?: {
     rsi14_5m?: number | null;
     atr14_5m?: number | null;
