@@ -239,42 +239,29 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const confidence = Number.isFinite(mind.confidence) ? `${Math.round(mind.confidence)}%` : "n/a";
     const reason = mind.reason ?? mind.because ?? "n/a";
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
-    const levels = snapshot.levels ?? mind.levels;
-    const levelParts = levels
-      ? [
-          Number.isFinite(levels.entry) ? `entry ${formatPrice(levels.entry)}` : "entry n/a",
-          Number.isFinite(levels.stop) ? `stop ${formatPrice(levels.stop)}` : "stop n/a",
-          Array.isArray(levels.targets) && levels.targets.length > 0
-            ? `targets ${levels.targets.map((t: number) => formatPrice(t)).join(",")}`
-            : "targets n/a",
-        ]
-      : [];
-    const formingProgress =
-      Number.isFinite(snapshot.formingProgress) ? `${snapshot.formingProgress}/5` : undefined;
-    const lastClosed = snapshot.lastClosed5mTs ? `LAST5M: ${snapshot.lastClosed5mTs}` : undefined;
-    const lastBar = snapshot.lastClosed5mBar;
-    const lastBarLine =
-      lastBar && Number.isFinite(lastBar.open) && Number.isFinite(lastBar.close)
-        ? `5m last: O/H/L/C/V ${formatPrice(lastBar.open)}/${formatPrice(lastBar.high)}/${formatPrice(lastBar.low)}/${formatPrice(lastBar.close)}/${Math.round(lastBar.volume)}`
+    const botState = snapshot.botState ?? "n/a";
+    const waitFor = snapshot.waitFor ? snapshot.waitFor.replace(/_/g, " ") : undefined;
+    const entry = Number.isFinite(snapshot.entry) ? `entry ${formatPrice(snapshot.entry as number)}` : undefined;
+    const stop = Number.isFinite(snapshot.stop) ? `stop ${formatPrice(snapshot.stop as number)}` : undefined;
+    const targets =
+      Array.isArray(snapshot.targets) && snapshot.targets.length > 0
+        ? `targets ${snapshot.targets.map((t) => formatPrice(t)).join(",")}`
         : undefined;
-    const formingLine = formingProgress ? `FORMING: ${formingProgress}` : undefined;
-    const extras = snapshot.extras ?? {};
-    const extraParts = [
-      Number.isFinite(extras.rsi14_5m) ? `RSI5m=${Math.round(extras.rsi14_5m as number)}` : undefined,
-      Number.isFinite(extras.atr14_5m) ? `ATR5m=${formatPrice(extras.atr14_5m as number)}` : undefined,
-      Number.isFinite(extras.relVol5m) ? `RV5m=${(extras.relVol5m as number).toFixed(2)}x` : undefined,
-    ].filter((part): part is string => Boolean(part));
+    const tradeLine = [entry, stop, targets].filter(Boolean).join(" | ");
+    const enterLine =
+      botState === "IN_TRADE" && Number.isFinite(snapshot.entry)
+        ? `ENTER ${direction.toUpperCase()} @ ${formatPrice(snapshot.entry as number)}`
+        : undefined;
     const lines = enforceLineLimit(
       "MIND",
       [
         `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
         `BIAS: ${direction} | CONF: ${confidence}`,
+        `STATE: ${botState}`,
+        waitFor ? `WAIT: ${waitFor}` : undefined,
+        enterLine,
+        tradeLine ? `TRADE: ${tradeLine}` : undefined,
         `REASON: ${reason}`,
-        lastClosed,
-        lastBarLine,
-        formingLine,
-        levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
-        extraParts.length ? `EXTRAS: ${extraParts.join(" | ")}` : undefined,
       ].filter(nonEmpty)
     );
     return { type: "MIND", lines, text: lines.join("\n") };

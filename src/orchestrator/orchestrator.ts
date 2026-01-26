@@ -1,4 +1,4 @@
-import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalLLMSnapshot, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalExecutionState, MinimalLLMSnapshot, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
@@ -15,7 +15,7 @@ import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
 import { requiresDecisionState } from "../utils/decisionState.js";
 import { volumePolicy } from "../utils/volumePolicy.js";
-import { detectBreak, determineStructure, evaluateEntry, extractSwings, lastSwings } from "../utils/swing.js";
+import { extractSwings } from "../utils/swing.js";
 import {
   buildDecision,
   buildNoEntryDecision,
@@ -798,6 +798,8 @@ export class Orchestrator {
   private readonly minLlmAgreement: number;
   private readonly minRulesProbability: number;
   private readonly autoAllInOnHighProb: boolean;
+  private readonly minimalLlmBars: number;
+  private readonly minimalLlmConfidence: number;
 
   // POTD config (soft prior by default)
   private potdBias: PotdBias;
@@ -849,6 +851,8 @@ export class Orchestrator {
     this.minLlmAgreement = parseInt(process.env.MIN_LLM_AGREEMENT || "70", 10);
     this.minRulesProbability = parseInt(process.env.MIN_RULES_PROBABILITY || "70", 10);
     this.autoAllInOnHighProb = process.env.AUTO_ALL_IN_ON_HIGH_PROB !== "false";
+    this.minimalLlmBars = parseInt(process.env.MINIMAL_LLM_BARS || "30", 10);
+    this.minimalLlmConfidence = parseInt(process.env.MINIMAL_LLM_CONFIDENCE || "60", 10);
 
     // Load POTD config from env vars
     const potdBiasRaw = (process.env.POTD_BIAS || "NONE").toUpperCase();
@@ -894,7 +898,11 @@ export class Orchestrator {
       pendingCandidateExpiresAt: initialState?.pendingCandidateExpiresAt,
       mode: "QUIET",
       potd: initialPotd,
-      timingState: initialState?.timingState
+      timingState: initialState?.timingState,
+      minimalExecution: {
+        phase: "WAITING_FOR_THESIS",
+        waitReason: "waiting_for_thesis",
+      }
     };
   }
 
@@ -1398,6 +1406,28 @@ export class Orchestrator {
     return { high, low };
   }
 
+  private getMinimalExecutionState(): MinimalExecutionState {
+    if (!this.state.minimalExecution) {
+      this.state.minimalExecution = { phase: "WAITING_FOR_THESIS", waitReason: "waiting_for_thesis" };
+    }
+    return this.state.minimalExecution;
+  }
+
+  private resetMinimalExecution(waitReason: string): void {
+    this.state.minimalExecution = {
+      phase: "WAITING_FOR_THESIS",
+      waitReason,
+    };
+  }
+
+  private computeMinimalTargets(direction: "long" | "short", entry: number, stop: number): number[] {
+    const risk = Math.abs(entry - stop);
+    if (!Number.isFinite(risk) || risk <= 0) return [];
+    return direction === "long"
+      ? [entry + risk, entry + risk * 2]
+      : [entry - risk, entry - risk * 2];
+  }
+
   private extractActiveMind(mindState?: Record<string, any>): BotState["activeMind"] | undefined {
     if (!mindState || typeof mindState !== "object") return undefined;
     if (mindState.activeMind && typeof mindState.activeMind === "object") {
@@ -1448,134 +1478,65 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const closed5mBars = buildClosed5mBars(this.recentBars5m, 60);
-    const forming5mBar = this.buildForming5mBar(ts);
-    const extras = computeVolumeExtras({
-      closed5mBars,
-      forming5mBar: forming5mBar ?? undefined,
-    });
-    const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
-    const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
-    const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
+    const closed5mBars = buildClosed5mBars(this.recentBars5m, this.minimalLlmBars);
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const swingPoints = this.extractSwings(closed5mBars);
-    const structure = determineStructure(swingPoints);
-    const breakInfo = Number.isFinite(lastClosed5m?.close)
-      ? detectBreak(structure.trend, swingPoints, lastClosed5m?.close as number)
-      : { broken: false as const };
-    const structureState = breakInfo.broken ? "broken" : structure.state;
-    const { lastHigh, lastLow } = lastSwings(swingPoints);
-    const structurePayload = {
-      trend: structure.trend,
-      state: structureState,
-      keyLevels: {
-        lastSwingHigh: lastHigh?.price,
-        lastSwingLow: lastLow?.price,
-        breakLevel: breakInfo.broken ? breakInfo.breakLevel : undefined,
-      },
-    };
-    const entrySignal = forming5mBar
-      ? (() => {
-          const signal = evaluateEntry(structurePayload.trend, {
-            ts,
-            open: forming5mBar.open,
-            high: forming5mBar.high,
-            low: forming5mBar.low,
-            close: forming5mBar.close,
-            volume: forming5mBar.volume,
-          }, swingPoints);
-          return {
-            verdict: signal.verdict,
-            direction: signal.direction,
-            entry_price: signal.entryPrice,
-            stop_price: signal.stop,
-            targets: signal.targets,
-            because: signal.because,
-          };
-        })()
-      : null;
-    const lastClosedTs = lastClosed5m?.ts ?? null;
-    const formingStartTs = forming5mBar?.startTs ?? null;
-    const llmSnapshot: MinimalLLMSnapshot = {
-      mode: "MIND_5M_CLOSE",
-      symbol,
-      lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
-      nowTs: ts,
-      session: computeSessionContext(ts),
-      closed5m: closed5mBars,
-      closed5mBars,
-      lastClosed5mTs: lastClosed5m?.ts ?? null,
-      lastClosed5m,
-      swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
-      structure: structurePayload,
-      entrySignal: entrySignal ?? undefined,
-      forming5m: forming5mBar ?? null,
-      forming5mBar: forming5mBar
-        ? {
-            bucketStart: forming5mBar.startTs,
-            progress: forming5mBar.progressMinutes,
-            o: forming5mBar.open,
-            h: forming5mBar.high,
-            l: forming5mBar.low,
-            c: forming5mBar.close,
-            v: forming5mBar.volume,
-          }
-        : null,
-      meta: {
-        closed5mCount: closed5mBars.length,
-        swingsCount: swingPoints.length,
-        lastClosedTs,
-        formingStartTs,
-        nowTs: ts,
-      },
-      extras: {
-        ...extras,
-        rsi14_5m,
-        atr14_5m,
-      },
-      previousMindState: this.state.mindState,
-      activeMind: this.state.activeMind,
-    };
-    console.log(
-      `[MINIMAL][DEBUG] barsSent=${closed5mBars.length} lastClosedTs=${lastClosedTs ?? "n/a"} formingStartTs=${formingStartTs ?? "n/a"} swingsCount=${swingPoints.length} lastSwingHigh=${lastHigh?.price ?? "n/a"} lastSwingLow=${lastLow?.price ?? "n/a"}`
-    );
-    const previousMindState = this.state.mindState;
-    const fallbackMindState5m: Record<string, any> = {
-      mindId: this.state.activeMind?.mindId ?? "",
-      direction: (this.state.activeMind?.bias ?? "none").toString().toLowerCase(),
-      confidence: 0,
-      reason: "LLM unavailable",
-    };
-    const { mindState, valid } = this.llmService
-      ? await this.llmService.getMinimalMindState(llmSnapshot)
-      : { mindState: fallbackMindState5m, valid: false };
+    const exec = this.getMinimalExecutionState();
+    let mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
+    let valid = false;
 
-    if (!valid) {
-      console.error("[MINIMAL] MindState invalid: using HOLD fallback");
-    }
-    let nextActiveMind = this.state.activeMind;
-    if (valid) {
-      if (!mindState.mindId) {
-        mindState.mindId = randomUUID();
+    if (exec.phase === "WAITING_FOR_THESIS") {
+      if (closed5mBars.length < this.minimalLlmBars) {
+        exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
+      } else if (this.llmService) {
+        const llmSnapshot: MinimalLLMSnapshot = {
+          symbol,
+          nowTs: ts,
+          closed5m: closed5mBars,
+        };
+        const result = await this.llmService.getMinimalMindState(llmSnapshot);
+        mindState = result.mindState;
+        valid = result.valid;
+        if (!mindState.mindId) {
+          mindState.mindId = randomUUID();
+        }
+        this.state.mindState = mindState;
+        this.state.activeMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+        this.state.lastLLMCallAt = ts;
+        this.state.lastLLMDecision = mindState.reason ?? mindState.direction;
+
+        if (valid && mindState.direction !== "none" && mindState.confidence >= this.minimalLlmConfidence) {
+          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.thesisDirection = mindState.direction;
+          exec.thesisConfidence = mindState.confidence;
+          exec.thesisPrice = lastClosed5m?.close ?? close;
+          exec.thesisTs = ts;
+          exec.pullbackHigh = undefined;
+          exec.pullbackLow = undefined;
+          exec.pullbackTs = undefined;
+          exec.entryPrice = undefined;
+          exec.entryTs = undefined;
+          exec.stopPrice = undefined;
+          exec.targets = undefined;
+          exec.waitReason = "waiting_for_pullback";
+        } else {
+          exec.waitReason =
+            mindState.direction === "none"
+              ? "llm_no_direction"
+              : `confidence_below_${this.minimalLlmConfidence}`;
+        }
+      } else {
+        exec.waitReason = "llm_unavailable";
       }
-      nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
-    this.state.mindState = mindState;
-    this.state.activeMind = nextActiveMind;
-    this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision =
-      typeof mindState.reason === "string"
-        ? mindState.reason
-        : typeof mindState.direction === "string"
-        ? mindState.direction
-        : undefined;
+    this.state.minimalExecution = exec;
 
-    const direction = mindState.direction;
+    const direction =
+      mindState.direction === "long" ? "LONG" : mindState.direction === "short" ? "SHORT" : undefined;
     console.log(
       `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
-    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=THESIS_5M`);
 
     return [
       {
@@ -1588,12 +1549,21 @@ export class Orchestrator {
           price: close,
           direction,
           mindState,
-          activeMind: nextActiveMind,
-          mode: "MIND_5M_CLOSE",
+          activeMind: this.state.activeMind,
+          mode: "THESIS_5M",
           closed5mBarsCount: closed5mBars.length,
-          formingProgress: forming5mBar?.progressMinutes ?? null,
-          extras: llmSnapshot.extras,
           lastClosed5mBar: lastClosed5m,
+          botState: exec.phase,
+          waitFor: exec.waitReason ?? null,
+          thesis: {
+            direction: exec.thesisDirection ?? null,
+            confidence: exec.thesisConfidence ?? null,
+            price: exec.thesisPrice ?? null,
+            ts: exec.thesisTs ?? null,
+          },
+          entry: exec.entryPrice ?? null,
+          stop: exec.stopPrice ?? null,
+          targets: exec.targets ?? null,
         },
       },
     ];
@@ -1604,137 +1574,87 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
-    const closed5mBars = buildClosed5mBars(this.recentBars5m, 60);
-    const forming5mBar = this.buildForming5mBar(ts);
-    if (forming5mBar) {
-      console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
-    }
-    const extras = computeVolumeExtras({
-      closed5mBars,
-      forming5mBar: forming5mBar ?? undefined,
-    });
-    const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
-    const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
-    const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
-    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const swingPoints = this.extractSwings(closed5mBars);
-    const structure = determineStructure(swingPoints);
-    const breakInfo = Number.isFinite(lastClosed5m?.close)
-      ? detectBreak(structure.trend, swingPoints, lastClosed5m?.close as number)
-      : { broken: false as const };
-    const structureState = breakInfo.broken ? "broken" : structure.state;
-    const { lastHigh, lastLow } = lastSwings(swingPoints);
-    const structurePayload = {
-      trend: structure.trend,
-      state: structureState,
-      keyLevels: {
-        lastSwingHigh: lastHigh?.price,
-        lastSwingLow: lastLow?.price,
-        breakLevel: breakInfo.broken ? breakInfo.breakLevel : undefined,
-      },
-    };
-    const entrySignal = forming5mBar
-      ? (() => {
-          const signal = evaluateEntry(structurePayload.trend, {
-            ts,
-            open: forming5mBar.open,
-            high: forming5mBar.high,
-            low: forming5mBar.low,
-            close: forming5mBar.close,
-            volume: forming5mBar.volume,
-          }, swingPoints);
-          return {
-            verdict: signal.verdict,
-            direction: signal.direction,
-            entry_price: signal.entryPrice,
-            stop_price: signal.stop,
-            targets: signal.targets,
-            because: signal.because,
-          };
-        })()
-      : null;
-    const lastClosedTs = lastClosed5m?.ts ?? null;
-    const formingStartTs = forming5mBar?.startTs ?? null;
-    const llmSnapshot: MinimalLLMSnapshot = {
-      mode: "EXEC_FORMING_5M",
-      symbol,
-      lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
-      nowTs: ts,
-      session: computeSessionContext(ts),
-      closed5m: closed5mBars,
-      closed5mBars,
-      lastClosed5mTs: lastClosed5m?.ts ?? null,
-      lastClosed5m,
-      swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
-      structure: structurePayload,
-      entrySignal: entrySignal ?? undefined,
-      forming5m: forming5mBar ?? null,
-      forming5mBar: forming5mBar
-        ? {
-            bucketStart: forming5mBar.startTs,
-            progress: forming5mBar.progressMinutes,
-            o: forming5mBar.open,
-            h: forming5mBar.high,
-            l: forming5mBar.low,
-            c: forming5mBar.close,
-            v: forming5mBar.volume,
+    const exec = this.getMinimalExecutionState();
+    const bars1m = this.recentBars1m;
+    const current = bars1m[bars1m.length - 1];
+    const previous = bars1m[bars1m.length - 2];
+
+    if (current && exec.thesisDirection) {
+      if (exec.phase === "WAITING_FOR_PULLBACK" && previous) {
+        const isBearish = current.close < current.open;
+        const isBullish = current.close > current.open;
+        const lowerLow = current.low < previous.low;
+        const higherHigh = current.high > previous.high;
+
+        if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
+          exec.pullbackHigh = current.high;
+          exec.pullbackLow = current.low;
+          exec.pullbackTs = ts;
+          exec.phase = "WAITING_FOR_ENTRY";
+          exec.waitReason = "waiting_for_break_above_pullback_high";
+        }
+
+        if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
+          exec.pullbackHigh = current.high;
+          exec.pullbackLow = current.low;
+          exec.pullbackTs = ts;
+          exec.phase = "WAITING_FOR_ENTRY";
+          exec.waitReason = "waiting_for_break_below_pullback_low";
+        }
+      } else if (exec.phase === "WAITING_FOR_ENTRY") {
+        if (exec.thesisDirection === "long" && exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+          if (current.close > exec.pullbackHigh) {
+            exec.entryPrice = current.close;
+            exec.entryTs = ts;
+            exec.stopPrice = exec.pullbackLow;
+            exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
           }
-        : null,
-      meta: {
-        closed5mCount: closed5mBars.length,
-        swingsCount: swingPoints.length,
-        lastClosedTs,
-        formingStartTs,
-        nowTs: ts,
-      },
-      extras: {
-        ...extras,
-        rsi14_5m,
-        atr14_5m,
-      },
-      previousMindState: this.state.mindState,
-      activeMind: this.state.activeMind,
-    };
-    console.log(
-      `[MINIMAL][DEBUG] barsSent=${closed5mBars.length} lastClosedTs=${lastClosedTs ?? "n/a"} formingStartTs=${formingStartTs ?? "n/a"} swingsCount=${swingPoints.length} lastSwingHigh=${lastHigh?.price ?? "n/a"} lastSwingLow=${lastLow?.price ?? "n/a"}`
-    );
-    const previousMindState = this.state.mindState;
-    const fallbackMindState1m: Record<string, any> = {
-      mindId: this.state.activeMind?.mindId ?? "",
-      direction: (this.state.activeMind?.bias ?? "none").toString().toLowerCase(),
-      confidence: 0,
-      reason: "LLM unavailable",
-    };
-    const { mindState, valid } = this.llmService
-      ? await this.llmService.getMinimalMindState(llmSnapshot)
-      : { mindState: fallbackMindState1m, valid: false };
-
-    if (!valid) {
-      console.error("[MINIMAL] MindState invalid: using HOLD fallback");
-    }
-    let nextActiveMind = this.state.activeMind;
-    if (valid) {
-      if (!mindState.mindId) {
-        mindState.mindId = randomUUID();
+        } else if (
+          exec.thesisDirection === "short" &&
+          exec.pullbackHigh !== undefined &&
+          exec.pullbackLow !== undefined
+        ) {
+          if (current.close < exec.pullbackLow) {
+            exec.entryPrice = current.close;
+            exec.entryTs = ts;
+            exec.stopPrice = exec.pullbackHigh;
+            exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
+          }
+        } else {
+          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.waitReason = "waiting_for_pullback";
+        }
+      } else if (exec.phase === "IN_TRADE") {
+        if (exec.stopPrice === undefined || !exec.targets || exec.targets.length === 0) {
+          this.resetMinimalExecution("invalid_trade_state");
+        } else if (exec.thesisDirection === "long") {
+          if (current.low <= exec.stopPrice) {
+            this.resetMinimalExecution("stopped_out");
+          } else if (current.high >= exec.targets[0]!) {
+            this.resetMinimalExecution("target_hit");
+          }
+        } else if (exec.thesisDirection === "short") {
+          if (current.high >= exec.stopPrice) {
+            this.resetMinimalExecution("stopped_out");
+          } else if (current.low <= exec.targets[0]!) {
+            this.resetMinimalExecution("target_hit");
+          }
+        }
       }
-      nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
     }
 
-    this.state.mindState = mindState;
-    this.state.activeMind = nextActiveMind;
-    this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision =
-      typeof mindState.reason === "string"
-        ? mindState.reason
-        : typeof mindState.direction === "string"
-        ? mindState.direction
-        : undefined;
+    const mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
+    const direction =
+      mindState.direction === "long" ? "LONG" : mindState.direction === "short" ? "SHORT" : undefined;
 
-    const direction = mindState.direction;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
+      `[MINIMAL][EXECUTION] mind=${mindState.mindId ?? "n/a"} direction=${mindState.direction ?? "n/a"} conf=${mindState.confidence ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
-    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
+    console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXECUTION`);
 
     return [
       {
@@ -1747,12 +1667,19 @@ export class Orchestrator {
           price: close,
           direction,
           mindState,
-          activeMind: nextActiveMind,
-          mode: "EXEC_FORMING_5M",
-          closed5mBarsCount: closed5mBars.length,
-          formingProgress: forming5mBar?.progressMinutes ?? null,
-          extras: llmSnapshot.extras,
-          lastClosed5mBar: lastClosed5m,
+          activeMind: this.state.activeMind,
+          mode: "EXECUTION",
+          botState: exec.phase,
+          waitFor: exec.waitReason ?? null,
+          thesis: {
+            direction: exec.thesisDirection ?? null,
+            confidence: exec.thesisConfidence ?? null,
+            price: exec.thesisPrice ?? null,
+            ts: exec.thesisTs ?? null,
+          },
+          entry: exec.entryPrice ?? null,
+          stop: exec.stopPrice ?? null,
+          targets: exec.targets ?? null,
         },
       },
     ];

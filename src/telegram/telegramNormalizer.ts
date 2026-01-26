@@ -20,11 +20,16 @@ export type TelegramSnapshot = {
   gates?: string;
   volumeRetestOk?: boolean;
   mindState?: Record<string, any>;
+  botState?: string;
+  waitFor?: string | null;
   indicators?: Record<string, any>;
   formingProgress?: number | null;
   lastClosed5mTs?: string;
   lastClosed5mBar?: { ts: number; open: number; high: number; low: number; close: number; volume: number } | null;
   levels?: { entry: number | null; stop: number | null; targets: number[] };
+  entry?: number | null;
+  stop?: number | null;
+  targets?: number[] | null;
   extras?: { rsi14_5m?: number | null; atr14_5m?: number | null; relVol5m?: number | null };
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
@@ -472,7 +477,7 @@ const buildHardArmCondition = (reasons: string[]): string => {
 
 export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot | null {
   const symbol = getSymbol(event);
-  const dir = getDirection(event);
+  const dir = getDirection(event) ?? (event.type === "MIND_STATE_UPDATED" ? "LONG" : undefined);
   const decisionState = getDecisionState(event);
   if (!dir) return null;
   let conf = getTacticalConfidence(event);
@@ -572,10 +577,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       ts,
       mode: event.data.mode,
       mindState: event.data.mindState,
+      botState: event.data.botState,
+      waitFor: event.data.waitFor,
       formingProgress,
       lastClosed5mTs,
       lastClosed5mBar,
       levels,
+      entry: event.data.entry ?? event.data.entryPrice,
+      stop: event.data.stop ?? event.data.stopPrice,
+      targets: Array.isArray(event.data.targets) ? event.data.targets : undefined,
       extras: event.data.extras,
     };
   }

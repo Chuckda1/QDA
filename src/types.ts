@@ -177,64 +177,11 @@ export type SwingPoint = {
   index: number;
 };
 
-export type MinimalStructure = {
-  trend: "up" | "down" | "range";
-  state: "intact" | "weakening" | "broken";
-  keyLevels?: {
-    lastSwingHigh?: number;
-    lastSwingLow?: number;
-    breakLevel?: number;
-  };
-};
-
-export type MinimalEntrySignal = {
-  verdict: "ENTER" | "WAIT";
-  direction: "LONG" | "SHORT" | "NONE";
-  entry_price?: number;
-  stop_price?: number;
-  targets?: number[];
-  because: string;
-};
 
 export type MinimalLLMSnapshot = {
-  mode: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
   symbol: string;
   nowTs: number;
-  session: { isRTH: boolean; etNow: string; sessionDate: string };
-  lastPrice: number | null;
   closed5m: RawBar[];
-  closed5mBars?: RawBar[];
-  lastClosed5mTs?: number | null;
-  lastClosed5m?: RawBar | null;
-  swings5m?: Array<{ t: number; p: number; k: "HIGH" | "LOW"; i: number }>;
-  structure?: MinimalStructure;
-  entrySignal?: MinimalEntrySignal;
-  forming5m: Forming5mBar | null;
-  forming5mBar?: {
-    bucketStart: number;
-    progress: number;
-    o: number;
-    h: number;
-    l: number;
-    c: number;
-    v: number;
-  } | null;
-  meta?: {
-    closed5mCount: number;
-    swingsCount: number;
-    lastClosedTs: number | null;
-    formingStartTs: number | null;
-    nowTs: number;
-  };
-  extras?: {
-    rsi14_5m?: number | null;
-    atr14_5m?: number | null;
-    relVol5m?: number | null;
-    volNow5m?: number | null;
-    volAvg5m?: number | null;
-  };
-  previousMindState?: Record<string, any>;
-  activeMind?: Record<string, any>;
 };
 
 export type DomainEventType =
@@ -412,4 +359,27 @@ export interface BotState {
     thesisState?: string;
     invalidation_conditions?: string[];
   };
+  minimalExecution?: MinimalExecutionState;
 }
+
+export type MinimalExecutionPhase =
+  | "WAITING_FOR_THESIS"
+  | "WAITING_FOR_PULLBACK"
+  | "WAITING_FOR_ENTRY"
+  | "IN_TRADE";
+
+export type MinimalExecutionState = {
+  phase: MinimalExecutionPhase;
+  thesisDirection?: "long" | "short";
+  thesisConfidence?: number;
+  thesisPrice?: number;
+  thesisTs?: number;
+  pullbackHigh?: number;
+  pullbackLow?: number;
+  pullbackTs?: number;
+  entryPrice?: number;
+  entryTs?: number;
+  stopPrice?: number;
+  targets?: number[];
+  waitReason?: string;
+};
