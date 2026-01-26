@@ -21,6 +21,15 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const HAS_OPENAI_KEY = !!process.env.OPENAI_API_KEY;
 const SYMBOLS = process.env.SYMBOLS || "SPY";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "not_set";
+const BOT_MODE = (process.env.BOT_MODE || "").trim();
+const BOT_MODE_NORMALIZED = BOT_MODE.toLowerCase();
+const parseWarmupBars = (value: string | undefined, fallback: number): number => {
+  const parsed = Number.parseInt((value ?? "").trim(), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, parsed);
+};
+const WARMUP_1M_BARS = parseWarmupBars(process.env.WARMUP_1M_BARS, 60);
+const WARMUP_5M_BARS = parseWarmupBars(process.env.WARMUP_5M_BARS, 30);
 
 // Print startup inventory
 console.log("=== STAGE 0 STARTUP INVENTORY ===");
@@ -28,8 +37,11 @@ console.log(`BUILD_ID: ${BUILD_ID}`);
 console.log(`NODE_ENV: ${NODE_ENV}`);
 console.log(`ENTRY_MODE: ${ENTRY_MODE}`);
 console.log(`OPENAI_API_KEY: ${HAS_OPENAI_KEY}`);
+console.log(`BOT_MODE: ${BOT_MODE || "not_set"}`);
 console.log(`SYMBOLS: ${SYMBOLS}`);
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
+console.log(`WARMUP_1M_BARS: ${WARMUP_1M_BARS}`);
+console.log(`WARMUP_5M_BARS: ${WARMUP_5M_BARS}`);
 console.log("=================================");
 
 // STAGE 3: Structured pulse tracker
@@ -150,25 +162,38 @@ const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
 // Start scheduler
 scheduler.start();
 
-// One-shot minimal tick (startup confirmation)
-if ((process.env.BOT_MODE || "").toLowerCase() === "minimal") {
-  setTimeout(async () => {
-    try {
-      const now = Date.now();
-      await orch.processTick({
-        ts: now,
-        symbol,
-        close: 500,
-        open: 499,
-        high: 501,
-        low: 498,
-        volume: 1000,
-      }, "1m");
-      console.log("[MINIMAL] one-shot tick injected");
-    } catch (err: any) {
-      console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
-    }
-  }, 1500);
+let warmupReadyResolve: (() => void) | null = null;
+const warmupReady = new Promise<void>((resolve) => {
+  warmupReadyResolve = resolve;
+});
+const markWarmupReady = (): void => {
+  if (warmupReadyResolve) {
+    warmupReadyResolve();
+    warmupReadyResolve = null;
+  }
+};
+
+// One-shot minimal tick (startup confirmation) after warmup data is loaded
+if (BOT_MODE_NORMALIZED === "minimal") {
+  warmupReady.then(() => {
+    setTimeout(async () => {
+      try {
+        const now = Date.now();
+        await orch.processTick({
+          ts: now,
+          symbol,
+          close: 500,
+          open: 499,
+          high: 501,
+          low: 498,
+          volume: 1000,
+        }, "1m");
+        console.log("[MINIMAL] one-shot tick injected");
+      } catch (err: any) {
+        console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
+      }
+    }, 1500);
+  });
 }
 setInterval(() => {
   logStructuredPulse(orch, governor, symbol);
@@ -276,8 +301,8 @@ if (alpacaKey && alpacaSecret) {
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
       const agg5mFrom1m = new BarAggregator(5);
       const agg15mFrom5m = new BarAggregator(15);
-      const warmup5mBars = Math.max(0, parseInt(process.env.WARMUP_5M_BARS || "30", 10));
-      const warmup1mBars = Math.max(0, parseInt(process.env.WARMUP_1M_BARS || "60", 10));
+      const warmup5mBars = WARMUP_5M_BARS;
+      const warmup1mBars = WARMUP_1M_BARS;
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
 
@@ -328,6 +353,8 @@ if (alpacaKey && alpacaSecret) {
         }
       } catch (warmupError: any) {
         console.warn(`[${instanceId}] Warmup failed: ${warmupError?.message || String(warmupError)}`);
+      } finally {
+        markWarmupReady();
       }
       
       // Use WebSocket for real-time bars (preferred)
@@ -441,11 +468,13 @@ if (alpacaKey && alpacaSecret) {
       }
     } catch (error: any) {
       console.error("Alpaca feed error:", error.message);
+      markWarmupReady();
     }
   })().catch(err => console.error("Alpaca feed initialization error:", err));
 } else {
   console.log(`[${instanceId}] ⚠️  No Alpaca credentials - bot running without market data feed`);
   console.log(`[${instanceId}]    Wire your own data source or set ALPACA_API_KEY and ALPACA_API_SECRET`);
+  markWarmupReady();
 }
 
 // Option 2: Wire your own data source here
