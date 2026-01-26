@@ -986,7 +986,7 @@ Rules:
     if (!response.ok) {
       const error = await response.text();
       console.error(`[LLM] MindState error (${duration}ms):`, response.status, error);
-      return { mindState: { ...fallback, because: "LLM error" }, valid: false };
+      return { mindState: { ...fallback, reason: "LLM error" }, valid: false };
     }
     const json = await response.json();
     const content = json?.choices?.[0]?.message?.content ?? "{}";
@@ -995,12 +995,12 @@ Rules:
       const normalized = this.normalizeMinimalMindState(parsed);
       if (!normalized) {
         console.error("[LLM] MindState invalid schema:", content);
-        return { mindState: { ...fallback, because: "LLM invalid schema" }, valid: false };
+        return { mindState: { ...fallback, reason: "LLM invalid schema" }, valid: false };
       }
       return { mindState: normalized, valid: true };
     } catch (err) {
       console.error("[LLM] MindState parse error:", err);
-      return { mindState: { ...fallback, because: "LLM parse error" }, valid: false };
+      return { mindState: { ...fallback, reason: "LLM parse error" }, valid: false };
     }
   }
 }

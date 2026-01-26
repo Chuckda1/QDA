@@ -1499,7 +1499,7 @@ export class Orchestrator {
     this.state.lastLLMDecision =
       typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
 
-    const direction = mindState.trend ?? mindState.bias;
+    const direction = mindState.trend;
     console.log(
       `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
@@ -1593,7 +1593,7 @@ export class Orchestrator {
     this.state.lastLLMDecision =
       typeof mindState.reason === "string" ? mindState.reason : typeof mindState.trend === "string" ? mindState.trend : undefined;
 
-    const direction = mindState.trend ?? mindState.bias;
+    const direction = mindState.trend;
     console.log(
       `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} trend=${mindState.trend ?? "n/a"} entry=${mindState.entry ?? "n/a"} reason=${mindState.reason ?? "n/a"}`
     );
