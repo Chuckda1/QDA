@@ -160,6 +160,28 @@ function computeBollingerSnapshot(
   return { width, position: Number(pos.toFixed(2)) };
 }
 
+function computeEmaWarm(closes: number[], period: number, minBars: number): number | undefined {
+  if (closes.length < minBars) return undefined;
+  if (closes.length >= period) return computeEMA(closes, period);
+  const seed = closes[0];
+  if (!Number.isFinite(seed)) return undefined;
+  const padding = Array(period - closes.length).fill(seed);
+  return computeEMA([...padding, ...closes], period);
+}
+
+function computeVwapFallback(bars: OHLCVBar[], minBars: number, window: number): number | undefined {
+  if (bars.length < minBars) return undefined;
+  const sessionVwap = computeSessionVWAP(bars);
+  if (Number.isFinite(sessionVwap)) return sessionVwap;
+  const period = Math.min(window, bars.length);
+  const rolling = computeVWAP(bars, period);
+  if (Number.isFinite(rolling)) return rolling;
+  const slice = bars.slice(-period);
+  if (!slice.length) return undefined;
+  const avg = slice.reduce((sum, bar) => sum + (bar.high + bar.low + bar.close) / 3, 0) / slice.length;
+  return Number.isFinite(avg) ? avg : undefined;
+}
+
 function buildIndicatorSet(bars: OHLCVBar[], tf: "1m" | "5m"): {
   tf: "1m" | "5m";
   vwap?: number;
@@ -1394,9 +1416,9 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m");
+    const indicators5m = this.buildMinimalIndicators5m();
     console.log("[MINIMAL] indicators5m", indicators5m);
-    this.logReadyGate(ts);
+    this.logReadyGate(ts, indicators5m);
     const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
@@ -1482,9 +1504,9 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
-    const indicators5m = this.recentBars5m.length >= 6 ? buildIndicatorSet(this.recentBars5m, "5m") : undefined;
+    const indicators5m = this.recentBars5m.length >= 6 ? this.buildMinimalIndicators5m() : undefined;
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
-    this.logReadyGate(ts);
+    this.logReadyGate(ts, indicators5m);
     const minimalIndicators = buildMinimalIndicatorSummary(indicators5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
@@ -1603,17 +1625,29 @@ export class Orchestrator {
     };
   }
 
-  private logReadyGate(ts: number): void {
+  private logReadyGate(ts: number, indicators5m?: ReturnType<typeof buildIndicatorSet>): void {
     if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
     this.lastReadyLogTs = ts;
     const bars5m = this.recentBars5m.length;
-    const readyRSI5m = bars5m >= 15;
-    const readyATR5m = bars5m >= 15;
-    const readyEma20_5m = bars5m >= 20;
-    const readyVWAP5m = bars5m >= 30;
+    const readyRSI5m = Number.isFinite(indicators5m?.rsi14);
+    const readyATR5m = Number.isFinite(indicators5m?.atr);
+    const readyEma20_5m = Number.isFinite(indicators5m?.ema20);
+    const readyVWAP5m = Number.isFinite(indicators5m?.vwap);
     console.log(
       `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m=${readyVWAP5m}`
     );
+  }
+
+  private buildMinimalIndicators5m(): ReturnType<typeof buildIndicatorSet> {
+    const indicators = buildIndicatorSet(this.recentBars5m, "5m");
+    if (!this.recentBars5m.length) return indicators;
+    const closes = this.recentBars5m.map((bar) => bar.close);
+    return {
+      ...indicators,
+      vwap: indicators.vwap ?? computeVwapFallback(this.recentBars5m, 10, 30),
+      ema20: indicators.ema20 ?? computeEmaWarm(closes.slice(-80), 20, 15),
+      ema50: indicators.ema50 ?? computeEmaWarm(closes.slice(-120), 50, 30),
+    };
   }
 
   /**
