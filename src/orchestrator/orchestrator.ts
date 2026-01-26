@@ -1408,14 +1408,7 @@ export class Orchestrator {
     console.log("[MINIMAL] indicators merged", indicators);
     this.logReadyGate(ts);
     const relVol = this.computeRelVol(this.recentBars1m);
-    const indicatorSnapshot = buildIndicatorSnapshot({
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      indicators1m,
-      indicators5m,
-      relVol,
-    });
+    const minimalIndicators = buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1454,7 +1447,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
+          indicators: minimalIndicators,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
@@ -1486,7 +1479,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
+          indicators: minimalIndicators,
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
@@ -1508,19 +1501,12 @@ export class Orchestrator {
     console.log("[MINIMAL] indicators merged", indicators);
     this.logReadyGate(ts);
     const relVol = this.computeRelVol(this.recentBars1m);
+    const minimalIndicators = buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol);
     const volumePolicySnapshot = relVol !== undefined ? volumePolicy(relVol) : undefined;
     const volumeLine =
       relVol !== undefined && volumePolicySnapshot
         ? `${volumePolicySnapshot.label} (${relVol.toFixed(2)}x)`
         : undefined;
-    const indicatorSnapshot = buildIndicatorSnapshot({
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      indicators1m,
-      indicators5m,
-      relVol,
-    });
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1572,7 +1558,7 @@ export class Orchestrator {
           mode: "EXEC_1M",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
+          indicators: minimalIndicators,
           relVol,
           freshness: this.buildFreshness(ts),
           closed5mBars,
@@ -1630,7 +1616,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: indicatorSnapshot,
+          indicators: minimalIndicators,
           mindState: normalizedMindState,
           activeMind: nextActiveMind,
           mode: "EXEC_1M",
@@ -1666,10 +1652,18 @@ export class Orchestrator {
   private logReadyGate(ts: number): void {
     if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
     this.lastReadyLogTs = ts;
-    const ready1m = this.recentBars1m.length >= 30;
-    const ready5m = this.recentBars5m.length >= 15;
+    const bars1m = this.recentBars1m.length;
+    const bars5m = this.recentBars5m.length;
+    const ready1m = bars1m >= 30;
+    const ready5m = bars5m >= 15;
+    const readyRSI1m = bars1m >= 15;
+    const readyATR1m = bars1m >= 15;
+    const readyVWAP1m = bars1m >= 30;
+    const readyRSI5m = bars5m >= 15;
+    const readyATR5m = bars5m >= 15;
+    const readyVWAP5m = bars5m >= 30;
     console.log(
-      `[MINIMAL] READY gate 1m=${ready1m} 5m=${ready5m} bars1m=${this.recentBars1m.length} bars5m=${this.recentBars5m.length}`
+      `[MINIMAL] READY gate 1m=${ready1m} 5m=${ready5m} bars1m=${bars1m} bars5m=${bars5m} readyRSI1m=${readyRSI1m} readyATR1m=${readyATR1m} readyVWAP1m=${readyVWAP1m} readyRSI5m=${readyRSI5m} readyATR5m=${readyATR5m} readyVWAP5m=${readyVWAP5m}`
     );
   }
 
