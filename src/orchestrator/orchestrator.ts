@@ -1222,6 +1222,14 @@ export class Orchestrator {
     return { mindId, bias, thesisState, invalidation_conditions };
   }
 
+  private validateInvalidation(mindState: Record<string, any>, activeMind?: BotState["activeMind"]): boolean {
+    const reason = typeof mindState?.invalidation_reason === "string" ? mindState.invalidation_reason : "";
+    const conditions = activeMind?.invalidation_conditions;
+    if (!reason || !Array.isArray(conditions) || conditions.length === 0) return false;
+    const needle = reason.toLowerCase();
+    return conditions.some((condition) => typeof condition === "string" && needle.includes(condition.toLowerCase()));
+  }
+
   private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     this.trackMinimalBar(snapshot, "5m");
@@ -1367,14 +1375,30 @@ export class Orchestrator {
           activeMind: this.state.activeMind,
         })
       : { summary: "LLM unavailable", bias: "NEUTRAL", conviction: 0, notes: [] };
-    const nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+    const rawAction = typeof mindState.action === "string" ? mindState.action.toUpperCase() : "HOLD";
+    const action = ["HOLD", "ARM", "ENTER", "RESET", "INVALID", "SUSPEND"].includes(rawAction) ? rawAction : "HOLD";
+    const activeMind = this.state.activeMind;
+    let normalizedMindState: Record<string, any> = { ...mindState, action };
+    if (activeMind?.bias && mindState.bias && mindState.bias !== activeMind.bias && !["RESET", "INVALID"].includes(action)) {
+      console.log(`[MINIMAL] ignored_bias_flip_1m from=${mindState.bias} to=${activeMind.bias}`);
+      normalizedMindState = { ...normalizedMindState, bias: activeMind.bias };
+    }
+    if (action === "INVALID" && !this.validateInvalidation(mindState, activeMind)) {
+      console.log("[MINIMAL] invalid_invalid: invalidation_reason does not match activeMind.invalidation_conditions");
+      normalizedMindState = {
+        ...normalizedMindState,
+        action: "RESET",
+        reset_reason: normalizedMindState.reset_reason ?? "invalid_invalid",
+      };
+    }
+    const nextActiveMind = this.extractActiveMind(normalizedMindState) ?? this.state.activeMind;
 
-    this.state.mindState = mindState;
+    this.state.mindState = normalizedMindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = mindState.summary;
+    this.state.lastLLMDecision = normalizedMindState.summary;
 
-    const direction = mindState.bias;
+    const direction = normalizedMindState.bias;
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_1M`);
 
     return [
@@ -1388,7 +1412,7 @@ export class Orchestrator {
           price: close,
           direction,
           indicators,
-          mindState,
+          mindState: normalizedMindState,
           activeMind: nextActiveMind,
           mode: "EXEC_1M",
           volume: {

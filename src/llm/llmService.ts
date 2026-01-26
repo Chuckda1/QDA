@@ -950,13 +950,22 @@ Return JSON only:
   "mindId": "uuid",
   "bias": "LONG|SHORT|NEUTRAL",
   "thesisState": "FLAT|THESIS_FORMED|PULLBACK_WAIT|ARMED|ENTERED|INVALID",
-  "action": "HOLD|ARM|ENTER|RESET|INVALID",
+  "action": "HOLD|ARM|ENTER|RESET|INVALID|SUSPEND",
   "confidence": 0-100,
+  "because": "1-2 lines",
+  "waiting_for": "short, actionable",
   "invalidation_conditions": ["..."],
   "reset_reason": "",
   "invalidation_reason": "",
   "notes": ["..."]
-}`;
+}
+
+Rules:
+- All fields above are REQUIRED in every response.
+- If mode=MIND_5M_CLOSE: invalidation_conditions must be a non-empty array.
+- If mode=EXEC_1M: bias must remain unchanged unless action is RESET or INVALID.
+- If action=INVALID: invalidation_reason must reference an item in activeMind.invalidation_conditions.
+`;
     const payload = {
       model: this.model,
       messages: [
