@@ -1103,6 +1103,34 @@ export class Orchestrator {
     return latest / avg;
   }
 
+  private buildForming5mBar(ts: number): {
+    startTs: number;
+    endTs: number;
+    progressMinutes: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  } | null {
+    const bucketMs = 5 * 60 * 1000;
+    const startTs = Math.floor(ts / bucketMs) * bucketMs;
+    const endTs = startTs + bucketMs;
+    const bars = this.recentBars1m.filter((bar) => bar.ts >= startTs && bar.ts <= ts);
+    if (bars.length === 0) return null;
+    const highs = bars.map((bar) => bar.high);
+    const lows = bars.map((bar) => bar.low);
+    const volumes = bars.map((bar) => bar.volume ?? 0);
+    const open = bars[0]?.open ?? bars[0]?.close;
+    const close = bars[bars.length - 1]?.close;
+    if (!Number.isFinite(open) || !Number.isFinite(close)) return null;
+    const high = Math.max(...highs);
+    const low = Math.min(...lows);
+    const volume = volumes.reduce((sum, v) => sum + v, 0);
+    const progressMinutes = Math.min(5, Math.max(1, Math.floor((ts - startTs) / 60000) + 1));
+    return { startTs, endTs, progressMinutes, open, high, low, close, volume };
+  }
+
   private buildImpulseContext(bars: OHLCVBar[]): {
     direction: "UP" | "DOWN" | "FLAT";
     move: number;
@@ -1196,7 +1224,7 @@ export class Orchestrator {
       rsi14_5m: indicators5m?.rsi14,
       relVol,
     };
-    const recent5mBars = this.recentBars5m.slice(-12).map((bar) => ({
+    const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
       high: bar.high,
@@ -1204,6 +1232,10 @@ export class Orchestrator {
       close: bar.close,
       volume: bar.volume,
     }));
+    const forming5mBar = this.buildForming5mBar(ts);
+    if (forming5mBar) {
+      console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
+    }
     const impulseContext = this.buildImpulseContext(this.recentBars1m);
     const rangeContext = this.buildRangeContext({
       ts,
@@ -1222,7 +1254,8 @@ export class Orchestrator {
           indicators,
           relVol,
           freshness: this.buildFreshness(ts),
-          recent5mBars,
+          closed5mBars,
+          forming5mBar,
           impulseContext,
           rangeContext,
           swingPoints,

@@ -892,7 +892,17 @@ Respond in this EXACT JSON format:
     indicators: Record<string, any>;
     relVol?: number;
     freshness?: Record<string, any>;
-    recent5mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+    closed5mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+    forming5mBar?: {
+      startTs: number;
+      endTs: number;
+      progressMinutes: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    } | null;
     impulseContext?: Record<string, any>;
     rangeContext?: Record<string, any>;
     swingPoints?: { high: number; low: number };
@@ -910,7 +920,8 @@ Price: ${context.price.toFixed(2)}
 Indicators: ${JSON.stringify(context.indicators)}
 relVol: ${context.relVol ?? "n/a"}
 freshness: ${JSON.stringify(context.freshness ?? {})}
-recent5mBars: ${JSON.stringify(context.recent5mBars ?? [])}
+closed5mBars: ${JSON.stringify(context.closed5mBars ?? [])}
+forming5mBar: ${JSON.stringify(context.forming5mBar ?? null)}
 impulseContext: ${JSON.stringify(context.impulseContext ?? {})}
 rangeContext: ${JSON.stringify(context.rangeContext ?? {})}
 swingPoints: ${JSON.stringify(context.swingPoints ?? {})}
