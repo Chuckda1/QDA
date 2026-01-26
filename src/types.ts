@@ -177,6 +177,8 @@ export type MinimalLLMSnapshot = {
   session: { isRTH: boolean; etNow: string; sessionDate: string };
   lastPrice: number | null;
   closed5m: RawBar[];
+  lastClosed5mTs?: number | null;
+  lastClosed5m?: RawBar | null;
   forming5m: Forming5mBar | null;
   extras?: {
     rsi14_5m?: number | null;

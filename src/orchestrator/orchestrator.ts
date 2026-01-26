@@ -1445,6 +1445,7 @@ export class Orchestrator {
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
+    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
@@ -1452,6 +1453,8 @@ export class Orchestrator {
       nowTs: ts,
       session: computeSessionContext(ts),
       closed5m: closed5mBars,
+      lastClosed5mTs: lastClosed5m?.ts ?? null,
+      lastClosed5m,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
@@ -1464,7 +1467,7 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      bias: this.state.activeMind?.bias ?? "NEUTRAL",
+      bias: this.state.activeMind?.bias ?? "UNKNOWN",
       state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       action: "HOLD",
       confidence: 0,
@@ -1517,7 +1520,7 @@ export class Orchestrator {
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
           extras: llmSnapshot.extras,
-          lastClosed5mBar: closed5mBars[closed5mBars.length - 1] ?? null,
+          lastClosed5mBar: lastClosed5m,
         },
       },
     ];
@@ -1540,6 +1543,7 @@ export class Orchestrator {
     const rsi14_5m = this.recentBars5m.length >= 15 ? computeRSI(this.recentBars5m.map((b) => b.close), 14) : null;
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
+    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
@@ -1547,6 +1551,8 @@ export class Orchestrator {
       nowTs: ts,
       session: computeSessionContext(ts),
       closed5m: closed5mBars,
+      lastClosed5mTs: lastClosed5m?.ts ?? null,
+      lastClosed5m,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
@@ -1559,7 +1565,7 @@ export class Orchestrator {
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
       mindId: this.state.activeMind?.mindId ?? "",
-      bias: this.state.activeMind?.bias ?? "NEUTRAL",
+      bias: this.state.activeMind?.bias ?? "UNKNOWN",
       state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       action: "HOLD",
       confidence: 0,
@@ -1612,7 +1618,7 @@ export class Orchestrator {
           closed5mBarsCount: closed5mBars.length,
           formingProgress: forming5mBar?.progressMinutes ?? null,
           extras: llmSnapshot.extras,
-          lastClosed5mBar: closed5mBars[closed5mBars.length - 1] ?? null,
+          lastClosed5mBar: lastClosed5m,
         },
       },
     ];

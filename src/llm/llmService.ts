@@ -964,6 +964,8 @@ mode: ${snapshot.mode}
 lastPrice: ${snapshot.lastPrice ?? "n/a"}
 nowTs: ${snapshot.nowTs}
 session: ${JSON.stringify(snapshot.session)}
+lastClosed5mTs: ${snapshot.lastClosed5mTs ?? "n/a"}
+lastClosed5m: ${JSON.stringify(snapshot.lastClosed5m ?? null)}
 closed5m: ${JSON.stringify(snapshot.closed5m)}
 forming5m: ${JSON.stringify(snapshot.forming5m)}
 extras: ${JSON.stringify(snapshot.extras ?? {})}
@@ -987,6 +989,8 @@ Return JSON only:
 Rules:
 - All fields above are REQUIRED in every response.
 - Do not ignore forming5m. Use it for intra-candle updates.
+- closed5m is a rolling window of recent bars. Use it to infer trend and structure.
+- Do not reset bias/state just because mode changes or a new 5m bar starts.
 - If context is thin, say so in summary or because, but still return a valid JSON.`;
     const payload = {
       model: this.model,
