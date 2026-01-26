@@ -3,7 +3,7 @@ import type { LLMService } from "../llm/llmService.js";
 import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
 import { EntryFilters, type EntryFilterContext, type EntryFilterResult } from "../rules/entryFilters.js";
-import { getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
+import { etToUtcTimestamp, getETClock, getETDateString, getMarketSessionLabel } from "../utils/timeUtils.js";
 import { inferTacticalBiasFromRecentBars } from "../rules/directionRules.js";
 import { computeTimingSignal } from "../rules/timingRules.js";
 import type { TimingSignal } from "../rules/timingRules.js";
@@ -1493,11 +1493,11 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : null;
+      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : undefined;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1588,11 +1588,11 @@ export class Orchestrator {
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
     this.state.lastLLMDecision =
-      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : null;
+      typeof mindState.because === "string" ? mindState.because : typeof mindState.state === "string" ? mindState.state : undefined;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 

@@ -205,7 +205,10 @@ export class LLMService {
     const bias = typeof input.bias === "string" ? input.bias : "";
     const state = typeof input.state === "string" ? input.state : "";
     const action = typeof input.action === "string" ? input.action : "";
-    const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : undefined;
+    if (!Number.isFinite(input.confidence)) {
+      return null;
+    }
+    const confidence = Number(input.confidence);
     const because = typeof input.because === "string" ? input.because : "";
     const waitingFor = typeof input.waiting_for === "string" ? input.waiting_for : "";
     const invalidIf = Array.isArray(input.invalid_if)
@@ -215,7 +218,7 @@ export class LLMService {
     const notes = Array.isArray(input.notes)
       ? input.notes.filter((n: unknown) => typeof n === "string")
       : [];
-    if (!bias || !state || !action || !Number.isFinite(confidence) || !because || !waitingFor) {
+    if (!bias || !state || !action || !because || !waitingFor) {
       return null;
     }
     return {

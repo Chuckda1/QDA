@@ -360,7 +360,7 @@ export interface BotState {
   mindState?: Record<string, any>;
   activeMind?: {
     mindId?: string;
-    bias?: Bias;
+    bias?: Bias | string;
     thesisState?: string;
     invalidation_conditions?: string[];
   };
