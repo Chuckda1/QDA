@@ -239,6 +239,10 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const structure = mind.structure ?? "n/a";
     const entry = mind.entry ?? mind.state ?? "n/a";
     const reason = mind.reason ?? mind.because ?? "n/a";
+    const entryDetail = mind.entryDetail;
+    const entryDetailLine = entryDetail?.verdict
+      ? `ENTRY_DETAIL: ${entryDetail.verdict}${entryDetail.direction ? ` ${entryDetail.direction}` : ""}${entryDetail.because ? ` | ${entryDetail.because}` : ""}`
+      : undefined;
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
     const levels = snapshot.levels ?? mind.levels;
     const levelParts = levels
@@ -270,6 +274,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       [
         `MIND: ${snapshot.symbol} | pr ${price} | ${snapshot.mode ?? "n/a"}`,
         `TREND: ${trend} | STRUCTURE: ${structure} | ENTRY: ${entry}`,
+        entryDetailLine,
         `REASON: ${reason}`,
         lastClosed,
         lastBarLine,

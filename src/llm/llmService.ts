@@ -162,8 +162,33 @@ export interface MinimalMindStateResponse {
   structure: string;
   entry: string;
   reason: string;
-  levels?: { key: string[]; support: number[]; resistance: number[] } | null;
+  levels?:
+    | {
+        key?: string[];
+        support?: number[];
+        resistance?: number[];
+        entry?: number;
+        stop?: number;
+        targets?: number[];
+      }
+    | null;
   notes: string[];
+  bias?: string;
+  structure_state?: string;
+  thesis?: string;
+  entryDetail?: {
+    verdict: string;
+    direction: string;
+    entry_price?: number;
+    stop_price?: number;
+    targets?: number[];
+    because?: string;
+  };
+  invalidation?: {
+    level?: number;
+    because?: string;
+  };
+  next?: string;
 }
 
 export type MinimalMindStateResult = {
@@ -199,17 +224,52 @@ export class LLMService {
   private normalizeMinimalMindState(input: any): MinimalMindStateResponse | null {
     if (!input || typeof input !== "object") return null;
     const mindId = typeof input.mindId === "string" ? input.mindId : "";
-    const trend = typeof input.trend === "string" ? input.trend : "";
-    const structure = typeof input.structure === "string" ? input.structure : "";
-    const entry = typeof input.entry === "string" ? input.entry : "";
-    const reason = typeof input.reason === "string" ? input.reason : "";
+    const bias = typeof input.bias === "string" ? input.bias : undefined;
+    const trend = typeof input.trend === "string" ? input.trend : bias ?? "";
+    const structureState = typeof input.structure_state === "string" ? input.structure_state : undefined;
+    const structure = typeof input.structure === "string" ? input.structure : structureState ?? "";
+    const thesis = typeof input.thesis === "string" ? input.thesis : undefined;
+    const entryRaw = input.entry;
+    const reason = typeof input.reason === "string" ? input.reason : thesis ?? "";
     const levels = input.levels && typeof input.levels === "object" ? input.levels : null;
+    let entry = "";
+    let entryDetail: MinimalMindStateResponse["entryDetail"] | undefined;
+    if (entryRaw && typeof entryRaw === "object") {
+      entryDetail = {
+        verdict: typeof entryRaw.verdict === "string" ? entryRaw.verdict : "",
+        direction: typeof entryRaw.direction === "string" ? entryRaw.direction : "",
+        entry_price: Number.isFinite(entryRaw.entry_price) ? Number(entryRaw.entry_price) : undefined,
+        stop_price: Number.isFinite(entryRaw.stop_price) ? Number(entryRaw.stop_price) : undefined,
+        targets: Array.isArray(entryRaw.targets)
+          ? entryRaw.targets.filter((v: unknown) => Number.isFinite(v))
+          : undefined,
+        because: typeof entryRaw.because === "string" ? entryRaw.because : undefined,
+      };
+      entry = entryDetail.verdict;
+    } else if (typeof entryRaw === "string") {
+      entry = entryRaw;
+    }
     const notes = Array.isArray(input.notes)
       ? input.notes.filter((n: unknown) => typeof n === "string")
       : [];
     if (!trend || !structure || !entry || !reason) {
       return null;
     }
+    const invalidation = input.invalidation && typeof input.invalidation === "object"
+      ? {
+          level: Number.isFinite(input.invalidation.level) ? Number(input.invalidation.level) : undefined,
+          because: typeof input.invalidation.because === "string" ? input.invalidation.because : undefined,
+        }
+      : undefined;
+    const next = typeof input.next === "string" ? input.next : undefined;
+    const derivedLevels =
+      entryDetail && (entryDetail.entry_price || entryDetail.stop_price || entryDetail.targets?.length)
+        ? {
+            entry: entryDetail.entry_price,
+            stop: entryDetail.stop_price,
+            targets: entryDetail.targets,
+          }
+        : null;
     return {
       mindId,
       trend,
@@ -223,9 +283,18 @@ export class LLMService {
             resistance: Array.isArray(levels.resistance)
               ? levels.resistance.filter((v: unknown) => Number.isFinite(v))
               : [],
+            entry: Number.isFinite(levels.entry) ? Number(levels.entry) : undefined,
+            stop: Number.isFinite(levels.stop) ? Number(levels.stop) : undefined,
+            targets: Array.isArray(levels.targets) ? levels.targets.filter((v: unknown) => Number.isFinite(v)) : undefined,
           }
-        : null,
+        : derivedLevels,
       notes,
+      bias,
+      structure_state: structureState,
+      thesis,
+      entryDetail,
+      invalidation,
+      next,
     };
   }
 
@@ -936,46 +1005,77 @@ Respond in this EXACT JSON format:
       reason: "LLM unavailable",
       levels: null,
       notes: ["invalid_response"],
+      bias: typeof snapshot.activeMind?.bias === "string" ? snapshot.activeMind.bias : undefined,
+      structure_state: "intact",
+      thesis: "LLM unavailable",
+      entryDetail: {
+        verdict: "WAIT",
+        direction: "NONE",
+        because: "LLM unavailable",
+      },
+      next: "wait for more confirmation",
     };
     if (!this.enabled) {
       return { mindState: fallback, valid: false };
     }
+    const inputPayload = {
+      symbol: snapshot.symbol,
+      ts: snapshot.nowTs,
+      mode: snapshot.mode,
+      bars5m_closed: snapshot.closed5m,
+      bar5m_forming: snapshot.forming5m
+        ? {
+            bucketStart: snapshot.forming5m.startTs,
+            progress: snapshot.forming5m.progressMinutes,
+            o: snapshot.forming5m.open,
+            h: snapshot.forming5m.high,
+            l: snapshot.forming5m.low,
+            c: snapshot.forming5m.close,
+            v: snapshot.forming5m.volume,
+          }
+        : null,
+      swings5m: snapshot.swings5m ?? [],
+      structure: snapshot.structure ?? null,
+      entrySignal: snapshot.entrySignal ?? null,
+      session: snapshot.session,
+      lastPrice: snapshot.lastPrice ?? null,
+      previousMindState: snapshot.previousMindState ?? {},
+      activeMind: snapshot.activeMind ?? {},
+      extras: snapshot.extras ?? {},
+    };
     const prompt = `You are reading a 5-minute chart for ${snapshot.symbol}. Return JSON only.
-mode: ${snapshot.mode}
-lastPrice: ${snapshot.lastPrice ?? "n/a"}
-nowTs: ${snapshot.nowTs}
-session: ${JSON.stringify(snapshot.session)}
-lastClosed5mTs: ${snapshot.lastClosed5mTs ?? "n/a"}
-lastClosed5m: ${JSON.stringify(snapshot.lastClosed5m ?? null)}
-swings: ${JSON.stringify(snapshot.swings ?? { highs: [], lows: [] })}
-closed5m: ${JSON.stringify(snapshot.closed5m)}
-forming5m: ${JSON.stringify(snapshot.forming5m)}
-extras: ${JSON.stringify(snapshot.extras ?? {})}
-previousMindState: ${JSON.stringify(snapshot.previousMindState ?? {})}
-activeMind: ${JSON.stringify(snapshot.activeMind ?? {})}
+Input (JSON):
+${JSON.stringify(inputPayload)}
 
 Return JSON only:
 {
-  "mindId": "string",
-  "trend": "up|down|range|string",
-  "structure": "intact|weakening|broken|string",
-  "entry": "yes|wait|string",
-  "reason": "1-2 lines",
-  "levels": { "key": [string], "support": [number], "resistance": [number] } | null,
-  "notes": ["..."]
+  "trend": "up|down|range",
+  "structure_state": "intact|weakening|broken",
+  "bias": "LONG|SHORT|NEUTRAL",
+  "thesis": "1-2 sentences what the market is doing",
+  "entry": {
+    "verdict": "ENTER|WAIT",
+    "direction": "LONG|SHORT|NONE",
+    "entry_price": 0,
+    "stop_price": 0,
+    "targets": [0],
+    "because": "short reason in plain english"
+  },
+  "invalidation": {
+    "level": 0,
+    "because": "why this level breaks the idea"
+  },
+  "next": "what we need to see next (actionable)"
 }
 
 Rules:
 - All fields above are REQUIRED in every response.
-- Do not ignore forming5m. Use it for intra-candle updates.
-- closed5m is a rolling window of recent bars. Use it to infer trend and structure.
-- Do not reset trend/entry just because mode changes or a new 5m bar starts.
-- Market structure rules (OHLC only):
-  - UPTREND: higher swing highs + higher swing lows.
-  - DOWNTREND: lower swing highs + lower swing lows.
-  - REVERSAL requires a swing in the opposite direction AND a break of prior structure.
-  - Avoid countertrend entries unless structure is broken.
-- If context is thin, say so in reason, but still return a valid JSON.`;
+- Use swings5m + bars5m_closed for structure. Raw OHLC only.
+- Use bar5m_forming for entry timing (do not ignore it).
+- A reversal needs opposite swing then break of prior structure with a close.
+- Avoid countertrend entries unless structure is broken.
+- Do not reset thesis just because mode changes or a new 5m bar starts.
+- If context is thin, say so in thesis, but still return valid JSON.`;
     const payload = {
       model: this.model,
       messages: [

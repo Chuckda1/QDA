@@ -170,6 +170,32 @@ export type Forming5mBar = {
   volume: number;
 };
 
+export type SwingPoint = {
+  ts: number;
+  price: number;
+  kind: "HIGH" | "LOW";
+  index: number;
+};
+
+export type MinimalStructure = {
+  trend: "up" | "down" | "range";
+  state: "intact" | "weakening" | "broken";
+  keyLevels?: {
+    lastSwingHigh?: number;
+    lastSwingLow?: number;
+    breakLevel?: number;
+  };
+};
+
+export type MinimalEntrySignal = {
+  verdict: "ENTER" | "WAIT";
+  direction: "LONG" | "SHORT" | "NONE";
+  entry_price?: number;
+  stop_price?: number;
+  targets?: number[];
+  because: string;
+};
+
 export type MinimalLLMSnapshot = {
   mode: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
   symbol: string;
@@ -179,10 +205,9 @@ export type MinimalLLMSnapshot = {
   closed5m: RawBar[];
   lastClosed5mTs?: number | null;
   lastClosed5m?: RawBar | null;
-  swings?: {
-    highs: Array<{ ts: number; price: number }>;
-    lows: Array<{ ts: number; price: number }>;
-  };
+  swings5m?: Array<{ t: number; p: number; k: "HIGH" | "LOW"; i: number }>;
+  structure?: MinimalStructure;
+  entrySignal?: MinimalEntrySignal;
   forming5m: Forming5mBar | null;
   extras?: {
     rsi14_5m?: number | null;

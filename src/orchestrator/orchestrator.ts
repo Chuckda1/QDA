@@ -15,6 +15,7 @@ import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
 import { requiresDecisionState } from "../utils/decisionState.js";
 import { volumePolicy } from "../utils/volumePolicy.js";
+import { detectBreak, determineStructure, evaluateEntry, extractSwings, lastSwings } from "../utils/swing.js";
 import {
   buildDecision,
   buildNoEntryDecision,
@@ -1322,34 +1323,8 @@ export class Orchestrator {
     return { startTs, endTs, progressMinutes, open, high, low, close, volume };
   }
 
-  private extractSwings(bars: OHLCVBar[]): { highs: Array<{ ts: number; price: number }>; lows: Array<{ ts: number; price: number }> } {
-    if (bars.length < 5) return { highs: [], lows: [] };
-    const highs: Array<{ ts: number; price: number }> = [];
-    const lows: Array<{ ts: number; price: number }> = [];
-    for (let i = 2; i < bars.length - 2; i += 1) {
-      const h = bars[i].high;
-      const l = bars[i].low;
-      if (
-        h > bars[i - 1].high &&
-        h > bars[i - 2].high &&
-        h > bars[i + 1].high &&
-        h > bars[i + 2].high
-      ) {
-        highs.push({ ts: bars[i].ts, price: h });
-      }
-      if (
-        l < bars[i - 1].low &&
-        l < bars[i - 2].low &&
-        l < bars[i + 1].low &&
-        l < bars[i + 2].low
-      ) {
-        lows.push({ ts: bars[i].ts, price: l });
-      }
-    }
-    return {
-      highs: highs.slice(-2),
-      lows: lows.slice(-2),
-    };
+  private extractSwings(bars: OHLCVBar[]) {
+    return extractSwings(bars, 2, false);
   }
 
   private buildImpulseContext(bars: OHLCVBar[]): {
@@ -1481,7 +1456,42 @@ export class Orchestrator {
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const swings = this.extractSwings(closed5mBars);
+    const swingPoints = this.extractSwings(closed5mBars);
+    const structure = determineStructure(swingPoints);
+    const breakInfo = Number.isFinite(lastClosed5m?.close)
+      ? detectBreak(structure.trend, swingPoints, lastClosed5m?.close as number)
+      : { broken: false as const };
+    const structureState = breakInfo.broken ? "broken" : structure.state;
+    const { lastHigh, lastLow } = lastSwings(swingPoints);
+    const structurePayload = {
+      trend: structure.trend,
+      state: structureState,
+      keyLevels: {
+        lastSwingHigh: lastHigh?.price,
+        lastSwingLow: lastLow?.price,
+        breakLevel: breakInfo.broken ? breakInfo.breakLevel : undefined,
+      },
+    };
+    const entrySignal = forming5mBar
+      ? (() => {
+          const signal = evaluateEntry(structurePayload.trend, {
+            ts,
+            open: forming5mBar.open,
+            high: forming5mBar.high,
+            low: forming5mBar.low,
+            close: forming5mBar.close,
+            volume: forming5mBar.volume,
+          }, swingPoints);
+          return {
+            verdict: signal.verdict,
+            direction: signal.direction,
+            entry_price: signal.entryPrice,
+            stop_price: signal.stop,
+            targets: signal.targets,
+            because: signal.because,
+          };
+        })()
+      : null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "MIND_5M_CLOSE",
       symbol,
@@ -1491,7 +1501,9 @@ export class Orchestrator {
       closed5m: closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
-      swings,
+      swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
+      structure: structurePayload,
+      entrySignal: entrySignal ?? undefined,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
@@ -1577,7 +1589,42 @@ export class Orchestrator {
     const atr14_5m = this.recentBars5m.length >= 15 ? computeATR(this.recentBars5m, 14) : null;
     const lastPrice = Number.isFinite(forming5mBar?.close) ? (forming5mBar as { close: number }).close : close;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const swings = this.extractSwings(closed5mBars);
+    const swingPoints = this.extractSwings(closed5mBars);
+    const structure = determineStructure(swingPoints);
+    const breakInfo = Number.isFinite(lastClosed5m?.close)
+      ? detectBreak(structure.trend, swingPoints, lastClosed5m?.close as number)
+      : { broken: false as const };
+    const structureState = breakInfo.broken ? "broken" : structure.state;
+    const { lastHigh, lastLow } = lastSwings(swingPoints);
+    const structurePayload = {
+      trend: structure.trend,
+      state: structureState,
+      keyLevels: {
+        lastSwingHigh: lastHigh?.price,
+        lastSwingLow: lastLow?.price,
+        breakLevel: breakInfo.broken ? breakInfo.breakLevel : undefined,
+      },
+    };
+    const entrySignal = forming5mBar
+      ? (() => {
+          const signal = evaluateEntry(structurePayload.trend, {
+            ts,
+            open: forming5mBar.open,
+            high: forming5mBar.high,
+            low: forming5mBar.low,
+            close: forming5mBar.close,
+            volume: forming5mBar.volume,
+          }, swingPoints);
+          return {
+            verdict: signal.verdict,
+            direction: signal.direction,
+            entry_price: signal.entryPrice,
+            stop_price: signal.stop,
+            targets: signal.targets,
+            because: signal.because,
+          };
+        })()
+      : null;
     const llmSnapshot: MinimalLLMSnapshot = {
       mode: "EXEC_FORMING_5M",
       symbol,
@@ -1587,7 +1634,9 @@ export class Orchestrator {
       closed5m: closed5mBars,
       lastClosed5mTs: lastClosed5m?.ts ?? null,
       lastClosed5m,
-      swings,
+      swings5m: swingPoints.map((s) => ({ t: s.ts, p: s.price, k: s.kind, i: s.index })),
+      structure: structurePayload,
+      entrySignal: entrySignal ?? undefined,
       forming5m: forming5mBar ?? null,
       extras: {
         ...extras,
