@@ -199,12 +199,16 @@ function buildIndicatorSnapshot(params: {
   const avgVol5m = computeAvgVolume(params.bars5m);
   const currentVol1m = params.bars1m.length ? params.bars1m[params.bars1m.length - 1]?.volume : undefined;
   const currentVol5m = params.bars5m.length ? params.bars5m[params.bars5m.length - 1]?.volume : undefined;
+  const safeVol1m = Number.isFinite(currentVol1m) ? (currentVol1m as number) : undefined;
+  const safeVol5m = Number.isFinite(currentVol5m) ? (currentVol5m as number) : undefined;
   const vwap1m = params.indicators1m.vwap;
   const vwap5m = params.indicators5m?.vwap;
+  const safeVwap1m = Number.isFinite(vwap1m) ? (vwap1m as number) : undefined;
+  const safeVwap5m = Number.isFinite(vwap5m) ? (vwap5m as number) : undefined;
   const distPct1m =
-    Number.isFinite(vwap1m) && vwap1m !== 0 ? ((params.price - vwap1m) / vwap1m) * 100 : undefined;
+    safeVwap1m !== undefined && safeVwap1m !== 0 ? ((params.price - safeVwap1m) / safeVwap1m) * 100 : undefined;
   const distPct5m =
-    Number.isFinite(vwap5m) && vwap5m !== 0 ? ((params.price - vwap5m) / vwap5m) * 100 : undefined;
+    safeVwap5m !== undefined && safeVwap5m !== 0 ? ((params.price - safeVwap5m) / safeVwap5m) * 100 : undefined;
   return {
     vwap: { "1m": vwap1m, "5m": vwap5m },
     vwapDistancePct: { "1m": distPct1m, "5m": distPct5m },
@@ -232,11 +236,11 @@ function buildIndicatorSnapshot(params: {
     bollinger: { "1m": bb1m, "5m": bb5m },
     volume: {
       relVol: params.relVol,
-      current: { "1m": currentVol1m, "5m": currentVol5m },
+      current: { "1m": safeVol1m, "5m": safeVol5m },
       average: { "1m": avgVol1m, "5m": avgVol5m },
       ratio: {
-        "1m": Number.isFinite(currentVol1m) && avgVol1m ? currentVol1m / avgVol1m : undefined,
-        "5m": Number.isFinite(currentVol5m) && avgVol5m ? currentVol5m / avgVol5m : undefined,
+        "1m": safeVol1m !== undefined && avgVol1m ? safeVol1m / avgVol1m : undefined,
+        "5m": safeVol5m !== undefined && avgVol5m ? safeVol5m / avgVol5m : undefined,
       },
     },
   };
@@ -1406,7 +1410,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicatorSnapshot,
+          indicators: indicatorSnapshot,
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
