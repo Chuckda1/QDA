@@ -236,36 +236,39 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   if (snapshot.type === "MIND") {
     const mind = snapshot.mindState ?? {};
     const bias = mind.bias ?? "n/a";
-    const thesisState = mind.thesisState ?? "n/a";
+    const state = mind.state ?? mind.thesisState ?? "n/a";
     const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : "n/a";
-    const action = mind.action ?? "n/a";
+    const command = mind.command ?? mind.action ?? "n/a";
     const waitingFor = mind.waiting_for ?? "n/a";
     const price = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "n/a";
     const invalidations = Array.isArray(mind.invalidation_conditions)
       ? mind.invalidation_conditions.filter((item: unknown) => typeof item === "string" && item.length > 0)
       : [];
-    const indicators = snapshot.indicators ?? {};
-    const vwap5m = indicators.vwap5m ?? indicators.vwap_5m ?? indicators.vwap?.["5m"];
-    const vwapPartial = indicators.vwap_isPartial === true;
-    const rsi5m = indicators.rsi14_5m ?? indicators.rsi_5m ?? indicators.rsi14?.["5m"];
-    const atr5m = indicators.atr14_5m ?? indicators.atr_5m ?? indicators.atr14?.["5m"];
-    const ema20_5m = indicators.ema20_5m ?? indicators.ema20_5m ?? indicators.ema20?.["5m"];
-    const vwapLabel = `${formatPrice(vwap5m)}${vwapPartial ? "*" : ""}`;
-    const indicatorLine = [
-      `VWAP5m=${vwapLabel}`,
-      `RSI5m=${Number.isFinite(rsi5m) ? Math.round(rsi5m) : "n/a"}`,
-      `ATR5m=${formatPrice(atr5m)}`,
-      `EMA20_5m=${formatPrice(ema20_5m)}`,
-    ].join(" ");
+    const levels = snapshot.levels ?? mind.levels;
+    const levelParts = levels
+      ? [
+          Number.isFinite(levels.entry) ? `entry ${formatPrice(levels.entry)}` : "entry n/a",
+          Number.isFinite(levels.stop) ? `stop ${formatPrice(levels.stop)}` : "stop n/a",
+          Array.isArray(levels.targets) && levels.targets.length > 0
+            ? `targets ${levels.targets.map((t: number) => formatPrice(t)).join(",")}`
+            : "targets n/a",
+        ]
+      : [];
+    const formingProgress =
+      Number.isFinite(snapshot.formingProgress) ? `${snapshot.formingProgress}/5` : undefined;
+    const lastClosed = snapshot.lastClosed5mTs ? `LAST5M: ${snapshot.lastClosed5mTs}` : undefined;
+    const formingLine = formingProgress ? `FORMING: ${formingProgress}` : undefined;
     const invalidLines = invalidations.length
       ? invalidations.slice(0, 2).map((item) => `- ${item}`)
       : ["- n/a"];
     const lines = enforceLineLimit("MIND", [
-      `BIAS: ${bias} | STATE: ${thesisState} | ACTION: ${action} | CONF: ${confidence} | px ${price}`,
+      `BIAS: ${bias} | STATE: ${state} | CMD: ${command} | CONF: ${confidence} | px ${price}`,
       `WAITING_FOR: ${waitingFor}`,
+      lastClosed,
+      formingLine,
       "INVALID_IF:",
       ...invalidLines,
-      `IND: ${indicatorLine}`,
+      levelParts.length ? `LEVELS: ${levelParts.join(" | ")}` : undefined,
     ]);
     return { type: "MIND", lines, text: lines.join("\n") };
   }

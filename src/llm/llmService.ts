@@ -156,20 +156,23 @@ export interface ArmedCoachingResponse {
   urgency: "LOW" | "MEDIUM" | "HIGH";
 }
 
-export interface MindStateResponse {
-  summary: string;
-  mindId?: string;
-  bias?: "LONG" | "SHORT" | "NEUTRAL";
-  thesisState?: "FLAT" | "THESIS_FORMED" | "PULLBACK_WAIT" | "ARMED" | "ENTERED" | "INVALID";
-  action?: "HOLD" | "ARM" | "ENTER" | "RESET" | "INVALID" | "SUSPEND";
-  confidence?: number;
-  because?: string;
-  waiting_for?: string;
-  invalidation_conditions?: string[];
-  reset_reason?: string;
-  invalidation_reason?: string;
-  notes?: string[];
+export interface RawMindStateResponse {
+  mindId: string;
+  state: string;
+  bias: "LONG" | "SHORT" | "NEUTRAL";
+  command: "HOLD" | "ARM" | "ENTER" | "RESET" | "INVALID";
+  confidence: number;
+  because: string;
+  waiting_for: string;
+  invalidation_conditions: string[];
+  levels: { entry: number | null; stop: number | null; targets: number[] };
+  notes: string[];
 }
+
+export type RawMindStateResult = {
+  mindState: RawMindStateResponse;
+  valid: boolean;
+};
 
 export class LLMService {
   private apiKey: string;
@@ -194,6 +197,51 @@ export class LLMService {
     } else {
       console.log(`[LLMService] OPENAI_API_KEY found (length: ${this.apiKey.length}, starts with: ${this.apiKey.substring(0, 7)}...)`);
     }
+  }
+
+  private normalizeRawMindState(input: any): RawMindStateResponse | null {
+    if (!input || typeof input !== "object") return null;
+    const mindId = typeof input.mindId === "string" ? input.mindId : undefined;
+    const state = typeof input.state === "string" ? input.state : undefined;
+    const bias = input.bias === "LONG" || input.bias === "SHORT" || input.bias === "NEUTRAL" ? input.bias : undefined;
+    const command =
+      input.command === "HOLD" ||
+      input.command === "ARM" ||
+      input.command === "ENTER" ||
+      input.command === "RESET" ||
+      input.command === "INVALID"
+        ? input.command
+        : undefined;
+    const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : undefined;
+    const because = typeof input.because === "string" ? input.because : undefined;
+    const waitingFor = typeof input.waiting_for === "string" ? input.waiting_for : undefined;
+    const invalidation = Array.isArray(input.invalidation_conditions)
+      ? input.invalidation_conditions.filter((item: unknown) => typeof item === "string")
+      : undefined;
+    const levels = input.levels && typeof input.levels === "object" ? input.levels : undefined;
+    const entry = Number.isFinite(levels?.entry) ? Number(levels.entry) : null;
+    const stop = Number.isFinite(levels?.stop) ? Number(levels.stop) : null;
+    const targets = Array.isArray(levels?.targets)
+      ? levels.targets.filter((t: unknown) => Number.isFinite(t)).map((t: number) => Number(t))
+      : [];
+    const notes = Array.isArray(input.notes)
+      ? input.notes.filter((n: unknown) => typeof n === "string")
+      : [];
+    if (!mindId || !state || !bias || !command || !Number.isFinite(confidence) || !because || !waitingFor || !invalidation) {
+      return null;
+    }
+    return {
+      mindId,
+      state,
+      bias,
+      command,
+      confidence,
+      because,
+      waiting_for: waitingFor,
+      invalidation_conditions: invalidation,
+      levels: { entry, stop, targets },
+      notes,
+    };
   }
 
   /**
@@ -895,15 +943,12 @@ Respond in this EXACT JSON format:
   }
 
   async getMindState(context: {
-    mode?: "MIND_5M_CLOSE" | "EXEC_FORMING_5M";
     symbol: string;
     price: number;
-    indicators: Record<string, any>;
-    indicators1m?: Record<string, any>;
-    indicators5m?: Record<string, any>;
     relVol?: number;
+    meta?: Record<string, any>;
     freshness?: Record<string, any>;
-    closed5mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
+    closed5mBars: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
     forming5mBar?: {
       startTs: number;
       endTs: number;
@@ -914,87 +959,57 @@ Respond in this EXACT JSON format:
       close: number;
       volume: number;
     } | null;
-    recent1mBars?: Array<{ ts: number; open?: number; high: number; low: number; close: number; volume?: number }>;
-    impulseContext?: Record<string, any>;
-    rangeContext?: Record<string, any>;
-    swingPoints?: { high: number; low: number };
     previousMindState?: Record<string, any>;
     activeMind?: Record<string, any>;
-  }): Promise<MindStateResponse> {
+  }): Promise<RawMindStateResult> {
+    const fallback: RawMindStateResponse = {
+      mindId: typeof context.activeMind?.mindId === "string" ? context.activeMind.mindId : "unknown",
+      state: typeof context.activeMind?.state === "string"
+        ? context.activeMind.state
+        : typeof context.activeMind?.thesisState === "string"
+        ? context.activeMind.thesisState
+        : "UNKNOWN",
+      bias: context.activeMind?.bias ?? "NEUTRAL",
+      command: "HOLD",
+      confidence: 0,
+      because: "LLM unavailable",
+      waiting_for: "valid LLM response",
+      invalidation_conditions: Array.isArray(context.activeMind?.invalidation_conditions)
+        ? context.activeMind.invalidation_conditions
+        : [],
+      levels: { entry: null, stop: null, targets: [] },
+      notes: ["invalid_response"],
+    };
     if (!this.enabled) {
-      return {
-        summary: "LLM disabled: using placeholder mind state.",
-        bias: "NEUTRAL",
-        thesisState: "FLAT",
-        action: "HOLD",
-        confidence: 50,
-        because: "LLM disabled",
-        waiting_for: "LLM enabled",
-        invalidation_conditions: [],
-        reset_reason: "",
-        invalidation_reason: "",
-        notes: [],
-      };
+      return { mindState: fallback, valid: false };
     }
-    const prompt = `You are summarizing a market mind-state for ${context.symbol}.
-mode: ${context.mode ?? "EXEC_FORMING_5M"}
-Price: ${context.price.toFixed(2)}
-Indicators: ${JSON.stringify(context.indicators)}
-indicators1m: ${JSON.stringify(context.indicators1m ?? {})}
-indicators5m: ${JSON.stringify(context.indicators5m ?? {})}
+    const prompt = `You are the market mind for ${context.symbol}. Return JSON only.
+price: ${context.price.toFixed(2)}
 relVol: ${context.relVol ?? "n/a"}
+meta: ${JSON.stringify(context.meta ?? {})}
 freshness: ${JSON.stringify(context.freshness ?? {})}
 closed5mBars: ${JSON.stringify(context.closed5mBars ?? [])}
 forming5mBar: ${JSON.stringify(context.forming5mBar ?? null)}
-recent1mBars: ${JSON.stringify(context.recent1mBars ?? [])}
-impulseContext: ${JSON.stringify(context.impulseContext ?? {})}
-rangeContext: ${JSON.stringify(context.rangeContext ?? {})}
-swingPoints: ${JSON.stringify(context.swingPoints ?? {})}
 previousMindState: ${JSON.stringify(context.previousMindState ?? {})}
 activeMind: ${JSON.stringify(context.activeMind ?? {})}
 
-Definitions:
-- RESET = "I can’t trust the thesis right now." Pause until next 5m close.
-- INVALID = "This thesis is wrong." Only if a predefined invalidation condition is breached.
-- Only 5m (mode=MIND_5M_CLOSE) can form/flip thesis or mindId.
-- Forming 5m (mode=EXEC_FORMING_5M) can return HOLD/ARM/ENTER/RESET/SUSPEND; INVALID only if it cites an existing invalidation_conditions entry from activeMind.
-- RESET requires thesisState=FLAT or SUSPENDED and no bias flip.
-- INVALID requires thesisState=INVALID and must reference an invalidation_conditions entry.
-- INVALID means thesis broken by a 5m-defined condition (ex: "5m close below X", "VWAP reclaim lost + lower low", "break of range rail and hold").
-- RESET means thesis is stale/unclear/regime changed/data quality issue, but not hard invalidation.
-
-EXEC_FORMING_5M prompt (state machine: THESIS → ARMED → ENTER):
-- Treat activeMind as the locked thesis. Do not change bias or thesis; only advance or pause.
-- Use forming5mBar + closed5mBars + indicators (5m) to decide.
-- Answer only:
-  1) Has price pulled back against the thesis enough to ARM?
-  2) Is this the entry moment to ENTER now?
-- If not, what exactly are we waiting for?
-
 Return JSON only:
 {
-  "summary": "short sentence",
-  "mindId": "uuid",
+  "mindId": "string",
+  "state": "string (LLM-defined)",
   "bias": "LONG|SHORT|NEUTRAL",
-  "thesisState": "FLAT|THESIS_FORMED|PULLBACK_WAIT|ARMED|ENTERED|INVALID",
-  "action": "HOLD|ARM|ENTER|RESET|INVALID|SUSPEND",
+  "command": "HOLD|ARM|ENTER|RESET|INVALID",
   "confidence": 0-100,
   "because": "1-2 lines",
-  "waiting_for": "short, actionable",
+  "waiting_for": "short actionable condition",
   "invalidation_conditions": ["..."],
-  "reset_reason": "",
-  "invalidation_reason": "",
+  "levels": { "entry": number|null, "stop": number|null, "targets": [number]|[] },
   "notes": ["..."]
 }
 
 Rules:
-- All fields above are REQUIRED in every response.
-- If mode=MIND_5M_CLOSE: invalidation_conditions must be a non-empty array.
-- If mode=EXEC_FORMING_5M: bias must remain unchanged unless action is RESET or INVALID.
-- If action=INVALID: invalidation_reason must reference an item in activeMind.invalidation_conditions.
-- For EXEC_FORMING_5M: waiting_for must be a single, concrete condition.
-- For EXEC_FORMING_5M: invalidation_conditions must mirror activeMind.invalidation_conditions (do not invent new ones).
-`;
+- All fields are required.
+- Keep JSON valid and concise.`;
     const payload = {
       model: this.model,
       messages: [
@@ -1016,37 +1031,21 @@ Rules:
     if (!response.ok) {
       const error = await response.text();
       console.error(`[LLM] MindState error (${duration}ms):`, response.status, error);
-      return {
-        summary: "LLM error",
-        bias: "NEUTRAL",
-        thesisState: "FLAT",
-        action: "HOLD",
-        confidence: 0,
-        because: "LLM error",
-        waiting_for: "LLM recovery",
-        invalidation_conditions: [],
-        reset_reason: "",
-        invalidation_reason: "",
-      };
+      return { mindState: { ...fallback, because: "LLM error" }, valid: false };
     }
     const json = await response.json();
     const content = json?.choices?.[0]?.message?.content ?? "{}";
     try {
-      return JSON.parse(content);
+      const parsed = JSON.parse(content);
+      const normalized = this.normalizeRawMindState(parsed);
+      if (!normalized) {
+        console.error("[LLM] MindState invalid schema:", content);
+        return { mindState: { ...fallback, because: "LLM invalid schema" }, valid: false };
+      }
+      return { mindState: normalized, valid: true };
     } catch (err) {
       console.error("[LLM] MindState parse error:", err);
-      return {
-        summary: "LLM parse error",
-        bias: "NEUTRAL",
-        thesisState: "FLAT",
-        action: "HOLD",
-        confidence: 0,
-        because: "LLM parse error",
-        waiting_for: "valid JSON response",
-        invalidation_conditions: [],
-        reset_reason: "",
-        invalidation_reason: "",
-      };
+      return { mindState: { ...fallback, because: "LLM parse error" }, valid: false };
     }
   }
 }

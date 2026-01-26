@@ -20,6 +20,9 @@ export type TelegramSnapshot = {
   volumeRetestOk?: boolean;
   mindState?: Record<string, any>;
   indicators?: Record<string, any>;
+  formingProgress?: number | null;
+  lastClosed5mTs?: string;
+  levels?: { entry: number | null; stop: number | null; targets: number[] };
   rangeBias?: { bias: Bias; confidence?: number; note?: string };
   range?: {
     low: number;
@@ -548,6 +551,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   }
 
   if (event.type === "MIND_STATE_UPDATED") {
+    const lastClosed5mTs =
+      typeof event.data.lastClosed5mTs === "number" ? formatEtTimestamp(event.data.lastClosed5mTs) : undefined;
+    const formingProgress =
+      Number.isFinite(event.data.formingProgress) ? Number(event.data.formingProgress) : undefined;
+    const levels = event.data.mindState?.levels ?? event.data.levels;
     return {
       type: "MIND",
       symbol,
@@ -555,9 +563,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
       risk,
       px,
       ts,
-      indicators: event.data.indicators,
       mindState: event.data.mindState,
-      volumeLine,
+      formingProgress,
+      lastClosed5mTs,
+      levels,
     };
   }
 

@@ -255,46 +255,6 @@ function buildIndicatorSnapshot(params: {
   };
 }
 
-function buildMinimalIndicatorSummary(params: {
-  indicators5m?: ReturnType<typeof buildIndicatorSet>;
-  price: number;
-  sessionRange?: RangeBand;
-  swingPoints?: { high: number; low: number };
-}): {
-  vwap5m: number | null;
-  vwap_isPartial: boolean;
-  rsi14_5m: number | null;
-  atr14_5m: number | null;
-  ema9_5m: number | null;
-  ema20_5m: number | null;
-  ema50_5m: number | null;
-  distanceFromVWAPPct: number | null;
-  sessionHigh: number | null;
-  sessionLow: number | null;
-  lastSwingHigh: number | null;
-  lastSwingLow: number | null;
-} {
-  const toNumberOrNull = (value: unknown): number | null =>
-    Number.isFinite(value) ? (value as number) : null;
-  const vwap = params.indicators5m?.vwap;
-  const distanceFromVWAPPct =
-    Number.isFinite(vwap) && vwap !== 0 ? ((params.price - (vwap as number)) / (vwap as number)) * 100 : null;
-  return {
-    vwap5m: toNumberOrNull(vwap),
-    vwap_isPartial: params.indicators5m?.vwapIsPartial ?? false,
-    rsi14_5m: toNumberOrNull(params.indicators5m?.rsi14),
-    atr14_5m: toNumberOrNull(params.indicators5m?.atr),
-    ema9_5m: toNumberOrNull(params.indicators5m?.ema9),
-    ema20_5m: toNumberOrNull(params.indicators5m?.ema20),
-    ema50_5m: toNumberOrNull(params.indicators5m?.ema50),
-    distanceFromVWAPPct: Number.isFinite(distanceFromVWAPPct) ? Number(distanceFromVWAPPct.toFixed(2)) : null,
-    sessionHigh: toNumberOrNull(params.sessionRange?.high),
-    sessionLow: toNumberOrNull(params.sessionRange?.low),
-    lastSwingHigh: toNumberOrNull(params.swingPoints?.high),
-    lastSwingLow: toNumberOrNull(params.swingPoints?.low),
-  };
-}
-
 function buildTacticalSnapshot(params: {
   bars: OHLCVBar[];
   indicators: ReturnType<typeof buildIndicatorSet>;
@@ -757,7 +717,6 @@ export class Orchestrator {
   private lastRegimeLabel?: RegimeResult["regime"];
   private transitionLockRemaining: number = 0;
   private readonly transitionLockBars: number = 3;
-  private lastReadyLogTs: number | null = null;
 
   private lastTacticalDirection?: Direction | "NEUTRAL";
   private pendingTacticalDirection?: Direction | "NEUTRAL";
@@ -1388,17 +1347,22 @@ export class Orchestrator {
   private extractActiveMind(mindState?: Record<string, any>): BotState["activeMind"] | undefined {
     if (!mindState || typeof mindState !== "object") return undefined;
     if (mindState.activeMind && typeof mindState.activeMind === "object") {
-      const { mindId, bias, thesisState, invalidation_conditions } = mindState.activeMind as Record<string, any>;
+      const { mindId, bias, thesisState, state, invalidation_conditions } = mindState.activeMind as Record<string, any>;
       return {
         mindId: typeof mindId === "string" ? mindId : undefined,
         bias: bias === "LONG" || bias === "SHORT" || bias === "NEUTRAL" ? bias : undefined,
-        thesisState: typeof thesisState === "string" ? thesisState : undefined,
+        thesisState: typeof state === "string" ? state : typeof thesisState === "string" ? thesisState : undefined,
         invalidation_conditions: Array.isArray(invalidation_conditions) ? invalidation_conditions : undefined,
       };
     }
     const mindId = typeof mindState.mindId === "string" ? mindState.mindId : undefined;
     const bias = mindState.bias === "LONG" || mindState.bias === "SHORT" || mindState.bias === "NEUTRAL" ? mindState.bias : undefined;
-    const thesisState = typeof mindState.thesisState === "string" ? mindState.thesisState : undefined;
+    const thesisState =
+      typeof mindState.state === "string"
+        ? mindState.state
+        : typeof mindState.thesisState === "string"
+        ? mindState.thesisState
+        : undefined;
     const invalidation_conditions = Array.isArray(mindState.invalidation_conditions)
       ? mindState.invalidation_conditions
       : undefined;
@@ -1421,26 +1385,7 @@ export class Orchestrator {
     const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
     console.log(`[MINIMAL] recentBars5m.length=${this.recentBars5m.length} last5mTs=${last5mTs ?? "n/a"}`);
 
-    const indicators5m = buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 5 });
-    console.log("[MINIMAL] indicators5m", indicators5m);
-    this.logReadyGate(ts);
-    if (!Number.isFinite(indicators5m.vwap)) {
-      this.logVwapDiagnostics(ts);
-    }
-    const swingPoints =
-      this.computeSwingPoints(this.recentBars5m, 12) ??
-      this.computeSwingPoints(this.recentBars1m, 20);
-    const sessionRange = computeContextRange({
-      ts,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-    });
-    const minimalIndicators = buildMinimalIndicatorSummary({
-      indicators5m,
-      price: close,
-      sessionRange,
-      swingPoints,
-    });
+    const relVol = this.computeRelVol(this.recentBars5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1449,64 +1394,60 @@ export class Orchestrator {
       close: bar.close,
       volume: bar.volume,
     }));
-    const rangeContext = this.buildRangeContext({
-      ts,
-      price: close,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-      atr: indicators5m.atr,
-    });
-    const recent1mBars = this.recentBars1m.slice(-20).map((bar) => ({
-      ts: bar.ts,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-      volume: bar.volume,
-    }));
+    const forming5mBar = this.buildForming5mBar(ts);
     const previousMindState = this.state.mindState;
     const fallbackMindState5m: Record<string, any> = {
-      summary: "LLM unavailable",
       mindId: this.state.activeMind?.mindId,
+      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
-      action: "HOLD",
+      command: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
-      waiting_for: "LLM enabled",
+      waiting_for: "valid LLM response",
       invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      reset_reason: "",
-      invalidation_reason: "",
+      levels: { entry: null, stop: null, targets: [] },
       notes: [],
     };
-    const mindState = this.llmService
+    const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
-          mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: minimalIndicators,
+          relVol,
+          meta: {
+            nowTs: ts,
+            symbol,
+            barsCount5m: this.recentBars5m.length,
+            formingProgress: forming5mBar?.progressMinutes ?? null,
+          },
           freshness: this.buildFreshness(ts),
-          closed5mBars,
-          recent1mBars,
-          rangeContext,
-          swingPoints,
+          closed5mBars: this.recentBars5m.slice(-60),
+          forming5mBar,
           previousMindState,
           activeMind: this.state.activeMind,
         })
-      : fallbackMindState5m;
-    const nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+      : { mindState: fallbackMindState5m, valid: false };
+
+    if (!valid) {
+      console.error("[MINIMAL] MindState invalid: using HOLD fallback");
+    }
+    const command = mindState.command;
+    let nextActiveMind = this.state.activeMind;
+    if (valid) {
+      if (command === "RESET" || command === "INVALID") {
+        nextActiveMind = undefined;
+      } else {
+        nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+      }
+    }
 
     this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = mindState.summary;
+    this.state.lastLLMDecision = `${mindState.command}:${mindState.state}`;
 
     const direction = mindState.bias;
     console.log(
-      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.thesisState ?? "n/a"} action=${mindState.action ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
-    );
-    console.log(
-      `[MINIMAL][5M_CLOSE] bars5m=${this.recentBars5m.length} vwap=${Number.isFinite(minimalIndicators.vwap5m) ? minimalIndicators.vwap5m?.toFixed(2) : "n/a"} partial=${minimalIndicators.vwap_isPartial} sessionHigh=${Number.isFinite(minimalIndicators.sessionHigh) ? minimalIndicators.sessionHigh?.toFixed(2) : "n/a"} sessionLow=${Number.isFinite(minimalIndicators.sessionLow) ? minimalIndicators.sessionLow?.toFixed(2) : "n/a"} lastSwingHigh=${Number.isFinite(minimalIndicators.lastSwingHigh) ? minimalIndicators.lastSwingHigh?.toFixed(2) : "n/a"} lastSwingLow=${Number.isFinite(minimalIndicators.lastSwingLow) ? minimalIndicators.lastSwingLow?.toFixed(2) : "n/a"}`
+      `[MINIMAL][MIND_5M_CLOSE] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} command=${mindState.command ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=MIND_5M_CLOSE`);
 
@@ -1520,10 +1461,12 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: minimalIndicators,
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
+          lastClosed5mTs: closed5mBars[closed5mBars.length - 1]?.ts,
+          formingProgress: forming5mBar?.progressMinutes ?? null,
+          forming5mBar,
         },
       },
     ];
@@ -1534,23 +1477,7 @@ export class Orchestrator {
     this.trackMinimalBar(snapshot, "1m");
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
-    const indicators5m = this.recentBars5m.length >= 6
-      ? buildIndicatorSet(this.recentBars5m, "5m", { vwapMinBars: 5 })
-      : undefined;
-    console.log("[MINIMAL] indicators5m", indicators5m ?? {});
-    this.logReadyGate(ts);
-    const swingPoints = this.computeSwingPoints(this.recentBars5m, 12);
-    const sessionRange = computeContextRange({
-      ts,
-      bars1m: this.recentBars1m,
-      bars5m: this.recentBars5m,
-    });
-    const minimalIndicators = buildMinimalIndicatorSummary({
-      indicators5m,
-      price: close,
-      sessionRange,
-      swingPoints,
-    });
+    const relVol = this.computeRelVol(this.recentBars5m);
     const closed5mBars = this.recentBars5m.slice(-12).map((bar) => ({
       ts: bar.ts,
       open: bar.open,
@@ -1563,76 +1490,59 @@ export class Orchestrator {
     if (forming5mBar) {
       console.log(`[MINIMAL] forming5mBar progress=${forming5mBar.progressMinutes} start=${forming5mBar.startTs}`);
     }
-    const recent1mBars = this.recentBars1m.slice(-20).map((bar) => ({
-      ts: bar.ts,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-      volume: bar.volume,
-    }));
     const previousMindState = this.state.mindState;
     const fallbackMindState1m: Record<string, any> = {
-      summary: "LLM unavailable",
       mindId: this.state.activeMind?.mindId,
+      state: this.state.activeMind?.thesisState ?? "UNKNOWN",
       bias: this.state.activeMind?.bias ?? "NEUTRAL",
-      thesisState: this.state.activeMind?.thesisState ?? "FLAT",
-      action: "HOLD",
+      command: "HOLD",
       confidence: 0,
       because: "LLM unavailable",
-      waiting_for: "LLM enabled",
+      waiting_for: "valid LLM response",
       invalidation_conditions: this.state.activeMind?.invalidation_conditions ?? [],
-      reset_reason: "",
-      invalidation_reason: "",
+      levels: { entry: null, stop: null, targets: [] },
       notes: [],
     };
-    const mindState = this.llmService
+    const { mindState, valid } = this.llmService
       ? await this.llmService.getMindState({
-          mode: "EXEC_FORMING_5M",
           symbol,
           price: close,
-          indicators: minimalIndicators,
+          relVol,
+          meta: {
+            nowTs: ts,
+            symbol,
+            barsCount5m: this.recentBars5m.length,
+            formingProgress: forming5mBar?.progressMinutes ?? null,
+          },
           freshness: this.buildFreshness(ts),
-          closed5mBars,
+          closed5mBars: this.recentBars5m.slice(-60),
           forming5mBar,
-          recent1mBars,
-          swingPoints,
           previousMindState,
           activeMind: this.state.activeMind,
         })
-      : fallbackMindState1m;
-    const rawAction = typeof mindState.action === "string" ? mindState.action.toUpperCase() : "HOLD";
-    const action = ["HOLD", "ARM", "ENTER", "RESET", "INVALID", "SUSPEND"].includes(rawAction) ? rawAction : "HOLD";
-    const activeMind = this.state.activeMind;
-    let normalizedMindState: Record<string, any> = { ...mindState, action };
-    if (activeMind?.bias && mindState.bias && mindState.bias !== activeMind.bias && !["RESET", "INVALID"].includes(action)) {
-      console.log(`[MINIMAL] ignored_bias_flip_1m from=${mindState.bias} to=${activeMind.bias}`);
-      normalizedMindState = { ...normalizedMindState, bias: activeMind.bias };
-    }
-    if (Array.isArray(activeMind?.invalidation_conditions)) {
-      normalizedMindState = {
-        ...normalizedMindState,
-        invalidation_conditions: activeMind.invalidation_conditions,
-      };
-    }
-    if (action === "INVALID" && !this.validateInvalidation(mindState, activeMind)) {
-      console.log("[MINIMAL] invalid_invalid: invalidation_reason does not match activeMind.invalidation_conditions");
-      normalizedMindState = {
-        ...normalizedMindState,
-        action: "RESET",
-        reset_reason: normalizedMindState.reset_reason ?? "invalid_invalid",
-      };
-    }
-    const nextActiveMind = this.extractActiveMind(normalizedMindState) ?? this.state.activeMind;
+      : { mindState: fallbackMindState1m, valid: false };
 
-    this.state.mindState = normalizedMindState;
+    if (!valid) {
+      console.error("[MINIMAL] MindState invalid: using HOLD fallback");
+    }
+    const command = mindState.command;
+    let nextActiveMind = this.state.activeMind;
+    if (valid) {
+      if (command === "RESET" || command === "INVALID") {
+        nextActiveMind = undefined;
+      } else {
+        nextActiveMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+      }
+    }
+
+    this.state.mindState = mindState;
     this.state.activeMind = nextActiveMind;
     this.state.lastLLMCallAt = ts;
-    this.state.lastLLMDecision = normalizedMindState.summary;
+    this.state.lastLLMDecision = `${mindState.command}:${mindState.state}`;
 
-    const direction = normalizedMindState.bias;
+    const direction = mindState.bias;
     console.log(
-      `[MINIMAL][EXEC_FORMING_5M] mind=${normalizedMindState.mindId ?? "n/a"} bias=${normalizedMindState.bias ?? "n/a"} state=${normalizedMindState.thesisState ?? "n/a"} action=${normalizedMindState.action ?? "n/a"} conf=${Number.isFinite(normalizedMindState.confidence) ? normalizedMindState.confidence : "n/a"} wait=${normalizedMindState.waiting_for ?? "n/a"}`
+      `[MINIMAL][EXEC_FORMING_5M] mind=${mindState.mindId ?? "n/a"} bias=${mindState.bias ?? "n/a"} state=${mindState.state ?? "n/a"} command=${mindState.command ?? "n/a"} conf=${Number.isFinite(mindState.confidence) ? mindState.confidence : "n/a"} wait=${mindState.waiting_for ?? "n/a"}`
     );
     console.log(`[MINIMAL] MIND_STATE_UPDATED symbol=${symbol} ts=${ts} mode=EXEC_FORMING_5M`);
 
@@ -1646,10 +1556,11 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: minimalIndicators,
-          mindState: normalizedMindState,
+          mindState,
           activeMind: nextActiveMind,
           mode: "EXEC_FORMING_5M",
+          lastClosed5mTs: closed5mBars[closed5mBars.length - 1]?.ts,
+          formingProgress: forming5mBar?.progressMinutes ?? null,
           forming5mBar,
         },
       },
@@ -1674,39 +1585,6 @@ export class Orchestrator {
       session: this.state.session,
       lastTradePx: this.state.price,
     };
-  }
-
-  private logReadyGate(ts: number): void {
-    if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
-    this.lastReadyLogTs = ts;
-    const bars5m = this.recentBars5m.length;
-    const readyRSI5m = bars5m >= 15;
-    const readyATR5m = bars5m >= 15;
-    const readyEma20_5m = bars5m >= 20;
-    const readyVWAP5mPartial = bars5m >= 2;
-    const readyVWAP5m = bars5m >= 30;
-    console.log(
-      `[MINIMAL] READY_5M bars5m=${bars5m} RSI5m=${readyRSI5m} ATR5m=${readyATR5m} EMA20_5m=${readyEma20_5m} VWAP5m_partial=${readyVWAP5mPartial} VWAP5m=${readyVWAP5m}`
-    );
-  }
-
-  private logVwapDiagnostics(ts: number): void {
-    const bars = this.recentBars5m;
-    if (bars.length === 0) return;
-    const lastTs = bars[bars.length - 1]!.ts;
-    const lastDate = new Date(lastTs);
-    const sessionStartTs = etToUtcTimestamp(9, 30, lastDate);
-    const sessionEndTs = etToUtcTimestamp(16, 0, lastDate);
-    let sessionBars = 0;
-    let sessionVolume = 0;
-    for (const bar of bars) {
-      if (bar.ts < sessionStartTs || bar.ts >= sessionEndTs) continue;
-      sessionBars += 1;
-      sessionVolume += bar.volume ?? 0;
-    }
-    console.log(
-      `[MINIMAL] VWAP_DIAG ts=${ts} sessionBars=${sessionBars} sessionVol=${Math.round(sessionVolume)} last5mTs=${lastTs}`
-    );
   }
 
   /**
