@@ -276,8 +276,8 @@ if (alpacaKey && alpacaSecret) {
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
       const agg5mFrom1m = new BarAggregator(5);
       const agg15mFrom5m = new BarAggregator(15);
-      const warmup5mBars = Math.max(0, parseInt(process.env.WARMUP_5M_BARS || "50", 10));
-      const warmup1mBars = Math.max(0, parseInt(process.env.WARMUP_1M_BARS || "30", 10));
+      const warmup5mBars = Math.max(0, parseInt(process.env.WARMUP_5M_BARS || "30", 10));
+      const warmup1mBars = Math.max(0, parseInt(process.env.WARMUP_1M_BARS || "60", 10));
       
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
 

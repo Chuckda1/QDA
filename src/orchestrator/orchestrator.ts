@@ -246,25 +246,41 @@ function buildIndicatorSnapshot(params: {
   };
 }
 
-function buildMinimalIndicatorSummary(snapshot: Record<string, any>): {
-  vwap_1m: number | null;
-  vwap_5m: number | null;
-  rsi_1m: number | null;
-  rsi_5m: number | null;
-  atr_1m: number | null;
-  atr_5m: number | null;
-  relVol: number | null;
+function buildMinimalIndicatorSummary(
+  indicators1m: ReturnType<typeof buildIndicatorSet>,
+  indicators5m: ReturnType<typeof buildIndicatorSet> | undefined,
+  relVol?: number
+): {
+  vwap1m: number | null;
+  vwap5m: number | null;
+  rsi14_1m: number | null;
+  rsi14_5m: number | null;
+  atr14_1m: number | null;
+  atr14_5m: number | null;
+  ema9_1m: number | null;
+  ema20_1m: number | null;
+  ema50_1m: number | null;
+  ema9_5m: number | null;
+  ema20_5m: number | null;
+  ema50_5m: number | null;
+  relVol1m: number | null;
 } {
   const toNumberOrNull = (value: unknown): number | null =>
     Number.isFinite(value) ? (value as number) : null;
   return {
-    vwap_1m: toNumberOrNull(snapshot?.vwap?.["1m"]),
-    vwap_5m: toNumberOrNull(snapshot?.vwap?.["5m"]),
-    rsi_1m: toNumberOrNull(snapshot?.rsi14?.["1m"]),
-    rsi_5m: toNumberOrNull(snapshot?.rsi14?.["5m"]),
-    atr_1m: toNumberOrNull(snapshot?.atr14?.["1m"]),
-    atr_5m: toNumberOrNull(snapshot?.atr14?.["5m"]),
-    relVol: toNumberOrNull(snapshot?.volume?.relVol),
+    vwap1m: toNumberOrNull(indicators1m.vwap),
+    vwap5m: toNumberOrNull(indicators5m?.vwap),
+    rsi14_1m: toNumberOrNull(indicators1m.rsi14),
+    rsi14_5m: toNumberOrNull(indicators5m?.rsi14),
+    atr14_1m: toNumberOrNull(indicators1m.atr),
+    atr14_5m: toNumberOrNull(indicators5m?.atr),
+    ema9_1m: toNumberOrNull(indicators1m.ema9),
+    ema20_1m: toNumberOrNull(indicators1m.ema20),
+    ema50_1m: toNumberOrNull(indicators1m.ema50),
+    ema9_5m: toNumberOrNull(indicators5m?.ema9),
+    ema20_5m: toNumberOrNull(indicators5m?.ema20),
+    ema50_5m: toNumberOrNull(indicators5m?.ema50),
+    relVol1m: toNumberOrNull(relVol),
   };
 }
 
@@ -730,6 +746,7 @@ export class Orchestrator {
   private lastRegimeLabel?: RegimeResult["regime"];
   private transitionLockRemaining: number = 0;
   private readonly transitionLockBars: number = 3;
+  private lastReadyLogTs: number | null = null;
 
   private lastTacticalDirection?: Direction | "NEUTRAL";
   private pendingTacticalDirection?: Direction | "NEUTRAL";
@@ -1389,6 +1406,7 @@ export class Orchestrator {
     console.log("[MINIMAL] indicators1m", indicators1m);
     console.log("[MINIMAL] indicators5m", indicators5m);
     console.log("[MINIMAL] indicators merged", indicators);
+    this.logReadyGate(ts);
     const relVol = this.computeRelVol(this.recentBars1m);
     const indicatorSnapshot = buildIndicatorSnapshot({
       price: close,
@@ -1436,7 +1454,7 @@ export class Orchestrator {
           mode: "MIND_5M_CLOSE",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
+          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
           freshness: this.buildFreshness(ts),
           closed5mBars,
           rangeContext,
@@ -1468,7 +1486,7 @@ export class Orchestrator {
           symbol,
           price: close,
           direction,
-          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
+          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
           mindState,
           activeMind: nextActiveMind,
           mode: "MIND_5M_CLOSE",
@@ -1488,6 +1506,7 @@ export class Orchestrator {
     console.log("[MINIMAL] indicators1m", indicators1m);
     console.log("[MINIMAL] indicators5m", indicators5m ?? {});
     console.log("[MINIMAL] indicators merged", indicators);
+    this.logReadyGate(ts);
     const relVol = this.computeRelVol(this.recentBars1m);
     const volumePolicySnapshot = relVol !== undefined ? volumePolicy(relVol) : undefined;
     const volumeLine =
@@ -1553,7 +1572,7 @@ export class Orchestrator {
           mode: "EXEC_1M",
           symbol,
           price: close,
-          indicators: buildMinimalIndicatorSummary(indicatorSnapshot),
+          indicators: buildMinimalIndicatorSummary(indicators1m, indicators5m, relVol),
           relVol,
           freshness: this.buildFreshness(ts),
           closed5mBars,
@@ -1642,6 +1661,16 @@ export class Orchestrator {
       session: this.state.session,
       lastTradePx: this.state.price,
     };
+  }
+
+  private logReadyGate(ts: number): void {
+    if (this.lastReadyLogTs && ts - this.lastReadyLogTs < 5 * 60 * 1000) return;
+    this.lastReadyLogTs = ts;
+    const ready1m = this.recentBars1m.length >= 30;
+    const ready5m = this.recentBars5m.length >= 15;
+    console.log(
+      `[MINIMAL] READY gate 1m=${ready1m} 5m=${ready5m} bars1m=${this.recentBars1m.length} bars5m=${this.recentBars5m.length}`
+    );
   }
 
   /**
