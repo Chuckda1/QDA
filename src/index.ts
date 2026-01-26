@@ -144,11 +144,32 @@ const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
   }
 }, () => orch.getLastDiagnostics(), (potd) => orch.setPotdState(potd));
 
+// STAGE 3: Start structured pulse timer (every 60 seconds, runs in all modes)
+const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+
 // Start scheduler
 scheduler.start();
 
-// STAGE 3: Start structured pulse timer (every 60 seconds, runs in all modes)
-const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+// One-shot minimal tick (startup confirmation)
+if ((process.env.BOT_MODE || "").toLowerCase() === "minimal") {
+  setTimeout(async () => {
+    try {
+      const now = Date.now();
+      await orch.processTick({
+        ts: now,
+        symbol,
+        close: 500,
+        open: 499,
+        high: 501,
+        low: 498,
+        volume: 1000,
+      }, "1m");
+      console.log("[MINIMAL] one-shot tick injected");
+    } catch (err: any) {
+      console.error("[MINIMAL] one-shot tick failed:", err?.message || String(err));
+    }
+  }, 1500);
+}
 setInterval(() => {
   logStructuredPulse(orch, governor, symbol);
 }, 60000); // 60 seconds

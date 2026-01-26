@@ -1,9 +1,9 @@
 import type { Play, SetupCandidate, TradeAction } from "../../types.js";
-import type { DecisionBlocker } from "../../legacy/legacyTypes.js";
+import type { DecisionBlocker } from "../legacyTypes.js";
 
 export type DecisionStatus = "NO_SETUP" | "BLOCKED" | "LLM_PASS" | "ARMED";
 /** @deprecated Legacy-only. Do not use in minimal mode. */
-export type { DecisionBlocker } from "../../legacy/legacyTypes.js";
+export type { DecisionBlocker } from "../legacyTypes.js";
 export type DecisionLlmSummary = {
   biasDirection?: "LONG" | "SHORT" | "NEUTRAL";
   agreement?: number;
