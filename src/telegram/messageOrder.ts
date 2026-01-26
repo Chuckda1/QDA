@@ -27,6 +27,7 @@ const PRIORITY: Record<DomainEventType, number> = {
   VOLUME_UPDATE: 18,
   PLAN_OF_DAY: 0, // Highest priority (scheduled)
   MIND_STATE_UPDATED: 2,
+  SESSION_UPDATE: 19,
 };
 
 /**
