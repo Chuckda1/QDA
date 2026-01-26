@@ -1,6 +1,6 @@
 export type OHLCV = {
   ts: number;
-  open: number;
+  open?: number;
   high: number;
   low: number;
   close: number;
@@ -144,8 +144,9 @@ export function detectBreak(
 
 export function entrySignalUptrend(forming: OHLCV, lastSwingLow: number): EntrySignal {
   const range = forming.high - forming.low;
-  const body = Math.abs(forming.close - forming.open);
-  const bullish = forming.close > forming.open;
+  const open = forming.open ?? forming.close;
+  const body = Math.abs(forming.close - open);
+  const bullish = forming.close > open;
 
   const nearSupport = forming.low <= lastSwingLow * 1.001;
   const strongCandle = bullish && range > 0 && body / range >= 0.5;
@@ -165,8 +166,9 @@ export function entrySignalUptrend(forming: OHLCV, lastSwingLow: number): EntryS
 
 export function entrySignalDowntrend(forming: OHLCV, lastSwingHigh: number): EntrySignal {
   const range = forming.high - forming.low;
-  const body = Math.abs(forming.close - forming.open);
-  const bearish = forming.close < forming.open;
+  const open = forming.open ?? forming.close;
+  const body = Math.abs(forming.close - open);
+  const bearish = forming.close < open;
 
   const nearResistance = forming.high >= lastSwingHigh * 0.999;
   const strongCandle = bearish && range > 0 && body / range >= 0.5;
