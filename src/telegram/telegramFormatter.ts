@@ -25,15 +25,15 @@ const formatUpdateHeader = (input: {
   const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
   if (input.fromSide && input.toSide) {
     if (input.fromSide === input.toSide) {
-      return `UPDATE: ${input.symbol} ${input.fromSide} 🔁 | px ${px}`;
+      return `UPDATE: ${input.symbol} ${input.fromSide} 🔁 | pr ${px}`;
     }
-    return `UPDATE: ${input.symbol} ${input.fromSide} → ${input.toSide} 🔁 | px ${px}`;
+    return `UPDATE: ${input.symbol} ${input.fromSide} → ${input.toSide} 🔁 | pr ${px}`;
   }
   const side = input.toSide ?? input.fromSide;
   if (side) {
-    return `UPDATE: ${input.symbol} ${side} 🔁 | px ${px}`;
+    return `UPDATE: ${input.symbol} ${side} 🔁 | pr ${px}`;
   }
-  return `UPDATE: ${input.symbol} | px ${px}`;
+  return `UPDATE: ${input.symbol} | pr ${px}`;
 };
 
 const formatManageHeader = (input: {
@@ -43,7 +43,7 @@ const formatManageHeader = (input: {
   ts: string;
 }): string => {
   const px = Number.isFinite(input.px) ? formatPrice(input.px) : "—";
-  return `MANAGE: ${input.symbol} ${input.dir} 🛠️ | px ${px} | ${input.ts}`;
+  return `MANAGE: ${input.symbol} ${input.dir} 🛠️ | pr ${px} | ${input.ts}`;
 };
 
 const enforceLineLimit = (type: TelegramSnapshotType, lines: string[]): string[] => {
@@ -87,7 +87,7 @@ const formatEtTimeShort = (ts?: string): string | undefined => {
 export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | null {
   if (snapshot.type === "SIGNAL") {
     const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
-    const header = `${snapshot.symbol} ${snapshot.dir} ✅ ${snapshot.conf ?? "?"}% | SIGNAL | risk=${snapshot.risk} | px ${px} | ${snapshot.ts ?? "n/a"}`;
+    const header = `${snapshot.symbol} ${snapshot.dir} ✅ ${snapshot.conf ?? "?"}% | SIGNAL | risk=${snapshot.risk} | pr ${px} | ${snapshot.ts ?? "n/a"}`;
     const entryTf = snapshot.entryTriggerTf ? `${snapshot.entryTriggerTf} close` : "1m close";
     const chase = snapshot.chaseAllowed ? "YES" : "NO";
     const entry = `ENTRY: ${snapshot.entryTrigger ?? "n/a"} (${entryTf}) | CHASE: ${chase}`;
@@ -108,7 +108,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       const time = formatEtTimeShort(snapshot.range.ts ?? snapshot.ts);
       const timeSuffix = time ? ` | ${time}` : "";
       const modeLabel = snapshot.range.mode === "TIGHT" ? "CHOP" : "RANGE";
-      const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | px ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
+      const header = `${snapshot.symbol} ⚪ ${modeLabel} | WATCH | pr ${formatPrice(snapshot.range.price)} | risk=${snapshot.risk}${timeSuffix}`;
       const contextLine = snapshot.range.contextRange
         ? `CONTEXT_RANGE: ${formatPrice(snapshot.range.contextRange.low)}-${formatPrice(snapshot.range.contextRange.high)} | VWAP ${formatPrice(snapshot.range.vwap)}`
         : `CONTEXT_RANGE: n/a | VWAP ${formatPrice(snapshot.range.vwap)}`;
@@ -171,7 +171,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       return { type: "WATCH", lines: lines.slice(0, 14), text: lines.slice(0, 14).join("\n") };
     }
     const px = Number.isFinite(snapshot.px) ? formatPrice(snapshot.px) : "—";
-    const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk} | px ${px} | ${snapshot.ts ?? "n/a"}`;
+    const header = `${snapshot.symbol} ${snapshot.dir} 🟡 ${snapshot.conf ?? "?"}% | WATCH | risk=${snapshot.risk} | pr ${px} | ${snapshot.ts ?? "n/a"}`;
     const arm = `ARM: ${snapshot.armCondition ?? "n/a"} (creates play)`;
     const entry = `ENTRY: ${snapshot.entryRule ?? "pullback only (NO chase)"}`;
     const planStop = `STOP PLAN: ${snapshot.planStop ?? "last swing (auto when armed)"}`;
@@ -201,7 +201,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const updatePx = Number.isFinite(update.price) ? update.price : snapshot.px;
     const isTimeCutoff = update.cause === "time cutoff";
     const header = isTimeCutoff
-      ? `UPDATE: TIME CUTOFF ⏱️ | ${snapshot.symbol} | px ${Number.isFinite(updatePx) ? formatPrice(updatePx) : "—"}`
+      ? `UPDATE: TIME CUTOFF ⏱️ | ${snapshot.symbol} | pr ${Number.isFinite(updatePx) ? formatPrice(updatePx) : "—"}`
       : formatUpdateHeader({
       symbol: snapshot.symbol,
       fromSide: update.fromSide,
