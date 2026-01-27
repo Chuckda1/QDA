@@ -134,35 +134,37 @@ export class Orchestrator {
 
   private buildMinimalSetupCandidates(params: {
     closed5mBars: RawBar[];
+    activeDirection?: "long" | "short" | "none";
   }): MinimalSetupCandidate[] {
-    const { closed5mBars } = params;
+    const { closed5mBars, activeDirection } = params;
     const lastClosed = closed5mBars[closed5mBars.length - 1];
     if (!lastClosed) return [];
     const swings = extractSwings(closed5mBars, 2, false);
     const { lastHigh, lastLow } = lastSwings(swings);
-    const pullbackHigh = lastClosed.high;
-    const pullbackLow = lastClosed.low;
     const lastSwingHigh = lastHigh?.price;
     const lastSwingLow = lastLow?.price;
 
-    const longInvalidation = Number.isFinite(lastSwingLow) ? (lastSwingLow as number) : pullbackLow;
-    const shortInvalidation = Number.isFinite(lastSwingHigh) ? (lastSwingHigh as number) : pullbackHigh;
+    if (!Number.isFinite(lastSwingLow) || !Number.isFinite(lastSwingHigh)) return [];
 
-    if (!Number.isFinite(longInvalidation) || !Number.isFinite(shortInvalidation)) return [];
-
-    const longRef = Number.isFinite(lastSwingLow) ? "lastSwingLow" : "pullbackLow";
-    const shortRef = Number.isFinite(lastSwingHigh) ? "lastSwingHigh" : "pullbackHigh";
     const priceRef = lastClosed.close;
-    const longDist = Math.abs(priceRef - longInvalidation);
-    const shortDist = Math.abs(priceRef - shortInvalidation);
-    const longPct = priceRef ? (longDist / priceRef) * 100 : 0;
-    const shortPct = priceRef ? (shortDist / priceRef) * 100 : 0;
-    console.log(
-      `[INV_DEBUG] dir=LONG inv=${longInvalidation.toFixed(2)} ref=${longRef} price=${priceRef.toFixed(2)} dist=${longDist.toFixed(2)} (${longPct.toFixed(3)}%) atr5m=n/a dist/atr=n/a`
-    );
-    console.log(
-      `[INV_DEBUG] dir=SHORT inv=${shortInvalidation.toFixed(2)} ref=${shortRef} price=${priceRef.toFixed(2)} dist=${shortDist.toFixed(2)} (${shortPct.toFixed(3)}%) atr5m=n/a dist/atr=n/a`
-    );
+    const buffer = Math.max(0.2, priceRef * 0.0003);
+    const longInvalidation = (lastSwingLow as number) - buffer;
+    const shortInvalidation = (lastSwingHigh as number) + buffer;
+
+    if (activeDirection === "long") {
+      const longDist = Math.abs(priceRef - longInvalidation);
+      const longPct = priceRef ? (longDist / priceRef) * 100 : 0;
+      console.log(
+        `[INV_DEBUG] dir=LONG inv=${longInvalidation.toFixed(2)} ref=thesisSwingLow price=${priceRef.toFixed(2)} dist=${longDist.toFixed(2)} (${longPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} atr5m=n/a dist/atr=n/a`
+      );
+    }
+    if (activeDirection === "short") {
+      const shortDist = Math.abs(priceRef - shortInvalidation);
+      const shortPct = priceRef ? (shortDist / priceRef) * 100 : 0;
+      console.log(
+        `[INV_DEBUG] dir=SHORT inv=${shortInvalidation.toFixed(2)} ref=thesisSwingHigh price=${priceRef.toFixed(2)} dist=${shortDist.toFixed(2)} (${shortPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} atr5m=n/a dist/atr=n/a`
+      );
+    }
 
     const baseId = lastClosed.ts;
     return [
@@ -175,8 +177,6 @@ export class Orchestrator {
         referenceLevels: {
           lastSwingHigh,
           lastSwingLow,
-          pullbackHigh,
-          pullbackLow,
         },
         rationale: "Recent pullback provides a defined trigger and invalidation.",
       },
@@ -189,8 +189,6 @@ export class Orchestrator {
         referenceLevels: {
           lastSwingHigh,
           lastSwingLow,
-          pullbackHigh,
-          pullbackLow,
         },
         rationale: "Recent pullback provides a defined trigger and invalidation.",
       },
@@ -255,7 +253,10 @@ export class Orchestrator {
       );
     }
     if (this.llmService) {
-      const candidates = this.buildMinimalSetupCandidates({ closed5mBars: barsForCandidates });
+      const candidates = this.buildMinimalSetupCandidates({
+        closed5mBars: barsForCandidates,
+        activeDirection: exec.thesisDirection,
+      });
       if (candidates.length < 2) {
         if (warmupNote && exec.phase === "WAITING_FOR_THESIS") {
           exec.waitReason = warmupNote;
