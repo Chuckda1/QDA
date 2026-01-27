@@ -1459,27 +1459,11 @@ export class Orchestrator {
       exec.pendingCount = 0;
       return { accepted: true, flipped: false, pending: false };
     }
-    if (confidence >= 75) {
-      exec.thesisDirection = nextDirection;
-      exec.thesisConfidence = confidence;
-      exec.pendingDirection = undefined;
-      exec.pendingCount = 0;
-      return { accepted: true, flipped: true, pending: false };
-    }
-    if (exec.pendingDirection === nextDirection) {
-      exec.pendingCount = (exec.pendingCount ?? 0) + 1;
-    } else {
-      exec.pendingDirection = nextDirection;
-      exec.pendingCount = 1;
-    }
-    if ((exec.pendingCount ?? 0) >= 2) {
-      exec.thesisDirection = nextDirection;
-      exec.thesisConfidence = confidence;
-      exec.pendingDirection = undefined;
-      exec.pendingCount = 0;
-      return { accepted: true, flipped: true, pending: false };
-    }
-    return { accepted: false, flipped: false, pending: true };
+    exec.thesisDirection = nextDirection;
+    exec.thesisConfidence = confidence;
+    exec.pendingDirection = undefined;
+    exec.pendingCount = 0;
+    return { accepted: true, flipped: true, pending: false };
   }
 
   private computeMinimalTargets(direction: "long" | "short", entry: number, stop: number): number[] {
