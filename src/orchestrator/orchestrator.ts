@@ -6,6 +6,7 @@ import type {
   BotState,
   DomainEvent,
   Forming5mBar,
+  MinimalDebugInfo,
   MinimalExecutionPhase,
   MinimalExecutionState,
   MinimalLLMSnapshot,
@@ -182,8 +183,8 @@ export class Orchestrator {
 
     const priceRef = lastClosed.close;
     const buffer = Math.max(0.2, priceRef * 0.0003);
-    let longInvalidation: number;
-    let shortInvalidation: number;
+    let longInvalidation: number = priceRef - buffer; // Default fallback
+    let shortInvalidation: number = priceRef + buffer; // Default fallback
     let referenceLevels: { lastSwingHigh?: number; lastSwingLow?: number } = {};
     let mode: "SWING" | "FALLBACK" = "FALLBACK";
 
@@ -258,10 +259,10 @@ export class Orchestrator {
     }
 
     const baseId = lastClosed.ts;
-    const builtCandidates = [
+    const builtCandidates: MinimalSetupCandidate[] = [
       {
         id: `MIN_LONG_${baseId}`,
-        direction: "LONG",
+        direction: "LONG" as const,
         entryTrigger: "Enter on break above pullback high after a pullback down.",
         invalidationLevel: longInvalidation,
         pullbackRule: "Pullback = last closed 5m bar closes down or makes a lower low.",
@@ -272,7 +273,7 @@ export class Orchestrator {
       },
       {
         id: `MIN_SHORT_${baseId}`,
-        direction: "SHORT",
+        direction: "SHORT" as const,
         entryTrigger: "Enter on break below pullback low after a pullback up.",
         invalidationLevel: shortInvalidation,
         pullbackRule: "Pullback = last closed 5m bar closes up or makes a higher high.",
@@ -351,10 +352,35 @@ export class Orchestrator {
 
     // LLM sees ONLY 5m data: closed5mBars + forming5mBar
     // No warmup gating - LLM can be called with any bars
+    let debugInfo: MinimalDebugInfo | undefined = undefined;
     if (this.llmService) {
       // Call LLM if we have any 5m data (closed bars or forming bar)
       const has5mData = closed5mBars.length > 0 || forming5mBar !== null;
       if (has5mData) {
+        // Compute debug info before LLM call
+        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
+          ts: forming5mBar.endTs,
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+        }] : []);
+        
+        debugInfo = {
+          barsClosed5m: closed5mBars.length,
+          hasForming5m: !!forming5mBar,
+          formingProgressMin: forming5mBar?.progressMinutes ?? null,
+          formingStartTs: forming5mBar?.startTs ?? null,
+          formingEndTs: forming5mBar?.endTs ?? null,
+          formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
+          lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
+          candidateBarsUsed: barsForCandidates.length,
+          candidateCount: null, // No candidates in new schema
+          botPhase: exec.phase,
+          botWaitReason: exec.waitReason ?? null,
+        };
+
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
@@ -370,6 +396,11 @@ export class Orchestrator {
         const decision = result.decision;
         this.state.lastLLMCallAt = ts;
         this.state.lastLLMDecision = decision.because ?? decision.action;
+        
+        // LLM_VIS log with all debug info
+        console.log(
+          `[LLM_VIS] sel=${decision.action} conf=${decision.confidence} barsClosed5m=${debugInfo.barsClosed5m} forming=${debugInfo.hasForming5m ? "Y" : "N"} prog=${debugInfo.formingProgressMin ?? "n/a"} cand=${debugInfo.candidateCount ?? "n/a"} phase=${debugInfo.botPhase} wait=${debugInfo.botWaitReason ?? "n/a"}`
+        );
         console.log(
           `[LLM_MIN] selected=${decision.action} conf=${decision.confidence} barsClosed=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"}`
         );
@@ -384,7 +415,7 @@ export class Orchestrator {
           exec.thesisConfidence = decision.confidence;
           exec.activeCandidate = undefined;
           exec.phase = "WAITING_FOR_THESIS";
-          exec.waitReason = decision.waiting_for ?? "llm_wait";
+          exec.waitReason = decision.waiting_for;
           this.clearTradeState(exec);
         } else {
           exec.thesisDirection = decision.action === "ARM_LONG" ? "long" : "short";
@@ -521,6 +552,7 @@ export class Orchestrator {
           candidate: exec.activeCandidate ?? null,
           botState: exec.phase,
           waitFor: exec.waitReason ?? null,
+          debug: debugInfo,
         },
       },
     ];

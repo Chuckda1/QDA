@@ -116,6 +116,20 @@ export interface BotState {
 
 export type DomainEventType = "MIND_STATE_UPDATED";
 
+export type MinimalDebugInfo = {
+  barsClosed5m: number;
+  hasForming5m: boolean;
+  formingProgressMin: number | null;
+  formingStartTs: number | null;
+  formingEndTs: number | null;
+  formingRange: number | null;
+  lastClosedRange: number | null;
+  candidateBarsUsed: number;
+  candidateCount: number | null;
+  botPhase: MinimalExecutionPhase;
+  botWaitReason: string | null;
+};
+
 export interface DomainEvent {
   type: DomainEventType;
   timestamp: number;
@@ -134,5 +148,6 @@ export interface DomainEvent {
     candidate?: MinimalSetupCandidate | null;
     botState: MinimalExecutionPhase;
     waitFor?: string | null;
+    debug?: MinimalDebugInfo;
   };
 }

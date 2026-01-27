@@ -2,6 +2,8 @@ import type { DomainEvent } from "../types.js";
 
 export type TelegramSnapshotType = "MIND";
 
+import type { MinimalDebugInfo } from "../types.js";
+
 export type TelegramSnapshot = {
   type: TelegramSnapshotType;
   symbol: string;
@@ -14,6 +16,7 @@ export type TelegramSnapshot = {
   invalidation?: number;
   trigger?: string;
   ts?: string;
+  debug?: MinimalDebugInfo;
 };
 
 const formatEtTimestamp = (ts: number): string =>
@@ -47,5 +50,6 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     invalidation,
     trigger,
     ts: formatEtTimestamp(event.timestamp),
+    debug: event.data.debug,
   };
 }

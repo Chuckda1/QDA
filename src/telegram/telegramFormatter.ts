@@ -25,5 +25,17 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     snapshot.reason ? `REASON: ${snapshot.reason}` : undefined,
   ].filter(Boolean) as string[];
 
+  // Add debug line for minimal mode
+  if (snapshot.debug) {
+    const d = snapshot.debug;
+    const barsClosed = d.barsClosed5m ?? "n/a";
+    const forming = d.hasForming5m ? `Y(${d.formingProgressMin ?? "n/a"})` : "N";
+    const cand = d.candidateCount ?? "n/a";
+    const phase = d.botPhase ?? "n/a";
+    const sel = snapshot.direction ?? "n/a";
+    const debugLine = `DEBUG: 5mClosed=${barsClosed} forming=${forming} cand=${cand} phase=${phase} conf=${conf} sel=${sel}`;
+    lines.push(debugLine);
+  }
+
   return { type: "MIND", lines, text: lines.join("\n") };
 }
