@@ -27,6 +27,19 @@ export type MinimalLLMSnapshot = {
   forming5mBar?: Forming5mBar | null;
 };
 
+export type ArmDecisionRaw5mResponse = {
+  mindId: string;
+  action: "ARM_LONG" | "ARM_SHORT" | "WAIT";
+  confidence: number; // 0-100
+  because: string;
+  waiting_for: string; // Required field
+};
+
+export type ArmDecisionRaw5mResult = {
+  decision: ArmDecisionRaw5mResponse;
+  valid: boolean;
+};
+
 export type MinimalSetupCandidate = {
   id: string;
   direction: "LONG" | "SHORT";

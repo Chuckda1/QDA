@@ -9,6 +9,7 @@ import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
 import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import { StateStore } from "./persistence/stateStore.js";
+import { BarAggregator } from "./datafeed/barAggregator.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
@@ -122,6 +123,7 @@ try {
 const orch = new Orchestrator(instanceId, llmService);
 const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, instanceId, llmService);
+const agg5m = new BarAggregator(5);
 
 // Initialize scheduler
 const scheduler = new Scheduler(governor, instanceId, (mode) => {
@@ -246,12 +248,13 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
           try {
-            console.log(
-              `[INGEST][ALPACA] tf=1m ts=${bar.ts} o=${bar.open} h=${bar.high} l=${bar.low} c=${bar.close} v=${bar.volume}`
-            );
             const normalizedBar = normalizeBar(bar);
-            bars5mCount++;
-            const events5m = await orch.processTick(
+            console.log(
+              `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
+            );
+            
+            // a) Update forming5mBar with 1m bar (no LLM call)
+            const events1m = await orch.processTick(
               {
                 ts: normalizedBar.ts,
                 symbol: normalizedBar.symbol,
@@ -261,9 +264,43 @@ if (alpacaKey && alpacaSecret) {
                 low: normalizedBar.low,
                 volume: normalizedBar.volume
               },
-              "5m"
+              "1m"
             );
-            await publisher.publishOrdered(events5m);
+            
+            // b) Push 1m bar to aggregator, get closed 5m if bucket completed
+            const closed5m = agg5m.push1m({
+              ts: normalizedBar.ts,
+              symbol: normalizedBar.symbol,
+              open: normalizedBar.open,
+              high: normalizedBar.high,
+              low: normalizedBar.low,
+              close: normalizedBar.close,
+              volume: normalizedBar.volume,
+            });
+            
+            // c) If closed 5m bar exists, process it (triggers LLM)
+            if (closed5m !== null) {
+              console.log(
+                `[CLOSE5M] ts=${closed5m.ts} o=${closed5m.open} h=${closed5m.high} l=${closed5m.low} c=${closed5m.close} v=${closed5m.volume}`
+              );
+              bars5mCount++;
+              const events5m = await orch.processTick(
+                {
+                  ts: closed5m.ts,
+                  symbol: closed5m.symbol,
+                  close: closed5m.close,
+                  open: closed5m.open,
+                  high: closed5m.high,
+                  low: closed5m.low,
+                  volume: closed5m.volume
+                },
+                "5m"
+              );
+              await publisher.publishOrdered(events5m);
+            }
+            
+            // Publish 1m events if any (for state updates)
+            await publisher.publishOrdered(events1m);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
@@ -278,12 +315,13 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
           try {
-            console.log(
-              `[INGEST][ALPACA] tf=1m ts=${bar.ts} o=${bar.open} h=${bar.high} l=${bar.low} c=${bar.close} v=${bar.volume}`
-            );
             const normalizedBar = normalizeBar(bar);
-            bars5mCount++;
-            const events5m = await orch.processTick(
+            console.log(
+              `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
+            );
+            
+            // a) Update forming5mBar with 1m bar (no LLM call)
+            const events1m = await orch.processTick(
               {
                 ts: normalizedBar.ts,
                 symbol: normalizedBar.symbol,
@@ -293,9 +331,43 @@ if (alpacaKey && alpacaSecret) {
                 low: normalizedBar.low,
                 volume: normalizedBar.volume
               },
-              "5m"
+              "1m"
             );
-            await publisher.publishOrdered(events5m);
+            
+            // b) Push 1m bar to aggregator, get closed 5m if bucket completed
+            const closed5m = agg5m.push1m({
+              ts: normalizedBar.ts,
+              symbol: normalizedBar.symbol,
+              open: normalizedBar.open,
+              high: normalizedBar.high,
+              low: normalizedBar.low,
+              close: normalizedBar.close,
+              volume: normalizedBar.volume,
+            });
+            
+            // c) If closed 5m bar exists, process it (triggers LLM)
+            if (closed5m !== null) {
+              console.log(
+                `[CLOSE5M] ts=${closed5m.ts} o=${closed5m.open} h=${closed5m.high} l=${closed5m.low} c=${closed5m.close} v=${closed5m.volume}`
+              );
+              bars5mCount++;
+              const events5m = await orch.processTick(
+                {
+                  ts: closed5m.ts,
+                  symbol: closed5m.symbol,
+                  close: closed5m.close,
+                  open: closed5m.open,
+                  high: closed5m.high,
+                  low: closed5m.low,
+                  volume: closed5m.volume
+                },
+                "5m"
+              );
+              await publisher.publishOrdered(events5m);
+            }
+            
+            // Publish 1m events if any (for state updates)
+            await publisher.publishOrdered(events1m);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);

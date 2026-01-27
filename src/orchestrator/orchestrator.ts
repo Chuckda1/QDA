@@ -76,8 +76,8 @@ export class Orchestrator {
     this.state.lastTickTs = input.ts;
     this.state.price = input.close;
 
-    if (timeframe !== "5m") {
-      return [];
+    if (timeframe === "1m") {
+      return this.handleMinimal1m(snapshot);
     }
 
     return this.handleMinimal5m(snapshot);
@@ -179,36 +179,81 @@ export class Orchestrator {
       console.log(`[CANDIDATE_BUILD] FAIL: no lastClosed bar`);
       return [];
     }
-    const swings = extractSwings(closed5mBars, 2, false);
-    console.log(`[CANDIDATE_BUILD] swingsCount=${swings.length}`);
-    const { lastHigh, lastLow } = lastSwings(swings);
-    const lastSwingHigh = lastHigh?.price;
-    const lastSwingLow = lastLow?.price;
-
-    if (!Number.isFinite(lastSwingLow) || !Number.isFinite(lastSwingHigh)) {
-      console.log(
-        `[CANDIDATE_BUILD] FAIL: missing swings lastHigh=${lastSwingHigh ?? "null"} lastLow=${lastSwingLow ?? "null"}`
-      );
-      return [];
-    }
 
     const priceRef = lastClosed.close;
     const buffer = Math.max(0.2, priceRef * 0.0003);
-    const longInvalidation = (lastSwingLow as number) - buffer;
-    const shortInvalidation = (lastSwingHigh as number) + buffer;
+    let longInvalidation: number;
+    let shortInvalidation: number;
+    let referenceLevels: { lastSwingHigh?: number; lastSwingLow?: number } = {};
+    let mode: "SWING" | "FALLBACK" = "FALLBACK";
 
+    // MODE 1: SWING mode (preferred) - requires 5+ bars and valid swings
+    const minBarsForSwings = 2 * 2 + 1; // 5 bars minimum for lookback=2
+    if (closed5mBars.length >= minBarsForSwings) {
+      const swings = extractSwings(closed5mBars, 2, false);
+      console.log(
+        `[CANDIDATE_BUILD] swingsCount=${swings.length} barsChecked=${closed5mBars.length - 4} (bars ${2} to ${closed5mBars.length - 3})`
+      );
+      
+      const { lastHigh, lastLow } = lastSwings(swings);
+      const lastSwingHigh = lastHigh?.price;
+      const lastSwingLow = lastLow?.price;
+
+      if (Number.isFinite(lastSwingLow) && Number.isFinite(lastSwingHigh)) {
+        // SWING mode: use swing-based invalidation
+        mode = "SWING";
+        longInvalidation = (lastSwingLow as number) - buffer;
+        shortInvalidation = (lastSwingHigh as number) + buffer;
+        referenceLevels = {
+          lastSwingHigh: lastSwingHigh as number,
+          lastSwingLow: lastSwingLow as number,
+        };
+        console.log(
+          `[CANDIDATE_BUILD] Using SWING mode: lastHigh=${lastSwingHigh.toFixed(2)} lastLow=${lastSwingLow.toFixed(2)}`
+        );
+      } else {
+        // Swings not detected, fall through to FALLBACK mode
+        mode = "FALLBACK";
+        console.log(
+          `[CANDIDATE_BUILD] Swings not detected, falling back to FALLBACK mode. lastHigh=${lastSwingHigh ?? "null"} lastLow=${lastSwingLow ?? "null"}`
+        );
+      }
+    } else {
+      // Not enough bars for swings, use FALLBACK mode
+      mode = "FALLBACK";
+      console.log(
+        `[CANDIDATE_BUILD] Insufficient bars for swings (have ${closed5mBars.length}, need ${minBarsForSwings}), using FALLBACK mode`
+      );
+    }
+
+    // MODE 2: FALLBACK mode - use rolling high/low from available bars
+    if (mode === "FALLBACK") {
+      const rollingHigh = Math.max(...closed5mBars.map((b) => b.high));
+      const rollingLow = Math.min(...closed5mBars.map((b) => b.low));
+      longInvalidation = rollingLow - buffer;
+      shortInvalidation = rollingHigh + buffer;
+      referenceLevels = {
+        lastSwingHigh: rollingHigh,
+        lastSwingLow: rollingLow,
+      };
+      console.log(
+        `[CANDIDATE_BUILD] Using FALLBACK mode: rollingHigh=${rollingHigh.toFixed(2)} rollingLow=${rollingLow.toFixed(2)}`
+      );
+    }
+
+    // Log invalidation debug for active direction
     if (activeDirection === "long") {
       const longDist = Math.abs(priceRef - longInvalidation);
       const longPct = priceRef ? (longDist / priceRef) * 100 : 0;
       console.log(
-        `[INV_DEBUG] dir=LONG inv=${longInvalidation.toFixed(2)} ref=thesisSwingLow price=${priceRef.toFixed(2)} dist=${longDist.toFixed(2)} (${longPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} atr5m=n/a dist/atr=n/a`
+        `[INV_DEBUG] dir=LONG inv=${longInvalidation.toFixed(2)} ref=${mode === "SWING" ? "thesisSwingLow" : "rollingLow"} price=${priceRef.toFixed(2)} dist=${longDist.toFixed(2)} (${longPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} mode=${mode}`
       );
     }
     if (activeDirection === "short") {
       const shortDist = Math.abs(priceRef - shortInvalidation);
       const shortPct = priceRef ? (shortDist / priceRef) * 100 : 0;
       console.log(
-        `[INV_DEBUG] dir=SHORT inv=${shortInvalidation.toFixed(2)} ref=thesisSwingHigh price=${priceRef.toFixed(2)} dist=${shortDist.toFixed(2)} (${shortPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} atr5m=n/a dist/atr=n/a`
+        `[INV_DEBUG] dir=SHORT inv=${shortInvalidation.toFixed(2)} ref=${mode === "SWING" ? "thesisSwingHigh" : "rollingHigh"} price=${priceRef.toFixed(2)} dist=${shortDist.toFixed(2)} (${shortPct.toFixed(3)}%) buffer=${buffer.toFixed(2)} mode=${mode}`
       );
     }
 
@@ -220,11 +265,10 @@ export class Orchestrator {
         entryTrigger: "Enter on break above pullback high after a pullback down.",
         invalidationLevel: longInvalidation,
         pullbackRule: "Pullback = last closed 5m bar closes down or makes a lower low.",
-        referenceLevels: {
-          lastSwingHigh,
-          lastSwingLow,
-        },
-        rationale: "Recent pullback provides a defined trigger and invalidation.",
+        referenceLevels,
+        rationale: mode === "SWING" 
+          ? "Recent pullback provides a defined trigger and invalidation."
+          : "Rolling low provides invalidation anchor until swings form.",
       },
       {
         id: `MIN_SHORT_${baseId}`,
@@ -232,15 +276,14 @@ export class Orchestrator {
         entryTrigger: "Enter on break below pullback low after a pullback up.",
         invalidationLevel: shortInvalidation,
         pullbackRule: "Pullback = last closed 5m bar closes up or makes a higher high.",
-        referenceLevels: {
-          lastSwingHigh,
-          lastSwingLow,
-        },
-        rationale: "Recent pullback provides a defined trigger and invalidation.",
+        referenceLevels,
+        rationale: mode === "SWING"
+          ? "Recent pullback provides a defined trigger and invalidation."
+          : "Rolling high provides invalidation anchor until swings form.",
       },
     ];
     console.log(
-      `[CANDIDATE_BUILD] SUCCESS: built ${builtCandidates.length} candidates LONG_inv=${longInvalidation.toFixed(2)} SHORT_inv=${shortInvalidation.toFixed(2)}`
+      `[CANDIDATE_BUILD] SUCCESS: built ${builtCandidates.length} candidates mode=${mode} LONG_inv=${longInvalidation.toFixed(2)} SHORT_inv=${shortInvalidation.toFixed(2)}`
     );
     return builtCandidates;
   }
@@ -263,6 +306,18 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  private handleMinimal1m(snapshot: TickSnapshot): DomainEvent[] {
+    // Only update forming5mBar state (no thesis gate, no candidates, no execution)
+    const forming5mBar = this.updateForming5mBar(snapshot);
+    if (forming5mBar) {
+      const progress = forming5mBar.progressMinutes;
+      console.log(
+        `[FORMING5M] start=${forming5mBar.startTs} progress=${progress}/5 o=${forming5mBar.open.toFixed(2)} h=${forming5mBar.high.toFixed(2)} l=${forming5mBar.low.toFixed(2)} c=${forming5mBar.close.toFixed(2)} v=${forming5mBar.volume}`
+      );
+    }
+    return []; // No events from 1m updates
+  }
+
   private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     const events: DomainEvent[] = [];
@@ -273,82 +328,74 @@ export class Orchestrator {
       return events;
     }
 
-    const forming5mBar = this.updateForming5mBar(snapshot);
+    // Closed 5m bar from BarAggregator - push to recentBars5m
+    const closedBar = {
+      ts: snapshot.ts,
+      open: snapshot.open ?? close,
+      high: snapshot.high ?? close,
+      low: snapshot.low ?? close,
+      close: close,
+      volume: snapshot.volume ?? 0,
+    };
+    this.recentBars5m.push(closedBar);
+    if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+    this.state.last5mCloseTs = closedBar.ts;
+    console.log(
+      `[CLOSE5M] ts=${closedBar.ts} lenClosed=${this.recentBars5m.length} o=${closedBar.open.toFixed(2)} h=${closedBar.high.toFixed(2)} l=${closedBar.low.toFixed(2)} c=${closedBar.close.toFixed(2)} v=${closedBar.volume}`
+    );
+
     const closed5mBars = this.recentBars5m;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
+    const forming5mBar = this.forming5mBar; // Use current forming bar state (updated by 1m path)
     const exec = this.state.minimalExecution;
 
-    const formingAsClosed = forming5mBar
-      ? {
-          ts: forming5mBar.endTs,
-          open: forming5mBar.open,
-          high: forming5mBar.high,
-          low: forming5mBar.low,
-          close: forming5mBar.close,
-          volume: forming5mBar.volume,
-        }
-      : null;
-    const barsForCandidates = closed5mBars.length
-      ? closed5mBars
-      : formingAsClosed
-      ? [formingAsClosed]
-      : [];
-    // Warmup is informational only - doesn't block thesis formation
-    const warmupNote =
-      closed5mBars.length < this.minimalLlmBars
-        ? `warmup_${closed5mBars.length}/${this.minimalLlmBars}`
-        : undefined;
+    // LLM sees ONLY 5m data: closed5mBars + forming5mBar
+    // No warmup gating - LLM can be called with any bars
     if (this.llmService) {
-      // Always try to build candidates, but don't require them for LLM call
-      const candidates = this.buildMinimalSetupCandidates({
-        closed5mBars: barsForCandidates,
-        activeDirection: exec.thesisDirection,
-      });
-      console.log(
-        `[CANDIDATE_CHECK] candidatesCount=${candidates.length} barsForCandidates=${barsForCandidates.length} willCallLLM=${barsForCandidates.length > 0}`
-      );
-      
-      // Call LLM if we have any bars (candidates optional)
-      if (barsForCandidates.length > 0) {
+      // Call LLM if we have any 5m data (closed bars or forming bar)
+      const has5mData = closed5mBars.length > 0 || forming5mBar !== null;
+      if (has5mData) {
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
-          closed5mBars: barsForCandidates,
+          closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
           forming5mBar,
         };
         console.log(
-          `[LLM_CALL] bars=${barsForCandidates.length} candidates=${candidates.length} sendingToLLM=true`
+          `[LLM5M] closed5m=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"} callingLLM=true`
         );
-        const result = await this.llmService.getMinimalSetupSelection({
+        const result = await this.llmService.getArmDecisionRaw5m({
           snapshot: llmSnapshot,
-          candidates,
         });
-        const selection = result.selection;
+        const decision = result.decision;
         this.state.lastLLMCallAt = ts;
-        this.state.lastLLMDecision = selection.reason ?? selection.selected;
+        this.state.lastLLMDecision = decision.because ?? decision.action;
         console.log(
-          `[MINIMAL][LLM_RESPONSE] selected=${selection.selected} confidence=${selection.confidence} reason=${selection.reason?.substring(0, 80) ?? "n/a"}`
+          `[LLM_MIN] selected=${decision.action} conf=${decision.confidence} barsClosed=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"}`
+        );
+        console.log(
+          `[LLM5M] action=${decision.action} conf=${decision.confidence} because=${decision.because?.substring(0, 80) ?? "n/a"} waiting_for=${decision.waiting_for ?? "n/a"}`
         );
 
         exec.thesisPrice = lastClosed5m?.close ?? close;
         exec.thesisTs = ts;
-        if (selection.selected === "PASS") {
+        if (decision.action === "WAIT") {
           exec.thesisDirection = "none";
-          exec.thesisConfidence = selection.confidence;
+          exec.thesisConfidence = decision.confidence;
           exec.activeCandidate = undefined;
           exec.phase = "WAITING_FOR_THESIS";
-          exec.waitReason = "llm_pass";
+          exec.waitReason = decision.waiting_for ?? "llm_wait";
           this.clearTradeState(exec);
         } else {
-          exec.thesisDirection = selection.selected === "LONG" ? "long" : "short";
-          exec.thesisConfidence = selection.confidence;
-          exec.activeCandidate = candidates.length > 0 ? candidates.find((c) => c.direction === selection.selected) : undefined;
+          exec.thesisDirection = decision.action === "ARM_LONG" ? "long" : "short";
+          exec.thesisConfidence = decision.confidence; // Use LLM confidence directly, no clamping/overriding
+          exec.activeCandidate = undefined; // No candidates in new schema
           exec.phase = "WAITING_FOR_PULLBACK";
           exec.waitReason = "waiting_for_pullback";
           this.clearTradeState(exec);
         }
       } else {
-        // No bars yet - just wait
+        // No 5m data yet - just wait
         if (exec.phase === "WAITING_FOR_THESIS") {
           exec.waitReason = "waiting_for_bars";
         }
@@ -357,9 +404,9 @@ export class Orchestrator {
       exec.waitReason = "llm_unavailable";
     }
 
+    // Entry execution requires at least 2 closed bars or 1 closed + forming
     const canEnter = closed5mBars.length >= 2 || (closed5mBars.length >= 1 && !!forming5mBar);
     exec.canEnter = canEnter;
-    // Warmup only affects entry execution, not thesis formation
     // Don't overwrite LLM-set waitReason after thesis is formed
     if (!canEnter && exec.phase === "WAITING_FOR_THESIS" && !exec.thesisDirection) {
       exec.waitReason = "waiting_for_bars";

@@ -3,7 +3,10 @@ import type {
   MinimalSetupCandidate,
   MinimalSetupSelectionResponse,
   MinimalSetupSelectionResult,
+  ArmDecisionRaw5mResponse,
+  ArmDecisionRaw5mResult,
 } from "../types.js";
+import { randomUUID } from "crypto";
 
 export class LLMService {
   private apiKey: string;
@@ -165,6 +168,127 @@ ${JSON.stringify(llmInput)}`;
     } catch (err) {
       console.error("[LLM] SetupSelection parse error:", err);
       return { selection: { ...fallback, reason: "LLM parse error" }, valid: false };
+    }
+  }
+
+  private normalizeArmDecisionRaw5m(input: any): ArmDecisionRaw5mResponse | null {
+    if (!input || typeof input !== "object") return null;
+    const actionRaw = typeof input.action === "string" ? input.action.toUpperCase() : "";
+    const action =
+      actionRaw === "ARM_LONG" || actionRaw === "ARM_SHORT" || actionRaw === "WAIT"
+        ? (actionRaw as "ARM_LONG" | "ARM_SHORT" | "WAIT")
+        : "WAIT";
+    const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : NaN;
+    const because = typeof input.because === "string" ? input.because : "";
+    const waiting_for = typeof input.waiting_for === "string" ? input.waiting_for : "";
+    const mindId = typeof input.mindId === "string" ? input.mindId : randomUUID();
+    
+    // All fields are required, including waiting_for
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100 || !because || !waiting_for) {
+      return null;
+    }
+    return { mindId, action, confidence, because, waiting_for };
+  }
+
+  async getArmDecisionRaw5m(params: {
+    snapshot: MinimalLLMSnapshot;
+  }): Promise<ArmDecisionRaw5mResult> {
+    const fallback: ArmDecisionRaw5mResponse = {
+      mindId: randomUUID(),
+      action: "WAIT",
+      confidence: 0,
+      because: "LLM unavailable",
+      waiting_for: "llm_unavailable",
+    };
+    if (!this.enabled) {
+      return { decision: fallback, valid: false };
+    }
+
+    const closed5mBars = params.snapshot.closed5mBars.slice(-30).map((bar) => ({
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+    const forming5mBar = params.snapshot.forming5mBar
+      ? {
+          open: params.snapshot.forming5mBar.open,
+          high: params.snapshot.forming5mBar.high,
+          low: params.snapshot.forming5mBar.low,
+          close: params.snapshot.forming5mBar.close,
+          volume: params.snapshot.forming5mBar.volume,
+        }
+      : null;
+
+    const llmInput = {
+      closed5mBars,
+      forming5mBar,
+    };
+
+    const prompt = `You are a trading assistant.
+You receive ONLY 5-minute OHLCV bars (closed + forming). Analyze price action and decide whether to ARM_LONG, ARM_SHORT, or WAIT.
+
+CRITICAL: You MUST compute confidence solely from the provided bars. Do NOT reduce confidence just because the sample is small. If you are uncertain, express that uncertainty in "because" and "waiting_for", but keep confidence as your honest estimate based on the available data. Do not apply any warmup multipliers or sample-size penalties to confidence.
+
+Return JSON only:
+{
+  "mindId": "uuid-string",
+  "action": "ARM_LONG|ARM_SHORT|WAIT",
+  "confidence": 0,
+  "because": "brief reason referencing price behavior",
+  "waiting_for": "short text describing what you're waiting for (required for all actions)"
+}
+
+Rules:
+- All fields above are REQUIRED in every response, including "waiting_for".
+- "confidence" must be 0-100 and reflect your honest assessment of the provided bars.
+- "action" must be ARM_LONG, ARM_SHORT, or WAIT.
+- Do NOT invent indicators. Use only OHLCV data.
+- Do NOT add invalidation levels, stop prices, buffers, or swing references.
+- Do NOT reduce confidence based on bar count or warmup status.
+- If uncertain, use "because" and "waiting_for" to explain, but keep confidence as your true estimate.
+
+Raw 5m data:
+${JSON.stringify(llmInput)}`;
+
+    const payload = {
+      model: this.model,
+      messages: [
+        { role: "system", content: "Return JSON only. No markdown." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
+    };
+
+    const start = Date.now();
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const duration = Date.now() - start;
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`[LLM] ArmDecisionRaw5m error (${duration}ms):`, response.status, error);
+      return { decision: { ...fallback, because: "LLM error" }, valid: false };
+    }
+    const json = await response.json();
+    const content = json?.choices?.[0]?.message?.content ?? "{}";
+    try {
+      const parsed = JSON.parse(content);
+      const normalized = this.normalizeArmDecisionRaw5m(parsed);
+      if (!normalized) {
+        console.error("[LLM] ArmDecisionRaw5m invalid schema:", content);
+        return { decision: { ...fallback, because: "LLM invalid schema" }, valid: false };
+      }
+      return { decision: normalized, valid: true };
+    } catch (err) {
+      console.error("[LLM] ArmDecisionRaw5m parse error:", err);
+      return { decision: { ...fallback, because: "LLM parse error" }, valid: false };
     }
   }
 
