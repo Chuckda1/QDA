@@ -449,47 +449,30 @@ export class Orchestrator {
         const lowerLow = current5m.low < previous5m.low;
         const higherHigh = current5m.high > previous5m.high;
 
+        // Enter ON pullback for LONG thesis
         if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
+          exec.entryPrice = current5m.close;
+          exec.entryTs = ts;
           exec.pullbackHigh = current5m.high;
           exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
-          exec.phase = "WAITING_FOR_ENTRY";
-          exec.waitReason = "waiting_for_break_above_pullback_high";
+          exec.stopPrice = current5m.low; // Stop at pullback low
+          exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+          exec.phase = "IN_TRADE";
+          exec.waitReason = "in_trade";
         }
 
+        // Enter ON pullback for SHORT thesis
         if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
+          exec.entryPrice = current5m.close;
+          exec.entryTs = ts;
           exec.pullbackHigh = current5m.high;
           exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
-          exec.phase = "WAITING_FOR_ENTRY";
-          exec.waitReason = "waiting_for_break_below_pullback_low";
-        }
-      } else if (exec.phase === "WAITING_FOR_ENTRY") {
-        if (exec.thesisDirection === "long" && exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
-          if (current5m.close > exec.pullbackHigh) {
-            exec.entryPrice = current5m.close;
-            exec.entryTs = ts;
-            exec.stopPrice = exec.pullbackLow;
-            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
-            exec.phase = "IN_TRADE";
-            exec.waitReason = "in_trade";
-          }
-        } else if (
-          exec.thesisDirection === "short" &&
-          exec.pullbackHigh !== undefined &&
-          exec.pullbackLow !== undefined
-        ) {
-          if (current5m.close < exec.pullbackLow) {
-            exec.entryPrice = current5m.close;
-            exec.entryTs = ts;
-            exec.stopPrice = exec.pullbackHigh;
-            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
-            exec.phase = "IN_TRADE";
-            exec.waitReason = "in_trade";
-          }
-        } else {
-          exec.phase = "WAITING_FOR_PULLBACK";
-          exec.waitReason = "waiting_for_pullback";
+          exec.stopPrice = current5m.high; // Stop at pullback high
+          exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+          exec.phase = "IN_TRADE";
+          exec.waitReason = "in_trade";
         }
       } else if (exec.phase === "IN_TRADE") {
         if (exec.stopPrice === undefined || !exec.targets || exec.targets.length === 0) {
