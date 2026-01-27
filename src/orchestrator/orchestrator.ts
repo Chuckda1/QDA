@@ -114,6 +114,9 @@ export class Orchestrator {
         // Update last5mCloseTs only when a bar actually closes
         this.state.last5mCloseTs = closedBar.ts;
         console.log(
+          `[MINIMAL][5M_CLOSE_COMMIT] last5mCloseTs=${this.state.last5mCloseTs} len=${this.recentBars5m.length}`
+        );
+        console.log(
           `[MINIMAL][ROLLOVER] oldStart=${this.formingBucketStart} newStart=${startTs} closedBar o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
         );
         console.log(
@@ -306,6 +309,9 @@ export class Orchestrator {
         const selection = result.selection;
         this.state.lastLLMCallAt = ts;
         this.state.lastLLMDecision = selection.reason ?? selection.selected;
+        console.log(
+          `[MINIMAL][LLM_RESPONSE] selected=${selection.selected} confidence=${selection.confidence} reason=${selection.reason?.substring(0, 80) ?? "n/a"}`
+        );
 
         exec.thesisPrice = lastClosed5m?.close ?? close;
         exec.thesisTs = ts;
