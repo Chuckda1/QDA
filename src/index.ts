@@ -7,10 +7,8 @@ import { Scheduler } from "./scheduler/scheduler.js";
 import { CommandHandler } from "./commands.js";
 import { yieldNow } from "./utils/yieldNow.js";
 import { LLMService } from "./llm/llmService.js";
-import { BarAggregator } from "./datafeed/barAggregator.js";
 import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import { StateStore } from "./persistence/stateStore.js";
-import type { Play } from "./types.js";
 
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
@@ -66,73 +64,29 @@ if (process.env.WARMUP_1M_BARS || process.env.WARMUP_5M_BARS) {
 console.log(`TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}`);
 console.log("=================================");
 
-if (BOT_MODE === "minimal") {
-  if (WARMUP_1M_BARS < 60 || WARMUP_5M_BARS < 30) {
-    console.warn(
-      `[${instanceId}] Warmup below recommended defaults: 1m=${WARMUP_1M_BARS} (rec 60) 5m=${WARMUP_5M_BARS} (rec 30)`
-    );
-  }
+if (WARMUP_1M_BARS < 60 || WARMUP_5M_BARS < 30) {
+  console.warn(
+    `[${instanceId}] Warmup below recommended defaults: 1m=${WARMUP_1M_BARS} (rec 60) 5m=${WARMUP_5M_BARS} (rec 30)`
+  );
 }
 
-// STAGE 3: Structured pulse tracker
-let bars1mCount = 0;
+// STAGE 3: Minimal pulse tracker
 let bars5mCount = 0;
-let bars15mCount = 0;
-
-function getPlayState(play: Play | null | undefined): "NONE" | "ARMED" | "ENTERED" | "MANAGING" | "CLOSED" {
-  if (!play) return "NONE";
-  if (play.status === "CLOSED" || play.stopHit) return "CLOSED";
-  if (play.status === "ENTERED") {
-    // If entered and managing, it's MANAGING
-    return "MANAGING";
-  }
-  if (play.status === "ARMED") return "ARMED";
-  return "ARMED";
-}
 
 function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbol: string): void {
   const s = orch.getState();
   const mode = governor.getMode();
-  const play = s.activePlay;
-  const d = orch.getLastDiagnostics();
-  
   const pulse = {
     mode,
     symbol,
-    last1mTs: s.last1mTs || null,
     last5mTs: s.last5mTs || null,
-    last15mTs: s.last15mTs || null,
     price: s.price ?? null,
-    bars1mCount,
     bars5mCount,
-    bars15mCount,
-    activePlayId: play?.id || null,
-    pendingPlayId: s.pendingPlay?.id || null,
-    entered: play?.status === "ENTERED",
-    state: getPlayState(play),
     lastLLMCallAt: s.lastLLMCallAt || null,
     lastLLMDecision: s.lastLLMDecision || null,
-    diag: d ? {
-      regime: d.regime?.regime ?? null,
-      bias: d.macroBias ?? null,
-      potd: d.potd ? {
-        bias: d.potd.bias,
-        mode: d.potd.mode,
-        alignment: d.potd.alignment
-      } : null,
-      direction: d.directionInference?.direction ?? null,
-      entryPermission: d.entryPermission ?? null,
-      candidateStats: d.candidateStats ?? null
-    } : null
   };
-  
-  // Log as single JSON line
   console.log(`[PULSE] ${JSON.stringify(pulse)}`);
-  
-  // Reset counters for next interval
-  bars1mCount = 0;
   bars5mCount = 0;
-  bars15mCount = 0;
 }
 
 // Initialize Telegram
@@ -165,26 +119,18 @@ try {
   console.warn("LLM service initialization error:", error.message);
 }
 
-const orch = new Orchestrator(instanceId, llmService, {
-  activePlay: persisted?.activePlay ?? null,
-  pendingPlay: persisted?.pendingPlay ?? null,
-  pendingCandidate: persisted?.pendingCandidate ?? null,
-  pendingCandidateExpiresAt: persisted?.pendingCandidateExpiresAt,
-  potd: persisted?.potd,
-  timingState: persisted?.timingState,
-});
+const orch = new Orchestrator(instanceId, llmService);
 const publisher = new MessagePublisher(governor, bot, chatId);
-const commands = new CommandHandler(orch, governor, publisher, instanceId, llmService);
+const commands = new CommandHandler(orch, instanceId, llmService);
 
 // Initialize scheduler
-const scheduler = new Scheduler(governor, publisher, instanceId, (mode) => {
+const scheduler = new Scheduler(governor, instanceId, (mode) => {
   orch.setMode(mode);
-  // STAGE 1: Log error once when switching to ACTIVE mode if LLM disabled
   if (mode === "ACTIVE" && llmService && !llmService.isEnabled() && !llmErrorLogged) {
     console.error("[STAGE 1] LLM DISABLED: OPENAI_API_KEY missing. LLM calls will return fallback responses.");
     llmErrorLogged = true;
   }
-}, () => orch.getLastDiagnostics(), (potd) => orch.setPotdState(potd));
+});
 
 // STAGE 3: Start structured pulse timer (every 60 seconds, runs in all modes)
 const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
@@ -233,31 +179,6 @@ bot.onText(/\/status/, async () => {
   await sendTelegramMessageSafe(bot, chatId, msg);
 });
 
-bot.onText(/\/diag/, async () => {
-  await yieldNow();
-  const msg = await commands.diag();
-  await sendTelegramMessageSafe(bot, chatId, msg);
-});
-
-bot.onText(/\/detail/, async () => {
-  await yieldNow();
-  const msg = await commands.detail();
-  await sendTelegramMessageSafe(bot, chatId, msg);
-});
-
-bot.onText(/\/enter/, async () => {
-  await yieldNow();
-  const msg = await commands.enter();
-  await sendTelegramMessageSafe(bot, chatId, msg);
-});
-
-bot.onText(/\/exit(?:\s+(.+))?/, async (msg, match) => {
-  await yieldNow();
-  const reason = match?.[1] || undefined;
-  const response = await commands.exit(reason);
-  await sendTelegramMessageSafe(bot, chatId, response);
-});
-
 bot.onText(/\/version/, async () => {
   await yieldNow();
   const msg = await commands.version(BUILD_ID);
@@ -284,24 +205,18 @@ await announceStartupThrottled({
   text: `[${instanceId}] ✅ Bot online. Mode: ${governor.getMode()}`,
 });
 
-// Periodic state persistence (every 15 seconds)
+// Periodic state persistence (every 30 seconds)
 setInterval(() => {
   const state = {
     version: 1 as const,
     instanceId,
     savedAt: Date.now(),
-    activePlay: orch.getState().activePlay ?? null,
-    pendingPlay: orch.getState().pendingPlay ?? null,
-    pendingCandidate: orch.getState().pendingCandidate ?? null,
-    pendingCandidateExpiresAt: orch.getState().pendingCandidateExpiresAt,
-    timingState: orch.getState().timingState,
-    potd: orch.getPotdState(),
     governor: governor.exportState(),
   };
   store.save(state).catch((err) => {
     console.warn(`[persist] save failed: ${err?.message || String(err)}`);
   });
-}, 15000);
+}, 30000);
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)
@@ -321,65 +236,10 @@ if (alpacaKey && alpacaSecret) {
       });
       
       const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
-      const agg5mFrom1m = new BarAggregator(5);
-      const agg15mFrom5m = new BarAggregator(15);
-      
       console.log(`[${instanceId}] 📊 Alpaca ${feed.toUpperCase()} feed connecting for ${symbol}...`);
 
-      // Warmup: fetch 5m and 1m separately, then aggregate 15m from 5m
-      try {
-        if (BOT_MODE === "minimal") {
-          console.log(`[${instanceId}] Warmup: skipped for minimal mode (live bars only).`);
-        } else {
-          if (WARMUP_5M_BARS > 0) {
-            console.log(`[${instanceId}] Warmup: fetching ${WARMUP_5M_BARS}x 5m bars for ${symbol}...`);
-            const bars5m = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", WARMUP_5M_BARS);
-            for (const bar of bars5m) {
-              await orch.processTick({
-                ts: bar.ts,
-                symbol: bar.symbol,
-                close: bar.close,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                volume: bar.volume
-              }, "5m");
-              const bar15m = agg15mFrom5m.push1m(bar);
-              if (bar15m) {
-                await orch.processTick({
-                  ts: bar15m.ts,
-                  symbol: bar15m.symbol,
-                  close: bar15m.close,
-                  open: bar15m.open,
-                  high: bar15m.high,
-                  low: bar15m.low,
-                  volume: bar15m.volume
-                }, "15m");
-              }
-            }
-          }
-
-          if (WARMUP_1M_BARS > 0) {
-            console.log(`[${instanceId}] Warmup: fetching ${WARMUP_1M_BARS}x 1m bars for ${symbol}...`);
-            const bars1m = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", WARMUP_1M_BARS);
-            for (const bar of bars1m) {
-              await orch.processTick({
-                ts: bar.ts,
-                symbol: bar.symbol,
-                close: bar.close,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                volume: bar.volume
-              }, "1m");
-            }
-          }
-        }
-      } catch (warmupError: any) {
-        console.warn(`[${instanceId}] Warmup failed: ${warmupError?.message || String(warmupError)}`);
-      } finally {
-        resolveWarmupReady();
-      }
+      // Warmup skipped (minimal-only bot)
+      resolveWarmupReady();
       
       // Use WebSocket for real-time bars (preferred)
       try {
@@ -387,65 +247,20 @@ if (alpacaKey && alpacaSecret) {
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
           try {
             const normalizedBar = normalizeBar(bar);
-            if (BOT_MODE === "minimal") {
-              bars5mCount++;
-              const events5m = await orch.processTick(
-                {
-                  ts: normalizedBar.ts,
-                  symbol: normalizedBar.symbol,
-                  close: normalizedBar.close,
-                  open: normalizedBar.open,
-                  high: normalizedBar.high,
-                  low: normalizedBar.low,
-                  volume: normalizedBar.volume
-                },
-                "5m"
-              );
-              await publisher.publishOrdered(events5m);
-              continue;
-            }
-            // 1m processing
-            bars1mCount++;
-            const events1m = await orch.processTick({
-              ts: normalizedBar.ts,
-              symbol: normalizedBar.symbol,
-              close: normalizedBar.close,
-              open: normalizedBar.open,
-              high: normalizedBar.high,
-              low: normalizedBar.low,
-              volume: normalizedBar.volume
-            }, "1m");
-            await publisher.publishOrdered(events1m);
-
-            // 5m aggregation + processing (only fires when a 5m bar closes)
-            const bar5m = agg5mFrom1m.push1m(normalizedBar);
-            if (bar5m) {
-              bars5mCount++;
-              const events5m = await orch.processTick({
-                ts: bar5m.ts,
-                symbol: bar5m.symbol,
-                close: bar5m.close,
-                open: bar5m.open,
-                high: bar5m.high,
-                low: bar5m.low,
-                volume: bar5m.volume
-              }, "5m");
-              await publisher.publishOrdered(events5m);
-              const bar15m = agg15mFrom5m.push1m(bar5m);
-              if (bar15m) {
-                bars15mCount++;
-                const events15m = await orch.processTick({
-                  ts: bar15m.ts,
-                  symbol: bar15m.symbol,
-                  close: bar15m.close,
-                  open: bar15m.open,
-                  high: bar15m.high,
-                  low: bar15m.low,
-                  volume: bar15m.volume
-                }, "15m");
-                await publisher.publishOrdered(events15m);
-              }
-            }
+            bars5mCount++;
+            const events5m = await orch.processTick(
+              {
+                ts: normalizedBar.ts,
+                symbol: normalizedBar.symbol,
+                close: normalizedBar.close,
+                open: normalizedBar.open,
+                high: normalizedBar.high,
+                low: normalizedBar.low,
+                volume: normalizedBar.volume
+              },
+              "5m"
+            );
+            await publisher.publishOrdered(events5m);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
@@ -461,63 +276,20 @@ if (alpacaKey && alpacaSecret) {
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
           try {
             const normalizedBar = normalizeBar(bar);
-            if (BOT_MODE === "minimal") {
-              bars5mCount++;
-              const events5m = await orch.processTick(
-                {
-                  ts: normalizedBar.ts,
-                  symbol: normalizedBar.symbol,
-                  close: normalizedBar.close,
-                  open: normalizedBar.open,
-                  high: normalizedBar.high,
-                  low: normalizedBar.low,
-                  volume: normalizedBar.volume
-                },
-                "5m"
-              );
-              await publisher.publishOrdered(events5m);
-              continue;
-            }
-            bars1mCount++;
-            const events1m = await orch.processTick({
-              ts: normalizedBar.ts,
-              symbol: normalizedBar.symbol,
-              close: normalizedBar.close,
-              open: normalizedBar.open,
-              high: normalizedBar.high,
-              low: normalizedBar.low,
-              volume: normalizedBar.volume
-            }, "1m");
-            await publisher.publishOrdered(events1m);
-
-            const bar5m = agg5mFrom1m.push1m(normalizedBar);
-            if (bar5m) {
-              bars5mCount++;
-              const events5m = await orch.processTick({
-                ts: bar5m.ts,
-                symbol: bar5m.symbol,
-                close: bar5m.close,
-                open: bar5m.open,
-                high: bar5m.high,
-                low: bar5m.low,
-                volume: bar5m.volume
-              }, "5m");
-              await publisher.publishOrdered(events5m);
-              const bar15m = agg15mFrom5m.push1m(bar5m);
-              if (bar15m) {
-                bars15mCount++;
-                const events15m = await orch.processTick({
-                  ts: bar15m.ts,
-                  symbol: bar15m.symbol,
-                  close: bar15m.close,
-                  open: bar15m.open,
-                  high: bar15m.high,
-                  low: bar15m.low,
-                  volume: bar15m.volume
-                }, "15m");
-                await publisher.publishOrdered(events15m);
-              }
-            }
+            bars5mCount++;
+            const events5m = await orch.processTick(
+              {
+                ts: normalizedBar.ts,
+                symbol: normalizedBar.symbol,
+                close: normalizedBar.close,
+                open: normalizedBar.open,
+                high: normalizedBar.high,
+                low: normalizedBar.low,
+                volume: normalizedBar.volume
+              },
+              "5m"
+            );
+            await publisher.publishOrdered(events5m);
           } catch (processError: any) {
             // Log processing errors but continue the loop
             console.error(`[${instanceId}] Error processing bar (ts=${bar.ts}):`, processError.message);
