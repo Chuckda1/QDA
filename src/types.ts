@@ -78,6 +78,7 @@ export type MinimalExecutionState = {
   thesisPrice?: number;
   thesisTs?: number;
   activeCandidate?: MinimalSetupCandidate;
+  canEnter?: boolean;
   pullbackHigh?: number;
   pullbackLow?: number;
   pullbackTs?: number;
@@ -90,8 +91,8 @@ export type MinimalExecutionState = {
 
 export interface BotState {
   startedAt: number;
-  lastTickAt?: number;
-  last5mTs?: number;
+  lastTickTs?: number;
+  last5mCloseTs?: number;
   session: string;
   price?: number;
   mode: BotMode;

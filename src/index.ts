@@ -79,7 +79,7 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
   const pulse = {
     mode,
     symbol,
-    last5mTs: s.last5mTs || null,
+    last5mCloseTs: s.last5mCloseTs || null,
     price: s.price ?? null,
     bars5mCount,
     lastLLMCallAt: s.lastLLMCallAt || null,

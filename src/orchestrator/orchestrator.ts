@@ -73,10 +73,10 @@ export class Orchestrator {
   async processTick(input: TickInput, timeframe: "5m" | "1m" = "5m"): Promise<DomainEvent[]> {
     const snapshot: TickSnapshot = { ...input, timeframe };
     this.state.session = getMarketSessionLabel(new Date(input.ts));
-    this.state.lastTickAt = input.ts;
+    this.state.lastTickTs = input.ts;
     this.state.price = input.close;
     if (timeframe === "5m") {
-      this.state.last5mTs = input.ts;
+      this.state.last5mCloseTs = input.ts;
     }
 
     if (timeframe !== "5m") {
@@ -245,17 +245,20 @@ export class Orchestrator {
       : formingAsClosed
       ? [formingAsClosed]
       : [];
-    if (closed5mBars.length < this.minimalLlmBars) {
+    const warmupNote =
+      closed5mBars.length < this.minimalLlmBars
+        ? `warmup_${closed5mBars.length}/${this.minimalLlmBars}`
+        : undefined;
+    if (warmupNote) {
       console.log(
-        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mTs=${this.state.last5mTs ?? "n/a"} forming=${forming5mBar ? "yes" : "no"}`
+        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mCloseTs=${this.state.last5mCloseTs ?? "n/a"} forming=${forming5mBar ? "yes" : "no"}`
       );
-      exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
     }
     if (this.llmService) {
       const candidates = this.buildMinimalSetupCandidates({ closed5mBars: barsForCandidates });
       if (candidates.length < 2) {
-        if (closed5mBars.length < this.minimalLlmBars) {
-          exec.waitReason = "insufficient_levels";
+        if (warmupNote && exec.phase === "WAITING_FOR_THESIS") {
+          exec.waitReason = warmupNote;
         }
       } else {
         const llmSnapshot: MinimalLLMSnapshot = {
@@ -294,10 +297,16 @@ export class Orchestrator {
       exec.waitReason = "llm_unavailable";
     }
 
+    const canEnter = closed5mBars.length >= 2 || (closed5mBars.length >= 1 && !!forming5mBar);
+    exec.canEnter = canEnter;
+    if (!canEnter && exec.phase !== "IN_TRADE") {
+      exec.waitReason = warmupNote ?? "entry_warmup";
+    }
+
     const current5m = forming5mBar ?? lastClosed5m ?? null;
     const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : null;
 
-    if (current5m && exec.thesisDirection && exec.thesisDirection !== "none") {
+    if (canEnter && current5m && exec.thesisDirection && exec.thesisDirection !== "none") {
       if (exec.phase === "WAITING_FOR_PULLBACK" && previous5m) {
         const open = current5m.open ?? current5m.close;
         const isBearish = current5m.close < open;
