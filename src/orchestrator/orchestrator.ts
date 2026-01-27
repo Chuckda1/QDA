@@ -94,17 +94,13 @@ export class Orchestrator {
     const closeVal = snapshot.close;
     if (!Number.isFinite(closeVal)) return null;
 
-    const nextForming: Forming5mBar = {
-      startTs,
-      endTs,
-      progressMinutes,
-      open: snapshot.open ?? closeVal,
-      high: snapshot.high ?? closeVal,
-      low: snapshot.low ?? closeVal,
-      close: closeVal,
-      volume: snapshot.volume ?? 0,
-    };
+    // Debug: log bucket math and timestamp progression
+    const prevTs = this.forming5mBar?.endTs ?? null;
+    console.log(
+      `[BUCKET_DEBUG] ts=${snapshot.ts} startTs=${startTs} endTs=${endTs} formingBucketStart=${this.formingBucketStart ?? "null"} prevTs=${prevTs ?? "null"} tsDelta=${prevTs !== null ? snapshot.ts - prevTs : "n/a"}`
+    );
 
+    // Handle bucket rollover: push closed bar and start new bucket
     if (this.formingBucketStart !== null && startTs !== this.formingBucketStart) {
       if (this.forming5mBar) {
         const closedBar = {
@@ -119,16 +115,52 @@ export class Orchestrator {
         if (this.recentBars5m.length > 120) this.recentBars5m.shift();
         const lastTs = this.recentBars5m[this.recentBars5m.length - 1]?.ts;
         console.log(
+          `[MINIMAL][ROLLOVER] oldStart=${this.formingBucketStart} newStart=${startTs} closedBar o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
+        );
+        console.log(
           `[MINIMAL][5M_CLOSE] start=${this.forming5mBar.startTs} end=${this.forming5mBar.endTs} o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
         );
         console.log(
           `[MINIMAL][5M_PUSH] len=${this.recentBars5m.length} lastTs=${lastTs ?? "n/a"}`
         );
       }
+      // Start new bucket with first tick's open
+      this.formingBucketStart = startTs;
+      this.forming5mBar = {
+        startTs,
+        endTs,
+        progressMinutes,
+        open: snapshot.open ?? closeVal,
+        high: snapshot.high ?? closeVal,
+        low: snapshot.low ?? closeVal,
+        close: closeVal,
+        volume: snapshot.volume ?? 0,
+      };
+      return this.forming5mBar;
     }
 
+    // Same bucket: accumulate high/low/close/volume, keep first open
+    if (this.forming5mBar && this.formingBucketStart === startTs) {
+      this.forming5mBar.high = Math.max(this.forming5mBar.high, snapshot.high ?? closeVal);
+      this.forming5mBar.low = Math.min(this.forming5mBar.low, snapshot.low ?? closeVal);
+      this.forming5mBar.close = closeVal;
+      this.forming5mBar.volume += snapshot.volume ?? 0;
+      this.forming5mBar.progressMinutes = progressMinutes;
+      return this.forming5mBar;
+    }
+
+    // First bucket initialization
     this.formingBucketStart = startTs;
-    this.forming5mBar = nextForming;
+    this.forming5mBar = {
+      startTs,
+      endTs,
+      progressMinutes,
+      open: snapshot.open ?? closeVal,
+      high: snapshot.high ?? closeVal,
+      low: snapshot.low ?? closeVal,
+      close: closeVal,
+      volume: snapshot.volume ?? 0,
+    };
     return this.forming5mBar;
   }
 
