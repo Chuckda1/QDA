@@ -1,4 +1,4 @@
-import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalExecutionState, MinimalLLMSnapshot, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalExecutionState, MinimalLLMSnapshot, MinimalSetupCandidate, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
@@ -15,7 +15,7 @@ import type { DirectionInference } from "../rules/directionRules.js";
 import type { RegimeResult } from "../rules/regimeRules.js";
 import { requiresDecisionState } from "../utils/decisionState.js";
 import { volumePolicy } from "../utils/volumePolicy.js";
-import { extractSwings } from "../utils/swing.js";
+import { extractSwings, lastSwings } from "../utils/swing.js";
 import {
   buildDecision,
   buildNoEntryDecision,
@@ -1239,7 +1239,7 @@ export class Orchestrator {
     if (botMode === "minimal") {
       if (timeframe === "5m") {
         console.log(`[TICK] branch=MINIMAL tf=5m ts=${input.ts}`);
-        return await this.handleMinimal5m(snapshot);
+        return await this.handleMinimalForming5m(snapshot);
       }
       if (timeframe !== "1m") {
         console.log(`[TICK] branch=MINIMAL tf=${timeframe} ts=${input.ts}`);
@@ -1338,6 +1338,58 @@ export class Orchestrator {
     return extractSwings(bars, 2, false);
   }
 
+  private buildMinimalSetupCandidates(params: {
+    closed5mBars: OHLCVBar[];
+    forming5mBar?: Forming5mBar | null;
+  }): MinimalSetupCandidate[] {
+    const { closed5mBars } = params;
+    const lastClosed = closed5mBars[closed5mBars.length - 1];
+    if (!lastClosed) return [];
+    const swings = this.extractSwings(closed5mBars);
+    const { lastHigh, lastLow } = lastSwings(swings);
+    const pullbackHigh = lastClosed.high;
+    const pullbackLow = lastClosed.low;
+    const lastSwingHigh = lastHigh?.price;
+    const lastSwingLow = lastLow?.price;
+
+    const longInvalidation = Number.isFinite(lastSwingLow) ? (lastSwingLow as number) : pullbackLow;
+    const shortInvalidation = Number.isFinite(lastSwingHigh) ? (lastSwingHigh as number) : pullbackHigh;
+
+    if (!Number.isFinite(longInvalidation) || !Number.isFinite(shortInvalidation)) return [];
+
+    const baseId = lastClosed.ts;
+    return [
+      {
+        id: `MIN_LONG_${baseId}`,
+        direction: "LONG",
+        entryTrigger: "Enter on break above pullback high after a pullback down.",
+        invalidationLevel: longInvalidation,
+        pullbackRule: "Pullback = last closed 5m bar closes down or makes a lower low.",
+        referenceLevels: {
+          lastSwingHigh,
+          lastSwingLow,
+          pullbackHigh,
+          pullbackLow,
+        },
+        rationale: "Recent pullback provides a defined trigger and invalidation.",
+      },
+      {
+        id: `MIN_SHORT_${baseId}`,
+        direction: "SHORT",
+        entryTrigger: "Enter on break below pullback low after a pullback up.",
+        invalidationLevel: shortInvalidation,
+        pullbackRule: "Pullback = last closed 5m bar closes up or makes a higher high.",
+        referenceLevels: {
+          lastSwingHigh,
+          lastSwingLow,
+          pullbackHigh,
+          pullbackLow,
+        },
+        rationale: "Recent pullback provides a defined trigger and invalidation.",
+      },
+    ];
+  }
+
   private buildImpulseContext(bars: OHLCVBar[]): {
     direction: "UP" | "DOWN" | "FLAT";
     move: number;
@@ -1424,6 +1476,7 @@ export class Orchestrator {
       thesisConfidence: undefined,
       thesisPrice: undefined,
       thesisTs: undefined,
+      activeCandidate: undefined,
       pendingDirection: undefined,
       pendingCount: 0,
       pullbackHigh: undefined,
@@ -1577,7 +1630,9 @@ export class Orchestrator {
 
   private async handleMinimalForming5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
-    this.trackMinimalBar(snapshot, "1m");
+    if (snapshot.timeframe === "1m") {
+      this.trackMinimalBar(snapshot, "1m");
+    }
     console.log(`[MINIMAL] handler=handleMinimalForming5m symbol=${symbol} ts=${ts}`);
 
     const events: DomainEvent[] = [];
@@ -1600,7 +1655,26 @@ export class Orchestrator {
       return events;
     }
 
-    const forming5mBar = this.buildForming5mBar(ts);
+    let forming5mBar = this.buildForming5mBar(ts);
+    if (!forming5mBar && snapshot.timeframe === "5m") {
+      const bucketMs = 5 * 60 * 1000;
+      const startTs = Math.floor(ts / bucketMs) * bucketMs;
+      const endTs = startTs + bucketMs;
+      const progressMinutes = Math.min(5, Math.max(1, Math.floor((ts - startTs) / 60000) + 1));
+      const closeVal = close;
+      if (Number.isFinite(closeVal)) {
+        forming5mBar = {
+          startTs,
+          endTs,
+          progressMinutes,
+          open: snapshot.open ?? closeVal,
+          high: snapshot.high ?? closeVal,
+          low: snapshot.low ?? closeVal,
+          close: closeVal,
+          volume: snapshot.volume ?? 0,
+        };
+      }
+    }
     if (forming5mBar && forming5mBar.progressMinutes >= 5) {
       const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
       if (!last5mTs || last5mTs < forming5mBar.endTs) {
@@ -1628,45 +1702,61 @@ export class Orchestrator {
           exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
         }
       } else {
-        const llmSnapshot: MinimalLLMSnapshot = {
-          symbol,
-          nowTs: ts,
-          closed5mBars,
-          forming5mBar,
-        };
-        const result = await this.llmService.getMinimalMindState(llmSnapshot);
-        mindState = result.mindState;
-        valid = result.valid;
-        if (!mindState.mindId) {
-          mindState.mindId = randomUUID();
-        }
-        this.state.mindState = mindState;
-        this.state.activeMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
-        this.state.lastLLMCallAt = ts;
-        this.state.lastLLMDecision = mindState.reason ?? mindState.direction;
+        const candidates = this.buildMinimalSetupCandidates({ closed5mBars, forming5mBar });
+        if (candidates.length < 2) {
+          if (exec.phase === "WAITING_FOR_THESIS") {
+            exec.waitReason = "insufficient_levels";
+          }
+        } else {
+          const llmSnapshot: MinimalLLMSnapshot = {
+            symbol,
+            nowTs: ts,
+            closed5mBars,
+            forming5mBar,
+          };
+          const result = await this.llmService.getMinimalSetupSelection({
+            snapshot: llmSnapshot,
+            candidates,
+          });
+          const selection = result.selection;
+          valid = result.valid;
+          mindState = {
+            mindId: mindState.mindId ?? randomUUID(),
+            direction:
+              selection.selected === "LONG"
+                ? "long"
+                : selection.selected === "SHORT"
+                ? "short"
+                : "none",
+            confidence: selection.confidence,
+            reason: selection.reason,
+          };
+          this.state.mindState = mindState;
+          this.state.activeMind = this.extractActiveMind(mindState) ?? this.state.activeMind;
+          this.state.lastLLMCallAt = ts;
+          this.state.lastLLMDecision = selection.reason ?? selection.selected;
 
-        if (valid && exec.phase !== "IN_TRADE") {
-          const prevDirection = exec.thesisDirection ?? "none";
-          const update = this.applyThesisLock(exec, mindState.direction, mindState.confidence);
-          if (update.accepted) {
+          if (valid && exec.phase !== "IN_TRADE") {
             exec.thesisPrice = lastClosed5m?.close ?? close;
             exec.thesisTs = ts;
-            if (exec.thesisDirection === "none") {
+            if (selection.selected === "PASS") {
+              exec.thesisDirection = "none";
+              exec.thesisConfidence = selection.confidence;
+              exec.activeCandidate = undefined;
               exec.phase = "WAITING_FOR_THESIS";
-              exec.waitReason = "llm_no_direction";
+              exec.waitReason = "llm_pass";
               this.clearMinimalTradeState(exec);
-            } else if (update.flipped || prevDirection !== exec.thesisDirection || exec.phase === "WAITING_FOR_THESIS") {
+            } else {
+              exec.thesisDirection = selection.selected === "LONG" ? "long" : "short";
+              exec.thesisConfidence = selection.confidence;
+              exec.activeCandidate = candidates.find((c) => c.direction === selection.selected);
               exec.phase = "WAITING_FOR_PULLBACK";
               exec.waitReason = "waiting_for_pullback";
               this.clearMinimalTradeState(exec);
             }
-          } else if (exec.phase === "WAITING_FOR_THESIS") {
-            const pendingDir = exec.pendingDirection ?? "none";
-            const pendingCount = exec.pendingCount ?? 0;
-            exec.waitReason = `pending_${pendingDir}_${pendingCount}`;
+          } else if (!valid && exec.phase === "WAITING_FOR_THESIS") {
+            exec.waitReason = "llm_invalid";
           }
-        } else if (!valid && exec.phase === "WAITING_FOR_THESIS") {
-          exec.waitReason = "llm_invalid";
         }
       }
     } else if (exec.phase === "WAITING_FOR_THESIS") {
@@ -1796,6 +1886,7 @@ export class Orchestrator {
             price: exec.thesisPrice ?? null,
             ts: exec.thesisTs ?? null,
           },
+          candidate: exec.activeCandidate ?? null,
           entry: exec.entryPrice ?? null,
           stop: exec.stopPrice ?? null,
           targets: exec.targets ?? null,

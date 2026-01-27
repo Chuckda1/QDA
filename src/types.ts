@@ -186,6 +186,32 @@ export type MinimalLLMSnapshot = {
   recent1mBars?: RawBar[];
 };
 
+export type MinimalSetupCandidate = {
+  id: string;
+  direction: "LONG" | "SHORT";
+  entryTrigger: string;
+  invalidationLevel: number;
+  pullbackRule: string;
+  referenceLevels: {
+    lastSwingHigh?: number;
+    lastSwingLow?: number;
+    pullbackHigh?: number;
+    pullbackLow?: number;
+  };
+  rationale: string;
+};
+
+export type MinimalSetupSelectionResponse = {
+  selected: "LONG" | "SHORT" | "PASS";
+  confidence: number;
+  reason: string;
+};
+
+export type MinimalSetupSelectionResult = {
+  selection: MinimalSetupSelectionResponse;
+  valid: boolean;
+};
+
 export type DomainEventType =
   | "PLAY_ARMED"
   | "ENTRY_WINDOW_OPENED"
@@ -384,6 +410,7 @@ export type MinimalExecutionState = {
   thesisConfidence?: number;
   thesisPrice?: number;
   thesisTs?: number;
+  activeCandidate?: MinimalSetupCandidate;
   pendingDirection?: "long" | "short" | "none";
   pendingCount?: number;
   pullbackHigh?: number;

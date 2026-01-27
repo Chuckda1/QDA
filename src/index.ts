@@ -23,6 +23,12 @@ const SYMBOLS = process.env.SYMBOLS || "SPY";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "not_set";
 const BOT_MODE = (process.env.BOT_MODE || "").toLowerCase();
 
+const normalizeBarTs = (ts: number): number => (ts < 1_000_000_000_000 ? ts * 1000 : ts);
+const normalizeBar = <T extends { ts: number }>(bar: T): T => ({
+  ...bar,
+  ts: normalizeBarTs(bar.ts),
+});
+
 const parseWarmupBars = (value: string | undefined, fallback: number): number => {
   const parsed = parseInt(value ?? "", 10);
   if (Number.isFinite(parsed)) return Math.max(0, parsed);
@@ -380,21 +386,39 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
           try {
+            const normalizedBar = normalizeBar(bar);
+            if (BOT_MODE === "minimal") {
+              bars5mCount++;
+              const events5m = await orch.processTick(
+                {
+                  ts: normalizedBar.ts,
+                  symbol: normalizedBar.symbol,
+                  close: normalizedBar.close,
+                  open: normalizedBar.open,
+                  high: normalizedBar.high,
+                  low: normalizedBar.low,
+                  volume: normalizedBar.volume
+                },
+                "5m"
+              );
+              await publisher.publishOrdered(events5m);
+              continue;
+            }
             // 1m processing
             bars1mCount++;
             const events1m = await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close,
-              open: bar.open,
-              high: bar.high,
-              low: bar.low,
-              volume: bar.volume
+              ts: normalizedBar.ts,
+              symbol: normalizedBar.symbol,
+              close: normalizedBar.close,
+              open: normalizedBar.open,
+              high: normalizedBar.high,
+              low: normalizedBar.low,
+              volume: normalizedBar.volume
             }, "1m");
             await publisher.publishOrdered(events1m);
 
             // 5m aggregation + processing (only fires when a 5m bar closes)
-            const bar5m = agg5mFrom1m.push1m(bar);
+            const bar5m = agg5mFrom1m.push1m(normalizedBar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({
@@ -436,19 +460,37 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
           try {
+            const normalizedBar = normalizeBar(bar);
+            if (BOT_MODE === "minimal") {
+              bars5mCount++;
+              const events5m = await orch.processTick(
+                {
+                  ts: normalizedBar.ts,
+                  symbol: normalizedBar.symbol,
+                  close: normalizedBar.close,
+                  open: normalizedBar.open,
+                  high: normalizedBar.high,
+                  low: normalizedBar.low,
+                  volume: normalizedBar.volume
+                },
+                "5m"
+              );
+              await publisher.publishOrdered(events5m);
+              continue;
+            }
             bars1mCount++;
             const events1m = await orch.processTick({
-              ts: bar.ts,
-              symbol: bar.symbol,
-              close: bar.close,
-              open: bar.open,
-              high: bar.high,
-              low: bar.low,
-              volume: bar.volume
+              ts: normalizedBar.ts,
+              symbol: normalizedBar.symbol,
+              close: normalizedBar.close,
+              open: normalizedBar.open,
+              high: normalizedBar.high,
+              low: normalizedBar.low,
+              volume: normalizedBar.volume
             }, "1m");
             await publisher.publishOrdered(events1m);
 
-            const bar5m = agg5mFrom1m.push1m(bar);
+            const bar5m = agg5mFrom1m.push1m(normalizedBar);
             if (bar5m) {
               bars5mCount++;
               const events5m = await orch.processTick({

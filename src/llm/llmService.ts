@@ -214,6 +214,21 @@ export class LLMService {
     };
   }
 
+  private normalizeMinimalSetupSelection(input: any): import("../types.js").MinimalSetupSelectionResponse | null {
+    if (!input || typeof input !== "object") return null;
+    const selectedRaw = typeof input.selected === "string" ? input.selected.toUpperCase() : "";
+    const selected =
+      selectedRaw === "LONG" || selectedRaw === "SHORT" || selectedRaw === "PASS"
+        ? (selectedRaw as "LONG" | "SHORT" | "PASS")
+        : "PASS";
+    const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : NaN;
+    const reason = typeof input.reason === "string" ? input.reason : "";
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100 || !reason) {
+      return null;
+    }
+    return { selected, confidence, reason };
+  }
+
   /**
    * Check if LLM service is enabled (has API key)
    */
@@ -1010,6 +1025,96 @@ ${JSON.stringify(llmInput)}`;
     } catch (err) {
       console.error("[LLM] MindState parse error:", err);
       return { mindState: { ...fallback, reason: "LLM parse error" }, valid: false };
+    }
+  }
+
+  async getMinimalSetupSelection(params: {
+    snapshot: MinimalLLMSnapshot;
+    candidates: import("../types.js").MinimalSetupCandidate[];
+  }): Promise<import("../types.js").MinimalSetupSelectionResult> {
+    const fallback: import("../types.js").MinimalSetupSelectionResponse = {
+      selected: "PASS",
+      confidence: 0,
+      reason: "LLM unavailable",
+    };
+    if (!this.enabled) {
+      return { selection: fallback, valid: false };
+    }
+    const closed5mBars = params.snapshot.closed5mBars.map((bar) => ({
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+    const forming5mBar = params.snapshot.forming5mBar
+      ? {
+          open: params.snapshot.forming5mBar.open,
+          high: params.snapshot.forming5mBar.high,
+          low: params.snapshot.forming5mBar.low,
+          close: params.snapshot.forming5mBar.close,
+          volume: params.snapshot.forming5mBar.volume,
+        }
+      : null;
+    const llmInput = {
+      closed5mBars,
+      forming5mBar,
+      candidates: params.candidates,
+    };
+    const prompt = `You are a trading assistant.
+You receive recent OHLCV bars and 2 candidate setups (LONG and SHORT).
+Your job is to select the single best candidate RIGHT NOW, or PASS if neither is legitimate.
+
+Return JSON only:
+{
+  "selected": "LONG|SHORT|PASS",
+  "confidence": 0,
+  "reason": "brief reason referencing price behavior"
+}
+
+Rules:
+- All fields above are REQUIRED in every response.
+- Do NOT invent indicators.
+- Do NOT add extra fields.
+
+LLM input:
+${JSON.stringify(llmInput)}`;
+    const payload = {
+      model: this.model,
+      messages: [
+        { role: "system", content: "Return JSON only. No markdown." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
+    };
+    const start = Date.now();
+    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const duration = Date.now() - start;
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`[LLM] SetupSelection error (${duration}ms):`, response.status, error);
+      return { selection: { ...fallback, reason: "LLM error" }, valid: false };
+    }
+    const json = await response.json();
+    const content = json?.choices?.[0]?.message?.content ?? "{}";
+    try {
+      const parsed = JSON.parse(content);
+      const normalized = this.normalizeMinimalSetupSelection(parsed);
+      if (!normalized) {
+        console.error("[LLM] SetupSelection invalid schema:", content);
+        return { selection: { ...fallback, reason: "LLM invalid schema" }, valid: false };
+      }
+      return { selection: normalized, valid: true };
+    } catch (err) {
+      console.error("[LLM] SetupSelection parse error:", err);
+      return { selection: { ...fallback, reason: "LLM parse error" }, valid: false };
     }
   }
 }

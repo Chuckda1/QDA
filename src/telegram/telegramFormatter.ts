@@ -286,12 +286,18 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         waitingFor = waitForRaw.replace(/_/g, " ");
       }
     }
+    const invalidation =
+      snapshot.candidate && Number.isFinite(snapshot.candidate.invalidationLevel)
+        ? `INVALIDATION: ${formatPrice(snapshot.candidate.invalidationLevel)}`
+        : undefined;
+    const triggerText = snapshot.candidate?.entryTrigger ?? waitingFor;
     const lines = enforceLineLimit(
       "MIND",
       [
         `THESIS: ${thesisDirection} (${thesisConfidence})`,
         `STATE: ${state}`,
-        `WAITING_FOR: ${waitingFor}`,
+        invalidation,
+        `WAITING_FOR: ${triggerText}`,
       ].filter(nonEmpty)
     );
     return { type: "MIND", lines, text: lines.join("\n") };
