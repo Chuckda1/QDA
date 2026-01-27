@@ -81,9 +81,18 @@ export class LLMService {
       candidates: params.candidates,
     };
 
-    const prompt = `You are a trading assistant.
-You receive recent OHLCV bars and 2 candidate setups (LONG and SHORT).
-Your job is to select the single best candidate RIGHT NOW, or PASS if neither is legitimate.
+    const hasCandidates = params.candidates && params.candidates.length >= 2;
+    console.log(
+      `[LLM_SERVICE] hasCandidates=${hasCandidates} candidatesCount=${params.candidates?.length ?? 0} barsCount=${closed5mBars.length}`
+    );
+    
+    const prompt = hasCandidates
+      ? `You are a trading assistant.
+The bot has analyzed price action and produced 2 candidate setups (LONG and SHORT) with entry triggers and invalidation levels.
+Your job: Review the raw bars AND the bot's candidates, then select the single best candidate RIGHT NOW, or PASS if neither is legitimate.
+
+Bot's candidates:
+${JSON.stringify(params.candidates, null, 2)}
 
 Return JSON only:
 {
@@ -94,10 +103,29 @@ Return JSON only:
 
 Rules:
 - All fields above are REQUIRED in every response.
+- "confidence" must be 0-100.
 - Do NOT invent indicators.
 - Do NOT add extra fields.
 
-LLM input:
+Raw data:
+${JSON.stringify(llmInput)}`
+      : `You are a trading assistant.
+The bot has provided raw OHLCV bars. Analyze the price action and determine if you should take a LONG position, SHORT position, or PASS (wait).
+
+Return JSON only:
+{
+  "selected": "LONG|SHORT|PASS",
+  "confidence": 0,
+  "reason": "brief reason referencing price behavior"
+}
+
+Rules:
+- All fields above are REQUIRED in every response.
+- "confidence" must be 0-100.
+- Do NOT invent indicators.
+- Do NOT add extra fields.
+
+Raw data:
 ${JSON.stringify(llmInput)}`;
 
     const payload = {

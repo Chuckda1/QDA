@@ -171,14 +171,26 @@ export class Orchestrator {
     activeDirection?: "long" | "short" | "none";
   }): MinimalSetupCandidate[] {
     const { closed5mBars, activeDirection } = params;
+    console.log(
+      `[CANDIDATE_BUILD] barsCount=${closed5mBars.length} activeDir=${activeDirection ?? "none"}`
+    );
     const lastClosed = closed5mBars[closed5mBars.length - 1];
-    if (!lastClosed) return [];
+    if (!lastClosed) {
+      console.log(`[CANDIDATE_BUILD] FAIL: no lastClosed bar`);
+      return [];
+    }
     const swings = extractSwings(closed5mBars, 2, false);
+    console.log(`[CANDIDATE_BUILD] swingsCount=${swings.length}`);
     const { lastHigh, lastLow } = lastSwings(swings);
     const lastSwingHigh = lastHigh?.price;
     const lastSwingLow = lastLow?.price;
 
-    if (!Number.isFinite(lastSwingLow) || !Number.isFinite(lastSwingHigh)) return [];
+    if (!Number.isFinite(lastSwingLow) || !Number.isFinite(lastSwingHigh)) {
+      console.log(
+        `[CANDIDATE_BUILD] FAIL: missing swings lastHigh=${lastSwingHigh ?? "null"} lastLow=${lastSwingLow ?? "null"}`
+      );
+      return [];
+    }
 
     const priceRef = lastClosed.close;
     const buffer = Math.max(0.2, priceRef * 0.0003);
@@ -201,7 +213,7 @@ export class Orchestrator {
     }
 
     const baseId = lastClosed.ts;
-    return [
+    const builtCandidates = [
       {
         id: `MIN_LONG_${baseId}`,
         direction: "LONG",
@@ -227,6 +239,10 @@ export class Orchestrator {
         rationale: "Recent pullback provides a defined trigger and invalidation.",
       },
     ];
+    console.log(
+      `[CANDIDATE_BUILD] SUCCESS: built ${builtCandidates.length} candidates LONG_inv=${longInvalidation.toFixed(2)} SHORT_inv=${shortInvalidation.toFixed(2)}`
+    );
+    return builtCandidates;
   }
 
   private clearTradeState(exec: MinimalExecutionState): void {
@@ -277,31 +293,32 @@ export class Orchestrator {
       : formingAsClosed
       ? [formingAsClosed]
       : [];
+    // Warmup is informational only - doesn't block thesis formation
     const warmupNote =
       closed5mBars.length < this.minimalLlmBars
         ? `warmup_${closed5mBars.length}/${this.minimalLlmBars}`
         : undefined;
-    if (warmupNote) {
-      console.log(
-        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mCloseTs=${this.state.last5mCloseTs ?? "n/a"} forming=${forming5mBar ? "yes" : "no"}`
-      );
-    }
     if (this.llmService) {
+      // Always try to build candidates, but don't require them for LLM call
       const candidates = this.buildMinimalSetupCandidates({
         closed5mBars: barsForCandidates,
         activeDirection: exec.thesisDirection,
       });
-      if (candidates.length < 2) {
-        if (warmupNote && exec.phase === "WAITING_FOR_THESIS") {
-          exec.waitReason = warmupNote;
-        }
-      } else {
+      console.log(
+        `[CANDIDATE_CHECK] candidatesCount=${candidates.length} barsForCandidates=${barsForCandidates.length} willCallLLM=${barsForCandidates.length > 0}`
+      );
+      
+      // Call LLM if we have any bars (candidates optional)
+      if (barsForCandidates.length > 0) {
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
           closed5mBars: barsForCandidates,
           forming5mBar,
         };
+        console.log(
+          `[LLM_CALL] bars=${barsForCandidates.length} candidates=${candidates.length} sendingToLLM=true`
+        );
         const result = await this.llmService.getMinimalSetupSelection({
           snapshot: llmSnapshot,
           candidates,
@@ -325,10 +342,15 @@ export class Orchestrator {
         } else {
           exec.thesisDirection = selection.selected === "LONG" ? "long" : "short";
           exec.thesisConfidence = selection.confidence;
-          exec.activeCandidate = candidates.find((c) => c.direction === selection.selected);
+          exec.activeCandidate = candidates.length > 0 ? candidates.find((c) => c.direction === selection.selected) : undefined;
           exec.phase = "WAITING_FOR_PULLBACK";
           exec.waitReason = "waiting_for_pullback";
           this.clearTradeState(exec);
+        }
+      } else {
+        // No bars yet - just wait
+        if (exec.phase === "WAITING_FOR_THESIS") {
+          exec.waitReason = "waiting_for_bars";
         }
       }
     } else {
@@ -337,8 +359,10 @@ export class Orchestrator {
 
     const canEnter = closed5mBars.length >= 2 || (closed5mBars.length >= 1 && !!forming5mBar);
     exec.canEnter = canEnter;
-    if (!canEnter && exec.phase !== "IN_TRADE") {
-      exec.waitReason = warmupNote ?? "entry_warmup";
+    // Warmup only affects entry execution, not thesis formation
+    // Don't overwrite LLM-set waitReason after thesis is formed
+    if (!canEnter && exec.phase === "WAITING_FOR_THESIS" && !exec.thesisDirection) {
+      exec.waitReason = "waiting_for_bars";
     }
 
     const current5m = forming5mBar ?? lastClosed5m ?? null;
