@@ -1628,26 +1628,11 @@ export class Orchestrator {
           exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
         }
       } else {
-        const recent1mBars =
-          forming5mBar || this.recentBars1m.length === 0
-            ? undefined
-            : this.recentBars1m.slice(-10).map((bar) => {
-                const closeVal = bar.close;
-                return {
-                  ts: bar.ts,
-                  open: bar.open ?? closeVal,
-                  high: bar.high ?? closeVal,
-                  low: bar.low ?? closeVal,
-                  close: closeVal,
-                  volume: bar.volume ?? 0,
-                };
-              });
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
           closed5mBars,
           forming5mBar,
-          recent1mBars,
         };
         const result = await this.llmService.getMinimalMindState(llmSnapshot);
         mindState = result.mindState;
@@ -1688,46 +1673,45 @@ export class Orchestrator {
       exec.waitReason = "llm_unavailable";
     }
 
-    const bars1m = this.recentBars1m;
-    const current = bars1m[bars1m.length - 1];
-    const previous = bars1m[bars1m.length - 2];
+    const current5m = forming5mBar ?? lastClosed5m ?? null;
+    const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : null;
 
-    if (current && exec.thesisDirection && exec.thesisDirection !== "none") {
+    if (current5m && exec.thesisDirection && exec.thesisDirection !== "none") {
       const allowEntries =
         regime.regime !== "OPEN_WATCH" &&
         (regime.regime !== "LUNCH_CHOP" || (exec.thesisConfidence ?? 0) >= this.minimalLunchConfidence);
-      if (exec.phase === "WAITING_FOR_PULLBACK" && previous) {
-        const open = current.open ?? current.close;
-        const isBearish = current.close < open;
-        const isBullish = current.close > open;
-        const lowerLow = current.low < previous.low;
-        const higherHigh = current.high > previous.high;
+      if (exec.phase === "WAITING_FOR_PULLBACK" && previous5m) {
+        const open = current5m.open ?? current5m.close;
+        const isBearish = current5m.close < open;
+        const isBullish = current5m.close > open;
+        const lowerLow = current5m.low < previous5m.low;
+        const higherHigh = current5m.high > previous5m.high;
 
         if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
-          exec.pullbackHigh = current.high;
-          exec.pullbackLow = current.low;
+          exec.pullbackHigh = current5m.high;
+          exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
           exec.phase = "WAITING_FOR_ENTRY";
           exec.waitReason = "waiting_for_break_above_pullback_high";
         }
 
         if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
-          exec.pullbackHigh = current.high;
-          exec.pullbackLow = current.low;
+          exec.pullbackHigh = current5m.high;
+          exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
           exec.phase = "WAITING_FOR_ENTRY";
           exec.waitReason = "waiting_for_break_below_pullback_low";
         }
       } else if (exec.phase === "WAITING_FOR_ENTRY") {
         if (exec.thesisDirection === "long" && exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
-          if (current.close > exec.pullbackHigh) {
+          if (current5m.close > exec.pullbackHigh) {
             if (!allowEntries) {
               exec.waitReason =
                 regime.regime === "OPEN_WATCH"
                   ? "open_watch_no_entries"
                   : `lunch_confidence_below_${this.minimalLunchConfidence}`;
             } else {
-            exec.entryPrice = current.close;
+            exec.entryPrice = current5m.close;
             exec.entryTs = ts;
             exec.stopPrice = exec.pullbackLow;
             exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
@@ -1740,14 +1724,14 @@ export class Orchestrator {
           exec.pullbackHigh !== undefined &&
           exec.pullbackLow !== undefined
         ) {
-          if (current.close < exec.pullbackLow) {
+          if (current5m.close < exec.pullbackLow) {
             if (!allowEntries) {
               exec.waitReason =
                 regime.regime === "OPEN_WATCH"
                   ? "open_watch_no_entries"
                   : `lunch_confidence_below_${this.minimalLunchConfidence}`;
             } else {
-            exec.entryPrice = current.close;
+            exec.entryPrice = current5m.close;
             exec.entryTs = ts;
             exec.stopPrice = exec.pullbackHigh;
             exec.targets = this.computeMinimalTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
@@ -1763,15 +1747,15 @@ export class Orchestrator {
         if (exec.stopPrice === undefined || !exec.targets || exec.targets.length === 0) {
           this.resetMinimalExecution("invalid_trade_state");
         } else if (exec.thesisDirection === "long") {
-          if (current.low <= exec.stopPrice) {
+          if (current5m.low <= exec.stopPrice) {
             this.resetMinimalExecution("stopped_out");
-          } else if (current.high >= exec.targets[0]!) {
+          } else if (current5m.high >= exec.targets[0]!) {
             this.resetMinimalExecution("target_hit");
           }
         } else if (exec.thesisDirection === "short") {
-          if (current.high >= exec.stopPrice) {
+          if (current5m.high >= exec.stopPrice) {
             this.resetMinimalExecution("stopped_out");
-          } else if (current.low <= exec.targets[0]!) {
+          } else if (current5m.low <= exec.targets[0]!) {
             this.resetMinimalExecution("target_hit");
           }
         }
