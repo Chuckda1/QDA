@@ -10,6 +10,7 @@ import type {
   MinimalExecutionState,
   MinimalLLMSnapshot,
   MinimalSetupCandidate,
+  RawBar,
 } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 
@@ -119,7 +120,7 @@ export class Orchestrator {
   }
 
   private buildMinimalSetupCandidates(params: {
-    closed5mBars: typeof this.recentBars5m;
+    closed5mBars: RawBar[];
   }): MinimalSetupCandidate[] {
     const { closed5mBars } = params;
     const lastClosed = closed5mBars[closed5mBars.length - 1];
