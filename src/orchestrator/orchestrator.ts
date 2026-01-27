@@ -216,20 +216,38 @@ export class Orchestrator {
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
     const exec = this.state.minimalExecution;
 
+    const formingAsClosed = forming5mBar
+      ? {
+          ts: forming5mBar.endTs,
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+        }
+      : null;
+    const barsForCandidates = closed5mBars.length
+      ? closed5mBars
+      : formingAsClosed
+      ? [formingAsClosed]
+      : [];
     if (closed5mBars.length < this.minimalLlmBars) {
       console.log(
-        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mTs=${this.state.last5mTs ?? "n/a"}`
+        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mTs=${this.state.last5mTs ?? "n/a"} forming=${forming5mBar ? "yes" : "no"}`
       );
       exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
-    } else if (this.llmService) {
-      const candidates = this.buildMinimalSetupCandidates({ closed5mBars });
+    }
+    if (this.llmService) {
+      const candidates = this.buildMinimalSetupCandidates({ closed5mBars: barsForCandidates });
       if (candidates.length < 2) {
-        exec.waitReason = "insufficient_levels";
+        if (closed5mBars.length < this.minimalLlmBars) {
+          exec.waitReason = "insufficient_levels";
+        }
       } else {
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
-          closed5mBars,
+          closed5mBars: barsForCandidates,
           forming5mBar,
         };
         const result = await this.llmService.getMinimalSetupSelection({
