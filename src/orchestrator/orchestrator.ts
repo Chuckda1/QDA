@@ -150,6 +150,20 @@ export class Orchestrator {
 
     if (!Number.isFinite(longInvalidation) || !Number.isFinite(shortInvalidation)) return [];
 
+    const longRef = Number.isFinite(lastSwingLow) ? "lastSwingLow" : "pullbackLow";
+    const shortRef = Number.isFinite(lastSwingHigh) ? "lastSwingHigh" : "pullbackHigh";
+    const priceRef = lastClosed.close;
+    const longDist = Math.abs(priceRef - longInvalidation);
+    const shortDist = Math.abs(priceRef - shortInvalidation);
+    const longPct = priceRef ? (longDist / priceRef) * 100 : 0;
+    const shortPct = priceRef ? (shortDist / priceRef) * 100 : 0;
+    console.log(
+      `[INV_DEBUG] dir=LONG inv=${longInvalidation.toFixed(2)} ref=${longRef} price=${priceRef.toFixed(2)} dist=${longDist.toFixed(2)} (${longPct.toFixed(3)}%) atr5m=n/a dist/atr=n/a`
+    );
+    console.log(
+      `[INV_DEBUG] dir=SHORT inv=${shortInvalidation.toFixed(2)} ref=${shortRef} price=${priceRef.toFixed(2)} dist=${shortDist.toFixed(2)} (${shortPct.toFixed(3)}%) atr5m=n/a dist/atr=n/a`
+    );
+
     const baseId = lastClosed.ts;
     return [
       {
