@@ -1600,9 +1600,24 @@ export class Orchestrator {
       return events;
     }
 
+    const forming5mBar = this.buildForming5mBar(ts);
+    if (forming5mBar && forming5mBar.progressMinutes >= 5) {
+      const last5mTs = this.recentBars5m.length ? this.recentBars5m[this.recentBars5m.length - 1]?.ts : null;
+      if (!last5mTs || last5mTs < forming5mBar.endTs) {
+        this.recentBars5m.push({
+          ts: forming5mBar.endTs,
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+        });
+        if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+        this.state.last5mTs = forming5mBar.endTs;
+      }
+    }
     const closed5mBars = buildClosed5mBars(this.recentBars5m, this.minimalLlmBars);
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const forming5mBar = this.buildForming5mBar(ts);
     const exec = this.getMinimalExecutionState();
     let mindState = this.state.mindState ?? { direction: "none", confidence: 0, reason: "no_thesis" };
     let valid = false;
