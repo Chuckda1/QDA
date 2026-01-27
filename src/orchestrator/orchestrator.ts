@@ -1,4 +1,4 @@
-import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, GateStatus, MinimalExecutionState, MinimalLLMSnapshot, MinimalSetupCandidate, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
+import type { Bias, BotState, DataFreshness, Direction, DomainEvent, EntryPermission, Forming5mBar, GateStatus, MinimalExecutionState, MinimalLLMSnapshot, MinimalSetupCandidate, ModeState, Play, PotdBias, PotdMode, RangeBand, ReclaimState, SnapshotContract, TacticalSnapshot, TimingPhase, TimingStateContext, TradeAction } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 import { randomUUID } from "crypto";
 import { StopProfitRules } from "../rules/stopProfitRules.js";
