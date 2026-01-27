@@ -183,9 +183,16 @@ export class Orchestrator {
 
     const priceRef = lastClosed.close;
     const buffer = Math.max(0.2, priceRef * 0.0003);
-    let longInvalidation: number = priceRef - buffer; // Default fallback
-    let shortInvalidation: number = priceRef + buffer; // Default fallback
-    let referenceLevels: { lastSwingHigh?: number; lastSwingLow?: number } = {};
+    
+    // Initialize with FALLBACK defaults (will be overwritten if SWING mode succeeds)
+    const rollingHigh = Math.max(...closed5mBars.map((b) => b.high));
+    const rollingLow = Math.min(...closed5mBars.map((b) => b.low));
+    let longInvalidation: number = rollingLow - buffer;
+    let shortInvalidation: number = rollingHigh + buffer;
+    let referenceLevels: { lastSwingHigh?: number; lastSwingLow?: number } = {
+      lastSwingHigh: rollingHigh,
+      lastSwingLow: rollingLow,
+    };
     let mode: "SWING" | "FALLBACK" = "FALLBACK";
 
     // MODE 1: SWING mode (preferred) - requires 5+ bars and valid swings
@@ -213,30 +220,18 @@ export class Orchestrator {
           `[CANDIDATE_BUILD] Using SWING mode: lastHigh=${lastSwingHigh.toFixed(2)} lastLow=${lastSwingLow.toFixed(2)}`
         );
       } else {
-        // Swings not detected, fall through to FALLBACK mode
-        mode = "FALLBACK";
         console.log(
-          `[CANDIDATE_BUILD] Swings not detected, falling back to FALLBACK mode. lastHigh=${lastSwingHigh ?? "null"} lastLow=${lastSwingLow ?? "null"}`
+          `[CANDIDATE_BUILD] Swings not detected, using FALLBACK mode. lastHigh=${lastSwingHigh ?? "null"} lastLow=${lastSwingLow ?? "null"}`
         );
       }
     } else {
-      // Not enough bars for swings, use FALLBACK mode
-      mode = "FALLBACK";
       console.log(
         `[CANDIDATE_BUILD] Insufficient bars for swings (have ${closed5mBars.length}, need ${minBarsForSwings}), using FALLBACK mode`
       );
     }
 
-    // MODE 2: FALLBACK mode - use rolling high/low from available bars
+    // Log FALLBACK mode if used
     if (mode === "FALLBACK") {
-      const rollingHigh = Math.max(...closed5mBars.map((b) => b.high));
-      const rollingLow = Math.min(...closed5mBars.map((b) => b.low));
-      longInvalidation = rollingLow - buffer;
-      shortInvalidation = rollingHigh + buffer;
-      referenceLevels = {
-        lastSwingHigh: rollingHigh,
-        lastSwingLow: rollingLow,
-      };
       console.log(
         `[CANDIDATE_BUILD] Using FALLBACK mode: rollingHigh=${rollingHigh.toFixed(2)} rollingLow=${rollingLow.toFixed(2)}`
       );
