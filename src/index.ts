@@ -246,6 +246,9 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting bar processing loop...`);
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
           try {
+            console.log(
+              `[INGEST][ALPACA] tf=1m ts=${bar.ts} o=${bar.open} h=${bar.high} l=${bar.low} c=${bar.close} v=${bar.volume}`
+            );
             const normalizedBar = normalizeBar(bar);
             bars5mCount++;
             const events5m = await orch.processTick(
@@ -275,6 +278,9 @@ if (alpacaKey && alpacaSecret) {
         console.log(`[${instanceId}] Starting polling fallback loop...`);
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
           try {
+            console.log(
+              `[INGEST][ALPACA] tf=1m ts=${bar.ts} o=${bar.open} h=${bar.high} l=${bar.low} c=${bar.close} v=${bar.volume}`
+            );
             const normalizedBar = normalizeBar(bar);
             bars5mCount++;
             const events5m = await orch.processTick(

@@ -28,6 +28,7 @@ type TickSnapshot = TickInput & { timeframe: "5m" | "1m" };
 
 export class Orchestrator {
   private instanceId: string;
+  private orchId: string;
   private llmService?: LLMService;
   private state: BotState;
   private recentBars5m: Array<{
@@ -44,8 +45,9 @@ export class Orchestrator {
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
+    this.orchId = randomUUID();
     this.llmService = llmService;
-    this.minimalLlmBars = parseInt(process.env.MINIMAL_LLM_BARS || "30", 10);
+    this.minimalLlmBars = parseInt(process.env.MINIMAL_LLM_BARS || "5", 10);
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
@@ -55,6 +57,9 @@ export class Orchestrator {
         waitReason: "waiting_for_thesis",
       },
     };
+    console.log(
+      `[MINIMAL] orchestrator_init id=${this.orchId} instance=${this.instanceId} minimalLlmBars=${this.minimalLlmBars}`
+    );
   }
 
   setMode(mode: BotMode): void {
@@ -102,15 +107,23 @@ export class Orchestrator {
 
     if (this.formingBucketStart !== null && startTs !== this.formingBucketStart) {
       if (this.forming5mBar) {
-        this.recentBars5m.push({
+        const closedBar = {
           ts: this.forming5mBar.endTs,
           open: this.forming5mBar.open,
           high: this.forming5mBar.high,
           low: this.forming5mBar.low,
           close: this.forming5mBar.close,
           volume: this.forming5mBar.volume,
-        });
+        };
+        this.recentBars5m.push(closedBar);
         if (this.recentBars5m.length > 120) this.recentBars5m.shift();
+        const lastTs = this.recentBars5m[this.recentBars5m.length - 1]?.ts;
+        console.log(
+          `[MINIMAL][5M_CLOSE] start=${this.forming5mBar.startTs} end=${this.forming5mBar.endTs} o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
+        );
+        console.log(
+          `[MINIMAL][5M_PUSH] len=${this.recentBars5m.length} lastTs=${lastTs ?? "n/a"}`
+        );
       }
     }
 
@@ -204,6 +217,9 @@ export class Orchestrator {
     const exec = this.state.minimalExecution;
 
     if (closed5mBars.length < this.minimalLlmBars) {
+      console.log(
+        `[MINIMAL][THESIS_GATE] len=${closed5mBars.length} required=${this.minimalLlmBars} last5mTs=${this.state.last5mTs ?? "n/a"}`
+      );
       exec.waitReason = `collecting_5m_bars_${closed5mBars.length}/${this.minimalLlmBars}`;
     } else if (this.llmService) {
       const candidates = this.buildMinimalSetupCandidates({ closed5mBars });
