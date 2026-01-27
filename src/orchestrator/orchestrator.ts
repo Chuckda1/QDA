@@ -75,9 +75,6 @@ export class Orchestrator {
     this.state.session = getMarketSessionLabel(new Date(input.ts));
     this.state.lastTickTs = input.ts;
     this.state.price = input.close;
-    if (timeframe === "5m") {
-      this.state.last5mCloseTs = input.ts;
-    }
 
     if (timeframe !== "5m") {
       return [];
@@ -114,6 +111,8 @@ export class Orchestrator {
         this.recentBars5m.push(closedBar);
         if (this.recentBars5m.length > 120) this.recentBars5m.shift();
         const lastTs = this.recentBars5m[this.recentBars5m.length - 1]?.ts;
+        // Update last5mCloseTs only when a bar actually closes
+        this.state.last5mCloseTs = closedBar.ts;
         console.log(
           `[MINIMAL][ROLLOVER] oldStart=${this.formingBucketStart} newStart=${startTs} closedBar o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
         );
