@@ -1630,7 +1630,19 @@ export class Orchestrator {
         }
       } else {
         const recent1mBars =
-          forming5mBar || this.recentBars1m.length === 0 ? undefined : this.recentBars1m.slice(-10);
+          forming5mBar || this.recentBars1m.length === 0
+            ? undefined
+            : this.recentBars1m.slice(-10).map((bar) => {
+                const closeVal = bar.close;
+                return {
+                  ts: bar.ts,
+                  open: bar.open ?? closeVal,
+                  high: bar.high ?? closeVal,
+                  low: bar.low ?? closeVal,
+                  close: closeVal,
+                  volume: bar.volume ?? 0,
+                };
+              });
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
