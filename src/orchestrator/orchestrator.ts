@@ -384,6 +384,7 @@ export class Orchestrator {
         );
 
         if (matchingCandidate) {
+          const oldPhase = exec.phase;
           exec.thesisDirection = llmDirection;
           exec.thesisConfidence = decision.confidence;
           exec.activeCandidate = matchingCandidate;
@@ -394,15 +395,20 @@ export class Orchestrator {
           this.clearTradeState(exec);
           shouldPublishEvent = true; // Thesis changed - publish event
           console.log(
-            `[SETUP_MATCH] ${llmDirection.toUpperCase()} thesis set, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)}`
+            `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_PULLBACK | ${llmDirection.toUpperCase()} thesis ARMED, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence}`
           );
         } else {
-          console.log(`[SETUP_MATCH] FAIL: No matching candidate for ${llmDirection}`);
+          console.log(
+            `[SETUP_MATCH] FAIL: No matching candidate for ${llmDirection} (candidates=${candidates.length}, directions=${candidates.map(c => c.direction).join(",")})`
+          );
         }
       } else if (llmDirection === "none") {
         // LLM says WAIT - clear thesis
         if (exec.thesisDirection && exec.thesisDirection !== "none") {
-          console.log(`[SETUP_CLEAR] LLM says WAIT, clearing thesis`);
+          const oldPhase = exec.phase;
+          console.log(
+            `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | LLM says WAIT, clearing ${exec.thesisDirection} thesis`
+          );
           exec.thesisDirection = "none";
           exec.thesisConfidence = decision.confidence;
           exec.activeCandidate = undefined;
@@ -416,17 +422,26 @@ export class Orchestrator {
       // Check for pullback entry every 1m (responsive, not just on 5m close)
       if (exec.thesisDirection && exec.thesisDirection !== "none" && exec.phase === "WAITING_FOR_PULLBACK") {
         const current5m = forming5mBar ?? lastClosed5m;
-        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : null;
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
-        if (current5m && previous5m) {
+        if (current5m) {
           const open = current5m.open ?? current5m.close;
           const isBearish = current5m.close < open;
           const isBullish = current5m.close > open;
-          const lowerLow = current5m.low < previous5m.low;
-          const higherHigh = current5m.high > previous5m.high;
+          
+          // For pullback detection, we need previous bar to compare, but allow entry with just current bar if it's bearish/bullish
+          let lowerLow = false;
+          let higherHigh = false;
+          if (previous5m) {
+            lowerLow = current5m.low < previous5m.low;
+            higherHigh = current5m.high > previous5m.high;
+          }
 
           // Enter ON pullback for LONG thesis
-          if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
+          // Condition: current bar is bearish OR makes a lower low (if we have previous bar)
+          // If no previous bar, allow entry on any bearish bar
+          if (exec.thesisDirection === "long" && (isBearish || (previous5m && lowerLow))) {
+            const oldPhase = exec.phase;
             exec.entryPrice = current5m.close;
             exec.entryTs = ts;
             exec.pullbackHigh = current5m.high;
@@ -438,12 +453,15 @@ export class Orchestrator {
             exec.waitReason = "in_trade";
             shouldPublishEvent = true; // Entry executed - publish event
             console.log(
-              `[ENTRY] LONG entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | LONG entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
             );
           }
 
           // Enter ON pullback for SHORT thesis
-          if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
+          // Condition: current bar is bullish OR makes a higher high (if we have previous bar)
+          // If no previous bar, allow entry on any bullish bar
+          if (exec.thesisDirection === "short" && (isBullish || (previous5m && higherHigh))) {
+            const oldPhase = exec.phase;
             exec.entryPrice = current5m.close;
             exec.entryTs = ts;
             exec.pullbackHigh = current5m.high;
@@ -455,7 +473,7 @@ export class Orchestrator {
             exec.waitReason = "in_trade";
             shouldPublishEvent = true; // Entry executed - publish event
             console.log(
-              `[ENTRY] SHORT entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | SHORT entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
             );
           }
         }
@@ -467,13 +485,19 @@ export class Orchestrator {
         if (current5m) {
           // Check stop
           if (exec.thesisDirection === "long" && current5m.low <= exec.stopPrice) {
-            console.log(`[EXIT] Stop hit at ${current5m.low.toFixed(2)}`);
+            const oldPhase = exec.phase;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+            );
             exec.phase = "WAITING_FOR_THESIS";
             exec.waitReason = "stop_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
           } else if (exec.thesisDirection === "short" && current5m.high >= exec.stopPrice) {
-            console.log(`[EXIT] Stop hit at ${current5m.high.toFixed(2)}`);
+            const oldPhase = exec.phase;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Stop hit at ${current5m.high.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+            );
             exec.phase = "WAITING_FOR_THESIS";
             exec.waitReason = "stop_hit";
             this.clearTradeState(exec);
@@ -488,7 +512,10 @@ export class Orchestrator {
               (exec.thesisDirection === "long" && current5m.high >= target) ||
               (exec.thesisDirection === "short" && current5m.low <= target)
             );
-            console.log(`[EXIT] Target hit at ${hitTarget?.toFixed(2)}`);
+            const oldPhase = exec.phase;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Target hit at ${hitTarget?.toFixed(2)}`
+            );
             exec.phase = "WAITING_FOR_THESIS";
             exec.waitReason = "target_hit";
             this.clearTradeState(exec);
