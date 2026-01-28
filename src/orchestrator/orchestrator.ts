@@ -327,10 +327,13 @@ export class Orchestrator {
 
       const llmDirection: "long" | "short" | "none" = 
         decision.action === "ARM_LONG" ? "long" :
-        decision.action === "ARM_SHORT" ? "short" : "none";
+        decision.action === "ARM_SHORT" ? "short" :
+        decision.action === "A+" ? (decision.bias === "bearish" ? "short" : "long") : "none";
+      
+      const isMaturityFlip = decision.action === "A+";
 
       console.log(
-        `[LLM1M] action=${decision.action} conf=${decision.confidence} currentThesis=${exec.thesisDirection ?? "none"}`
+        `[LLM1M] action=${decision.action} bias=${decision.bias} maturity=${decision.maturity} conf=${decision.confidence} currentThesis=${exec.thesisDirection ?? "none"}`
       );
 
       // Track previous state to detect changes
@@ -344,7 +347,61 @@ export class Orchestrator {
         (llmDirection !== exec.thesisDirection) ||
         (!exec.thesisDirection || exec.thesisDirection === "none");
 
-      if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
+      // Handle A+ (maturity flip) - immediate entry opportunity
+      if (isMaturityFlip && (llmDirection === "long" || llmDirection === "short")) {
+        console.log(
+          `[A+_FLIP] Maturity flip detected: ${decision.bias} bias, ${decision.maturity} maturity, immediate ${llmDirection.toUpperCase()} opportunity`
+        );
+        
+        // For A+, we can enter immediately without waiting for pullback
+        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
+          ts: forming5mBar.endTs,
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+        }] : []);
+
+        const candidates = this.buildMinimalSetupCandidates({
+          closed5mBars: barsForCandidates,
+          activeDirection: exec.thesisDirection,
+        });
+
+        const matchingCandidate = candidates.find(
+          (c) => c.direction === (llmDirection === "long" ? "LONG" : "SHORT")
+        );
+
+        if (matchingCandidate) {
+          exec.thesisDirection = llmDirection;
+          exec.thesisConfidence = decision.confidence;
+          exec.activeCandidate = matchingCandidate;
+          exec.thesisPrice = lastClosed5m?.close ?? close;
+          exec.thesisTs = ts;
+          
+          // A+ can enter immediately on the current bar
+          const current5m = forming5mBar ?? lastClosed5m;
+          if (current5m) {
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
+            exec.stopPrice = llmDirection === "long" ? current5m.low : current5m.high;
+            exec.targets = this.computeTargets(llmDirection, exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "a+_maturity_flip_entry";
+            shouldPublishEvent = true;
+            console.log(
+              `[STATE_TRANSITION] ${exec.phase} -> IN_TRADE | A+ ${llmDirection.toUpperCase()} entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)}`
+            );
+          } else {
+            exec.phase = "WAITING_FOR_PULLBACK";
+            exec.waitReason = "waiting_for_pullback";
+            shouldPublishEvent = true;
+          }
+        }
+      } else if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
         console.log(
           `[SETUP_GEN] LLM direction changed: ${exec.thesisDirection ?? "none"} -> ${llmDirection}, generating candidates`
         );

@@ -29,10 +29,18 @@ export type MinimalLLMSnapshot = {
 
 export type ArmDecisionRaw5mResponse = {
   mindId: string;
-  action: "ARM_LONG" | "ARM_SHORT" | "WAIT";
+  action: "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+";
   confidence: number; // 0-100
+  bias: "bullish" | "bearish" | "neutral";
+  maturity: "early" | "developing" | "mature" | "extended" | "unclear";
   because: string;
   waiting_for: string; // Required field
+};
+
+export type PostTradeIntrospection = {
+  assessment: "aligned" | "early" | "late" | "unclear";
+  keySignal: string;
+  misread: "none" | "structure" | "momentum" | "participation" | "context" | "timing";
 };
 
 export type ArmDecisionRaw5mResult = {

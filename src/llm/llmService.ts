@@ -5,6 +5,7 @@ import type {
   MinimalSetupSelectionResult,
   ArmDecisionRaw5mResponse,
   ArmDecisionRaw5mResult,
+  PostTradeIntrospection,
 } from "../types.js";
 import { randomUUID } from "crypto";
 
@@ -171,14 +172,74 @@ ${JSON.stringify(llmInput)}`;
     }
   }
 
+  private parseControlSentence(text: string): ArmDecisionRaw5mResponse | null {
+    // Parse: CONTROL=<LONG|SHORT|WAIT|A+> | BIAS=<bullish|bearish|neutral> | MATURITY=<early|developing|mature|extended|unclear> | CONF=<0-100>
+    const controlMatch = text.match(/CONTROL=(\w+)/i);
+    const biasMatch = text.match(/BIAS=(bullish|bearish|neutral)/i);
+    const maturityMatch = text.match(/MATURITY=(early|developing|mature|extended|unclear)/i);
+    const confMatch = text.match(/CONF=(\d+)/i);
+
+    if (!controlMatch || !biasMatch || !maturityMatch || !confMatch) {
+      return null;
+    }
+
+    const controlRaw = controlMatch[1].toUpperCase();
+    let action: "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+";
+    if (controlRaw === "LONG") {
+      action = "ARM_LONG";
+    } else if (controlRaw === "SHORT") {
+      action = "ARM_SHORT";
+    } else if (controlRaw === "A+" || controlRaw === "A_PLUS") {
+      action = "A+";
+    } else {
+      action = "WAIT";
+    }
+
+    const bias = biasMatch[1].toLowerCase() as "bullish" | "bearish" | "neutral";
+    const maturity = maturityMatch[1].toLowerCase() as "early" | "developing" | "mature" | "extended" | "unclear";
+    const confidence = parseInt(confMatch[1], 10);
+
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100) {
+      return null;
+    }
+
+    // Generate because and waiting_for from parsed data
+    const because = `${bias} bias, ${maturity} move maturity`;
+    const waiting_for = action === "WAIT" ? `waiting_for_${maturity}_move_to_develop` : `ready_for_${action.toLowerCase()}`;
+
+    return {
+      mindId: randomUUID(),
+      action,
+      confidence,
+      bias,
+      maturity,
+      because,
+      waiting_for,
+    };
+  }
+
   private normalizeArmDecisionRaw5m(input: any): ArmDecisionRaw5mResponse | null {
+    // Try parsing as control sentence first
+    if (typeof input === "string") {
+      const parsed = this.parseControlSentence(input);
+      if (parsed) return parsed;
+    }
+
+    // Fallback to JSON format (backward compatibility)
     if (!input || typeof input !== "object") return null;
+    
     const actionRaw = typeof input.action === "string" ? input.action.toUpperCase() : "";
     const action =
-      actionRaw === "ARM_LONG" || actionRaw === "ARM_SHORT" || actionRaw === "WAIT"
-        ? (actionRaw as "ARM_LONG" | "ARM_SHORT" | "WAIT")
+      actionRaw === "ARM_LONG" || actionRaw === "ARM_SHORT" || actionRaw === "WAIT" || actionRaw === "A+" || actionRaw === "A_PLUS"
+        ? (actionRaw === "A_PLUS" ? "A+" : actionRaw) as "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+"
         : "WAIT";
     const confidence = Number.isFinite(input.confidence) ? Number(input.confidence) : NaN;
+    const bias = typeof input.bias === "string" 
+      ? (input.bias.toLowerCase() as "bullish" | "bearish" | "neutral")
+      : (action === "ARM_LONG" ? "bullish" : action === "ARM_SHORT" ? "bearish" : "neutral");
+    const maturity = typeof input.maturity === "string"
+      ? (input.maturity.toLowerCase() as "early" | "developing" | "mature" | "extended" | "unclear")
+      : "unclear";
     const because = typeof input.because === "string" ? input.because : "";
     const waiting_for = typeof input.waiting_for === "string" ? input.waiting_for : "";
     const mindId = typeof input.mindId === "string" ? input.mindId : randomUUID();
@@ -187,7 +248,7 @@ ${JSON.stringify(llmInput)}`;
     if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100 || !because || !waiting_for) {
       return null;
     }
-    return { mindId, action, confidence, because, waiting_for };
+    return { mindId, action, confidence, bias, maturity, because, waiting_for };
   }
 
   async getArmDecisionRaw5m(params: {
@@ -197,6 +258,8 @@ ${JSON.stringify(llmInput)}`;
       mindId: randomUUID(),
       action: "WAIT",
       confidence: 0,
+      bias: "neutral",
+      maturity: "unclear",
       because: "LLM unavailable",
       waiting_for: "llm_unavailable",
     };
@@ -226,52 +289,66 @@ ${JSON.stringify(llmInput)}`;
       forming5mBar,
     };
 
-    const prompt = `You are a discretionary market analyst assisting an execution system.
+    const prompt = `You are a senior discretionary market analyst assisting an automated execution system.
 
-You receive ONLY 5-minute OHLCV bars (closed + forming). Analyze price action and decide whether to ARM_LONG, ARM_SHORT, or WAIT.
+You will receive structured market data (OHLCV bars).
+You must internally perform full market reasoning, including:
+- Structure
+- Momentum
+- Participation
+- Context
+- Move maturity
 
-**CRITICAL: Move Maturity Lens**
+However, you must NOT output your reasoning.
 
-In addition to identifying direction (bullish, bearish, neutral), you must evaluate the *maturity* of the current move. Move maturity describes *where the market is in the lifecycle of a move*, not whether the move is "right" or "wrong."
+Your task is to compress your full analysis into ONE control sentence
+that the execution system will act on.
 
-When analyzing price action, always consider:
-- Is this move **early**, **developing**, **extended**, or **exhausting**?
-- Is price reacting **for the first time** to a level, or returning after prior tests?
-- Has momentum **expanded recently**, or is it **stalling after expansion**?
-- Is participation **increasing, stable, or fading** relative to the prior push?
+---
 
-Use this lens to *qualify confidence*, not to force a decision.
+### Required Internal Lens (do not output explicitly)
 
-**Guidance (do not treat as rules):**
-- Early/developing moves tend to have clean structure, space to targets, and improving participation.
-- Mature or extended moves often show overlapping candles, wickiness, failed continuation, or divergence between price and momentum.
-- A breakout attempt that occurs after a long consolidation or multiple failed pushes should be treated as lower quality unless participation clearly expands.
+Always evaluate MOVE MATURITY:
+- Is the current move early, developing, mature, extended, or exhausting?
+- Has momentum expanded recently, or is it stalling after expansion?
+- Is price discovering new value, or revisiting crowded levels?
+- Is risk-reward improving or degrading *right now*?
 
-**Confidence Calculation:**
-- You MUST compute confidence solely from the provided bars.
-- Do NOT reduce confidence just because the sample is small.
-- **Adjust confidence DOWN if the move appears mature or late** - this is part of your honest assessment.
-- If you are uncertain, express that uncertainty in "because" and "waiting_for", but keep confidence as your honest estimate based on the available data.
-- Do not apply any warmup multipliers or sample-size penalties to confidence.
+This lens should influence confidence and action selection,
+but must not be expressed as hard rules.
 
-**Prefer WAIT when direction is correct but maturity is unfavorable.**
+### A+ Action Context (Maturity Flip Archetypes)
 
-Return JSON only:
-{
-  "mindId": "uuid-string",
-  "action": "ARM_LONG|ARM_SHORT|WAIT",
-  "confidence": 0,
-  "because": "brief reason referencing price behavior and move maturity assessment",
-  "waiting_for": "short text describing what you're waiting for (required for all actions)"
-}
+A+ shorts come from *bullish ideas failing late*, not from bearish signals:
 
-Rules:
-- All fields above are REQUIRED in every response, including "waiting_for".
-- "confidence" must be 0-100 and reflect your honest assessment, adjusted for move maturity.
-- "action" must be ARM_LONG, ARM_SHORT, or WAIT.
-- Do NOT invent indicators. Use only OHLCV data.
-- Do NOT add invalidation levels, stop prices, buffers, or swing references.
-- If uncertain, use "because" and "waiting_for" to explain, but keep confidence as your true estimate.
+1. **Late Breakout Failure**: Price breaks above resistance/VWAP after consolidation, but lacks follow-through, shows upper wicks, momentum does not expand.
+2. **VWAP Reclaim → Immediate Rejection**: Price reclaims VWAP intrabar but cannot hold on close, sellers respond quickly.
+3. **Momentum Divergence at Highs**: Higher highs in price but momentum/participation fails to confirm.
+4. **Expansion → Compression → Failure**: Strong push earlier, followed by tight range near highs, then failed range resolution upward.
+
+A+ longs follow similar patterns in reverse.
+
+---
+
+### Output Format (STRICT)
+
+You MUST output exactly one line in the following format and nothing else:
+
+CONTROL=<LONG|SHORT|WAIT|A+> | BIAS=<bullish|bearish|neutral> | MATURITY=<early|developing|mature|extended|unclear> | CONF=<0-100>
+
+---
+
+### Behavioral Guidance (soft, not rules)
+
+- Prefer WAIT when direction is correct but move maturity is unfavorable.
+- Prefer A+ only when maturity *flips* in your favor and risk-reward improves sharply.
+- Do not chase late breakouts.
+- Do not anticipate reversals without evidence.
+- Confidence should decrease as moves become crowded or extended.
+
+---
+
+You are judged on alignment with live price behavior, not prediction.
 
 Raw 5m data:
 ${JSON.stringify(llmInput)}`;
@@ -301,18 +378,126 @@ ${JSON.stringify(llmInput)}`;
       return { decision: { ...fallback, because: "LLM error" }, valid: false };
     }
     const json = await response.json();
-    const content = json?.choices?.[0]?.message?.content ?? "{}";
+    const content = json?.choices?.[0]?.message?.content ?? "";
+    
+    // Try parsing as control sentence first
+    const normalized = this.normalizeArmDecisionRaw5m(content.trim());
+    if (normalized) {
+      return { decision: normalized, valid: true };
+    }
+    
+    // Fallback: try JSON parsing (backward compatibility)
     try {
       const parsed = JSON.parse(content);
-      const normalized = this.normalizeArmDecisionRaw5m(parsed);
-      if (!normalized) {
+      const normalizedJson = this.normalizeArmDecisionRaw5m(parsed);
+      if (!normalizedJson) {
         console.error("[LLM] ArmDecisionRaw5m invalid schema:", content);
         return { decision: { ...fallback, because: "LLM invalid schema" }, valid: false };
       }
-      return { decision: normalized, valid: true };
+      return { decision: normalizedJson, valid: true };
     } catch (err) {
       console.error("[LLM] ArmDecisionRaw5m parse error:", err);
+      console.error("[LLM] Raw content:", content);
       return { decision: { ...fallback, because: "LLM parse error" }, valid: false };
+    }
+  }
+
+  async getPostTradeIntrospection(params: {
+    snapshot: MinimalLLMSnapshot;
+    action: "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+";
+    entryPrice?: number;
+    exitPrice?: number;
+    entryTs?: number;
+    exitTs?: number;
+    outcome: "profit" | "loss" | "breakeven" | "wait_expired";
+  }): Promise<PostTradeIntrospection | null> {
+    if (!this.enabled) {
+      return null;
+    }
+
+    const closed5mBars = params.snapshot.closed5mBars.slice(-30).map((bar) => ({
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+    }));
+
+    const prompt = `You are reviewing a completed market decision.
+
+You are NOT allowed to suggest trades.
+You are NOT allowed to change past actions.
+
+Your task is to reflect on:
+- Whether move maturity was assessed correctly
+- Whether the chosen action (${params.action}) matched the context
+- What early signals mattered most in hindsight
+- What signals were misleading
+
+Do NOT output rules.
+Do NOT output advice.
+
+Context:
+- Action taken: ${params.action}
+- Outcome: ${params.outcome}
+${params.entryPrice ? `- Entry: ${params.entryPrice}` : ""}
+${params.exitPrice ? `- Exit: ${params.exitPrice}` : ""}
+
+Market data:
+${JSON.stringify(closed5mBars)}
+
+Summarize in 3 fields:
+
+ASSESSMENT=<aligned|early|late|unclear>
+KEY_SIGNAL=<one short phrase>
+MISREAD=<none|structure|momentum|participation|context|timing>
+
+Output exactly this format.`;
+
+    const payload = {
+      model: this.model,
+      messages: [
+        { role: "system", content: "Output exactly the required format. No markdown. No explanation." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.3,
+    };
+
+    try {
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        console.error("[LLM] PostTradeIntrospection error:", response.status);
+        return null;
+      }
+
+      const json = await response.json();
+      const content = json?.choices?.[0]?.message?.content ?? "";
+      
+      const assessmentMatch = content.match(/ASSESSMENT=(aligned|early|late|unclear)/i);
+      const keySignalMatch = content.match(/KEY_SIGNAL=(.+?)(?:\s|$)/i);
+      const misreadMatch = content.match(/MISREAD=(none|structure|momentum|participation|context|timing)/i);
+
+      if (!assessmentMatch || !keySignalMatch || !misreadMatch) {
+        console.error("[LLM] PostTradeIntrospection invalid format:", content);
+        return null;
+      }
+
+      return {
+        assessment: assessmentMatch[1].toLowerCase() as "aligned" | "early" | "late" | "unclear",
+        keySignal: keySignalMatch[1].trim(),
+        misread: misreadMatch[1].toLowerCase() as "none" | "structure" | "momentum" | "participation" | "context" | "timing",
+      };
+    } catch (err) {
+      console.error("[LLM] PostTradeIntrospection error:", err);
+      return null;
     }
   }
 
