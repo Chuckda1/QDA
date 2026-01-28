@@ -78,7 +78,7 @@ export class Orchestrator {
     this.state.price = input.close;
 
     if (timeframe === "1m") {
-      return this.handleMinimal1m(snapshot);
+      return await this.handleMinimal1m(snapshot);
     }
 
     return this.handleMinimal5m(snapshot);
@@ -98,33 +98,12 @@ export class Orchestrator {
       `[BUCKET_DEBUG] ts=${snapshot.ts} startTs=${startTs} endTs=${endTs} formingBucketStart=${this.formingBucketStart ?? "null"} prevTs=${prevTs ?? "null"} tsDelta=${prevTs !== null ? snapshot.ts - prevTs : "n/a"}`
     );
 
-    // Handle bucket rollover: push closed bar and start new bucket
+    // Handle bucket rollover: start new bucket (BarAggregator handles closed bar push)
     if (this.formingBucketStart !== null && startTs !== this.formingBucketStart) {
       if (this.forming5mBar) {
-        const closedBar = {
-          ts: this.forming5mBar.endTs,
-          open: this.forming5mBar.open,
-          high: this.forming5mBar.high,
-          low: this.forming5mBar.low,
-          close: this.forming5mBar.close,
-          volume: this.forming5mBar.volume,
-        };
-        this.recentBars5m.push(closedBar);
-        if (this.recentBars5m.length > 120) this.recentBars5m.shift();
-        const lastTs = this.recentBars5m[this.recentBars5m.length - 1]?.ts;
-        // Update last5mCloseTs only when a bar actually closes
-        this.state.last5mCloseTs = closedBar.ts;
+        // Log rollover but don't push - BarAggregator handles that
         console.log(
-          `[MINIMAL][5M_CLOSE_COMMIT] last5mCloseTs=${this.state.last5mCloseTs} len=${this.recentBars5m.length}`
-        );
-        console.log(
-          `[MINIMAL][ROLLOVER] oldStart=${this.formingBucketStart} newStart=${startTs} closedBar o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
-        );
-        console.log(
-          `[MINIMAL][5M_CLOSE] start=${this.forming5mBar.startTs} end=${this.forming5mBar.endTs} o=${closedBar.open} h=${closedBar.high} l=${closedBar.low} c=${closedBar.close} v=${closedBar.volume}`
-        );
-        console.log(
-          `[MINIMAL][5M_PUSH] len=${this.recentBars5m.length} lastTs=${lastTs ?? "n/a"}`
+          `[MINIMAL][ROLLOVER] oldStart=${this.formingBucketStart} newStart=${startTs} formingBar o=${this.forming5mBar.open} h=${this.forming5mBar.high} l=${this.forming5mBar.low} c=${this.forming5mBar.close} v=${this.forming5mBar.volume}`
         );
       }
       // Start new bucket with first tick's open
@@ -302,8 +281,17 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
-  private handleMinimal1m(snapshot: TickSnapshot): DomainEvent[] {
-    // Only update forming5mBar state (no thesis gate, no candidates, no execution)
+  private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
+    const { ts, symbol, close } = snapshot;
+    const events: DomainEvent[] = [];
+    const regime = getMarketRegime(new Date(ts));
+    if (!regime.isRTH) {
+      this.state.minimalExecution.phase = "WAITING_FOR_THESIS";
+      this.state.minimalExecution.waitReason = "market_closed";
+      return events;
+    }
+
+    // Update forming5mBar state
     const forming5mBar = this.updateForming5mBar(snapshot);
     if (forming5mBar) {
       const progress = forming5mBar.progressMinutes;
@@ -311,7 +299,262 @@ export class Orchestrator {
         `[FORMING5M] start=${forming5mBar.startTs} progress=${progress}/5 o=${forming5mBar.open.toFixed(2)} h=${forming5mBar.high.toFixed(2)} l=${forming5mBar.low.toFixed(2)} c=${forming5mBar.close.toFixed(2)} v=${forming5mBar.volume}`
       );
     }
-    return []; // No events from 1m updates
+
+    const closed5mBars = this.recentBars5m;
+    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
+    const exec = this.state.minimalExecution;
+    let shouldPublishEvent = false;
+    let debugInfo: MinimalDebugInfo | undefined = undefined;
+
+    // LLM called every 1m with RAW BARS ONLY (no candidates)
+    if (this.llmService && (closed5mBars.length > 0 || forming5mBar !== null)) {
+      const llmSnapshot: MinimalLLMSnapshot = {
+        symbol,
+        nowTs: ts,
+        closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
+        forming5mBar,
+      };
+
+      console.log(
+        `[LLM1M] closed5m=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"} callingLLM=true`
+      );
+      const result = await this.llmService.getArmDecisionRaw5m({
+        snapshot: llmSnapshot,
+      });
+      const decision = result.decision;
+      this.state.lastLLMCallAt = ts;
+      this.state.lastLLMDecision = decision.because ?? decision.action;
+
+      const llmDirection: "long" | "short" | "none" = 
+        decision.action === "ARM_LONG" ? "long" :
+        decision.action === "ARM_SHORT" ? "short" : "none";
+
+      console.log(
+        `[LLM1M] action=${decision.action} conf=${decision.confidence} currentThesis=${exec.thesisDirection ?? "none"}`
+      );
+
+      // Track previous state to detect changes
+      const previousThesisDirection = exec.thesisDirection;
+      const previousPhase = exec.phase;
+
+      // Generate candidates and match direction ONLY if:
+      // 1. LLM direction changed from current thesis, OR
+      // 2. No thesis exists yet
+      const needsNewSetup = 
+        (llmDirection !== exec.thesisDirection) ||
+        (!exec.thesisDirection || exec.thesisDirection === "none");
+
+      if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
+        console.log(
+          `[SETUP_GEN] LLM direction changed: ${exec.thesisDirection ?? "none"} -> ${llmDirection}, generating candidates`
+        );
+
+        // Bot generates setups from raw data
+        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
+          ts: forming5mBar.endTs,
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+        }] : []);
+
+        const candidates = this.buildMinimalSetupCandidates({
+          closed5mBars: barsForCandidates,
+          activeDirection: exec.thesisDirection,
+        });
+
+        debugInfo = {
+          barsClosed5m: closed5mBars.length,
+          hasForming5m: !!forming5mBar,
+          formingProgressMin: forming5mBar?.progressMinutes ?? null,
+          formingStartTs: forming5mBar?.startTs ?? null,
+          formingEndTs: forming5mBar?.endTs ?? null,
+          formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
+          lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
+          candidateBarsUsed: barsForCandidates.length,
+          candidateCount: candidates.length,
+          botPhase: exec.phase,
+          botWaitReason: exec.waitReason ?? null,
+        };
+
+        // Bot matches LLM direction to correct candidate
+        const matchingCandidate = candidates.find(
+          (c) => c.direction === (llmDirection === "long" ? "LONG" : "SHORT")
+        );
+
+        if (matchingCandidate) {
+          exec.thesisDirection = llmDirection;
+          exec.thesisConfidence = decision.confidence;
+          exec.activeCandidate = matchingCandidate;
+          exec.thesisPrice = lastClosed5m?.close ?? close;
+          exec.thesisTs = ts;
+          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.waitReason = "waiting_for_pullback";
+          this.clearTradeState(exec);
+          shouldPublishEvent = true; // Thesis changed - publish event
+          console.log(
+            `[SETUP_MATCH] ${llmDirection.toUpperCase()} thesis set, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)}`
+          );
+        } else {
+          console.log(`[SETUP_MATCH] FAIL: No matching candidate for ${llmDirection}`);
+        }
+      } else if (llmDirection === "none") {
+        // LLM says WAIT - clear thesis
+        if (exec.thesisDirection && exec.thesisDirection !== "none") {
+          console.log(`[SETUP_CLEAR] LLM says WAIT, clearing thesis`);
+          exec.thesisDirection = "none";
+          exec.thesisConfidence = decision.confidence;
+          exec.activeCandidate = undefined;
+          exec.phase = "WAITING_FOR_THESIS";
+          exec.waitReason = decision.waiting_for ?? "waiting_for_thesis";
+          this.clearTradeState(exec);
+          shouldPublishEvent = true; // Thesis cleared - publish event
+        }
+      }
+
+      // Check for pullback entry every 1m (responsive, not just on 5m close)
+      if (exec.thesisDirection && exec.thesisDirection !== "none" && exec.phase === "WAITING_FOR_PULLBACK") {
+        const current5m = forming5mBar ?? lastClosed5m;
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : null;
+
+        if (current5m && previous5m) {
+          const open = current5m.open ?? current5m.close;
+          const isBearish = current5m.close < open;
+          const isBullish = current5m.close > open;
+          const lowerLow = current5m.low < previous5m.low;
+          const higherHigh = current5m.high > previous5m.high;
+
+          // Enter ON pullback for LONG thesis
+          if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
+            exec.stopPrice = current5m.low; // Stop at pullback low
+            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
+            shouldPublishEvent = true; // Entry executed - publish event
+            console.log(
+              `[ENTRY] LONG entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+            );
+          }
+
+          // Enter ON pullback for SHORT thesis
+          if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
+            exec.stopPrice = current5m.high; // Stop at pullback high
+            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
+            shouldPublishEvent = true; // Entry executed - publish event
+            console.log(
+              `[ENTRY] SHORT entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+            );
+          }
+        }
+      }
+
+      // Check trade management if in trade
+      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && exec.targets) {
+        const current5m = forming5mBar ?? lastClosed5m;
+        if (current5m) {
+          // Check stop
+          if (exec.thesisDirection === "long" && current5m.low <= exec.stopPrice) {
+            console.log(`[EXIT] Stop hit at ${current5m.low.toFixed(2)}`);
+            exec.phase = "WAITING_FOR_THESIS";
+            exec.waitReason = "stop_hit";
+            this.clearTradeState(exec);
+            shouldPublishEvent = true; // Exit - publish event
+          } else if (exec.thesisDirection === "short" && current5m.high >= exec.stopPrice) {
+            console.log(`[EXIT] Stop hit at ${current5m.high.toFixed(2)}`);
+            exec.phase = "WAITING_FOR_THESIS";
+            exec.waitReason = "stop_hit";
+            this.clearTradeState(exec);
+            shouldPublishEvent = true; // Exit - publish event
+          }
+          // Check targets
+          else if (exec.targets.some(target => 
+            (exec.thesisDirection === "long" && current5m.high >= target) ||
+            (exec.thesisDirection === "short" && current5m.low <= target)
+          )) {
+            const hitTarget = exec.targets.find(target =>
+              (exec.thesisDirection === "long" && current5m.high >= target) ||
+              (exec.thesisDirection === "short" && current5m.low <= target)
+            );
+            console.log(`[EXIT] Target hit at ${hitTarget?.toFixed(2)}`);
+            exec.phase = "WAITING_FOR_THESIS";
+            exec.waitReason = "target_hit";
+            this.clearTradeState(exec);
+            shouldPublishEvent = true; // Exit - publish event
+          }
+        }
+      }
+
+      // Publish event if state changed or important event occurred
+      if (shouldPublishEvent || exec.phase !== previousPhase || exec.thesisDirection !== previousThesisDirection) {
+        if (!debugInfo) {
+          const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
+            ts: forming5mBar.endTs,
+            open: forming5mBar.open,
+            high: forming5mBar.high,
+            low: forming5mBar.low,
+            close: forming5mBar.close,
+            volume: forming5mBar.volume,
+          }] : []);
+          debugInfo = {
+            barsClosed5m: closed5mBars.length,
+            hasForming5m: !!forming5mBar,
+            formingProgressMin: forming5mBar?.progressMinutes ?? null,
+            formingStartTs: forming5mBar?.startTs ?? null,
+            formingEndTs: forming5mBar?.endTs ?? null,
+            formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
+            lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
+            candidateBarsUsed: barsForCandidates.length,
+            candidateCount: exec.activeCandidate ? 1 : 0,
+            botPhase: exec.phase,
+            botWaitReason: exec.waitReason ?? null,
+          };
+        }
+
+        const mindState = {
+          mindId: randomUUID(),
+          direction: exec.thesisDirection ?? "none",
+          confidence: exec.thesisConfidence ?? 0,
+          reason: this.state.lastLLMDecision ?? exec.waitReason ?? "waiting",
+        };
+
+        events.push({
+          type: "MIND_STATE_UPDATED",
+          timestamp: ts,
+          instanceId: this.instanceId,
+          data: {
+            timestamp: ts,
+            symbol,
+            price: close,
+            mindState,
+            thesis: {
+              direction: exec.thesisDirection ?? null,
+              confidence: exec.thesisConfidence ?? null,
+              price: exec.thesisPrice ?? null,
+              ts: exec.thesisTs ?? null,
+            },
+            candidate: exec.activeCandidate ?? null,
+            botState: exec.phase,
+            waitFor: exec.waitReason ?? null,
+            debug: debugInfo,
+          },
+        });
+      }
+    }
+
+    return events;
   }
 
   private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
@@ -324,7 +567,7 @@ export class Orchestrator {
       return events;
     }
 
-    // Closed 5m bar from BarAggregator - push to recentBars5m
+    // Closed 5m bar from BarAggregator - ONLY append, don't trigger LLM or reset anything
     const closedBar = {
       ts: snapshot.ts,
       open: snapshot.open ?? close,
@@ -340,199 +583,10 @@ export class Orchestrator {
       `[CLOSE5M] ts=${closedBar.ts} lenClosed=${this.recentBars5m.length} o=${closedBar.open.toFixed(2)} h=${closedBar.high.toFixed(2)} l=${closedBar.low.toFixed(2)} c=${closedBar.close.toFixed(2)} v=${closedBar.volume}`
     );
 
-    const closed5mBars = this.recentBars5m;
-    const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
-    const forming5mBar = this.forming5mBar; // Use current forming bar state (updated by 1m path)
-    const exec = this.state.minimalExecution;
+    // That's it - no LLM call, no candidate regeneration, no reset
+    // LLM is called every 1m in handleMinimal1m
+    // Entry logic is checked every 1m in handleMinimal1m
 
-    // LLM sees ONLY 5m data: closed5mBars + forming5mBar
-    // No warmup gating - LLM can be called with any bars
-    let debugInfo: MinimalDebugInfo | undefined = undefined;
-    if (this.llmService) {
-      // Call LLM if we have any 5m data (closed bars or forming bar)
-      const has5mData = closed5mBars.length > 0 || forming5mBar !== null;
-      if (has5mData) {
-        // Compute debug info before LLM call
-        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
-          ts: forming5mBar.endTs,
-          open: forming5mBar.open,
-          high: forming5mBar.high,
-          low: forming5mBar.low,
-          close: forming5mBar.close,
-          volume: forming5mBar.volume,
-        }] : []);
-        
-        debugInfo = {
-          barsClosed5m: closed5mBars.length,
-          hasForming5m: !!forming5mBar,
-          formingProgressMin: forming5mBar?.progressMinutes ?? null,
-          formingStartTs: forming5mBar?.startTs ?? null,
-          formingEndTs: forming5mBar?.endTs ?? null,
-          formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
-          lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
-          candidateBarsUsed: barsForCandidates.length,
-          candidateCount: null, // No candidates in new schema
-          botPhase: exec.phase,
-          botWaitReason: exec.waitReason ?? null,
-        };
-
-        const llmSnapshot: MinimalLLMSnapshot = {
-          symbol,
-          nowTs: ts,
-          closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
-          forming5mBar,
-        };
-        console.log(
-          `[LLM5M] closed5m=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"} callingLLM=true`
-        );
-        const result = await this.llmService.getArmDecisionRaw5m({
-          snapshot: llmSnapshot,
-        });
-        const decision = result.decision;
-        this.state.lastLLMCallAt = ts;
-        this.state.lastLLMDecision = decision.because ?? decision.action;
-        
-        // LLM_VIS log with all debug info
-        console.log(
-          `[LLM_VIS] sel=${decision.action} conf=${decision.confidence} barsClosed5m=${debugInfo.barsClosed5m} forming=${debugInfo.hasForming5m ? "Y" : "N"} prog=${debugInfo.formingProgressMin ?? "n/a"} cand=${debugInfo.candidateCount ?? "n/a"} phase=${debugInfo.botPhase} wait=${debugInfo.botWaitReason ?? "n/a"}`
-        );
-        console.log(
-          `[LLM_MIN] selected=${decision.action} conf=${decision.confidence} barsClosed=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"}`
-        );
-        console.log(
-          `[LLM5M] action=${decision.action} conf=${decision.confidence} because=${decision.because?.substring(0, 80) ?? "n/a"} waiting_for=${decision.waiting_for ?? "n/a"}`
-        );
-
-        exec.thesisPrice = lastClosed5m?.close ?? close;
-        exec.thesisTs = ts;
-        if (decision.action === "WAIT") {
-          exec.thesisDirection = "none";
-          exec.thesisConfidence = decision.confidence;
-          exec.activeCandidate = undefined;
-          exec.phase = "WAITING_FOR_THESIS";
-          exec.waitReason = decision.waiting_for;
-          this.clearTradeState(exec);
-        } else {
-          exec.thesisDirection = decision.action === "ARM_LONG" ? "long" : "short";
-          exec.thesisConfidence = decision.confidence; // Use LLM confidence directly, no clamping/overriding
-          exec.activeCandidate = undefined; // No candidates in new schema
-          exec.phase = "WAITING_FOR_PULLBACK";
-          exec.waitReason = "waiting_for_pullback";
-          this.clearTradeState(exec);
-        }
-      } else {
-        // No 5m data yet - just wait
-        if (exec.phase === "WAITING_FOR_THESIS") {
-          exec.waitReason = "waiting_for_bars";
-        }
-      }
-    } else {
-      exec.waitReason = "llm_unavailable";
-    }
-
-    // Entry execution requires at least 2 closed bars or 1 closed + forming
-    const canEnter = closed5mBars.length >= 2 || (closed5mBars.length >= 1 && !!forming5mBar);
-    exec.canEnter = canEnter;
-    // Don't overwrite LLM-set waitReason after thesis is formed
-    if (!canEnter && exec.phase === "WAITING_FOR_THESIS" && !exec.thesisDirection) {
-      exec.waitReason = "waiting_for_bars";
-    }
-
-    const current5m = forming5mBar ?? lastClosed5m ?? null;
-    const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : null;
-
-    if (canEnter && current5m && exec.thesisDirection && exec.thesisDirection !== "none") {
-      if (exec.phase === "WAITING_FOR_PULLBACK" && previous5m) {
-        const open = current5m.open ?? current5m.close;
-        const isBearish = current5m.close < open;
-        const isBullish = current5m.close > open;
-        const lowerLow = current5m.low < previous5m.low;
-        const higherHigh = current5m.high > previous5m.high;
-
-        // Enter ON pullback for LONG thesis
-        if (exec.thesisDirection === "long" && (isBearish || lowerLow)) {
-          exec.entryPrice = current5m.close;
-          exec.entryTs = ts;
-          exec.pullbackHigh = current5m.high;
-          exec.pullbackLow = current5m.low;
-          exec.pullbackTs = ts;
-          exec.stopPrice = current5m.low; // Stop at pullback low
-          exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
-          exec.phase = "IN_TRADE";
-          exec.waitReason = "in_trade";
-        }
-
-        // Enter ON pullback for SHORT thesis
-        if (exec.thesisDirection === "short" && (isBullish || higherHigh)) {
-          exec.entryPrice = current5m.close;
-          exec.entryTs = ts;
-          exec.pullbackHigh = current5m.high;
-          exec.pullbackLow = current5m.low;
-          exec.pullbackTs = ts;
-          exec.stopPrice = current5m.high; // Stop at pullback high
-          exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
-          exec.phase = "IN_TRADE";
-          exec.waitReason = "in_trade";
-        }
-      } else if (exec.phase === "IN_TRADE") {
-        if (exec.stopPrice === undefined || !exec.targets || exec.targets.length === 0) {
-          exec.phase = "WAITING_FOR_THESIS";
-          exec.waitReason = "invalid_trade_state";
-          this.clearTradeState(exec);
-        } else if (exec.thesisDirection === "long") {
-          if (current5m.low <= exec.stopPrice) {
-            exec.phase = "WAITING_FOR_THESIS";
-            exec.waitReason = "stopped_out";
-            this.clearTradeState(exec);
-          } else if (current5m.high >= exec.targets[0]!) {
-            exec.phase = "WAITING_FOR_THESIS";
-            exec.waitReason = "target_hit";
-            this.clearTradeState(exec);
-          }
-        } else if (exec.thesisDirection === "short") {
-          if (current5m.high >= exec.stopPrice) {
-            exec.phase = "WAITING_FOR_THESIS";
-            exec.waitReason = "stopped_out";
-            this.clearTradeState(exec);
-          } else if (current5m.low <= exec.targets[0]!) {
-            exec.phase = "WAITING_FOR_THESIS";
-            exec.waitReason = "target_hit";
-            this.clearTradeState(exec);
-          }
-        }
-      }
-    }
-
-    const mindState = {
-      mindId: randomUUID(),
-      direction: exec.thesisDirection ?? "none",
-      confidence: exec.thesisConfidence ?? 0,
-      reason: exec.waitReason ?? "waiting",
-    };
-
-    return [
-      ...events,
-      {
-        type: "MIND_STATE_UPDATED",
-        timestamp: ts,
-        instanceId: this.instanceId,
-        data: {
-          timestamp: ts,
-          symbol,
-          price: close,
-          mindState,
-          thesis: {
-            direction: exec.thesisDirection ?? null,
-            confidence: exec.thesisConfidence ?? null,
-            price: exec.thesisPrice ?? null,
-            ts: exec.thesisTs ?? null,
-          },
-          candidate: exec.activeCandidate ?? null,
-          botState: exec.phase,
-          waitFor: exec.waitReason ?? null,
-          debug: debugInfo,
-        },
-      },
-    ];
+    return events;
   }
 }
