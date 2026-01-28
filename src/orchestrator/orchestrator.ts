@@ -5,7 +5,9 @@ import type {
   BotMode,
   BotState,
   DomainEvent,
+  EntryType,
   Forming5mBar,
+  MarketBias,
   MinimalDebugInfo,
   MinimalExecutionPhase,
   MinimalExecutionState,
@@ -54,8 +56,10 @@ export class Orchestrator {
       session: getMarketSessionLabel(),
       mode: "QUIET",
       minimalExecution: {
-        phase: "WAITING_FOR_THESIS",
-        waitReason: "waiting_for_thesis",
+        bias: "NEUTRAL",
+        phase: "NEUTRAL_PHASE",
+        waitReason: "waiting_for_bias",
+        thesisDirection: "none", // Legacy compatibility
       },
     };
     console.log(
@@ -271,6 +275,73 @@ export class Orchestrator {
     exec.entryTs = undefined;
     exec.stopPrice = undefined;
     exec.targets = undefined;
+    exec.entryType = undefined;
+    exec.entryTrigger = undefined;
+  }
+
+  // Map LLM action to market bias (sticky, only flips on invalidation)
+  private llmActionToBias(action: "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+", llmBias: "bullish" | "bearish" | "neutral"): "BEARISH" | "BULLISH" | "NEUTRAL" {
+    if (action === "ARM_LONG" || (action === "A+" && llmBias === "bullish")) {
+      return "BULLISH";
+    } else if (action === "ARM_SHORT" || (action === "A+" && llmBias === "bearish")) {
+      return "BEARISH";
+    }
+    return "NEUTRAL";
+  }
+
+  // Check if bias should flip (only on structural invalidation)
+  private shouldFlipBias(currentBias: MarketBias, newBias: MarketBias, invalidationLevel?: number, currentPrice?: number): boolean {
+    if (currentBias === newBias || newBias === "NEUTRAL") {
+      return false; // No flip needed
+    }
+    
+    // Bias only flips if price crosses invalidation level
+    if (invalidationLevel !== undefined && currentPrice !== undefined) {
+      if (currentBias === "BULLISH" && currentPrice < invalidationLevel) {
+        return true; // Bullish bias invalidated
+      }
+      if (currentBias === "BEARISH" && currentPrice > invalidationLevel) {
+        return true; // Bearish bias invalidated
+      }
+    }
+    
+    // If no invalidation level set, allow flip (initial bias establishment)
+    return invalidationLevel === undefined;
+  }
+
+  // Detect entry type from price action
+  private detectEntryType(
+    bias: MarketBias,
+    current5m: { open: number; high: number; low: number; close: number },
+    previous5m?: { open: number; high: number; low: number; close: number }
+  ): { type: EntryType; trigger: string } {
+    const open = current5m.open ?? current5m.close;
+    const isBearish = current5m.close < open;
+    const isBullish = current5m.close > open;
+    const hasUpperWick = current5m.high > Math.max(current5m.open, current5m.close);
+    const hasLowerWick = current5m.low < Math.min(current5m.open, current5m.close);
+
+    if (bias === "BEARISH") {
+      // Rejection entry: bearish candle with upper wick at resistance
+      if (isBearish && hasUpperWick && previous5m && current5m.high > previous5m.high) {
+        return { type: "REJECTION_ENTRY", trigger: "Bearish rejection at resistance" };
+      }
+      // Breakdown entry: breaks below previous low
+      if (previous5m && current5m.low < previous5m.low) {
+        return { type: "BREAKDOWN_ENTRY", trigger: "Breakdown below previous low" };
+      }
+    } else if (bias === "BULLISH") {
+      // Rejection entry: bullish candle with lower wick at support
+      if (isBullish && hasLowerWick && previous5m && current5m.low < previous5m.low) {
+        return { type: "REJECTION_ENTRY", trigger: "Bullish rejection at support" };
+      }
+      // Breakdown entry: breaks above previous high
+      if (previous5m && current5m.high > previous5m.high) {
+        return { type: "BREAKDOWN_ENTRY", trigger: "Breakout above previous high" };
+      }
+    }
+
+    return { type: null, trigger: "" };
   }
 
   private computeTargets(direction: "long" | "short", entry: number, stop: number): number[] {
@@ -284,14 +355,14 @@ export class Orchestrator {
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     const events: DomainEvent[] = [];
-    const regime = getMarketRegime(new Date(ts));
-    if (!regime.isRTH) {
-      this.state.minimalExecution.phase = "WAITING_FOR_THESIS";
-      this.state.minimalExecution.waitReason = "market_closed";
-      return events;
-    }
+      const regime = getMarketRegime(new Date(ts));
+      if (!regime.isRTH) {
+        this.state.minimalExecution.phase = "NEUTRAL_PHASE";
+        this.state.minimalExecution.waitReason = "market_closed";
+        return events;
+      }
 
-    // Update forming5mBar state
+      // Update forming5mBar state
     const forming5mBar = this.updateForming5mBar(snapshot);
     if (forming5mBar) {
       const progress = forming5mBar.progressMinutes;
@@ -332,20 +403,43 @@ export class Orchestrator {
       
       const isMaturityFlip = decision.action === "A+";
 
+      // CRITICAL: Wire MarketBias as single source of truth
+      const newBias = this.llmActionToBias(decision.action, decision.bias);
+      const shouldFlip = this.shouldFlipBias(
+        exec.bias,
+        newBias,
+        exec.biasInvalidationLevel,
+        close
+      );
+
+      if (shouldFlip || exec.bias === "NEUTRAL") {
+        exec.bias = newBias;
+        exec.biasConfidence = decision.confidence;
+        exec.biasPrice = close;
+        exec.biasTs = ts;
+        if (exec.activeCandidate) {
+          exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
+        }
+      }
+
+      // Legacy compatibility: sync thesisDirection to bias
+      exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
+      exec.thesisConfidence = exec.biasConfidence;
+
       console.log(
-        `[LLM1M] action=${decision.action} bias=${decision.bias} maturity=${decision.maturity} conf=${decision.confidence} currentThesis=${exec.thesisDirection ?? "none"}`
+        `[LLM1M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} conf=${decision.confidence} phase=${exec.phase}`
       );
 
       // Track previous state to detect changes
-      const previousThesisDirection = exec.thesisDirection;
+      const previousBias = exec.bias;
       const previousPhase = exec.phase;
 
       // Generate candidates and match direction ONLY if:
-      // 1. LLM direction changed from current thesis, OR
-      // 2. No thesis exists yet
+      // 1. Bias changed, OR
+      // 2. No bias exists yet (NEUTRAL)
       const needsNewSetup = 
-        (llmDirection !== exec.thesisDirection) ||
-        (!exec.thesisDirection || exec.thesisDirection === "none");
+        (newBias !== exec.bias) ||
+        (exec.bias === "NEUTRAL");
 
       // Handle A+ (maturity flip) - immediate entry opportunity
       if (isMaturityFlip && (llmDirection === "long" || llmDirection === "short")) {
@@ -373,18 +467,21 @@ export class Orchestrator {
         );
 
         // A+ can enter even without perfect candidate match (maturity flips are opportunistic)
-        exec.thesisDirection = llmDirection;
-        exec.thesisConfidence = decision.confidence;
         exec.activeCandidate = matchingCandidate; // May be undefined for A+ - that's OK
-        exec.thesisPrice = lastClosed5m?.close ?? close;
-        exec.thesisTs = ts;
+        if (matchingCandidate) {
+          exec.biasInvalidationLevel = matchingCandidate.invalidationLevel;
+        }
         
         // A+ can enter immediately on the current bar
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
           const oldPhase = exec.phase;
+          const entryInfo = this.detectEntryType(exec.bias, current5m, closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined);
+          
           exec.entryPrice = current5m.close;
           exec.entryTs = ts;
+          exec.entryType = entryInfo.type;
+          exec.entryTrigger = entryInfo.trigger || "A+ maturity flip";
           exec.pullbackHigh = current5m.high;
           exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
@@ -394,16 +491,16 @@ export class Orchestrator {
           exec.waitReason = "a+_maturity_flip_entry";
           shouldPublishEvent = true;
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | A+ ${llmDirection.toUpperCase()} entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} ${matchingCandidate ? `candidate=${matchingCandidate.id}` : "no_candidate_match"}`
+            `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | A+ ${exec.bias} entry at ${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
           );
         } else {
-          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
           exec.waitReason = "waiting_for_pullback";
           shouldPublishEvent = true;
         }
       } else if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
         console.log(
-          `[SETUP_GEN] LLM direction changed: ${exec.thesisDirection ?? "none"} -> ${llmDirection}, generating candidates`
+          `[SETUP_GEN] BIAS change: ${exec.bias} -> ${newBias}, generating candidates`
         );
 
         // Bot generates setups from raw data
@@ -447,37 +544,36 @@ export class Orchestrator {
           exec.activeCandidate = matchingCandidate;
           exec.thesisPrice = lastClosed5m?.close ?? close;
           exec.thesisTs = ts;
-          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.phase = "BIAS_ESTABLISHED";
           exec.waitReason = "waiting_for_pullback";
           this.clearTradeState(exec);
           shouldPublishEvent = true; // Thesis changed - publish event
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_PULLBACK | ${llmDirection.toUpperCase()} thesis ARMED, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence}`
+            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence}`
           );
         } else {
           console.log(
             `[SETUP_MATCH] FAIL: No matching candidate for ${llmDirection} (candidates=${candidates.length}, directions=${candidates.map(c => c.direction).join(",")})`
           );
         }
-      } else if (llmDirection === "none") {
-        // LLM says WAIT - clear thesis
-        if (exec.thesisDirection && exec.thesisDirection !== "none") {
+      } else if (llmDirection === "none" || newBias === "NEUTRAL") {
+        // LLM says WAIT - but keep bias unless invalidated
+        // Only change phase, don't clear bias unless price invalidates it
+        if (exec.bias !== "NEUTRAL" && exec.phase !== "IN_TRADE") {
           const oldPhase = exec.phase;
-          console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | LLM says WAIT, clearing ${exec.thesisDirection} thesis`
-          );
-          exec.thesisDirection = "none";
-          exec.thesisConfidence = decision.confidence;
           exec.activeCandidate = undefined;
-          exec.phase = "WAITING_FOR_THESIS";
-          exec.waitReason = decision.waiting_for ?? "waiting_for_thesis";
+          exec.phase = "PULLBACK_IN_PROGRESS";
+          exec.waitReason = decision.waiting_for ?? "waiting_for_setup";
           this.clearTradeState(exec);
-          shouldPublishEvent = true; // Thesis cleared - publish event
+          shouldPublishEvent = true; // Phase change - publish event
+          console.log(
+            `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) entry_status=inactive`
+          );
         }
       }
 
       // Check for pullback entry every 1m (responsive, not just on 5m close)
-      if (exec.thesisDirection && exec.thesisDirection !== "none" && exec.phase === "WAITING_FOR_PULLBACK") {
+      if (exec.bias !== "NEUTRAL" && (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED")) {
         const current5m = forming5mBar ?? lastClosed5m;
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
@@ -494,43 +590,49 @@ export class Orchestrator {
             higherHigh = current5m.high > previous5m.high;
           }
 
-          // Enter ON pullback for LONG thesis
+          // Enter ON pullback for BULLISH bias
           // Condition: current bar is bearish OR makes a lower low (if we have previous bar)
-          // If no previous bar, allow entry on any bearish bar
-          if (exec.thesisDirection === "long" && (isBearish || (previous5m && lowerLow))) {
+          if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
             const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
             exec.entryPrice = current5m.close;
             exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
             exec.pullbackHigh = current5m.high;
             exec.pullbackLow = current5m.low;
             exec.pullbackTs = ts;
             exec.stopPrice = current5m.low; // Stop at pullback low
-            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
             exec.phase = "IN_TRADE";
             exec.waitReason = "in_trade";
             shouldPublishEvent = true; // Entry executed - publish event
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | LONG entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
             );
           }
 
-          // Enter ON pullback for SHORT thesis
+          // Enter ON pullback for BEARISH bias
           // Condition: current bar is bullish OR makes a higher high (if we have previous bar)
-          // If no previous bar, allow entry on any bullish bar
-          if (exec.thesisDirection === "short" && (isBullish || (previous5m && higherHigh))) {
+          if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
             const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
             exec.entryPrice = current5m.close;
             exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
             exec.pullbackHigh = current5m.high;
             exec.pullbackLow = current5m.low;
             exec.pullbackTs = ts;
             exec.stopPrice = current5m.high; // Stop at pullback high
-            exec.targets = this.computeTargets(exec.thesisDirection, exec.entryPrice, exec.stopPrice);
+            exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
             exec.phase = "IN_TRADE";
             exec.waitReason = "in_trade";
             shouldPublishEvent = true; // Entry executed - publish event
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | SHORT entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} targets=${exec.targets.map(t => t.toFixed(2)).join(",")}`
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
             );
           }
         }
@@ -546,16 +648,16 @@ export class Orchestrator {
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
             );
-            exec.phase = "WAITING_FOR_THESIS";
+            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = "stop_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
           } else if (exec.thesisDirection === "short" && current5m.high >= exec.stopPrice) {
             const oldPhase = exec.phase;
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Stop hit at ${current5m.high.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.high.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
             );
-            exec.phase = "WAITING_FOR_THESIS";
+            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = "stop_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
@@ -573,7 +675,7 @@ export class Orchestrator {
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Target hit at ${hitTarget?.toFixed(2)}`
             );
-            exec.phase = "WAITING_FOR_THESIS";
+            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = "target_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
@@ -582,7 +684,7 @@ export class Orchestrator {
       }
 
       // Publish event if state changed or important event occurred
-      if (shouldPublishEvent || exec.phase !== previousPhase || exec.thesisDirection !== previousThesisDirection) {
+      if (shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias) {
         if (!debugInfo) {
           const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
             ts: forming5mBar.endTs,
@@ -609,9 +711,13 @@ export class Orchestrator {
 
         const mindState = {
           mindId: randomUUID(),
-          direction: exec.thesisDirection ?? "none",
-          confidence: exec.thesisConfidence ?? 0,
+          direction: exec.thesisDirection ?? "none", // Legacy compatibility
+          confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
           reason: this.state.lastLLMDecision ?? exec.waitReason ?? "waiting",
+          bias: exec.bias,
+          phase: exec.phase,
+          entryStatus: exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const,
+          entryType: exec.entryType ?? undefined,
         };
 
         events.push({
@@ -646,7 +752,7 @@ export class Orchestrator {
     const events: DomainEvent[] = [];
     const regime = getMarketRegime(new Date(ts));
     if (!regime.isRTH) {
-      this.state.minimalExecution.phase = "WAITING_FOR_THESIS";
+      this.state.minimalExecution.phase = "NEUTRAL_PHASE";
       this.state.minimalExecution.waitReason = "market_closed";
       return events;
     }

@@ -76,9 +76,13 @@ export type MinimalSetupSelectionResult = {
 
 export interface MinimalMindStateResponse {
   mindId?: string;
-  direction: "long" | "short" | "none";
+  direction: "long" | "short" | "none"; // Legacy - maps to bias
   confidence: number;
   reason: string;
+  bias?: MarketBias; // New: explicit bias
+  phase?: MinimalExecutionPhase; // New: explicit phase
+  entryStatus?: "active" | "inactive"; // New: entry status
+  entryType?: EntryType; // New: entry type
 }
 
 export type MinimalMindStateResult = {
@@ -86,18 +90,43 @@ export type MinimalMindStateResult = {
   valid: boolean;
 };
 
+// Market Bias (sticky, changes slowly, only on structural invalidation)
+export type MarketBias = "BEARISH" | "BULLISH" | "NEUTRAL";
+
+// Trade Phase (fast, changes quickly)
 export type MinimalExecutionPhase =
-  | "WAITING_FOR_THESIS"
-  | "WAITING_FOR_PULLBACK"
-  | "WAITING_FOR_ENTRY"
-  | "IN_TRADE";
+  | "NEUTRAL_PHASE"
+  | "BIAS_ESTABLISHED"
+  | "PULLBACK_IN_PROGRESS"
+  | "PULLBACK_REJECTION"
+  | "PULLBACK_BREAKDOWN"
+  | "IN_TRADE"
+  | "CONSOLIDATION_AFTER_REJECTION";
+
+// Entry Types (explicit, not implied)
+export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | null;
 
 export type MinimalExecutionState = {
+  // Market Bias (sticky)
+  bias: MarketBias;
+  biasConfidence?: number;
+  biasPrice?: number;
+  biasTs?: number;
+  biasInvalidationLevel?: number; // Bias flips only if price crosses this
+  
+  // Trade Phase (fast)
   phase: MinimalExecutionPhase;
-  thesisDirection?: "long" | "short" | "none";
+  
+  // Entry tracking
+  entryType?: EntryType;
+  entryTrigger?: string; // What triggered the entry (e.g., "Bearish rejection at VWAP")
+  
+  // Legacy fields (for backward compatibility during transition)
+  thesisDirection?: "long" | "short" | "none"; // Maps to bias
   thesisConfidence?: number;
   thesisPrice?: number;
   thesisTs?: number;
+  
   activeCandidate?: MinimalSetupCandidate;
   canEnter?: boolean;
   pullbackHigh?: number;
