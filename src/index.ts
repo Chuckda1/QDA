@@ -11,6 +11,25 @@ import { announceStartupThrottled } from "./utils/startupAnnounce.js";
 import { StateStore } from "./persistence/stateStore.js";
 import { BarAggregator } from "./datafeed/barAggregator.js";
 
+// CRITICAL: Flush stdout immediately to ensure Railway captures logs
+const START_TIME = Date.now();
+process.stdout.write(`[STARTUP] Process starting at ${new Date().toISOString()}\n`);
+process.stdout.write(`[STARTUP] Node version: ${process.version}\n`);
+process.stdout.write(`[STARTUP] Platform: ${process.platform}\n`);
+
+// Top-level error handler to catch unhandled errors
+process.on("uncaughtException", (error) => {
+  console.error("[FATAL] Uncaught exception:", error);
+  console.error("[FATAL] Stack:", error.stack);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[FATAL] Unhandled rejection at:", promise);
+  console.error("[FATAL] Reason:", reason);
+  process.exit(1);
+});
+
 const instanceId = process.env.INSTANCE_ID || "qda-bot-001";
 
 // STAGE 0: BUILD_ID for proof of execution
@@ -21,6 +40,9 @@ const HAS_OPENAI_KEY = !!process.env.OPENAI_API_KEY;
 const SYMBOLS = process.env.SYMBOLS || "SPY";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "not_set";
 const BOT_MODE = (process.env.BOT_MODE || "").toLowerCase();
+
+console.log(`[STARTUP] Instance ID: ${instanceId}`);
+console.log(`[STARTUP] BUILD_ID: ${BUILD_ID}`);
 
 const normalizeBarTs = (ts: number): number => (ts < 1_000_000_000_000 ? ts * 1000 : ts);
 const normalizeBar = <T extends { ts: number }>(bar: T): T => ({
@@ -50,10 +72,10 @@ const resolveWarmupReady = (): void => {
 
 // Print startup inventory
 console.log("=== STAGE 0 STARTUP INVENTORY ===");
-console.log(`BUILD_ID: ${BUILD_ID}`);
-console.log(`NODE_ENV: ${NODE_ENV}`);
-console.log(`ENTRY_MODE: ${ENTRY_MODE}`);
-console.log(`OPENAI_API_KEY: ${HAS_OPENAI_KEY}`);
+console.log(`[STARTUP] BUILD_ID: ${BUILD_ID}`);
+console.log(`[STARTUP] NODE_ENV: ${NODE_ENV}`);
+console.log(`[STARTUP] ENTRY_MODE: ${ENTRY_MODE}`);
+console.log(`[STARTUP] OPENAI_API_KEY: ${HAS_OPENAI_KEY ? "SET" : "NOT SET"}`);
 console.log(`BOT_MODE: ${BOT_MODE || "default"}`);
 console.log(`SYMBOLS: ${SYMBOLS}`);
 console.log(`WARMUP_1M_BARS: ${WARMUP_1M_BARS}`);
@@ -219,6 +241,12 @@ setInterval(() => {
     console.warn(`[persist] save failed: ${err?.message || String(err)}`);
   });
 }, 30000);
+
+// Periodic heartbeat log (every 5 minutes) to confirm app is running
+setInterval(() => {
+  const uptime = Math.floor((Date.now() - START_TIME) / 1000);
+  console.log(`[HEARTBEAT] Bot is alive. Uptime: ${uptime}s`);
+}, 300000); // 5 minutes
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)
@@ -394,11 +422,17 @@ if (alpacaKey && alpacaSecret) {
 
 // Keep process alive
 process.on("SIGTERM", () => {
+  console.log(`[SHUTDOWN] SIGTERM received, shutting down gracefully...`);
   scheduler.stop();
   process.exit(0);
 });
 
 process.on("SIGINT", () => {
+  console.log(`[SHUTDOWN] SIGINT received, shutting down gracefully...`);
   scheduler.stop();
   process.exit(0);
 });
+
+// Log that we've reached the end of initialization
+console.log(`[STARTUP] ✅ Initialization complete. Bot is running.`);
+console.log(`[STARTUP] Waiting for market data...`);
