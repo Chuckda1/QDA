@@ -372,34 +372,34 @@ export class Orchestrator {
           (c) => c.direction === (llmDirection === "long" ? "LONG" : "SHORT")
         );
 
-        if (matchingCandidate) {
-          exec.thesisDirection = llmDirection;
-          exec.thesisConfidence = decision.confidence;
-          exec.activeCandidate = matchingCandidate;
-          exec.thesisPrice = lastClosed5m?.close ?? close;
-          exec.thesisTs = ts;
-          
-          // A+ can enter immediately on the current bar
-          const current5m = forming5mBar ?? lastClosed5m;
-          if (current5m) {
-            exec.entryPrice = current5m.close;
-            exec.entryTs = ts;
-            exec.pullbackHigh = current5m.high;
-            exec.pullbackLow = current5m.low;
-            exec.pullbackTs = ts;
-            exec.stopPrice = llmDirection === "long" ? current5m.low : current5m.high;
-            exec.targets = this.computeTargets(llmDirection, exec.entryPrice, exec.stopPrice);
-            exec.phase = "IN_TRADE";
-            exec.waitReason = "a+_maturity_flip_entry";
-            shouldPublishEvent = true;
-            console.log(
-              `[STATE_TRANSITION] ${exec.phase} -> IN_TRADE | A+ ${llmDirection.toUpperCase()} entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)}`
-            );
-          } else {
-            exec.phase = "WAITING_FOR_PULLBACK";
-            exec.waitReason = "waiting_for_pullback";
-            shouldPublishEvent = true;
-          }
+        // A+ can enter even without perfect candidate match (maturity flips are opportunistic)
+        exec.thesisDirection = llmDirection;
+        exec.thesisConfidence = decision.confidence;
+        exec.activeCandidate = matchingCandidate; // May be undefined for A+ - that's OK
+        exec.thesisPrice = lastClosed5m?.close ?? close;
+        exec.thesisTs = ts;
+        
+        // A+ can enter immediately on the current bar
+        const current5m = forming5mBar ?? lastClosed5m;
+        if (current5m) {
+          const oldPhase = exec.phase;
+          exec.entryPrice = current5m.close;
+          exec.entryTs = ts;
+          exec.pullbackHigh = current5m.high;
+          exec.pullbackLow = current5m.low;
+          exec.pullbackTs = ts;
+          exec.stopPrice = llmDirection === "long" ? current5m.low : current5m.high;
+          exec.targets = this.computeTargets(llmDirection, exec.entryPrice, exec.stopPrice);
+          exec.phase = "IN_TRADE";
+          exec.waitReason = "a+_maturity_flip_entry";
+          shouldPublishEvent = true;
+          console.log(
+            `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | A+ ${llmDirection.toUpperCase()} entry at ${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} ${matchingCandidate ? `candidate=${matchingCandidate.id}` : "no_candidate_match"}`
+          );
+        } else {
+          exec.phase = "WAITING_FOR_PULLBACK";
+          exec.waitReason = "waiting_for_pullback";
+          shouldPublishEvent = true;
         }
       } else if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
         console.log(

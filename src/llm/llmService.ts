@@ -174,12 +174,14 @@ ${JSON.stringify(llmInput)}`;
 
   private parseControlSentence(text: string): ArmDecisionRaw5mResponse | null {
     // Parse: CONTROL=<LONG|SHORT|WAIT|A+> | BIAS=<bullish|bearish|neutral> | MATURITY=<early|developing|mature|extended|unclear> | CONF=<0-100>
-    const controlMatch = text.match(/CONTROL=(\w+)/i);
-    const biasMatch = text.match(/BIAS=(bullish|bearish|neutral)/i);
-    const maturityMatch = text.match(/MATURITY=(early|developing|mature|extended|unclear)/i);
-    const confMatch = text.match(/CONF=(\d+)/i);
+    // More flexible parsing - allow variations in format
+    const controlMatch = text.match(/CONTROL[=:]?\s*(\w+)/i);
+    const biasMatch = text.match(/BIAS[=:]?\s*(bullish|bearish|neutral)/i);
+    const maturityMatch = text.match(/MATURITY[=:]?\s*(early|developing|mature|extended|unclear)/i);
+    const confMatch = text.match(/CONF[=:]?\s*(\d+)/i);
 
-    if (!controlMatch || !biasMatch || !maturityMatch || !confMatch) {
+    // CONTROL is required, others have defaults
+    if (!controlMatch) {
       return null;
     }
 
@@ -189,15 +191,24 @@ ${JSON.stringify(llmInput)}`;
       action = "ARM_LONG";
     } else if (controlRaw === "SHORT") {
       action = "ARM_SHORT";
-    } else if (controlRaw === "A+" || controlRaw === "A_PLUS") {
+    } else if (controlRaw === "A+" || controlRaw === "A_PLUS" || controlRaw === "APLUS") {
       action = "A+";
     } else {
       action = "WAIT";
     }
 
-    const bias = biasMatch[1].toLowerCase() as "bullish" | "bearish" | "neutral";
-    const maturity = maturityMatch[1].toLowerCase() as "early" | "developing" | "mature" | "extended" | "unclear";
-    const confidence = parseInt(confMatch[1], 10);
+    // Defaults for missing fields (graceful degradation)
+    const bias = biasMatch 
+      ? (biasMatch[1].toLowerCase() as "bullish" | "bearish" | "neutral")
+      : (action === "ARM_LONG" ? "bullish" : action === "ARM_SHORT" ? "bearish" : "neutral");
+    
+    const maturity = maturityMatch
+      ? (maturityMatch[1].toLowerCase() as "early" | "developing" | "mature" | "extended" | "unclear")
+      : "unclear";
+    
+    const confidence = confMatch 
+      ? parseInt(confMatch[1], 10)
+      : (action === "WAIT" ? 0 : 50); // Default confidence if missing
 
     if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100) {
       return null;
