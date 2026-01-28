@@ -352,6 +352,46 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  // Generate phase-aware reason that never contradicts bias
+  private getPhaseAwareReason(bias: MarketBias, phase: MinimalExecutionPhase, waitReason?: string): string {
+    // Never infer bias from phase - bias is authoritative
+    if (bias === "NEUTRAL") {
+      return "No bias established, waiting for market structure";
+    }
+
+    const biasLabel = bias === "BEARISH" ? "bearish" : "bullish";
+    
+    switch (phase) {
+      case "NEUTRAL_PHASE":
+        return `No ${biasLabel} bias established yet`;
+      
+      case "BIAS_ESTABLISHED":
+        return `${biasLabel.charAt(0).toUpperCase() + biasLabel.slice(1)} bias established, waiting for pullback`;
+      
+      case "PULLBACK_IN_PROGRESS":
+        return `Counter-trend pullback developing within ${biasLabel} structure`;
+      
+      case "PULLBACK_REJECTION":
+        return `Pullback rejected, ${biasLabel} structure intact`;
+      
+      case "PULLBACK_BREAKDOWN":
+        return `Pullback breaking down, ${biasLabel} move resuming`;
+      
+      case "IN_TRADE":
+        return `In ${biasLabel} trade, managing position`;
+      
+      case "CONSOLIDATION_AFTER_REJECTION":
+        return `Consolidating after rejection, ${biasLabel} bias maintained`;
+      
+      default:
+        // Fallback to waitReason if provided, but never say "neutral bias" when bias exists
+        if (waitReason && !waitReason.toLowerCase().includes("neutral bias")) {
+          return waitReason;
+        }
+        return `${biasLabel.charAt(0).toUpperCase() + biasLabel.slice(1)} bias maintained`;
+    }
+  }
+
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     const events: DomainEvent[] = [];
@@ -645,10 +685,11 @@ export class Orchestrator {
           // Check stop
           if (exec.thesisDirection === "long" && current5m.low <= exec.stopPrice) {
             const oldPhase = exec.phase;
+            const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+              `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
             );
-            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
+            exec.phase = newPhase;
             exec.waitReason = "stop_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
@@ -672,10 +713,11 @@ export class Orchestrator {
               (exec.thesisDirection === "short" && current5m.low <= target)
             );
             const oldPhase = exec.phase;
+            const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> WAITING_FOR_THESIS | Target hit at ${hitTarget?.toFixed(2)}`
+              `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Target hit at ${hitTarget?.toFixed(2)}`
             );
-            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
+            exec.phase = newPhase;
             exec.waitReason = "target_hit";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
@@ -713,7 +755,7 @@ export class Orchestrator {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none", // Legacy compatibility
           confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-          reason: this.state.lastLLMDecision ?? exec.waitReason ?? "waiting",
+          reason: this.getPhaseAwareReason(exec.bias, exec.phase, exec.waitReason),
           bias: exec.bias,
           phase: exec.phase,
           entryStatus: exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const,

@@ -17,6 +17,8 @@ export type TelegramSnapshot = {
   trigger?: string;
   ts?: string;
   debug?: MinimalDebugInfo;
+  bias?: string;
+  entryStatus?: string;
 };
 
 const formatEtTimestamp = (ts: number): string =>
@@ -33,6 +35,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const direction = mind.direction ?? "none";
   const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : undefined;
   const reason = typeof mind.reason === "string" ? mind.reason : undefined;
+  const bias = mind.bias ?? undefined;
+  const entryStatus = mind.entryStatus ?? undefined;
   const trigger = event.data.candidate?.entryTrigger;
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)
@@ -51,5 +55,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     trigger,
     ts: formatEtTimestamp(event.timestamp),
     debug: event.data.debug,
+    bias,
+    entryStatus,
   };
 }

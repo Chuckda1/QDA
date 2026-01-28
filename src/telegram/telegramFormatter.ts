@@ -17,12 +17,14 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     ? `INVALIDATION: ${formatPrice(snapshot.invalidation)}`
     : undefined;
 
+  const biasLabel = snapshot.bias ? `${snapshot.bias}` : (snapshot.direction !== "none" ? snapshot.direction.toUpperCase() : "NEUTRAL");
   const lines = [
-    `THESIS: ${snapshot.direction} (${conf}) | pr ${price}`,
-    `STATE: ${snapshot.botState ?? "n/a"}`,
-    `WAITING_FOR: ${waitFor}`,
+    `BIAS: ${biasLabel} (confidence ${conf})`,
+    `PHASE: ${snapshot.botState ?? "n/a"}`,
+    `ENTRY_STATUS: ${snapshot.entryStatus ?? "inactive"}`,
+    snapshot.reason ? `NOTE: ${snapshot.reason}` : undefined,
     invalidation,
-    snapshot.reason ? `REASON: ${snapshot.reason}` : undefined,
+    `WAITING_FOR: ${waitFor}`,
   ].filter(Boolean) as string[];
 
   // Add debug line for minimal mode

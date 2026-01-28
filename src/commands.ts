@@ -30,9 +30,11 @@ export class CommandHandler {
       `Session: ${s.session}`,
       `Price: ${s.price ?? "n/a"}`,
       "",
-      "THESIS:",
-      `Direction: ${exec.thesisDirection ?? "none"}`,
-      `Confidence: ${exec.thesisConfidence ?? 0}`,
+      "BIAS:",
+      `Bias: ${exec.bias}`,
+      `Confidence: ${exec.biasConfidence ?? exec.thesisConfidence ?? 0}%`,
+      `Phase: ${exec.phase}`,
+      `Entry Status: ${exec.phase === "IN_TRADE" ? "active" : "inactive"}`,
       `Wait: ${exec.waitReason ?? "n/a"}`,
     ].join("\n");
   }
