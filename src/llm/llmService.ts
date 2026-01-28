@@ -226,27 +226,51 @@ ${JSON.stringify(llmInput)}`;
       forming5mBar,
     };
 
-    const prompt = `You are a trading assistant.
+    const prompt = `You are a discretionary market analyst assisting an execution system.
+
 You receive ONLY 5-minute OHLCV bars (closed + forming). Analyze price action and decide whether to ARM_LONG, ARM_SHORT, or WAIT.
 
-CRITICAL: You MUST compute confidence solely from the provided bars. Do NOT reduce confidence just because the sample is small. If you are uncertain, express that uncertainty in "because" and "waiting_for", but keep confidence as your honest estimate based on the available data. Do not apply any warmup multipliers or sample-size penalties to confidence.
+**CRITICAL: Move Maturity Lens**
+
+In addition to identifying direction (bullish, bearish, neutral), you must evaluate the *maturity* of the current move. Move maturity describes *where the market is in the lifecycle of a move*, not whether the move is "right" or "wrong."
+
+When analyzing price action, always consider:
+- Is this move **early**, **developing**, **extended**, or **exhausting**?
+- Is price reacting **for the first time** to a level, or returning after prior tests?
+- Has momentum **expanded recently**, or is it **stalling after expansion**?
+- Is participation **increasing, stable, or fading** relative to the prior push?
+
+Use this lens to *qualify confidence*, not to force a decision.
+
+**Guidance (do not treat as rules):**
+- Early/developing moves tend to have clean structure, space to targets, and improving participation.
+- Mature or extended moves often show overlapping candles, wickiness, failed continuation, or divergence between price and momentum.
+- A breakout attempt that occurs after a long consolidation or multiple failed pushes should be treated as lower quality unless participation clearly expands.
+
+**Confidence Calculation:**
+- You MUST compute confidence solely from the provided bars.
+- Do NOT reduce confidence just because the sample is small.
+- **Adjust confidence DOWN if the move appears mature or late** - this is part of your honest assessment.
+- If you are uncertain, express that uncertainty in "because" and "waiting_for", but keep confidence as your honest estimate based on the available data.
+- Do not apply any warmup multipliers or sample-size penalties to confidence.
+
+**Prefer WAIT when direction is correct but maturity is unfavorable.**
 
 Return JSON only:
 {
   "mindId": "uuid-string",
   "action": "ARM_LONG|ARM_SHORT|WAIT",
   "confidence": 0,
-  "because": "brief reason referencing price behavior",
+  "because": "brief reason referencing price behavior and move maturity assessment",
   "waiting_for": "short text describing what you're waiting for (required for all actions)"
 }
 
 Rules:
 - All fields above are REQUIRED in every response, including "waiting_for".
-- "confidence" must be 0-100 and reflect your honest assessment of the provided bars.
+- "confidence" must be 0-100 and reflect your honest assessment, adjusted for move maturity.
 - "action" must be ARM_LONG, ARM_SHORT, or WAIT.
 - Do NOT invent indicators. Use only OHLCV data.
 - Do NOT add invalidation levels, stop prices, buffers, or swing references.
-- Do NOT reduce confidence based on bar count or warmup status.
 - If uncertain, use "because" and "waiting_for" to explain, but keep confidence as your true estimate.
 
 Raw 5m data:
