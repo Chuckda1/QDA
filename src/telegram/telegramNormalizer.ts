@@ -19,6 +19,9 @@ export type TelegramSnapshot = {
   debug?: MinimalDebugInfo;
   bias?: string;
   entryStatus?: string;
+  refPrice?: number;
+  refLabel?: string;
+  expectedResolution?: string;
 };
 
 const formatEtTimestamp = (ts: number): string =>
@@ -37,6 +40,9 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const reason = typeof mind.reason === "string" ? mind.reason : undefined;
   const bias = mind.bias ?? undefined;
   const entryStatus = mind.entryStatus ?? undefined;
+  const refPrice = Number.isFinite(mind.refPrice) ? Number(mind.refPrice) : undefined;
+  const refLabel = typeof mind.refLabel === "string" ? mind.refLabel : undefined;
+  const expectedResolution = mind.expectedResolution ?? undefined;
   const trigger = event.data.candidate?.entryTrigger;
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)
@@ -45,7 +51,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   return {
     type: "MIND",
     symbol: event.data.symbol,
-    price: event.data.price,
+    price: mind.price ?? event.data.price, // Use mindState price if available, fallback to event price
     direction,
     confidence,
     reason,
@@ -57,5 +63,8 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     debug: event.data.debug,
     bias,
     entryStatus,
+    refPrice,
+    refLabel,
+    expectedResolution,
   };
 }

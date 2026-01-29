@@ -839,6 +839,32 @@ export class Orchestrator {
           };
         }
 
+        // Determine reference price and label based on phase/state
+        let refPrice: number | undefined = undefined;
+        let refLabel: string | undefined = undefined;
+        
+        if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined) {
+          refPrice = exec.entryPrice;
+          refLabel = "entry";
+        } else if (exec.phase === "PULLBACK_IN_PROGRESS") {
+          if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
+            refPrice = exec.pullbackHigh;
+            refLabel = "pullback high";
+          } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
+            refPrice = exec.pullbackLow;
+            refLabel = "pullback low";
+          } else if (exec.biasPrice !== undefined) {
+            refPrice = exec.biasPrice;
+            refLabel = "bias established";
+          }
+        } else if (exec.biasPrice !== undefined) {
+          refPrice = exec.biasPrice;
+          refLabel = "bias established";
+        } else if (exec.thesisPrice !== undefined) {
+          refPrice = exec.thesisPrice;
+          refLabel = "bias established";
+        }
+
         const mindState = {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none", // Legacy compatibility
@@ -849,6 +875,9 @@ export class Orchestrator {
           entryStatus: exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const,
           entryType: exec.entryType ?? undefined,
           expectedResolution: exec.expectedResolution ?? undefined,
+          price: close, // Current price (first-class)
+          refPrice, // Reference price anchor
+          refLabel, // Label for reference price
         };
 
         events.push({

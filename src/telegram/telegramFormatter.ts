@@ -18,11 +18,22 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     : undefined;
 
   const biasLabel = snapshot.bias ? `${snapshot.bias}` : (snapshot.direction !== "none" ? snapshot.direction.toUpperCase() : "NEUTRAL");
+  const refPrice = formatPrice(snapshot.refPrice);
+  const refLine = snapshot.refPrice && snapshot.refLabel 
+    ? `REF: ${refPrice} (${snapshot.refLabel})`
+    : undefined;
+  const expectedLine = snapshot.expectedResolution 
+    ? `EXPECTED: ${snapshot.expectedResolution}`
+    : undefined;
+
   const lines = [
+    `PRICE: ${price}`, // Always first
+    refLine, // Reference price if available
     `BIAS: ${biasLabel} (confidence ${conf})`,
     `PHASE: ${snapshot.botState ?? "n/a"}`,
     `ENTRY_STATUS: ${snapshot.entryStatus ?? "inactive"}`,
     snapshot.reason ? `NOTE: ${snapshot.reason}` : undefined,
+    expectedLine, // Expected resolution if available
     invalidation,
     `WAITING_FOR: ${waitFor}`,
   ].filter(Boolean) as string[];

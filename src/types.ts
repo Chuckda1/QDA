@@ -84,6 +84,9 @@ export interface MinimalMindStateResponse {
   entryStatus?: "active" | "inactive"; // New: entry status
   entryType?: EntryType; // New: entry type
   expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
+  price?: number; // Current price (first-class)
+  refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
+  refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
 }
 
 export type MinimalMindStateResult = {
