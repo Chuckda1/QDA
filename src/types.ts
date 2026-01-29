@@ -128,6 +128,25 @@ export type ResolutionGate = {
   reason: string;
 };
 
+// No Trade Diagnostic - explains why no trade fired
+export type NoTradeReasonCode = 
+  | "NO_GATE_ARMED"
+  | "GATE_EXPIRED"
+  | "GATE_INVALIDATED"
+  | "VOL_TOO_HIGH"
+  | "AWAITING_PULLBACK_COMPLETION"
+  | "SESSION_CONSTRAINT";
+
+export type NoTradeDiagnostic = {
+  price: number;
+  bias: MarketBias;
+  phase: MinimalExecutionPhase;
+  expectedResolution?: ExpectedResolution;
+  gateStatus?: ResolutionGateStatus;
+  reasonCode: NoTradeReasonCode;
+  details: string;
+};
+
 export type MinimalExecutionState = {
   // Market Bias (sticky)
   bias: MarketBias;

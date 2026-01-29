@@ -14,6 +14,8 @@ import type {
   MinimalExecutionState,
   MinimalLLMSnapshot,
   MinimalSetupCandidate,
+  NoTradeDiagnostic,
+  NoTradeReasonCode,
   RawBar,
   ResolutionGate,
 } from "../types.js";
@@ -47,6 +49,7 @@ export class Orchestrator {
   private forming5mBar: Forming5mBar | null = null;
   private formingBucketStart: number | null = null;
   private readonly minimalLlmBars: number;
+  private lastDiagnosticPrice: number | null = null; // Track price for diagnostic emission
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -485,6 +488,87 @@ export class Orchestrator {
     return direction === "long"
       ? [entry + risk, entry + risk * 2]
       : [entry - risk, entry - risk * 2];
+  }
+
+  // Generate "Why No Trade Fired" diagnostic (mechanical, never narrative)
+  private generateNoTradeDiagnostic(
+    exec: MinimalExecutionState,
+    currentPrice: number,
+    atr: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>
+  ): NoTradeDiagnostic | null {
+    // Only emit when: phase === PULLBACK_IN_PROGRESS, entryStatus === inactive (not IN_TRADE), price moved > 0.75 ATR
+    if (exec.phase !== "PULLBACK_IN_PROGRESS") return null;
+    if (atr <= 0) return null;
+
+    // Check if price moved significantly
+    const priceMoved = this.lastDiagnosticPrice !== null 
+      ? Math.abs(currentPrice - this.lastDiagnosticPrice) > 0.75 * atr
+      : false;
+
+    if (!priceMoved && this.lastDiagnosticPrice !== null) return null;
+
+    // Determine reason code (canonical, no ambiguity)
+    let reasonCode: NoTradeReasonCode;
+    let details: string;
+
+    if (!exec.resolutionGate || exec.resolutionGate.status === "INACTIVE") {
+      reasonCode = "NO_GATE_ARMED";
+      details = "Structure not mature - pullback levels not locked";
+    } else if (exec.resolutionGate.status === "EXPIRED") {
+      reasonCode = "GATE_EXPIRED";
+      details = "Continuation occurred before trigger — move not chaseable";
+    } else if (exec.resolutionGate.status === "INVALIDATED") {
+      reasonCode = "GATE_INVALIDATED";
+      details = "Structure broke against bias";
+    } else if (exec.resolutionGate.status === "ARMED") {
+      // Gate is armed but not triggered - check why
+      const timeExpired = Date.now() > exec.resolutionGate.expiryTs;
+      const priceBeyondTrigger = exec.resolutionGate.direction === "short"
+        ? currentPrice < exec.resolutionGate.triggerPrice - 0.5 * atr
+        : currentPrice > exec.resolutionGate.triggerPrice + 0.5 * atr;
+      
+      if (timeExpired) {
+        reasonCode = "GATE_EXPIRED";
+        details = "Gate expired - continuation window closed";
+      } else if (priceBeyondTrigger) {
+        reasonCode = "GATE_EXPIRED";
+        details = "Continuation occurred without structure — move not chaseable";
+      } else {
+        reasonCode = "AWAITING_PULLBACK_COMPLETION";
+        details = "Gate armed, awaiting trigger price";
+      }
+    } else {
+      reasonCode = "AWAITING_PULLBACK_COMPLETION";
+      details = "Awaiting pullback completion";
+    }
+
+    // Check for session constraints (simplified - would check actual session times)
+    const regime = getMarketRegime(new Date());
+    if (!regime.isRTH) {
+      reasonCode = "SESSION_CONSTRAINT";
+      details = "Market closed or outside trading hours";
+    }
+
+    // Volatility check (simplified - would use actual volatility calculation)
+    // For now, we'll skip VOL_TOO_HIGH as it requires more sophisticated volatility tracking
+
+    return {
+      price: currentPrice,
+      bias: exec.bias,
+      phase: exec.phase,
+      expectedResolution: exec.expectedResolution,
+      gateStatus: exec.resolutionGate?.status,
+      reasonCode,
+      details,
+    };
+  }
+
+  // Emit diagnostic log
+  private emitNoTradeDiagnostic(diagnostic: NoTradeDiagnostic): void {
+    console.log(
+      `NO_TRADE: price=${diagnostic.price.toFixed(2)} bias=${diagnostic.bias} phase=${diagnostic.phase} expected=${diagnostic.expectedResolution ?? "n/a"} gate=${diagnostic.gateStatus ?? "n/a"} reason=${diagnostic.reasonCode} details="${diagnostic.details}"`
+    );
   }
 
   // Detect if continuation has started (expected continuation now in progress)
@@ -1249,6 +1333,17 @@ export class Orchestrator {
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
         if (current5m) {
+          // Emit "Why No Trade Fired" diagnostic when conditions are met
+          if (exec.phase === "PULLBACK_IN_PROGRESS") {
+            const atr = this.calculateATR(closed5mBars);
+            const diagnostic = this.generateNoTradeDiagnostic(exec, current5m.close, atr, closed5mBars);
+            if (diagnostic) {
+              this.emitNoTradeDiagnostic(diagnostic);
+              // Update last diagnostic price to prevent spam
+              this.lastDiagnosticPrice = current5m.close;
+            }
+          }
+
           // Only allow entry if gate is TRIGGERED or no gate exists
           const gateAllowsEntry = !exec.resolutionGate || 
                                   exec.resolutionGate.status === "TRIGGERED" ||
