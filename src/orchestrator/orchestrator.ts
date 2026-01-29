@@ -356,6 +356,252 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  // Detect if continuation has started (expected continuation now in progress)
+  private detectContinuation(
+    bias: MarketBias,
+    expectedResolution: ExpectedResolution | undefined,
+    current5m: { high: number; low: number; close: number },
+    previous5m: { high: number; low: number; close: number } | undefined,
+    pullbackHigh?: number,
+    pullbackLow?: number,
+    closed5mBars?: Array<{ high: number; low: number; close: number }>
+  ): boolean {
+    // Preconditions
+    if (expectedResolution !== "CONTINUATION" || bias === "NEUTRAL" || !previous5m) {
+      return false;
+    }
+
+    // Rule Set A: Structural Break (mandatory)
+    let structuralBreak = false;
+    if (bias === "BULLISH" && pullbackHigh !== undefined) {
+      structuralBreak = current5m.close > pullbackHigh;
+    } else if (bias === "BEARISH" && pullbackLow !== undefined) {
+      structuralBreak = current5m.close < pullbackLow;
+    }
+    
+    if (!structuralBreak) {
+      return false; // Must have structural break
+    }
+
+    // Rule Set B: Momentum Confirmation (at least one)
+    let momentumConfirmed = false;
+    
+    // Option 1: Range expansion (current bar range > average of last N bars)
+    if (closed5mBars && closed5mBars.length >= 3) {
+      const currentRange = Math.abs(current5m.high - current5m.low);
+      const recentBars = closed5mBars.slice(-5); // Last 5 bars
+      const avgRange = recentBars.reduce((sum, b) => sum + Math.abs(b.high - b.low), 0) / recentBars.length;
+      if (currentRange > avgRange * 1.2) {
+        momentumConfirmed = true;
+      }
+    }
+    
+    // Option 2: Price momentum (close direction matches bias)
+    if (!momentumConfirmed) {
+      if (bias === "BULLISH" && current5m.close > previous5m.close) {
+        momentumConfirmed = true;
+      } else if (bias === "BEARISH" && current5m.close < previous5m.close) {
+        momentumConfirmed = true;
+      }
+    }
+
+    if (!momentumConfirmed) {
+      return false; // Must have momentum confirmation
+    }
+
+    // Rule Set C: Acceptance (anti-fakeout) - close outside pullback range
+    let acceptanceConfirmed = false;
+    if (bias === "BULLISH" && pullbackHigh !== undefined) {
+      acceptanceConfirmed = current5m.close > pullbackHigh;
+    } else if (bias === "BEARISH" && pullbackLow !== undefined) {
+      acceptanceConfirmed = current5m.close < pullbackLow;
+    }
+
+    return structuralBreak && momentumConfirmed && acceptanceConfirmed;
+  }
+
+  // Check if entry should be blocked (no-chase rules)
+  private shouldBlockEntry(
+    bias: MarketBias,
+    phase: MinimalExecutionPhase,
+    currentPrice: number,
+    pullbackHigh?: number,
+    pullbackLow?: number
+  ): { blocked: boolean; reason?: string } {
+    // Only check blocking during continuation
+    if (phase !== "CONTINUATION_IN_PROGRESS") {
+      return { blocked: false };
+    }
+
+    if (pullbackHigh === undefined && pullbackLow === undefined) {
+      return { blocked: false };
+    }
+
+    // Rule 1: Extended Distance
+    let continuationExtension = 0;
+    let pullbackRange = 0;
+    
+    if (bias === "BULLISH" && pullbackHigh !== undefined) {
+      continuationExtension = currentPrice - pullbackHigh;
+      // Estimate pullback range (use a reasonable default if not available)
+      pullbackRange = pullbackHigh - (pullbackLow ?? pullbackHigh * 0.998);
+    } else if (bias === "BEARISH" && pullbackLow !== undefined) {
+      continuationExtension = pullbackLow - currentPrice;
+      pullbackRange = (pullbackHigh ?? pullbackLow * 1.002) - pullbackLow;
+    }
+
+    if (pullbackRange > 0 && continuationExtension > pullbackRange * 1.25) {
+      return { blocked: true, reason: "continuation_extended" };
+    }
+
+    return { blocked: false };
+  }
+
+  // Detect momentum pause or compression (transition to re-entry window)
+  private detectMomentumPause(
+    bias: MarketBias,
+    current5m: { high: number; low: number; close: number },
+    previous5m: { high: number; low: number; close: number } | undefined,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    impulseRange?: number
+  ): boolean {
+    if (!previous5m || !impulseRange || impulseRange <= 0) {
+      return false;
+    }
+
+    // Rule B: Range Compression
+    const currentRange = Math.abs(current5m.high - current5m.low);
+    const previousRange = Math.abs(previous5m.high - previous5m.low);
+    const avgRange = (currentRange + previousRange) / 2;
+    
+    if (avgRange < 0.6 * impulseRange) {
+      return true; // Range compression detected
+    }
+
+    // Rule A: Momentum Pause (price momentum stalls)
+    if (bias === "BULLISH") {
+      // Bullish: price should be rising, if it stalls or reverses, pause detected
+      if (current5m.close <= previous5m.close && current5m.high <= previous5m.high) {
+        return true;
+      }
+    } else if (bias === "BEARISH") {
+      // Bearish: price should be falling, if it stalls or reverses, pause detected
+      if (current5m.close >= previous5m.close && current5m.low >= previous5m.low) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Detect valid re-entry after continuation
+  private detectReentry(
+    bias: MarketBias,
+    current5m: { high: number; low: number; close: number; open?: number },
+    previous5m: { high: number; low: number; close: number; open?: number } | undefined,
+    continuationHigh?: number,
+    continuationLow?: number,
+    impulseRange?: number
+  ): { valid: boolean; pullbackHigh?: number; pullbackLow?: number } {
+    if (!previous5m || !impulseRange || impulseRange <= 0) {
+      return { valid: false };
+    }
+
+    const currentOpen = current5m.open ?? current5m.close;
+    const previousOpen = previous5m.open ?? previous5m.close;
+
+    // Rule Set A: Shallow Pullback (mandatory)
+    let shallowPullback = false;
+    let reentryPullbackHigh: number | undefined = undefined;
+    let reentryPullbackLow: number | undefined = undefined;
+
+    if (bias === "BULLISH" && continuationLow !== undefined) {
+      const minPullbackLow = continuationLow + 0.38 * impulseRange;
+      if (current5m.low >= minPullbackLow) {
+        shallowPullback = true;
+        reentryPullbackLow = current5m.low;
+        reentryPullbackHigh = current5m.high;
+      }
+    } else if (bias === "BEARISH" && continuationHigh !== undefined) {
+      const maxPullbackHigh = continuationHigh - 0.38 * impulseRange;
+      if (current5m.high <= maxPullbackHigh) {
+        shallowPullback = true;
+        reentryPullbackHigh = current5m.high;
+        reentryPullbackLow = current5m.low;
+      }
+    }
+
+    if (!shallowPullback) {
+      return { valid: false };
+    }
+
+    // Rule Set B: Structure Preservation (mandatory)
+    // For bullish: must not break below continuation low
+    // For bearish: must not break above continuation high
+    let structurePreserved = false;
+    if (bias === "BULLISH" && continuationLow !== undefined) {
+      structurePreserved = current5m.low >= continuationLow;
+    } else if (bias === "BEARISH" && continuationHigh !== undefined) {
+      structurePreserved = current5m.high <= continuationHigh;
+    }
+
+    if (!structurePreserved) {
+      return { valid: false };
+    }
+
+    // Rule Set C: Re-Ignition Signal (one required)
+    let reIgnition = false;
+
+    // Option 1: Engulfing candle
+    if (bias === "BULLISH") {
+      const isBullishEngulfing = current5m.close > currentOpen && 
+        previous5m.close < previousOpen &&
+        current5m.close > previousOpen &&
+        currentOpen < previous5m.close;
+      if (isBullishEngulfing) reIgnition = true;
+    } else if (bias === "BEARISH") {
+      const isBearishEngulfing = current5m.close < currentOpen &&
+        previous5m.close > previousOpen &&
+        current5m.close < previousOpen &&
+        currentOpen > previous5m.close;
+      if (isBearishEngulfing) reIgnition = true;
+    }
+
+    // Option 2: Break of micro range (price breaks previous bar high/low in bias direction)
+    if (!reIgnition) {
+      if (bias === "BULLISH" && current5m.high > previous5m.high && current5m.close > previous5m.close) {
+        reIgnition = true;
+      } else if (bias === "BEARISH" && current5m.low < previous5m.low && current5m.close < previous5m.close) {
+        reIgnition = true;
+      }
+    }
+
+    if (reIgnition) {
+      return { valid: true, pullbackHigh: reentryPullbackHigh, pullbackLow: reentryPullbackLow };
+    }
+
+    return { valid: false };
+  }
+
+  // Check if re-entry should be blocked
+  private shouldBlockReentry(
+    bias: MarketBias,
+    currentPrice: number,
+    barsSinceContinuation?: number,
+    closed5mBars?: Array<{ high: number; low: number; close: number }>
+  ): { blocked: boolean; reason?: string } {
+    // Rule 3: Time Decay
+    if (barsSinceContinuation !== undefined && barsSinceContinuation > 8) {
+      return { blocked: true, reason: "reentry_window_expired" };
+    }
+
+    // Rule 1: Too Much Distance (simplified - would need VWAP for full implementation)
+    // Rule 2: Exhaustion Signals (would need RSI/volume - simplified for now)
+    // These can be enhanced later with actual indicators
+
+    return { blocked: false };
+  }
+
   // Detect if pullback is failing (structure breaking against bias)
   private detectPullbackFailure(
     bias: MarketBias,
@@ -430,6 +676,12 @@ export class Orchestrator {
       
       case "CONSOLIDATION_AFTER_REJECTION":
         return `Consolidating after rejection, ${biasLabel} bias maintained`;
+      
+      case "CONTINUATION_IN_PROGRESS":
+        return `${biasLabel.charAt(0).toUpperCase() + biasLabel.slice(1)} continuation underway`;
+      
+      case "REENTRY_WINDOW":
+        return `Post-continuation pause detected, awaiting shallow pullback`;
       
       default:
         // Fallback to waitReason if provided, but never say "neutral bias" when bias exists
@@ -677,7 +929,114 @@ export class Orchestrator {
         }
       }
 
+      // Monitor continuation progress and detect momentum pause
+      if (exec.phase === "CONTINUATION_IN_PROGRESS" && exec.bias !== "NEUTRAL") {
+        const current5m = forming5mBar ?? lastClosed5m;
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
+
+        if (current5m && previous5m) {
+          // Update continuation tracking
+          if (exec.bias === "BULLISH") {
+            exec.continuationLow = Math.min(exec.continuationLow ?? current5m.low, current5m.low);
+            if (exec.impulseRange !== undefined) {
+              exec.impulseRange = Math.max(exec.impulseRange, current5m.high - (exec.pullbackHigh ?? current5m.low));
+            }
+          } else if (exec.bias === "BEARISH") {
+            exec.continuationHigh = Math.max(exec.continuationHigh ?? current5m.high, current5m.high);
+            if (exec.impulseRange !== undefined) {
+              exec.impulseRange = Math.max(exec.impulseRange, (exec.pullbackLow ?? current5m.high) - current5m.low);
+            }
+          }
+
+          // Increment bars counter
+          if (exec.barsSinceContinuation !== undefined) {
+            exec.barsSinceContinuation++;
+          } else {
+            exec.barsSinceContinuation = 1;
+          }
+
+          // Check for momentum pause (transition to re-entry window)
+          const momentumPaused = this.detectMomentumPause(
+            exec.bias,
+            current5m,
+            previous5m,
+            closed5mBars,
+            exec.impulseRange
+          );
+
+          if (momentumPaused) {
+            const oldPhase = exec.phase;
+            exec.phase = "REENTRY_WINDOW";
+            exec.waitReason = "waiting_for_reentry_pullback";
+            shouldPublishEvent = true;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} NOTE: Continuation paused, monitoring for re-entry`
+            );
+          }
+        }
+      }
+
+      // Monitor re-entry window and detect valid re-entry
+      if (exec.phase === "REENTRY_WINDOW" && exec.bias !== "NEUTRAL") {
+        const current5m = forming5mBar ?? lastClosed5m;
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
+
+        if (current5m && previous5m && current5m.open !== undefined) {
+          // Check if re-entry should be blocked
+          const blockCheck = this.shouldBlockReentry(
+            exec.bias,
+            current5m.close,
+            exec.barsSinceContinuation,
+            closed5mBars
+          );
+
+          if (blockCheck.blocked) {
+            const oldPhase = exec.phase;
+            exec.phase = "CONSOLIDATION_AFTER_REJECTION";
+            exec.waitReason = blockCheck.reason ?? "reentry_window_expired";
+            shouldPublishEvent = true;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} reason=${exec.waitReason} - Re-entry window expired`
+            );
+          } else {
+            // Check for valid re-entry
+            const reentryInfo = this.detectReentry(
+              exec.bias,
+              current5m,
+              previous5m,
+              exec.continuationHigh,
+              exec.continuationLow,
+              exec.impulseRange
+            );
+
+            if (reentryInfo.valid && reentryInfo.pullbackHigh !== undefined && reentryInfo.pullbackLow !== undefined) {
+              const oldPhase = exec.phase;
+              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m);
+              
+              exec.entryPrice = current5m.close;
+              exec.entryTs = ts;
+              exec.entryType = "REENTRY_AFTER_CONTINUATION";
+              exec.entryTrigger = entryInfo.trigger || "Post-continuation re-entry";
+              exec.pullbackHigh = reentryInfo.pullbackHigh;
+              exec.pullbackLow = reentryInfo.pullbackLow;
+              exec.pullbackTs = ts;
+              exec.stopPrice = exec.bias === "BULLISH" ? reentryInfo.pullbackLow : reentryInfo.pullbackHigh;
+              exec.targets = this.computeTargets(exec.bias === "BULLISH" ? "long" : "short", exec.entryPrice, exec.stopPrice);
+              exec.phase = "IN_TRADE";
+              exec.waitReason = "in_trade";
+              exec.entryBlocked = false;
+              exec.entryBlockReason = undefined;
+              shouldPublishEvent = true;
+              console.log(
+                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | TYPE=REENTRY_AFTER_CONTINUATION BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} NOTE: ${exec.bias} continuation re-entry after compression`
+              );
+            }
+          }
+        }
+      }
+
       // Check for pullback entry every 1m (responsive, not just on 5m close)
+      // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule)
       if (exec.bias !== "NEUTRAL" && (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED")) {
         const current5m = forming5mBar ?? lastClosed5m;
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
@@ -703,6 +1062,39 @@ export class Orchestrator {
               console.log(
                 `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Pullback failed, structure breaking against bias`
               );
+            } else {
+              // Check for continuation detection (expected continuation now in progress)
+              const continuationDetected = this.detectContinuation(
+                exec.bias,
+                exec.expectedResolution,
+                current5m,
+                previous5m,
+                exec.pullbackHigh,
+                exec.pullbackLow,
+                closed5mBars
+              );
+
+              if (continuationDetected) {
+                const oldPhase = exec.phase;
+                exec.phase = "CONTINUATION_IN_PROGRESS";
+                exec.waitReason = "continuation_underway";
+                // Calculate continuation extension and track metrics
+                if (exec.bias === "BULLISH" && exec.pullbackHigh !== undefined) {
+                  exec.continuationExtension = current5m.close - exec.pullbackHigh;
+                  exec.continuationLow = current5m.low; // Track lowest point during continuation
+                  exec.impulseRange = current5m.high - exec.pullbackHigh; // Initial impulse range
+                } else if (exec.bias === "BEARISH" && exec.pullbackLow !== undefined) {
+                  exec.continuationExtension = exec.pullbackLow - current5m.close;
+                  exec.continuationHigh = current5m.high; // Track highest point during continuation
+                  exec.impulseRange = exec.pullbackLow - current5m.low; // Initial impulse range
+                }
+                exec.continuationStartTs = ts;
+                exec.barsSinceContinuation = 0;
+                shouldPublishEvent = true;
+                console.log(
+                  `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} PRICE=${current5m.close.toFixed(2)} REF=${exec.pullbackHigh ?? exec.pullbackLow ?? "n/a"} NOTE: Expected continuation now in progress`
+                );
+              }
             }
           }
 
@@ -721,47 +1113,75 @@ export class Orchestrator {
           // Enter ON pullback for BULLISH bias
           // Condition: current bar is bearish OR makes a lower low (if we have previous bar)
           if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
-            const oldPhase = exec.phase;
-            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-            
-            exec.entryPrice = current5m.close;
-            exec.entryTs = ts;
-            exec.entryType = entryInfo.type;
-            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-            exec.pullbackHigh = current5m.high;
-            exec.pullbackLow = current5m.low;
-            exec.pullbackTs = ts;
-            exec.stopPrice = current5m.low; // Stop at pullback low
-            exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
-            exec.phase = "IN_TRADE";
-            exec.waitReason = "in_trade";
-            shouldPublishEvent = true; // Entry executed - publish event
-            console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-            );
+            // Check no-chase rules
+            const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
+            if (blockCheck.blocked) {
+              exec.entryBlocked = true;
+              exec.entryBlockReason = blockCheck.reason;
+              exec.waitReason = blockCheck.reason ?? "entry_blocked";
+              shouldPublishEvent = true;
+              console.log(
+                `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+              );
+            } else {
+              const oldPhase = exec.phase;
+              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+              
+              exec.entryPrice = current5m.close;
+              exec.entryTs = ts;
+              exec.entryType = entryInfo.type;
+              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+              exec.pullbackHigh = current5m.high;
+              exec.pullbackLow = current5m.low;
+              exec.pullbackTs = ts;
+              exec.stopPrice = current5m.low; // Stop at pullback low
+              exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
+              exec.phase = "IN_TRADE";
+              exec.waitReason = "in_trade";
+              exec.entryBlocked = false;
+              exec.entryBlockReason = undefined;
+              shouldPublishEvent = true; // Entry executed - publish event
+              console.log(
+                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+              );
+            }
           }
 
           // Enter ON pullback for BEARISH bias
           // Condition: current bar is bullish OR makes a higher high (if we have previous bar)
           if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
-            const oldPhase = exec.phase;
-            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-            
-            exec.entryPrice = current5m.close;
-            exec.entryTs = ts;
-            exec.entryType = entryInfo.type;
-            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-            exec.pullbackHigh = current5m.high;
-            exec.pullbackLow = current5m.low;
-            exec.pullbackTs = ts;
-            exec.stopPrice = current5m.high; // Stop at pullback high
-            exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
-            exec.phase = "IN_TRADE";
-            exec.waitReason = "in_trade";
-            shouldPublishEvent = true; // Entry executed - publish event
-            console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-            );
+            // Check no-chase rules
+            const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
+            if (blockCheck.blocked) {
+              exec.entryBlocked = true;
+              exec.entryBlockReason = blockCheck.reason;
+              exec.waitReason = blockCheck.reason ?? "entry_blocked";
+              shouldPublishEvent = true;
+              console.log(
+                `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+              );
+            } else {
+              const oldPhase = exec.phase;
+              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+              
+              exec.entryPrice = current5m.close;
+              exec.entryTs = ts;
+              exec.entryType = entryInfo.type;
+              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+              exec.pullbackHigh = current5m.high;
+              exec.pullbackLow = current5m.low;
+              exec.pullbackTs = ts;
+              exec.stopPrice = current5m.high; // Stop at pullback high
+              exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
+              exec.phase = "IN_TRADE";
+              exec.waitReason = "in_trade";
+              exec.entryBlocked = false;
+              exec.entryBlockReason = undefined;
+              shouldPublishEvent = true; // Entry executed - publish event
+              console.log(
+                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+              );
+            }
           }
         }
       }
@@ -846,13 +1266,25 @@ export class Orchestrator {
         if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined) {
           refPrice = exec.entryPrice;
           refLabel = "entry";
-        } else if (exec.phase === "PULLBACK_IN_PROGRESS") {
+        } else if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "CONTINUATION_IN_PROGRESS" || exec.phase === "REENTRY_WINDOW") {
           if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
             refPrice = exec.pullbackHigh;
-            refLabel = "pullback high";
+            if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+              refLabel = "pullback high (continuation)";
+            } else if (exec.phase === "REENTRY_WINDOW") {
+              refLabel = "pullback high (re-entry window)";
+            } else {
+              refLabel = "pullback high";
+            }
           } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
             refPrice = exec.pullbackLow;
-            refLabel = "pullback low";
+            if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+              refLabel = "pullback low (continuation)";
+            } else if (exec.phase === "REENTRY_WINDOW") {
+              refLabel = "pullback low (re-entry window)";
+            } else {
+              refLabel = "pullback low";
+            }
           } else if (exec.biasPrice !== undefined) {
             refPrice = exec.biasPrice;
             refLabel = "bias established";
@@ -872,7 +1304,9 @@ export class Orchestrator {
           reason: this.getPhaseAwareReason(exec.bias, exec.phase, exec.waitReason),
           bias: exec.bias,
           phase: exec.phase,
-          entryStatus: exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const,
+          entryStatus: exec.entryBlocked 
+            ? "blocked" as const 
+            : (exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const),
           entryType: exec.entryType ?? undefined,
           expectedResolution: exec.expectedResolution ?? undefined,
           price: close, // Current price (first-class)

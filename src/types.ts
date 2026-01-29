@@ -81,7 +81,7 @@ export interface MinimalMindStateResponse {
   reason: string;
   bias?: MarketBias; // New: explicit bias
   phase?: MinimalExecutionPhase; // New: explicit phase
-  entryStatus?: "active" | "inactive"; // New: entry status
+  entryStatus?: "active" | "inactive" | "blocked"; // New: entry status
   entryType?: EntryType; // New: entry type
   expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
   price?: number; // Current price (first-class)
@@ -104,11 +104,13 @@ export type MinimalExecutionPhase =
   | "PULLBACK_IN_PROGRESS"
   | "PULLBACK_REJECTION"
   | "PULLBACK_BREAKDOWN"
+  | "CONTINUATION_IN_PROGRESS"
+  | "REENTRY_WINDOW"
   | "IN_TRADE"
   | "CONSOLIDATION_AFTER_REJECTION";
 
 // Entry Types (explicit, not implied)
-export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | null;
+export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | null;
 
 // Expected Resolution (what should happen next in a pullback)
 export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
@@ -147,6 +149,15 @@ export type MinimalExecutionState = {
   stopPrice?: number;
   targets?: number[];
   waitReason?: string;
+  continuationExtension?: number; // Distance from pullback level when continuation detected
+  entryBlocked?: boolean; // True when no-chase rules prevent entry
+  entryBlockReason?: string; // Reason for entry blocking
+  // Re-entry tracking
+  impulseRange?: number; // Range of the continuation impulse move
+  continuationHigh?: number; // Highest point during continuation (bearish bias)
+  continuationLow?: number; // Lowest point during continuation (bullish bias)
+  continuationStartTs?: number; // When continuation was detected
+  barsSinceContinuation?: number; // Counter for time decay check
 };
 
 export interface BotState {
