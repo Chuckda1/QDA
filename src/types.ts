@@ -83,6 +83,7 @@ export interface MinimalMindStateResponse {
   phase?: MinimalExecutionPhase; // New: explicit phase
   entryStatus?: "active" | "inactive"; // New: entry status
   entryType?: EntryType; // New: entry type
+  expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
 }
 
 export type MinimalMindStateResult = {
@@ -106,6 +107,9 @@ export type MinimalExecutionPhase =
 // Entry Types (explicit, not implied)
 export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | null;
 
+// Expected Resolution (what should happen next in a pullback)
+export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
+
 export type MinimalExecutionState = {
   // Market Bias (sticky)
   bias: MarketBias;
@@ -116,6 +120,9 @@ export type MinimalExecutionState = {
   
   // Trade Phase (fast)
   phase: MinimalExecutionPhase;
+  
+  // Expected Resolution (what should happen next in pullback)
+  expectedResolution?: ExpectedResolution;
   
   // Entry tracking
   entryType?: EntryType;

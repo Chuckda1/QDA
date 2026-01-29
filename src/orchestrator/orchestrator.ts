@@ -6,6 +6,7 @@ import type {
   BotState,
   DomainEvent,
   EntryType,
+  ExpectedResolution,
   Forming5mBar,
   MarketBias,
   MinimalDebugInfo,
@@ -268,9 +269,12 @@ export class Orchestrator {
   }
 
   private clearTradeState(exec: MinimalExecutionState): void {
-    exec.pullbackHigh = undefined;
-    exec.pullbackLow = undefined;
-    exec.pullbackTs = undefined;
+    // Only clear pullback levels if we're not in PULLBACK_IN_PROGRESS (need them for failure detection)
+    if (exec.phase !== "PULLBACK_IN_PROGRESS") {
+      exec.pullbackHigh = undefined;
+      exec.pullbackLow = undefined;
+      exec.pullbackTs = undefined;
+    }
     exec.entryPrice = undefined;
     exec.entryTs = undefined;
     exec.stopPrice = undefined;
@@ -352,6 +356,50 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  // Detect if pullback is failing (structure breaking against bias)
+  private detectPullbackFailure(
+    bias: MarketBias,
+    expectedResolution: ExpectedResolution | undefined,
+    current5m: { high: number; low: number; close: number },
+    previous5m?: { high: number; low: number; close: number },
+    pullbackHigh?: number,
+    pullbackLow?: number
+  ): boolean {
+    if (expectedResolution !== "CONTINUATION") {
+      return false; // Only check for failure if we expect continuation
+    }
+
+    if (!previous5m) {
+      return false; // Need previous bar for structure comparison
+    }
+
+    // For BEARISH bias: failure = structure printing higher high and holding
+    if (bias === "BEARISH") {
+      const hasHigherHigh = current5m.high > previous5m.high;
+      const isHoldingAbove = current5m.close > previous5m.close;
+      // If we have pullback high, check if price is breaking above it
+      if (pullbackHigh && current5m.high > pullbackHigh) {
+        return true; // Breaking above pullback high = failure
+      }
+      // Structure failure: higher high + holding above
+      return hasHigherHigh && isHoldingAbove;
+    }
+
+    // For BULLISH bias: failure = structure printing lower low and holding
+    if (bias === "BULLISH") {
+      const hasLowerLow = current5m.low < previous5m.low;
+      const isHoldingBelow = current5m.close < previous5m.close;
+      // If we have pullback low, check if price is breaking below it
+      if (pullbackLow && current5m.low < pullbackLow) {
+        return true; // Breaking below pullback low = failure
+      }
+      // Structure failure: lower low + holding below
+      return hasLowerLow && isHoldingBelow;
+    }
+
+    return false;
+  }
+
   // Generate phase-aware reason that never contradicts bias
   private getPhaseAwareReason(bias: MarketBias, phase: MinimalExecutionPhase, waitReason?: string): string {
     // Never infer bias from phase - bias is authoritative
@@ -369,7 +417,7 @@ export class Orchestrator {
         return `${biasLabel.charAt(0).toUpperCase() + biasLabel.slice(1)} bias established, waiting for pullback`;
       
       case "PULLBACK_IN_PROGRESS":
-        return `Counter-trend pullback developing within ${biasLabel} structure`;
+        return `Counter-trend pullback developing within ${biasLabel} structure, expecting continuation`;
       
       case "PULLBACK_REJECTION":
         return `Pullback rejected, ${biasLabel} structure intact`;
@@ -586,10 +634,12 @@ export class Orchestrator {
           exec.thesisTs = ts;
           exec.phase = "BIAS_ESTABLISHED";
           exec.waitReason = "waiting_for_pullback";
+          // Set ExpectedResolution: expect continuation when pullback occurs
+          exec.expectedResolution = "CONTINUATION";
           this.clearTradeState(exec);
           shouldPublishEvent = true; // Thesis changed - publish event
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence}`
+            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence} expectedResolution=${exec.expectedResolution}`
           );
         } else {
           console.log(
@@ -604,10 +654,25 @@ export class Orchestrator {
           exec.activeCandidate = undefined;
           exec.phase = "PULLBACK_IN_PROGRESS";
           exec.waitReason = decision.waiting_for ?? "waiting_for_setup";
-          this.clearTradeState(exec);
+          // Set ExpectedResolution: expect continuation of bias direction
+          exec.expectedResolution = exec.bias === "BEARISH" || exec.bias === "BULLISH" ? "CONTINUATION" : "UNDECIDED";
+          // Track pullback levels for failure detection
+          const current5mForPullback = forming5mBar ?? lastClosed5m;
+          if (current5mForPullback) {
+            exec.pullbackHigh = current5mForPullback.high;
+            exec.pullbackLow = current5mForPullback.low;
+            exec.pullbackTs = ts;
+          }
+          // Clear entry state but keep pullback levels
+          exec.entryPrice = undefined;
+          exec.entryTs = undefined;
+          exec.entryType = undefined;
+          exec.entryTrigger = undefined;
+          exec.stopPrice = undefined;
+          exec.targets = undefined;
           shouldPublishEvent = true; // Phase change - publish event
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) entry_status=inactive`
+            `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} entry_status=inactive`
           );
         }
       }
@@ -618,6 +683,29 @@ export class Orchestrator {
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
         if (current5m) {
+          // Check for pullback failure first (structure breaking against bias)
+          if (exec.phase === "PULLBACK_IN_PROGRESS" && previous5m) {
+            const pullbackFailed = this.detectPullbackFailure(
+              exec.bias,
+              exec.expectedResolution,
+              current5m,
+              previous5m,
+              exec.pullbackHigh,
+              exec.pullbackLow
+            );
+
+            if (pullbackFailed) {
+              const oldPhase = exec.phase;
+              exec.expectedResolution = "FAILURE";
+              exec.phase = "CONSOLIDATION_AFTER_REJECTION";
+              exec.waitReason = "pullback_failed";
+              shouldPublishEvent = true;
+              console.log(
+                `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Pullback failed, structure breaking against bias`
+              );
+            }
+          }
+
           const open = current5m.open ?? current5m.close;
           const isBearish = current5m.close < open;
           const isBullish = current5m.close > open;
@@ -760,6 +848,7 @@ export class Orchestrator {
           phase: exec.phase,
           entryStatus: exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const,
           entryType: exec.entryType ?? undefined,
+          expectedResolution: exec.expectedResolution ?? undefined,
         };
 
         events.push({
