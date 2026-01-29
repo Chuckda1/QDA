@@ -405,9 +405,9 @@ export class Orchestrator {
   private clearTradeState(exec: MinimalExecutionState): void {
     // Only clear pullback levels if we're not in PULLBACK_IN_PROGRESS (need them for failure detection)
     if (exec.phase !== "PULLBACK_IN_PROGRESS") {
-      exec.pullbackHigh = undefined;
-      exec.pullbackLow = undefined;
-      exec.pullbackTs = undefined;
+    exec.pullbackHigh = undefined;
+    exec.pullbackLow = undefined;
+    exec.pullbackTs = undefined;
     }
     exec.entryPrice = undefined;
     exec.entryTs = undefined;
@@ -1099,7 +1099,7 @@ export class Orchestrator {
       // Update derived confidence continuously (not just on bias change)
       if (exec.bias !== "NEUTRAL") {
         exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-        exec.thesisConfidence = exec.biasConfidence;
+      exec.thesisConfidence = exec.biasConfidence;
       }
 
       console.log(
@@ -1509,16 +1509,7 @@ export class Orchestrator {
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
         if (current5m) {
-          // Emit "Why No Trade Fired" diagnostic when conditions are met
-          if (exec.phase === "PULLBACK_IN_PROGRESS") {
-            const atr = this.calculateATR(closed5mBars);
-            const diagnostic = this.generateNoTradeDiagnostic(exec, current5m.close, atr, closed5mBars);
-            if (diagnostic) {
-              this.emitNoTradeDiagnostic(diagnostic);
-              // Update last diagnostic price to prevent spam
-              this.lastDiagnosticPrice = current5m.close;
-            }
-          }
+          // Diagnostic generation moved to mindState construction (below) to pass through to Telegram
 
           // Only allow entry if gate is TRIGGERED or no gate exists
           const gateAllowsEntry = !exec.resolutionGate || 
@@ -1625,26 +1616,26 @@ export class Orchestrator {
                 `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
               );
             } else {
-              const oldPhase = exec.phase;
-              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-              
-              exec.entryPrice = current5m.close;
-              exec.entryTs = ts;
-              exec.entryType = entryInfo.type;
-              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-              exec.pullbackHigh = current5m.high;
-              exec.pullbackLow = current5m.low;
-              exec.pullbackTs = ts;
-              exec.stopPrice = current5m.low; // Stop at pullback low
-              exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
-              exec.phase = "IN_TRADE";
-              exec.waitReason = "in_trade";
+            const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
+            exec.stopPrice = current5m.low; // Stop at pullback low
+            exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
               exec.entryBlocked = false;
               exec.entryBlockReason = undefined;
-              shouldPublishEvent = true; // Entry executed - publish event
-              console.log(
-                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-              );
+            shouldPublishEvent = true; // Entry executed - publish event
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+            );
             }
           }
 
@@ -1665,26 +1656,26 @@ export class Orchestrator {
                 `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
               );
             } else {
-              const oldPhase = exec.phase;
-              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-              
-              exec.entryPrice = current5m.close;
-              exec.entryTs = ts;
-              exec.entryType = entryInfo.type;
-              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-              exec.pullbackHigh = current5m.high;
-              exec.pullbackLow = current5m.low;
-              exec.pullbackTs = ts;
-              exec.stopPrice = current5m.high; // Stop at pullback high
-              exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
-              exec.phase = "IN_TRADE";
-              exec.waitReason = "in_trade";
+            const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
+            exec.stopPrice = current5m.high; // Stop at pullback high
+            exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
               exec.entryBlocked = false;
               exec.entryBlockReason = undefined;
-              shouldPublishEvent = true; // Entry executed - publish event
-              console.log(
-                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-              );
+            shouldPublishEvent = true; // Entry executed - publish event
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+            );
             }
           }
         }
@@ -1801,6 +1792,20 @@ export class Orchestrator {
           refLabel = "bias established";
         }
 
+        // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
+        let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
+        if (exec.phase === "PULLBACK_IN_PROGRESS") {
+          const atr = this.calculateATR(closed5mBars);
+          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars);
+          if (diagnostic) {
+            noTradeDiagnostic = diagnostic;
+            // Also emit to console for logging
+            this.emitNoTradeDiagnostic(diagnostic);
+            // Update last diagnostic price to prevent spam
+            this.lastDiagnosticPrice = close;
+          }
+        }
+
         const mindState = {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none", // Legacy compatibility
@@ -1816,6 +1821,7 @@ export class Orchestrator {
           price: close, // Current price (first-class)
           refPrice, // Reference price anchor
           refLabel, // Label for reference price
+          noTradeDiagnostic, // Why no trade fired (when applicable)
         };
 
         events.push({

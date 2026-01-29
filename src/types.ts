@@ -87,6 +87,7 @@ export interface MinimalMindStateResponse {
   price?: number; // Current price (first-class)
   refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
   refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
+  noTradeDiagnostic?: NoTradeDiagnostic; // Why no trade fired (when applicable)
 }
 
 export type MinimalMindStateResult = {
@@ -135,7 +136,12 @@ export type NoTradeReasonCode =
   | "GATE_INVALIDATED"
   | "VOL_TOO_HIGH"
   | "AWAITING_PULLBACK_COMPLETION"
-  | "SESSION_CONSTRAINT";
+  | "SESSION_CONSTRAINT"
+  | "NO_REJECTION_CANDLE"
+  | "EMA_NOT_REJECTED"
+  | "STRUCTURE_INTACT"
+  | "RR_UNFAVORABLE"
+  | "PRICE_DRIFT_TOO_SMALL";
 
 export type NoTradeDiagnostic = {
   price: number;

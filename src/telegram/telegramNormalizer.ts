@@ -22,6 +22,11 @@ export type TelegramSnapshot = {
   refPrice?: number;
   refLabel?: string;
   expectedResolution?: string;
+  noTradeDiagnostic?: {
+    reasonCode: string;
+    details: string;
+    reasons?: string[]; // Human-readable reasons array
+  };
 };
 
 const formatEtTimestamp = (ts: number): string =>
@@ -47,6 +52,13 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)
     : undefined;
+  
+  // Extract no-trade diagnostic if present
+  const noTradeDiagnostic = mind.noTradeDiagnostic ? {
+    reasonCode: mind.noTradeDiagnostic.reasonCode,
+    details: mind.noTradeDiagnostic.details,
+    reasons: getHumanReadableReasons(mind.noTradeDiagnostic.reasonCode, mind.noTradeDiagnostic),
+  } : undefined;
 
   return {
     type: "MIND",
@@ -66,5 +78,50 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     refPrice,
     refLabel,
     expectedResolution,
+    noTradeDiagnostic,
   };
+}
+
+// Helper to convert reason codes to human-readable reasons
+function getHumanReadableReasons(reasonCode: string, diagnostic: any): string[] {
+  const reasons: string[] = [];
+  
+  switch (reasonCode) {
+    case "NO_GATE_ARMED":
+      reasons.push("No lower-high rejection candle");
+      reasons.push("No EMA rejection");
+      reasons.push("Structure not mature");
+      break;
+    case "GATE_EXPIRED":
+      reasons.push("Continuation occurred before trigger");
+      reasons.push("Move not chaseable");
+      break;
+    case "GATE_INVALIDATED":
+      reasons.push("Structure broke against bias");
+      reasons.push("No breakdown from consolidation");
+      break;
+    case "AWAITING_PULLBACK_COMPLETION":
+      reasons.push("Awaiting pullback completion");
+      reasons.push("Gate armed, awaiting trigger price");
+      break;
+    case "SESSION_CONSTRAINT":
+      reasons.push("Market closed or outside trading hours");
+      break;
+    case "NO_REJECTION_CANDLE":
+      reasons.push("No rejection candle at key level");
+      break;
+    case "EMA_NOT_REJECTED":
+      reasons.push("No EMA rejection");
+      break;
+    case "STRUCTURE_INTACT":
+      reasons.push("Structure intact - no breakdown");
+      break;
+    case "RR_UNFAVORABLE":
+      reasons.push("Risk > Reward unfavorable");
+      break;
+    default:
+      reasons.push(diagnostic.details || "Awaiting setup completion");
+  }
+  
+  return reasons;
 }
