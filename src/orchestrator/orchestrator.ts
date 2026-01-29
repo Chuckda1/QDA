@@ -584,7 +584,20 @@ export class Orchestrator {
       adverseExcursionPenalty
     ));
 
-    return Math.round(derivedConfidence);
+    const finalConfidence = Math.round(derivedConfidence);
+    
+    // Log confidence calculation details (only when significant change or every 5 minutes)
+    const shouldLogConfidence = exec.biasConfidence === undefined || 
+                                 Math.abs(finalConfidence - (exec.biasConfidence ?? 0)) > 5 ||
+                                 (nowTs % (5 * 60 * 1000) < 60000); // Log roughly every 5 minutes
+    
+    if (shouldLogConfidence && exec.bias !== "NEUTRAL") {
+      console.log(
+        `[CONFIDENCE_CALC] bias=${exec.bias} base=${baseBiasConfidence} structure=${structureAlignmentScore} momentum=${momentumConfirmation} decay=${timeDecay} penalty=${adverseExcursionPenalty} final=${finalConfidence}`
+      );
+    }
+
+    return finalConfidence;
   }
 
   // Generate "Why No Trade Fired" diagnostic (mechanical, never narrative)
@@ -1265,10 +1278,22 @@ export class Orchestrator {
                 atr,
                 ts
               );
+              // Logging is done inside armResolutionGate
+            } else {
               console.log(
-                `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)} expiry=${new Date(exec.resolutionGate?.expiryTs ?? 0).toISOString()}`
+                `[GATE_NOT_ARMED] ATR=${atr.toFixed(4)} - ATR too low, cannot arm gate`
               );
             }
+          } else {
+            // Log why gate wasn't armed
+            const reasons: string[] = [];
+            if (exec.expectedResolution !== "CONTINUATION") reasons.push(`expectedResolution=${exec.expectedResolution}`);
+            if (exec.pullbackHigh === undefined) reasons.push("pullbackHigh=undefined");
+            if (exec.pullbackLow === undefined) reasons.push("pullbackLow=undefined");
+            if (exec.bias !== "BEARISH" && exec.bias !== "BULLISH") reasons.push(`bias=${exec.bias}`);
+            console.log(
+              `[GATE_NOT_ARMED] Conditions not met: ${reasons.join(", ")}`
+            );
           }
           
           shouldPublishEvent = true; // Phase change - publish event
@@ -1389,12 +1414,24 @@ export class Orchestrator {
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
           const atr = this.calculateATR(closed5mBars);
+          const timeToExpiry = exec.resolutionGate.expiryTs - ts;
+          const timeToExpiryMin = Math.floor(timeToExpiry / (60 * 1000));
+          
+          // Log gate status periodically (every minute when armed)
+          if (ts % (60 * 1000) < 1000) { // Roughly every minute
+            const priceVsTrigger = exec.resolutionGate.direction === "short"
+              ? current5m.close - exec.resolutionGate.triggerPrice
+              : exec.resolutionGate.triggerPrice - current5m.close;
+            console.log(
+              `[GATE_STATUS] ${exec.resolutionGate.direction.toUpperCase()} ARMED price=${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} distance=${priceVsTrigger.toFixed(2)} expiryIn=${timeToExpiryMin}m`
+            );
+          }
           
           // Check for gate trigger (ARMED → TRIGGERED)
           if (this.checkGateTrigger(exec.resolutionGate, current5m.close, ts)) {
             exec.resolutionGate.status = "TRIGGERED";
             console.log(
-              `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)}`
+              `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} - Entry permission granted`
             );
             // Entry will be handled by normal entry logic below
           }
@@ -1406,11 +1443,14 @@ export class Orchestrator {
             exec.waitReason = "continuation_without_structure";
             exec.expectedResolution = "FAILURE";
             shouldPublishEvent = true;
+            const expiryReason = ts > exec.resolutionGate.expiryTs 
+              ? "Time expired" 
+              : "Continuation occurred without structure";
             console.log(
-              `[GATE_EXPIRED] ${exec.resolutionGate.direction.toUpperCase()} - Continuation occurred without structure, not chaseable`
+              `[GATE_EXPIRED] ${exec.resolutionGate.direction.toUpperCase()} - ${expiryReason}, not chaseable`
             );
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) - Gate expired`
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Gate expired`
             );
           }
           // Check for gate invalidation (ARMED → INVALIDATED)
@@ -1428,8 +1468,13 @@ export class Orchestrator {
             exec.waitReason = "structure_broken";
             exec.expectedResolution = "FAILURE";
             shouldPublishEvent = true;
+            const invalidationReason = exec.bias === "BEARISH" && exec.pullbackHigh && current5m.close > exec.pullbackHigh
+              ? `Price ${current5m.close.toFixed(2)} > pullbackHigh ${exec.pullbackHigh.toFixed(2)}`
+              : exec.bias === "BULLISH" && exec.pullbackLow && current5m.close < exec.pullbackLow
+              ? `Price ${current5m.close.toFixed(2)} < pullbackLow ${exec.pullbackLow.toFixed(2)}`
+              : "Structure broken against bias";
             console.log(
-              `[GATE_INVALIDATED] ${exec.resolutionGate.direction.toUpperCase()} - Structure broken against bias`
+              `[GATE_INVALIDATED] ${exec.resolutionGate.direction.toUpperCase()} - ${invalidationReason}`
             );
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Gate invalidated`
@@ -1464,7 +1509,17 @@ export class Orchestrator {
           if (!gateAllowsEntry && exec.resolutionGate) {
             // Gate is ARMED but not triggered - wait for gate
             exec.waitReason = `waiting_for_gate_trigger_${exec.resolutionGate.direction}`;
+            const priceVsTrigger = exec.resolutionGate.direction === "short"
+              ? current5m.close - exec.resolutionGate.triggerPrice
+              : exec.resolutionGate.triggerPrice - current5m.close;
+            console.log(
+              `[ENTRY_BLOCKED_BY_GATE] ${exec.resolutionGate.direction.toUpperCase()} gate=${exec.resolutionGate.status} price=${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} distance=${priceVsTrigger.toFixed(2)} - Waiting for gate trigger`
+            );
             return events;
+          } else if (gateAllowsEntry && exec.resolutionGate?.status === "TRIGGERED") {
+            console.log(
+              `[ENTRY_PERMITTED] Gate TRIGGERED, entry logic proceeding`
+            );
           }
           // Check for pullback failure first (structure breaking against bias)
           if (exec.phase === "PULLBACK_IN_PROGRESS" && previous5m) {
@@ -1622,7 +1677,7 @@ export class Orchestrator {
               `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
             );
             exec.phase = newPhase;
-            exec.waitReason = "stop_hit";
+            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
           } else if (exec.thesisDirection === "short" && current5m.high >= exec.stopPrice) {
@@ -1631,7 +1686,7 @@ export class Orchestrator {
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.high.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
             );
             exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
-            exec.waitReason = "stop_hit";
+            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
           }
@@ -1650,7 +1705,7 @@ export class Orchestrator {
               `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Target hit at ${hitTarget?.toFixed(2)}`
             );
             exec.phase = newPhase;
-            exec.waitReason = "target_hit";
+            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
           }
