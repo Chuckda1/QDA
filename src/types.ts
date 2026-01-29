@@ -84,6 +84,7 @@ export interface MinimalMindStateResponse {
   entryStatus?: "active" | "inactive" | "blocked"; // New: entry status
   entryType?: EntryType; // New: entry type
   expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
+  setup?: SetupType; // New: explicit setup type (REJECTION, BREAKDOWN, etc.)
   price?: number; // Current price (first-class)
   refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
   refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
@@ -115,6 +116,17 @@ export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_C
 
 // Expected Resolution (what should happen next in a pullback)
 export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
+
+// Setup Type - explicit, mutually-exclusive tradable patterns
+// Only one setup may be active at a time
+// No setup = no trade (even if bias is strong)
+export type SetupType = 
+  | "REJECTION"          // Trend continuation via pullback rejection
+  | "BREAKDOWN"          // Structural level break
+  | "COMPRESSION_BREAK"  // Volatility contraction → expansion
+  | "FAILED_BOUNCE"      // Counter-trend failure → reversal
+  | "TREND_REENTRY"      // Post-expansion continuation entry
+  | "NONE";              // Explicitly no setup
 
 // Resolution Gate - permission system for entries
 export type ResolutionGateStatus = "INACTIVE" | "ARMED" | "TRIGGERED" | "EXPIRED" | "INVALIDATED";
@@ -167,6 +179,14 @@ export type MinimalExecutionState = {
   
   // Expected Resolution (what should happen next in pullback)
   expectedResolution?: ExpectedResolution;
+  
+  // Setup Type (explicit, mutually-exclusive tradable pattern)
+  // Only one setup may be active at a time
+  // No setup = no trade (even if bias is strong)
+  setup?: SetupType;
+  setupDetectedAt?: number; // Timestamp when setup was detected
+  setupTriggerPrice?: number; // Price level that triggers entry for this setup
+  setupStopPrice?: number; // Stop price for this setup
   
   // Entry tracking
   entryType?: EntryType;

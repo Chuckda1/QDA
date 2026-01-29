@@ -22,6 +22,8 @@ export type TelegramSnapshot = {
   refPrice?: number;
   refLabel?: string;
   expectedResolution?: string;
+  setup?: string;
+  setupTriggerPrice?: number;
   noTradeDiagnostic?: {
     reasonCode: string;
     details: string;
@@ -48,6 +50,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const refPrice = Number.isFinite(mind.refPrice) ? Number(mind.refPrice) : undefined;
   const refLabel = typeof mind.refLabel === "string" ? mind.refLabel : undefined;
   const expectedResolution = mind.expectedResolution ?? undefined;
+  const setup = mind.setup ?? undefined;
   const trigger = event.data.candidate?.entryTrigger;
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)
@@ -78,6 +81,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     refPrice,
     refLabel,
     expectedResolution,
+    setup,
     noTradeDiagnostic,
   };
 }

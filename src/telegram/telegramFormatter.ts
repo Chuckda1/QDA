@@ -71,17 +71,35 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     expectedLine = `${expectedEmoji} EXPECTATION: ${expectedText}`;
   }
 
+  // Format setup with emoji
+  const setupEmoji = snapshot.setup && snapshot.setup !== "NONE" ? "🎯" : "⚪";
+  const setupLine = snapshot.setup 
+    ? `${setupEmoji} SETUP: ${snapshot.setup}${snapshot.setupTriggerPrice ? ` (trigger: ${formatPrice(snapshot.setupTriggerPrice)})` : ""}`
+    : undefined;
+  
+  // Format entry status with trigger info
+  const entryLine = snapshot.setup && snapshot.setup !== "NONE" && snapshot.setupTriggerPrice
+    ? `${entryEmoji} ENTRY: WAITING (trigger: ${formatPrice(snapshot.setupTriggerPrice)})`
+    : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
+
   const lines = [
     `${biasEmoji} PRICE: ${price}`, // Always first with bias emoji
     refLine, // Reference price if available
     `${biasEmoji} BIAS: ${biasLabel} (${conf})`,
     `${phaseEmoji} PHASE: ${snapshot.botState ?? "n/a"}`,
-    `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`,
+    setupLine, // Setup type if available
+    entryLine, // Entry status
     snapshot.reason ? `NOTE: ${snapshot.reason}` : undefined,
     expectedLine, // Expected resolution if available
     invalidation,
     `⏳ WAITING FOR: ${waitFor}`,
   ].filter(Boolean) as string[];
+  
+  // If no setup, add explicit message
+  if (snapshot.setup === "NONE" || (!snapshot.setup && snapshot.entryStatus !== "active")) {
+    lines.push("⚪ SETUP: NONE");
+    lines.push("🚫 NO TRADE — structure incomplete");
+  }
   
   // Add no-trade diagnostic if present
   if (snapshot.noTradeDiagnostic && snapshot.noTradeDiagnostic.reasons && snapshot.noTradeDiagnostic.reasons.length > 0) {
