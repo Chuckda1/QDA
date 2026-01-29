@@ -1483,6 +1483,25 @@ export class Orchestrator {
         }
       }
 
+      // ============================================================================
+      // ENTRY LOGIC: Find and Enter Setups
+      // ============================================================================
+      // The bot finds setups by:
+      // 1. Establishing bias (BEARISH/BULLISH) from LLM analysis
+      // 2. Detecting pullback structure (PULLBACK_IN_PROGRESS phase)
+      // 3. Arming resolution gate (if expectedResolution = CONTINUATION)
+      // 4. Waiting for gate trigger (price hits trigger price)
+      // 5. Entering on pullback rejection/breakdown when conditions are met
+      //
+      // Entry conditions:
+      // - BULLISH bias: Enter on bearish candle OR lower low during pullback
+      // - BEARISH bias: Enter on bullish candle OR higher high during pullback
+      //
+      // Entry is blocked if:
+      // - Gate is ARMED but not TRIGGERED (waiting for price to hit trigger)
+      // - No-chase rules triggered (continuation extended too far)
+      // - Re-entry window expired
+      // ============================================================================
       // Check for pullback entry every 1m (responsive, not just on 5m close)
       // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule)
       if (exec.bias !== "NEUTRAL" && (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED")) {
@@ -1592,6 +1611,9 @@ export class Orchestrator {
           // Enter ON pullback for BULLISH bias
           // Condition: current bar is bearish OR makes a lower low (if we have previous bar)
           if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
+            console.log(
+              `[ENTRY_CHECK] BULLISH bias - Entry condition met: isBearish=${isBearish} lowerLow=${lowerLow} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
+            );
             // Check no-chase rules
             const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
             if (blockCheck.blocked) {
@@ -1629,6 +1651,9 @@ export class Orchestrator {
           // Enter ON pullback for BEARISH bias
           // Condition: current bar is bullish OR makes a higher high (if we have previous bar)
           if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
+            console.log(
+              `[ENTRY_CHECK] BEARISH bias - Entry condition met: isBullish=${isBullish} higherHigh=${higherHigh} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
+            );
             // Check no-chase rules
             const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
             if (blockCheck.blocked) {
