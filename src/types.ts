@@ -150,7 +150,8 @@ export type NoTradeDiagnostic = {
 export type MinimalExecutionState = {
   // Market Bias (sticky)
   bias: MarketBias;
-  biasConfidence?: number;
+  baseBiasConfidence?: number; // LLM-provided initial confidence (base weight only)
+  biasConfidence?: number; // Derived confidence (computed from base + structure + momentum - decay - penalty)
   biasPrice?: number;
   biasTs?: number;
   biasInvalidationLevel?: number; // Bias flips only if price crosses this

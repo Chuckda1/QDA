@@ -490,6 +490,103 @@ export class Orchestrator {
       : [entry - risk, entry - risk * 2];
   }
 
+  // Calculate derived confidence from base + structure + momentum - decay - penalty
+  private calculateDerivedConfidence(
+    exec: MinimalExecutionState,
+    currentPrice: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    nowTs: number
+  ): number {
+    const baseBiasConfidence = exec.baseBiasConfidence ?? 50; // Default to 50 if no LLM confidence
+    
+    // Structure Alignment Score (0-20 points)
+    // Check if price action aligns with bias structure
+    let structureAlignmentScore = 0;
+    if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
+      // Bearish: price should be below pullback high
+      if (currentPrice < exec.pullbackHigh) {
+        structureAlignmentScore = 15; // Good alignment
+      } else if (currentPrice < exec.pullbackHigh * 1.002) {
+        structureAlignmentScore = 10; // Near alignment
+      } else {
+        structureAlignmentScore = -10; // Misalignment penalty
+      }
+    } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
+      // Bullish: price should be above pullback low
+      if (currentPrice > exec.pullbackLow) {
+        structureAlignmentScore = 15; // Good alignment
+      } else if (currentPrice > exec.pullbackLow * 0.998) {
+        structureAlignmentScore = 10; // Near alignment
+      } else {
+        structureAlignmentScore = -10; // Misalignment penalty
+      }
+    }
+
+    // Momentum Confirmation (0-15 points)
+    // Check if recent price action confirms bias direction
+    let momentumConfirmation = 0;
+    if (closed5mBars.length >= 2) {
+      const recentBars = closed5mBars.slice(-3);
+      if (exec.bias === "BEARISH") {
+        // Bearish: check if recent closes are declining
+        const declining = recentBars.every((bar, i) => 
+          i === 0 || bar.close < recentBars[i - 1].close
+        );
+        if (declining) momentumConfirmation = 15;
+        else if (recentBars[recentBars.length - 1].close < recentBars[0].close) {
+          momentumConfirmation = 10;
+        }
+      } else if (exec.bias === "BULLISH") {
+        // Bullish: check if recent closes are rising
+        const rising = recentBars.every((bar, i) => 
+          i === 0 || bar.close > recentBars[i - 1].close
+        );
+        if (rising) momentumConfirmation = 15;
+        else if (recentBars[recentBars.length - 1].close > recentBars[0].close) {
+          momentumConfirmation = 10;
+        }
+      }
+    }
+
+    // Time Decay (-0 to -20 points)
+    // Confidence decays over time if no structure confirmation
+    let timeDecay = 0;
+    if (exec.biasTs !== undefined) {
+      const hoursSinceBias = (nowTs - exec.biasTs) / (1000 * 60 * 60);
+      if (hoursSinceBias > 4) {
+        timeDecay = 20; // Full decay after 4 hours
+      } else if (hoursSinceBias > 2) {
+        timeDecay = 10; // Partial decay after 2 hours
+      } else if (hoursSinceBias > 1) {
+        timeDecay = 5; // Light decay after 1 hour
+      }
+    }
+
+    // Adverse Excursion Penalty (-0 to -15 points)
+    // Penalty if price moves significantly against bias
+    let adverseExcursionPenalty = 0;
+    if (exec.biasPrice !== undefined) {
+      const priceChange = exec.bias === "BEARISH" 
+        ? (currentPrice - exec.biasPrice) / exec.biasPrice // Bearish: penalty if price goes up
+        : (exec.biasPrice - currentPrice) / exec.biasPrice; // Bullish: penalty if price goes down
+      
+      if (priceChange > 0.01) { // >1% adverse move
+        adverseExcursionPenalty = Math.min(15, priceChange * 1500); // Cap at 15 points
+      }
+    }
+
+    // Calculate final derived confidence
+    const derivedConfidence = Math.max(0, Math.min(100, 
+      baseBiasConfidence + 
+      structureAlignmentScore + 
+      momentumConfirmation - 
+      timeDecay - 
+      adverseExcursionPenalty
+    ));
+
+    return Math.round(derivedConfidence);
+  }
+
   // Generate "Why No Trade Fired" diagnostic (mechanical, never narrative)
   private generateNoTradeDiagnostic(
     exec: MinimalExecutionState,
@@ -968,21 +1065,32 @@ export class Orchestrator {
       );
 
       if (shouldFlip || exec.bias === "NEUTRAL") {
+        // Deactivate gate if bias flips
+        if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
+          this.deactivateGate(exec);
+        }
         exec.bias = newBias;
-        exec.biasConfidence = decision.confidence;
+        // LLM confidence becomes base weight only
+        exec.baseBiasConfidence = decision.confidence;
         exec.biasPrice = close;
         exec.biasTs = ts;
         if (exec.activeCandidate) {
           exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
         }
+        // Calculate derived confidence
+        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
       }
 
       // Legacy compatibility: sync thesisDirection to bias
       exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
-      exec.thesisConfidence = exec.biasConfidence;
+      // Update derived confidence continuously (not just on bias change)
+      if (exec.bias !== "NEUTRAL") {
+        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+        exec.thesisConfidence = exec.biasConfidence;
+      }
 
       console.log(
-        `[LLM1M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} conf=${decision.confidence} phase=${exec.phase}`
+        `[LLM1M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} baseConf=${exec.baseBiasConfidence ?? decision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"} phase=${exec.phase}`
       );
 
       // Track previous state to detect changes
@@ -1095,7 +1203,8 @@ export class Orchestrator {
         if (matchingCandidate) {
           const oldPhase = exec.phase;
           exec.thesisDirection = llmDirection;
-          exec.thesisConfidence = decision.confidence;
+          // LLM confidence becomes base weight only
+          exec.baseBiasConfidence = decision.confidence;
           exec.activeCandidate = matchingCandidate;
           exec.thesisPrice = lastClosed5m?.close ?? close;
           exec.thesisTs = ts;
@@ -1103,10 +1212,13 @@ export class Orchestrator {
           exec.waitReason = "waiting_for_pullback";
           // Set ExpectedResolution: expect continuation when pullback occurs
           exec.expectedResolution = "CONTINUATION";
+          // Calculate derived confidence
+          exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+          exec.thesisConfidence = exec.biasConfidence;
           this.clearTradeState(exec);
           shouldPublishEvent = true; // Thesis changed - publish event
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} conf=${decision.confidence} expectedResolution=${exec.expectedResolution}`
+            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} baseConf=${decision.confidence} derivedConf=${exec.biasConfidence} expectedResolution=${exec.expectedResolution}`
           );
         } else {
           console.log(
