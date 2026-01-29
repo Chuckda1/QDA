@@ -15,6 +15,7 @@ import type {
   MinimalLLMSnapshot,
   MinimalSetupCandidate,
   RawBar,
+  ResolutionGate,
 } from "../types.js";
 import type { LLMService } from "../llm/llmService.js";
 
@@ -266,6 +267,136 @@ export class Orchestrator {
       `[CANDIDATE_BUILD] SUCCESS: built ${builtCandidates.length} candidates mode=${mode} LONG_inv=${longInvalidation.toFixed(2)} SHORT_inv=${shortInvalidation.toFixed(2)}`
     );
     return builtCandidates;
+  }
+
+  // Calculate simple ATR approximation from recent bars
+  private calculateATR(bars: Array<{ high: number; low: number; close: number }>, period: number = 14): number {
+    if (bars.length < 2) return 0;
+    const recentBars = bars.slice(-period);
+    let sum = 0;
+    for (let i = 1; i < recentBars.length; i++) {
+      const tr = Math.max(
+        recentBars[i].high - recentBars[i].low,
+        Math.abs(recentBars[i].high - recentBars[i - 1].close),
+        Math.abs(recentBars[i].low - recentBars[i - 1].close)
+      );
+      sum += tr;
+    }
+    return sum / (recentBars.length - 1);
+  }
+
+  // Arm resolution gate (INACTIVE → ARMED)
+  private armResolutionGate(
+    exec: MinimalExecutionState,
+    bias: MarketBias,
+    pullbackHigh: number,
+    pullbackLow: number,
+    atr: number,
+    nowTs: number,
+    timeframeMinutes: number = 5
+  ): void {
+    if (bias === "NEUTRAL") return;
+
+    const direction = bias === "BULLISH" ? "long" : "short";
+    let triggerPrice: number;
+    let stopPrice: number;
+    let reason: string;
+
+    if (bias === "BEARISH") {
+      // Bearish: trigger on break below pullback low
+      triggerPrice = pullbackLow - 0.1 * atr;
+      stopPrice = pullbackHigh + 0.1 * atr;
+      reason = "Bearish pullback continuation trigger armed";
+    } else {
+      // Bullish: trigger on break above pullback high
+      triggerPrice = pullbackHigh + 0.1 * atr;
+      stopPrice = pullbackLow - 0.1 * atr;
+      reason = "Bullish pullback continuation trigger armed";
+    }
+
+    exec.resolutionGate = {
+      status: "ARMED",
+      direction,
+      triggerPrice,
+      stopPrice,
+      expiryTs: nowTs + 2 * timeframeMinutes * 60 * 1000, // 2 timeframes
+      armedTs: nowTs,
+      reason,
+    };
+  }
+
+  // Check if gate should be triggered (ARMED → TRIGGERED)
+  private checkGateTrigger(
+    gate: ResolutionGate,
+    currentPrice: number,
+    nowTs: number,
+    maxVolThreshold: number = 2.0 // Simplified - would use actual volatility
+  ): boolean {
+    if (gate.status !== "ARMED") return false;
+    if (nowTs > gate.expiryTs) return false;
+
+    // Check price trigger
+    let priceTriggered = false;
+    if (gate.direction === "short") {
+      priceTriggered = currentPrice <= gate.triggerPrice;
+    } else {
+      priceTriggered = currentPrice >= gate.triggerPrice;
+    }
+
+    // Simplified volatility check (would use actual volatility calculation)
+    const volatilityOk = true; // Placeholder - implement actual volatility check
+
+    return priceTriggered && volatilityOk;
+  }
+
+  // Check if gate should expire (ARMED → EXPIRED)
+  private checkGateExpiry(
+    gate: ResolutionGate,
+    currentPrice: number,
+    nowTs: number,
+    atr: number
+  ): boolean {
+    if (gate.status !== "ARMED") return false;
+
+    // Time expiry
+    if (nowTs > gate.expiryTs) return true;
+
+    // Continuation without structure (price moved beyond trigger without hitting it)
+    if (gate.direction === "short") {
+      return currentPrice < gate.triggerPrice - 0.5 * atr;
+    } else {
+      return currentPrice > gate.triggerPrice + 0.5 * atr;
+    }
+  }
+
+  // Check if gate should be invalidated (ARMED → INVALIDATED)
+  private checkGateInvalidation(
+    gate: ResolutionGate,
+    bias: MarketBias,
+    currentPrice: number,
+    pullbackHigh?: number,
+    pullbackLow?: number,
+    biasInvalidationLevel?: number
+  ): boolean {
+    if (gate.status !== "ARMED") return false;
+
+    // Structure break against bias
+    if (bias === "BEARISH") {
+      if (pullbackHigh !== undefined && currentPrice > pullbackHigh) return true;
+      if (biasInvalidationLevel !== undefined && currentPrice > biasInvalidationLevel) return true;
+    } else if (bias === "BULLISH") {
+      if (pullbackLow !== undefined && currentPrice < pullbackLow) return true;
+      if (biasInvalidationLevel !== undefined && currentPrice < biasInvalidationLevel) return true;
+    }
+
+    return false;
+  }
+
+  // Deactivate gate (any → INACTIVE)
+  private deactivateGate(exec: MinimalExecutionState): void {
+    if (exec.resolutionGate && exec.resolutionGate.status !== "TRIGGERED") {
+      exec.resolutionGate.status = "INACTIVE";
+    }
   }
 
   private clearTradeState(exec: MinimalExecutionState): void {
@@ -922,6 +1053,28 @@ export class Orchestrator {
           exec.entryTrigger = undefined;
           exec.stopPrice = undefined;
           exec.targets = undefined;
+          
+          // Arm resolution gate if conditions are met
+          if (exec.expectedResolution === "CONTINUATION" && 
+              exec.pullbackHigh !== undefined && 
+              exec.pullbackLow !== undefined &&
+              (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
+            const atr = this.calculateATR(closed5mBars);
+            if (atr > 0) {
+              this.armResolutionGate(
+                exec,
+                exec.bias,
+                exec.pullbackHigh,
+                exec.pullbackLow,
+                atr,
+                ts
+              );
+              console.log(
+                `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)} expiry=${new Date(exec.resolutionGate?.expiryTs ?? 0).toISOString()}`
+              );
+            }
+          }
+          
           shouldPublishEvent = true; // Phase change - publish event
           console.log(
             `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} entry_status=inactive`
@@ -1035,6 +1188,60 @@ export class Orchestrator {
         }
       }
 
+      // Monitor resolution gate (check trigger, expiry, invalidation)
+      if (exec.resolutionGate && exec.resolutionGate.status === "ARMED") {
+        const current5m = forming5mBar ?? lastClosed5m;
+        if (current5m) {
+          const atr = this.calculateATR(closed5mBars);
+          
+          // Check for gate trigger (ARMED → TRIGGERED)
+          if (this.checkGateTrigger(exec.resolutionGate, current5m.close, ts)) {
+            exec.resolutionGate.status = "TRIGGERED";
+            console.log(
+              `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)}`
+            );
+            // Entry will be handled by normal entry logic below
+          }
+          // Check for gate expiry (ARMED → EXPIRED)
+          else if (this.checkGateExpiry(exec.resolutionGate, current5m.close, ts, atr)) {
+            exec.resolutionGate.status = "EXPIRED";
+            const oldPhase = exec.phase;
+            exec.phase = "CONSOLIDATION_AFTER_REJECTION";
+            exec.waitReason = "continuation_without_structure";
+            exec.expectedResolution = "FAILURE";
+            shouldPublishEvent = true;
+            console.log(
+              `[GATE_EXPIRED] ${exec.resolutionGate.direction.toUpperCase()} - Continuation occurred without structure, not chaseable`
+            );
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) - Gate expired`
+            );
+          }
+          // Check for gate invalidation (ARMED → INVALIDATED)
+          else if (this.checkGateInvalidation(
+            exec.resolutionGate,
+            exec.bias,
+            current5m.close,
+            exec.pullbackHigh,
+            exec.pullbackLow,
+            exec.biasInvalidationLevel
+          )) {
+            exec.resolutionGate.status = "INVALIDATED";
+            const oldPhase = exec.phase;
+            exec.phase = "CONSOLIDATION_AFTER_REJECTION";
+            exec.waitReason = "structure_broken";
+            exec.expectedResolution = "FAILURE";
+            shouldPublishEvent = true;
+            console.log(
+              `[GATE_INVALIDATED] ${exec.resolutionGate.direction.toUpperCase()} - Structure broken against bias`
+            );
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Gate invalidated`
+            );
+          }
+        }
+      }
+
       // Check for pullback entry every 1m (responsive, not just on 5m close)
       // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule)
       if (exec.bias !== "NEUTRAL" && (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED")) {
@@ -1042,6 +1249,16 @@ export class Orchestrator {
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
         if (current5m) {
+          // Only allow entry if gate is TRIGGERED or no gate exists
+          const gateAllowsEntry = !exec.resolutionGate || 
+                                  exec.resolutionGate.status === "TRIGGERED" ||
+                                  exec.resolutionGate.status === "INACTIVE";
+          
+          if (!gateAllowsEntry && exec.resolutionGate) {
+            // Gate is ARMED but not triggered - wait for gate
+            exec.waitReason = `waiting_for_gate_trigger_${exec.resolutionGate.direction}`;
+            return events;
+          }
           // Check for pullback failure first (structure breaking against bias)
           if (exec.phase === "PULLBACK_IN_PROGRESS" && previous5m) {
             const pullbackFailed = this.detectPullbackFailure(

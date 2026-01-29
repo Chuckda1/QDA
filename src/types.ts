@@ -115,6 +115,19 @@ export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_C
 // Expected Resolution (what should happen next in a pullback)
 export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
 
+// Resolution Gate - permission system for entries
+export type ResolutionGateStatus = "INACTIVE" | "ARMED" | "TRIGGERED" | "EXPIRED" | "INVALIDATED";
+
+export type ResolutionGate = {
+  status: ResolutionGateStatus;
+  direction: "long" | "short";
+  triggerPrice: number;
+  stopPrice: number;
+  expiryTs: number;
+  armedTs: number;
+  reason: string;
+};
+
 export type MinimalExecutionState = {
   // Market Bias (sticky)
   bias: MarketBias;
@@ -158,6 +171,8 @@ export type MinimalExecutionState = {
   continuationLow?: number; // Lowest point during continuation (bullish bias)
   continuationStartTs?: number; // When continuation was detected
   barsSinceContinuation?: number; // Counter for time decay check
+  // Resolution Gate (permission system for entries)
+  resolutionGate?: ResolutionGate;
 };
 
 export interface BotState {
