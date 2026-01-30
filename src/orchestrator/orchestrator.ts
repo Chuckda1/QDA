@@ -51,6 +51,12 @@ export class Orchestrator {
   private formingBucketStart: number | null = null;
   private readonly minimalLlmBars: number;
   private lastDiagnosticPrice: number | null = null; // Track price for diagnostic emission
+  private lastProcessedTs: number | null = null; // Track last processed timestamp for out-of-order detection
+  private llmCircuitBreaker: {
+    failures: number;
+    lastFailureTs: number | null;
+    isOpen: boolean;
+  } = { failures: 0, lastFailureTs: null, isOpen: false };
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -1352,15 +1358,30 @@ export class Orchestrator {
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     const events: DomainEvent[] = [];
-      const regime = getMarketRegime(new Date(ts));
-      if (!regime.isRTH) {
-        this.state.minimalExecution.phase = "NEUTRAL_PHASE";
-        this.state.minimalExecution.waitReason = "market_closed";
-        return events;
-      }
+    
+    // ============================================================================
+    // RULE 2: Guard against out-of-order ticks
+    // ============================================================================
+    if (this.lastProcessedTs !== null && ts < this.lastProcessedTs) {
+      console.log(
+        `[STALE_TICK_IGNORED] ts=${ts} lastProcessed=${this.lastProcessedTs} delta=${ts - this.lastProcessedTs} - Out of order tick ignored`
+      );
+      return events; // Ignore stale ticks - never mutate state
+    }
+    this.lastProcessedTs = ts;
+    
+    const regime = getMarketRegime(new Date(ts));
+    if (!regime.isRTH) {
+      this.state.minimalExecution.phase = "NEUTRAL_PHASE";
+      this.state.minimalExecution.waitReason = "market_closed";
+      return events;
+    }
 
       // Update forming5mBar state
+    const previousBucketStart = this.formingBucketStart;
     const forming5mBar = this.updateForming5mBar(snapshot);
+    const is5mClose = previousBucketStart !== null && this.formingBucketStart !== previousBucketStart;
+    
     if (forming5mBar) {
       const progress = forming5mBar.progressMinutes;
       console.log(
@@ -1373,9 +1394,17 @@ export class Orchestrator {
     const exec = this.state.minimalExecution;
     let shouldPublishEvent = false;
     let debugInfo: MinimalDebugInfo | undefined = undefined;
+    
+    // Track previous state to detect changes (for use in state transitions)
+    const previousBias = exec.bias;
+    const previousPhase = exec.phase;
 
-    // LLM called every 1m with RAW BARS ONLY (no candidates)
-    if (this.llmService && (closed5mBars.length > 0 || forming5mBar !== null)) {
+    // ============================================================================
+    // RULE 1: LLM must NEVER be called on 1m path - ONLY on 5m closes
+    // ============================================================================
+    // LLM reasoning should only run on closed 5m bars, never on forming or 1m ingestion
+    // The engine already knows how to reason intrabar - LLM adds zero value there
+    if (this.llmService && is5mClose && closed5mBars.length > 0) {
       const llmSnapshot: MinimalLLMSnapshot = {
         symbol,
         nowTs: ts,
@@ -1383,74 +1412,141 @@ export class Orchestrator {
         forming5mBar,
       };
 
-      console.log(
-        `[LLM1M] closed5m=${closed5mBars.length} forming=${forming5mBar ? "yes" : "no"} callingLLM=true`
-      );
-      const result = await this.llmService.getArmDecisionRaw5m({
-        snapshot: llmSnapshot,
-      });
-      const decision = result.decision;
-      this.state.lastLLMCallAt = ts;
-      this.state.lastLLMDecision = decision.because ?? decision.action;
-
-      const llmDirection: "long" | "short" | "none" = 
-        decision.action === "ARM_LONG" ? "long" :
-        decision.action === "ARM_SHORT" ? "short" :
-        decision.action === "A+" ? (decision.bias === "bearish" ? "short" : "long") : "none";
+      // ============================================================================
+      // RULE 3: LLM errors must be NON-FATAL (graceful degradation)
+      // ============================================================================
+      // Circuit breaker: if too many failures, skip LLM calls temporarily
+      const circuitBreakerCooldown = 60 * 1000; // 1 minute cooldown
+      const maxFailures = 3;
       
-      const isMaturityFlip = decision.action === "A+";
-
-      // CRITICAL: Wire MarketBias as single source of truth
-      const newBias = this.llmActionToBias(decision.action, decision.bias);
-      const shouldFlip = this.shouldFlipBias(
-        exec.bias,
-        newBias,
-        exec.biasInvalidationLevel,
-        close
-      );
-
-      if (shouldFlip || exec.bias === "NEUTRAL") {
-        // Deactivate gate if bias flips
-        if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
-          this.deactivateGate(exec);
+      if (this.llmCircuitBreaker.isOpen) {
+        const timeSinceFailure = this.llmCircuitBreaker.lastFailureTs 
+          ? ts - this.llmCircuitBreaker.lastFailureTs 
+          : Infinity;
+        if (timeSinceFailure > circuitBreakerCooldown) {
+          // Reset circuit breaker after cooldown
+          this.llmCircuitBreaker.isOpen = false;
+          this.llmCircuitBreaker.failures = 0;
+          console.log(`[CIRCUIT_BREAKER] Resetting - attempting LLM call`);
+        } else {
+          console.log(
+            `[CIRCUIT_BREAKER] OPEN - skipping LLM call (failures=${this.llmCircuitBreaker.failures} lastFailure=${timeSinceFailure}ms ago)`
+          );
+          // Graceful degradation: maintain current bias and phase, continue without LLM
         }
-        exec.bias = newBias;
-        // LLM confidence becomes base weight only
-        exec.baseBiasConfidence = decision.confidence;
-        exec.biasPrice = close;
-        exec.biasTs = ts;
-        if (exec.activeCandidate) {
-          exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
+      }
+      
+      if (!this.llmCircuitBreaker.isOpen) {
+        const llmSnapshot: MinimalLLMSnapshot = {
+          symbol,
+          nowTs: ts,
+          closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
+          forming5mBar: null, // Never pass forming bar to LLM
+        };
+
+        console.log(
+          `[LLM5M] closed5m=${closed5mBars.length} callingLLM=true (5m close detected)`
+        );
+        
+        let decision: any = null;
+        try {
+          const result = await this.llmService.getArmDecisionRaw5m({
+            snapshot: llmSnapshot,
+          });
+          decision = result.decision;
+          this.state.lastLLMCallAt = ts;
+          this.state.lastLLMDecision = decision.because ?? decision.action;
+          
+          // Reset circuit breaker on success
+          this.llmCircuitBreaker.failures = 0;
+          this.llmCircuitBreaker.lastFailureTs = null;
+          this.llmCircuitBreaker.isOpen = false;
+        } catch (error: any) {
+          // RULE 3: LLM errors must be NON-FATAL - graceful degradation
+          this.llmCircuitBreaker.failures += 1;
+          this.llmCircuitBreaker.lastFailureTs = ts;
+          
+          if (this.llmCircuitBreaker.failures >= maxFailures) {
+            this.llmCircuitBreaker.isOpen = true;
+            console.log(
+              `[LLM_UNAVAILABLE] Circuit breaker OPEN after ${this.llmCircuitBreaker.failures} failures - maintaining current state (bias=${exec.bias} phase=${exec.phase})`
+            );
+          } else {
+            console.log(
+              `[LLM_UNAVAILABLE] Error (${this.llmCircuitBreaker.failures}/${maxFailures}): ${error.message ?? error} - maintaining current state`
+            );
+          }
+          
+          // Graceful degradation: maintain current bias and phase
+          // Bot can continue trading without LLM temporarily
+          // Update derived confidence even without LLM (uses existing baseBiasConfidence)
+          if (exec.bias !== "NEUTRAL") {
+            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+            exec.thesisConfidence = exec.biasConfidence;
+          }
+          decision = null; // Signal that LLM call failed
         }
-        // Calculate derived confidence
-        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-      }
+        
+        // Only process LLM decision if call succeeded
+        if (decision !== null) {
+          const llmDirection: "long" | "short" | "none" = 
+            decision.action === "ARM_LONG" ? "long" :
+            decision.action === "ARM_SHORT" ? "short" :
+            decision.action === "A+" ? (decision.bias === "bearish" ? "short" : "long") : "none";
+          
+          const isMaturityFlip = decision.action === "A+";
 
-      // Legacy compatibility: sync thesisDirection to bias
-      exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
-      // Update derived confidence continuously (not just on bias change)
-      if (exec.bias !== "NEUTRAL") {
-        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-      exec.thesisConfidence = exec.biasConfidence;
-      }
+          // CRITICAL: Wire MarketBias as single source of truth
+          const newBias = this.llmActionToBias(decision.action, decision.bias);
+          const shouldFlip = this.shouldFlipBias(
+            exec.bias,
+            newBias,
+            exec.biasInvalidationLevel,
+            close
+          );
 
-      console.log(
-        `[LLM1M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} baseConf=${exec.baseBiasConfidence ?? decision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"} phase=${exec.phase}`
-      );
+          if (shouldFlip || exec.bias === "NEUTRAL") {
+            // Deactivate gate if bias flips
+            if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
+              this.deactivateGate(exec);
+            }
+            exec.bias = newBias;
+            // LLM confidence becomes base weight only
+            exec.baseBiasConfidence = decision.confidence;
+            exec.biasPrice = close;
+            exec.biasTs = ts;
+            if (exec.activeCandidate) {
+              exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
+            }
+            // Calculate derived confidence
+            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+          }
 
-      // Track previous state to detect changes
-      const previousBias = exec.bias;
-      const previousPhase = exec.phase;
+          // Legacy compatibility: sync thesisDirection to bias
+          exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
+          // Update derived confidence continuously (not just on bias change)
+          if (exec.bias !== "NEUTRAL") {
+            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+            exec.thesisConfidence = exec.biasConfidence;
+          }
 
-      // Generate candidates and match direction ONLY if:
-      // 1. Bias changed, OR
-      // 2. No bias exists yet (NEUTRAL)
-      const needsNewSetup = 
-        (newBias !== exec.bias) ||
-        (exec.bias === "NEUTRAL");
+          console.log(
+            `[LLM5M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} baseConf=${exec.baseBiasConfidence ?? decision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"} phase=${exec.phase}`
+          );
 
-      // Handle A+ (maturity flip) - immediate entry opportunity
-      if (isMaturityFlip && (llmDirection === "long" || llmDirection === "short")) {
+          // Track previous state to detect changes (for use in state transitions)
+          const previousBias = exec.bias;
+          const previousPhase = exec.phase;
+
+          // Generate candidates and match direction ONLY if:
+          // 1. Bias changed, OR
+          // 2. No bias exists yet (NEUTRAL)
+          const needsNewSetup = 
+            (newBias !== exec.bias) ||
+            (exec.bias === "NEUTRAL");
+
+          // Handle A+ (maturity flip) - immediate entry opportunity
+          if (isMaturityFlip && (llmDirection === "long" || llmDirection === "short")) {
         console.log(
           `[A+_FLIP] Maturity flip detected: ${decision.bias} bias, ${decision.maturity} maturity, immediate ${llmDirection.toUpperCase()} opportunity`
         );
@@ -1634,9 +1730,10 @@ export class Orchestrator {
           );
         }
       }
+    }
 
-      // Monitor continuation progress and detect momentum pause
-      if (exec.phase === "CONTINUATION_IN_PROGRESS" && exec.bias !== "NEUTRAL") {
+    // Monitor continuation progress and detect momentum pause
+    if (exec.phase === "CONTINUATION_IN_PROGRESS" && exec.bias !== "NEUTRAL") {
         const current5m = forming5mBar ?? lastClosed5m;
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
