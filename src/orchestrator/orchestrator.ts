@@ -1405,13 +1405,6 @@ export class Orchestrator {
     // LLM reasoning should only run on closed 5m bars, never on forming or 1m ingestion
     // The engine already knows how to reason intrabar - LLM adds zero value there
     if (this.llmService && is5mClose && closed5mBars.length > 0) {
-      const llmSnapshot: MinimalLLMSnapshot = {
-        symbol,
-        nowTs: ts,
-        closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
-        forming5mBar,
-      };
-
       // ============================================================================
       // RULE 3: LLM errors must be NON-FATAL (graceful degradation)
       // ============================================================================
@@ -1730,9 +1723,10 @@ export class Orchestrator {
           );
         }
       }
-    }
+      } // Close: if (!this.llmCircuitBreaker.isOpen)
+    } // Close: if (this.llmService && is5mClose && closed5mBars.length > 0)
 
-    // Monitor continuation progress and detect momentum pause
+    // Monitor continuation progress and detect momentum pause (runs regardless of LLM)
     if (exec.phase === "CONTINUATION_IN_PROGRESS" && exec.bias !== "NEUTRAL") {
         const current5m = forming5mBar ?? lastClosed5m;
         const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
