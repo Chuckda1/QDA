@@ -1,9 +1,10 @@
 import { randomUUID } from "crypto";
-import { getMarketRegime, getMarketSessionLabel } from "../utils/timeUtils.js";
+import { getMarketRegime, getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { extractSwings, lastSwings } from "../utils/swing.js";
 import type {
   BotMode,
   BotState,
+  DailyContextLite,
   DomainEvent,
   EntryType,
   ExpectedResolution,
@@ -57,6 +58,14 @@ export class Orchestrator {
     lastFailureTs: number | null;
     isOpen: boolean;
   } = { failures: 0, lastFailureTs: null, isOpen: false };
+  // Daily context tracking
+  private currentETDate: string = ""; // Track current ET date string (YYYY-MM-DD)
+  private prevDayClose?: number; // Previous day's close
+  private prevDayHigh?: number; // Previous day's high
+  private prevDayLow?: number; // Previous day's low
+  private overnightHigh?: number; // Overnight/pre-market high
+  private overnightLow?: number; // Overnight/pre-market low
+  private prevSessionVWAP?: number; // Previous session VWAP
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -293,6 +302,100 @@ export class Orchestrator {
       sum += tr;
     }
     return sum / (recentBars.length - 1);
+  }
+
+  // Calculate VWAP (Volume-Weighted Average Price) from bars
+  private calculateVWAP(bars: Array<{ high: number; low: number; close: number; volume: number }>): number {
+    if (bars.length === 0) return 0;
+    let cumulativeTPV = 0; // Cumulative Typical Price * Volume
+    let cumulativeVolume = 0;
+    for (const bar of bars) {
+      const typicalPrice = (bar.high + bar.low + bar.close) / 3;
+      cumulativeTPV += typicalPrice * bar.volume;
+      cumulativeVolume += bar.volume;
+    }
+    return cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : 0;
+  }
+
+  // Build daily context lite for LLM
+  private buildDailyContextLite(
+    exec: MinimalExecutionState,
+    closed5mBars: Array<{ ts: number; high: number; low: number; close: number; volume: number }>,
+    currentETDate: string
+  ): DailyContextLite | undefined {
+    // Check if we've crossed into a new day
+    if (this.currentETDate !== currentETDate) {
+      // New day detected - store previous day's data from last bar of previous day
+      if (closed5mBars.length > 0) {
+        // Find the last bar from the previous day
+        const lastBarPrevDay = [...closed5mBars].reverse().find(bar => {
+          const barDate = getETDateString(new Date(bar.ts));
+          return barDate !== currentETDate;
+        });
+        
+        if (lastBarPrevDay) {
+          // Store previous day's data
+          this.prevDayClose = lastBarPrevDay.close;
+          this.prevDayHigh = lastBarPrevDay.high;
+          this.prevDayLow = lastBarPrevDay.low;
+        } else if (this.prevDayClose === undefined && closed5mBars.length > 0) {
+          // First day - use first bar as prev day data (fallback)
+          const firstBar = closed5mBars[0];
+          this.prevDayClose = firstBar.close;
+          this.prevDayHigh = firstBar.high;
+          this.prevDayLow = firstBar.low;
+        }
+      }
+      // Reset overnight tracking for new day
+      this.overnightHigh = undefined;
+      this.overnightLow = undefined;
+      this.currentETDate = currentETDate;
+    }
+
+    // Track overnight high/low from first bars of the current day
+    if (closed5mBars.length > 0) {
+      const barsToday = closed5mBars.filter(bar => {
+        const barDate = getETDateString(new Date(bar.ts));
+        return barDate === currentETDate;
+      });
+      
+      if (barsToday.length > 0) {
+        const todayHigh = Math.max(...barsToday.map(b => b.high));
+        const todayLow = Math.min(...barsToday.map(b => b.low));
+        
+        if (this.overnightHigh === undefined || todayHigh > this.overnightHigh) {
+          this.overnightHigh = todayHigh;
+        }
+        if (this.overnightLow === undefined || todayLow < this.overnightLow) {
+          this.overnightLow = todayLow;
+        }
+      }
+    }
+
+    // Calculate previous session VWAP (from all bars up to now)
+    if (closed5mBars.length > 0) {
+      this.prevSessionVWAP = this.calculateVWAP(closed5mBars);
+    }
+
+    // Build context object
+    const context: DailyContextLite = {};
+    if (this.prevDayClose !== undefined) context.prevClose = this.prevDayClose;
+    if (this.prevDayHigh !== undefined) context.prevHigh = this.prevDayHigh;
+    if (this.prevDayLow !== undefined) context.prevLow = this.prevDayLow;
+    if (this.overnightHigh !== undefined) context.overnightHigh = this.overnightHigh;
+    if (this.overnightLow !== undefined) context.overnightLow = this.overnightLow;
+    if (this.prevSessionVWAP !== undefined) context.vwapPrevSession = this.prevSessionVWAP;
+    
+    // Bias anchor
+    if (exec.bias !== "NEUTRAL" && exec.biasTs !== undefined) {
+      context.biasAnchor = {
+        bias: exec.bias,
+        sinceTs: exec.biasTs,
+        invalidationLevel: exec.biasInvalidationLevel,
+      };
+    }
+
+    return Object.keys(context).length > 0 ? context : undefined;
   }
 
   // Arm resolution gate (INACTIVE → ARMED)
@@ -1502,11 +1605,24 @@ export class Orchestrator {
     const previousPhase = exec.phase;
 
     // ============================================================================
+    // ============================================================================
     // RULE 1: LLM must NEVER be called on 1m path - ONLY on 5m closes
     // ============================================================================
     // LLM reasoning should only run on closed 5m bars, never on forming or 1m ingestion
     // The engine already knows how to reason intrabar - LLM adds zero value there
-    if (this.llmService && is5mClose && closed5mBars.length > 0) {
+    // 
+    // LLM calls are stateless by design. No prior context is reused.
+    // Each call contains ONLY:
+    // - A fixed system prompt (constant)
+    // - The current snapshot (closed5mBars + forming5mBar + dailyContextLite)
+    // Previous assistant replies are NEVER included in subsequent requests.
+    // ============================================================================
+    
+    // Explicit guard: LLM is ONLY called on 5m bar closes
+    if (!is5mClose) {
+      // LLM is NOT called on 1m ticks or forming bars - this prevents request storms
+      // All processing continues normally, just without LLM input
+    } else if (this.llmService && closed5mBars.length > 0) {
       // ============================================================================
       // RULE 3: LLM errors must be NON-FATAL (graceful degradation)
       // ============================================================================
@@ -1532,15 +1648,21 @@ export class Orchestrator {
       }
       
       if (!this.llmCircuitBreaker.isOpen) {
+        // Build daily context
+        const currentETDate = getETDateString(new Date(ts));
+        const exec = this.state.minimalExecution;
+        const dailyContextLite = this.buildDailyContextLite(exec, closed5mBars, currentETDate);
+        
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
-          closed5mBars: closed5mBars.slice(-30), // Last 30 closed bars
+          closed5mBars: closed5mBars.slice(-60), // Last 60 closed bars (≈ 5 hours)
           forming5mBar: null, // Never pass forming bar to LLM
+          dailyContextLite, // Lightweight daily anchor
         };
 
         console.log(
-          `[LLM5M] closed5m=${closed5mBars.length} callingLLM=true (5m close detected)`
+          `[LLM5M] closed5m=${closed5mBars.length} callingLLM=true (5m close detected) barsWindow=60 dailyContext=${dailyContextLite ? "yes" : "no"}`
         );
         
         let decision: any = null;
@@ -1549,6 +1671,9 @@ export class Orchestrator {
             snapshot: llmSnapshot,
           });
           decision = result.decision;
+          
+          // Store for debugging/logging only - NEVER sent back to LLM
+          // LLM calls are stateless - no prior responses are reused
           this.state.lastLLMCallAt = ts;
           this.state.lastLLMDecision = decision.because ?? decision.action;
           

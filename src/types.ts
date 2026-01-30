@@ -20,11 +20,26 @@ export type Forming5mBar = {
   volume: number;
 };
 
+export type DailyContextLite = {
+  prevClose?: number; // Previous day's close
+  prevHigh?: number; // Previous day's high
+  prevLow?: number; // Previous day's low
+  overnightHigh?: number; // Overnight/pre-market high
+  overnightLow?: number; // Overnight/pre-market low
+  vwapPrevSession?: number; // Previous session VWAP (or yesterday VWAP)
+  biasAnchor?: {
+    bias: MarketBias;
+    sinceTs: number;
+    invalidationLevel?: number;
+  };
+};
+
 export type MinimalLLMSnapshot = {
   symbol: string;
   nowTs: number;
   closed5mBars: RawBar[];
   forming5mBar?: Forming5mBar | null;
+  dailyContextLite?: DailyContextLite;
 };
 
 export type ArmDecisionRaw5mResponse = {

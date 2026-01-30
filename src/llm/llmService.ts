@@ -132,10 +132,13 @@ Rules:
 Raw data:
 ${JSON.stringify(llmInput)}`;
 
+    // Build fresh messages array - NO prior context or assistant responses
+    // LLM calls are stateless by design. No prior context is reused.
+    const SYSTEM_PROMPT = "Return JSON only. No markdown."; // Fixed constant system prompt
     const payload = {
       model: this.model,
       messages: [
-        { role: "system", content: "Return JSON only. No markdown." },
+        { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: prompt },
       ],
       temperature: 0.2,
@@ -265,6 +268,14 @@ ${JSON.stringify(llmInput)}`;
   async getArmDecisionRaw5m(params: {
     snapshot: MinimalLLMSnapshot;
   }): Promise<ArmDecisionRaw5mResult> {
+    // ============================================================================
+    // LLM calls are stateless by design. No prior context is reused.
+    // Each call contains ONLY:
+    // - A fixed system prompt (constant)
+    // - The current snapshot (closed5mBars + forming5mBar + dailyContextLite)
+    // Previous assistant replies are NEVER included in subsequent requests.
+    // ============================================================================
+    
     const fallback: ArmDecisionRaw5mResponse = {
       mindId: randomUUID(),
       action: "WAIT",
@@ -278,7 +289,7 @@ ${JSON.stringify(llmInput)}`;
       return { decision: fallback, valid: false };
     }
 
-    const closed5mBars = params.snapshot.closed5mBars.slice(-30).map((bar) => ({
+    const closed5mBars = params.snapshot.closed5mBars.slice(-60).map((bar) => ({
       open: bar.open,
       high: bar.high,
       low: bar.low,
@@ -298,6 +309,7 @@ ${JSON.stringify(llmInput)}`;
     const llmInput = {
       closed5mBars,
       forming5mBar,
+      dailyContextLite: params.snapshot.dailyContextLite,
     };
 
     const prompt = `You are a senior discretionary market analyst assisting an automated execution system.
@@ -361,13 +373,16 @@ CONTROL=<LONG|SHORT|WAIT|A+> | BIAS=<bullish|bearish|neutral> | MATURITY=<early|
 
 You are judged on alignment with live price behavior, not prediction.
 
-Raw 5m data:
+Raw 5m data (60 bars ≈ 5 hours):
 ${JSON.stringify(llmInput)}`;
 
+    // Build fresh messages array - NO prior context or assistant responses
+    // This ensures each call is stateless and bounded in size
+    const SYSTEM_PROMPT = "Return JSON only. No markdown."; // Fixed constant system prompt
     const payload = {
       model: this.model,
       messages: [
-        { role: "system", content: "Return JSON only. No markdown." },
+        { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: prompt },
       ],
       temperature: 0.2,
@@ -426,7 +441,7 @@ ${JSON.stringify(llmInput)}`;
       return null;
     }
 
-    const closed5mBars = params.snapshot.closed5mBars.slice(-30).map((bar) => ({
+    const closed5mBars = params.snapshot.closed5mBars.slice(-60).map((bar) => ({
       open: bar.open,
       high: bar.high,
       low: bar.low,
@@ -465,10 +480,13 @@ MISREAD=<none|structure|momentum|participation|context|timing>
 
 Output exactly this format.`;
 
+    // Build fresh messages array - NO prior context or assistant responses
+    // LLM calls are stateless by design. No prior context is reused.
+    const SYSTEM_PROMPT = "Output exactly the required format. No markdown. No explanation."; // Fixed constant system prompt
     const payload = {
       model: this.model,
       messages: [
-        { role: "system", content: "Output exactly the required format. No markdown. No explanation." },
+        { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: prompt },
       ],
       temperature: 0.3,
