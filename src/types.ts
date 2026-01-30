@@ -136,6 +136,7 @@ export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
 // Only one setup may be active at a time
 // No setup = no trade (even if bias is strong)
 export type SetupType = 
+  | "EARLY_REJECTION"    // Early rejection at resistance (failed reclaim of EMA/VWAP)
   | "REJECTION"          // Trend continuation via pullback rejection
   | "BREAKDOWN"          // Structural level break
   | "COMPRESSION_BREAK"  // Volatility contraction → expansion

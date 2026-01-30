@@ -317,6 +317,39 @@ export class Orchestrator {
     return cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : 0;
   }
 
+  // Calculate EMA (Exponential Moving Average)
+  private calculateEMA(bars: Array<{ close: number }>, period: number): number {
+    if (bars.length === 0) return 0;
+    if (bars.length < period) {
+      // Not enough data - use SMA as fallback
+      const sum = bars.reduce((acc, bar) => acc + bar.close, 0);
+      return sum / bars.length;
+    }
+    
+    const recentBars = bars.slice(-period);
+    // Start with SMA
+    const sma = recentBars.reduce((acc, bar) => acc + bar.close, 0) / period;
+    
+    // Calculate EMA with smoothing factor
+    const multiplier = 2 / (period + 1);
+    let ema = sma;
+    
+    // Apply EMA formula to remaining bars
+    for (let i = period; i < bars.length; i++) {
+      ema = (bars[i].close - ema) * multiplier + ema;
+    }
+    
+    return ema;
+  }
+
+  // Calculate Volume SMA (Simple Moving Average)
+  private calculateVolumeSMA(bars: Array<{ volume: number }>, period: number = 20): number {
+    if (bars.length === 0) return 0;
+    const recentBars = bars.slice(-period);
+    const sum = recentBars.reduce((acc, bar) => acc + bar.volume, 0);
+    return sum / recentBars.length;
+  }
+
   // Build daily context lite for LLM
   private buildDailyContextLite(
     exec: MinimalExecutionState,
@@ -587,8 +620,9 @@ export class Orchestrator {
     exec: MinimalExecutionState,
     current5m: { open: number; high: number; low: number; close: number },
     previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    closed5mBars: Array<{ high: number; low: number; close: number }>,
-    atr: number
+    closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
+    atr: number,
+    forming5mBar: Forming5mBar | null
   ): { setup: SetupType; triggerPrice?: number; stopPrice?: number; rejectionCandleLow?: number; rejectionCandleHigh?: number } {
     const bias = exec.bias;
     const phase = exec.phase;
@@ -597,6 +631,93 @@ export class Orchestrator {
     // No setup if no bias
     if (bias === "NEUTRAL") {
       return { setup: "NONE" };
+    }
+
+    // Calculate indicators needed for EARLY_REJECTION detection
+    const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ open: number; high: number; low: number; close: number; volume: number }>;
+    const ema9 = closedBarsWithVolume.length >= 9 
+      ? this.calculateEMA(closedBarsWithVolume.map(bar => ({ close: bar.close })), 9)
+      : 0;
+    const ema21 = closedBarsWithVolume.length >= 21
+      ? this.calculateEMA(closedBarsWithVolume.map(bar => ({ close: bar.close })), 21)
+      : 0;
+    const vwap = closedBarsWithVolume.length > 0
+      ? this.calculateVWAP(closedBarsWithVolume)
+      : 0;
+    const volSMA20 = closedBarsWithVolume.length >= 20
+      ? this.calculateVolumeSMA(closedBarsWithVolume.map(bar => ({ volume: bar.volume })), 20)
+      : 0;
+
+    // Setup hold mechanism: if EARLY_REJECTION is active, check hold TTL before re-detecting
+    if (exec.setup === "EARLY_REJECTION") {
+      const setupHoldDuration = 2 * 5 * 60 * 1000; // 2 bars = 10 minutes
+      const setupHoldUntil = (exec.setupDetectedAt ?? 0) + setupHoldDuration;
+      const now = Date.now();
+      
+      // Check for invalidation: price closes above stop (for bearish) or below stop (for bullish)
+      const invalidated = (bias === "BEARISH" && exec.setupStopPrice !== undefined && current5m.close > exec.setupStopPrice) ||
+                         (bias === "BULLISH" && exec.setupStopPrice !== undefined && current5m.close < exec.setupStopPrice);
+      
+      if (invalidated) {
+        console.log(
+          `[EARLY_REJECTION_INVALIDATED] Price broke stop - bias=${bias} price=${current5m.close.toFixed(2)} stop=${exec.setupStopPrice?.toFixed(2) ?? "n/a"}`
+        );
+        return { setup: "NONE" };
+      } else if (now < setupHoldUntil) {
+        // EARLY_REJECTION persists - return existing setup
+        return {
+          setup: "EARLY_REJECTION",
+          triggerPrice: exec.setupTriggerPrice,
+          stopPrice: exec.setupStopPrice,
+        };
+      }
+      // Hold expired - allow re-detection below
+    }
+    
+    // Priority order: BREAKDOWN > EARLY_REJECTION > REJECTION > COMPRESSION_BREAK > FAILED_BOUNCE > TREND_REENTRY > NONE
+    
+    // 0. EARLY_REJECTION_SETUP (Failed reclaim of EMA/VWAP at resistance)
+    // Allowed when: Phase = BIAS_ESTABLISHED, PULLBACK_IN_PROGRESS, or CONSOLIDATION_AFTER_REJECTION
+    // ExpectedResolution = CONTINUATION
+    // Priority: Check before REJECTION to catch early signals
+    // Note: phase !== "IN_TRADE" is implicit in the phase checks above
+    if ((phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS" || phase === "CONSOLIDATION_AFTER_REJECTION") &&
+        expectedResolution === "CONTINUATION" &&
+        ema9 > 0 && vwap > 0 && volSMA20 > 0) {
+      
+      const current5mWithVolume = {
+        ...current5m,
+        volume: 'volume' in current5m ? (current5m as any).volume : 0,
+      };
+      const previous5mWithVolume = previous5m && 'volume' in previous5m
+        ? { ...previous5m, volume: (previous5m as any).volume }
+        : undefined;
+      
+      const earlyRejection = this.detectEarlyRejection(
+        bias,
+        current5mWithVolume,
+        previous5mWithVolume,
+        forming5mBar,
+        closedBarsWithVolume,
+        exec.pullbackHigh,
+        exec.pullbackLow,
+        atr,
+        ema9,
+        ema21,
+        vwap,
+        volSMA20
+      );
+      
+      if (earlyRejection.detected) {
+        console.log(
+          `[EARLY_REJECTION_DETECTED] bias=${bias} trigger=${earlyRejection.triggerPrice?.toFixed(2)} stop=${earlyRejection.stopPrice?.toFixed(2)} strength=${earlyRejection.strength}`
+        );
+        return {
+          setup: "EARLY_REJECTION",
+          triggerPrice: earlyRejection.triggerPrice,
+          stopPrice: earlyRejection.stopPrice,
+        };
+      }
     }
     
     // 1. REJECTION_SETUP (Primary Trend Continuation)
@@ -637,19 +758,19 @@ export class Orchestrator {
             rejectionCandleHigh: exec.rejectionCandleHigh,
           };
         }
-        } else {
-          // Not REJECTION yet - detect it
-          const rejectionSetup = this.detectRejectionSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, atr);
-          if (rejectionSetup.detected) {
-            return {
-              setup: "REJECTION",
-              triggerPrice: rejectionSetup.triggerPrice,
-              stopPrice: rejectionSetup.stopPrice,
-              rejectionCandleLow: rejectionSetup.rejectionCandleLow,
-              rejectionCandleHigh: rejectionSetup.rejectionCandleHigh,
-            };
-          }
+      } else {
+        // Not REJECTION yet - detect it
+        const rejectionSetup = this.detectRejectionSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, atr);
+        if (rejectionSetup.detected) {
+          return {
+            setup: "REJECTION",
+            triggerPrice: rejectionSetup.triggerPrice,
+            stopPrice: rejectionSetup.stopPrice,
+            rejectionCandleLow: rejectionSetup.rejectionCandleLow,
+            rejectionCandleHigh: rejectionSetup.rejectionCandleHigh,
+          };
         }
+      }
     }
     
     // 2. BREAKDOWN_SETUP (Structure Failure)
@@ -708,6 +829,191 @@ export class Orchestrator {
     return { setup: "NONE" };
   }
   
+  // Helper: Detect EARLY_REJECTION setup (failed reclaim of EMA/VWAP at resistance)
+  private detectEarlyRejection(
+    bias: MarketBias,
+    current5m: { open: number; high: number; low: number; close: number; volume: number },
+    previous5m: { open: number; high: number; low: number; close: number; volume: number } | undefined,
+    forming5mBar: Forming5mBar | null,
+    closed5mBars: Array<{ open: number; high: number; low: number; close: number; volume: number }>,
+    pullbackHigh: number | undefined,
+    pullbackLow: number | undefined,
+    atr: number,
+    ema9: number,
+    ema21: number,
+    vwap: number,
+    volSMA20: number
+  ): { detected: boolean; triggerPrice?: number; stopPrice?: number; strength?: number } {
+    // Use forming bar if available, otherwise use current5m
+    const b = forming5mBar && forming5mBar.progressMinutes >= 2
+      ? {
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+          volume: forming5mBar.volume,
+          progress: forming5mBar.progressMinutes,
+        }
+      : {
+          open: current5m.open ?? current5m.close,
+          high: current5m.high,
+          low: current5m.low,
+          close: current5m.close,
+          volume: current5m.volume,
+          progress: 5, // Closed bar
+        };
+
+    if (!previous5m || atr <= 0 || volSMA20 <= 0) return { detected: false };
+
+    // Calculate candlestick geometry
+    const body = Math.abs(b.close - b.open);
+    const range = Math.max(b.high - b.low, 0.01);
+    const upperWick = b.high - Math.max(b.open, b.close);
+    const lowerWick = Math.min(b.open, b.close) - b.low;
+    
+    const bodyPct = body / range;
+    const upperPct = upperWick / range;
+    const lowerPct = lowerWick / range;
+
+    // Noise filter: ignore tiny candles
+    if (range < 0.35 * atr) return { detected: false };
+    
+    // Don't decide on minute 1 noise
+    if (b.progress < 2) return { detected: false };
+
+    if (bias === "BEARISH") {
+      // Bearish EARLY_REJECTION: failed reclaim of EMA/VWAP with upper wick rejection
+      
+      // Rejection candle shape requirements
+      const closeWeak = (b.close <= b.open) || (b.close <= (b.high - 0.5 * range));
+      const wickOk = upperPct >= 0.35;
+      const bodyOk = bodyPct <= 0.45;
+      
+      if (!(wickOk && bodyOk && closeWeak)) return { detected: false };
+
+      // Reclaim-fail of key levels (EMA9 or VWAP)
+      const eps = 0.01; // Small epsilon for level comparison
+      const taggedEma = b.high >= ema9 - eps && b.close < ema9;
+      const taggedVwap = b.high >= vwap - eps && b.close < vwap;
+      
+      if (!(taggedEma || taggedVwap)) return { detected: false };
+
+      // Require cross attempt (was below, tried to reclaim, failed)
+      const wasBelowEma = previous5m.close <= ema9 || b.open <= ema9;
+      const wasBelowVwap = previous5m.close <= vwap || b.open <= vwap;
+      if (!((taggedEma && wasBelowEma) || (taggedVwap && wasBelowVwap))) return { detected: false };
+
+      // Structure: higher-high attempt or local pop
+      const higherHigh = b.high > previous5m.high;
+      const highestHigh3Bars = closed5mBars.length >= 3
+        ? Math.max(...closed5mBars.slice(-3).map(bar => bar.high))
+        : previous5m.high;
+      const taggedLocalHigh = b.high >= highestHigh3Bars - eps;
+      const taggedPullbackRes = pullbackHigh !== undefined && b.high >= pullbackHigh - 0.02;
+      
+      if (!(higherHigh || taggedLocalHigh || taggedPullbackRes)) return { detected: false };
+
+      // Volume confirmation (progress-adjusted if forming)
+      const volAdj = b.progress < 5 ? b.volume * (5 / b.progress) : b.volume;
+      const relVol = volAdj / volSMA20;
+
+      const aPlus = (upperPct >= 0.45) && (bodyPct <= 0.35);
+      const closeInBottom40 = b.close <= b.low + 0.60 * range;
+      
+      // Volume tiers
+      const volOk = (relVol >= 1.10) || (aPlus && relVol >= 0.90);
+      if (!volOk) return { detected: false };
+
+      // Calculate strength score
+      let strength = 0;
+      if (taggedEma && taggedVwap) strength += 2; // Tagged both
+      if (relVol >= 1.3) strength += 2;
+      else if (relVol >= 1.1) strength += 1;
+      if (upperPct >= 0.5) strength += 2;
+      else if (upperPct >= 0.45) strength += 1;
+      if (closeInBottom40) strength += 1;
+      if (higherHigh) strength += 1;
+
+      // Build setup
+      const stop = b.high + 0.05 * atr; // Buffer above rejection high
+      // Entry trigger: use close for strong setups, break-low for weaker
+      const triggerPrice = strength >= 6 ? b.close : b.low - 0.02;
+
+      return {
+        detected: true,
+        triggerPrice,
+        stopPrice: stop,
+        strength,
+      };
+    } else if (bias === "BULLISH") {
+      // Bullish EARLY_REJECTION: failed breakdown of EMA/VWAP with lower wick rejection
+      
+      // Rejection candle shape requirements (symmetric)
+      const closeStrong = (b.close >= b.open) || (b.close >= (b.low + 0.5 * range));
+      const wickOk = lowerPct >= 0.35;
+      const bodyOk = bodyPct <= 0.45;
+      
+      if (!(wickOk && bodyOk && closeStrong)) return { detected: false };
+
+      // Reclaim-fail of key levels (EMA9 or VWAP) - bullish version
+      const eps = 0.01;
+      const taggedEma = b.low <= ema9 + eps && b.close > ema9;
+      const taggedVwap = b.low <= vwap + eps && b.close > vwap;
+      
+      if (!(taggedEma || taggedVwap)) return { detected: false };
+
+      // Require cross attempt (was above, tried to break down, failed)
+      const wasAboveEma = previous5m.close >= ema9 || b.open >= ema9;
+      const wasAboveVwap = previous5m.close >= vwap || b.open >= vwap;
+      if (!((taggedEma && wasAboveEma) || (taggedVwap && wasAboveVwap))) return { detected: false };
+
+      // Structure: lower-low attempt or local pop
+      const lowerLow = b.low < previous5m.low;
+      const lowestLow3Bars = closed5mBars.length >= 3
+        ? Math.min(...closed5mBars.slice(-3).map(bar => bar.low))
+        : previous5m.low;
+      const taggedLocalLow = b.low <= lowestLow3Bars + eps;
+      const taggedPullbackSup = pullbackLow !== undefined && b.low <= pullbackLow + 0.02;
+      
+      if (!(lowerLow || taggedLocalLow || taggedPullbackSup)) return { detected: false };
+
+      // Volume confirmation (progress-adjusted if forming)
+      const volAdj = b.progress < 5 ? b.volume * (5 / b.progress) : b.volume;
+      const relVol = volAdj / volSMA20;
+
+      const aPlus = (lowerPct >= 0.45) && (bodyPct <= 0.35);
+      const closeInTop40 = b.close >= b.high - 0.60 * range;
+      
+      // Volume tiers
+      const volOk = (relVol >= 1.10) || (aPlus && relVol >= 0.90);
+      if (!volOk) return { detected: false };
+
+      // Calculate strength score
+      let strength = 0;
+      if (taggedEma && taggedVwap) strength += 2; // Tagged both
+      if (relVol >= 1.3) strength += 2;
+      else if (relVol >= 1.1) strength += 1;
+      if (lowerPct >= 0.5) strength += 2;
+      else if (lowerPct >= 0.45) strength += 1;
+      if (closeInTop40) strength += 1;
+      if (lowerLow) strength += 1;
+
+      // Build setup
+      const stop = b.low - 0.05 * atr; // Buffer below rejection low
+      // Entry trigger: use close for strong setups, break-high for weaker
+      const triggerPrice = strength >= 6 ? b.close : b.high + 0.02;
+
+      return {
+        detected: true,
+        triggerPrice,
+        stopPrice: stop,
+        strength,
+      };
+    }
+
+    return { detected: false };
+  }
+
   // Helper: Detect REJECTION setup
   private detectRejectionSetup(
     bias: MarketBias,
@@ -2188,7 +2494,7 @@ export class Orchestrator {
         exec.setupStopPrice = undefined;
       } else if (current5m) {
         const atr = this.calculateATR(closed5mBars);
-        const setupResult = this.detectSetup(exec, current5m, previous5m ?? undefined, closed5mBars, atr);
+        const setupResult = this.detectSetup(exec, current5m, previous5m ?? undefined, closed5mBars, atr, forming5mBar);
         
         // Update setup state
         const oldSetup = exec.setup;
