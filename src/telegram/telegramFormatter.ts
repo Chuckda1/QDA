@@ -111,6 +111,53 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     });
   }
 
+  // Add target zones if in trade
+  if (snapshot.entryStatus === "active" && snapshot.entryPrice && snapshot.stopPrice && snapshot.targetZones) {
+    const risk = Math.abs(snapshot.entryPrice - snapshot.stopPrice);
+    const riskStr = risk.toFixed(2);
+    
+    lines.push(""); // Blank line separator
+    lines.push(`📊 ENTRY: ${formatPrice(snapshot.entryPrice)} STOP: ${formatPrice(snapshot.stopPrice)} (R=${riskStr})`);
+    
+    // R targets
+    if (snapshot.targetZones.rTargets) {
+      const r = snapshot.targetZones.rTargets;
+      lines.push(`🎯 TARGETS: 1R=${formatPrice(r.t1)} | 2R=${formatPrice(r.t2)} | 3R=${formatPrice(r.t3)}`);
+    }
+    
+    // ATR targets
+    if (snapshot.targetZones.atrTargets) {
+      const atr = snapshot.targetZones.atrTargets;
+      lines.push(`📈 ATR: T1=${formatPrice(atr.t1)} | T2=${formatPrice(atr.t2)}`);
+    }
+    
+    // Magnet levels
+    const magnets: string[] = [];
+    if (snapshot.targetZones.magnetLevels?.microLow) {
+      magnets.push(`microLow=${formatPrice(snapshot.targetZones.magnetLevels.microLow)}`);
+    }
+    if (snapshot.targetZones.magnetLevels?.majorLow) {
+      magnets.push(`majorLow=${formatPrice(snapshot.targetZones.magnetLevels.majorLow)}`);
+    }
+    if (snapshot.targetZones.magnetLevels?.vwap) {
+      magnets.push(`vwap=${formatPrice(snapshot.targetZones.magnetLevels.vwap)}`);
+    }
+    if (magnets.length > 0) {
+      lines.push(`🧲 MAGNET: ${magnets.join(" | ")}`);
+    }
+    
+    // Expected zone
+    if (snapshot.targetZones.expectedZone) {
+      const zone = snapshot.targetZones.expectedZone;
+      lines.push(`📍 EXPECTED_ZONE: ${formatPrice(zone.lower)} – ${formatPrice(zone.upper)}`);
+    }
+    
+    // Measured move if available
+    if (snapshot.targetZones.measuredMove) {
+      lines.push(`📏 MEASURED_MOVE: ${formatPrice(snapshot.targetZones.measuredMove)}`);
+    }
+  }
+
   // Add debug line for minimal mode
   if (snapshot.debug) {
     const d = snapshot.debug;

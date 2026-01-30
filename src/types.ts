@@ -90,6 +90,23 @@ export type MinimalSetupSelectionResult = {
 };
 
 export interface MinimalMindStateResponse {
+  // Target zones (when in trade)
+  targetZones?: {
+    rTargets?: { t1: number; t2: number; t3: number };
+    atrTargets?: { t1: number; t2: number };
+    magnetLevels?: {
+      microLow?: number;
+      majorLow?: number;
+      microHigh?: number;
+      majorHigh?: number;
+      vwap?: number;
+    };
+    measuredMove?: number;
+    expectedZone?: { lower: number; upper: number };
+    expectedEnd?: number;
+  };
+  entryPrice?: number;
+  stopPrice?: number;
   mindId?: string;
   direction: "long" | "short" | "none"; // Legacy - maps to bias
   confidence: number;
@@ -226,7 +243,21 @@ export type MinimalExecutionState = {
   entryPrice?: number;
   entryTs?: number;
   stopPrice?: number;
-  targets?: number[];
+  targets?: number[]; // Legacy: [T1, T2] - kept for backward compatibility
+  targetZones?: {
+    rTargets: { t1: number; t2: number; t3: number }; // Risk-unit targets
+    atrTargets: { t1: number; t2: number }; // ATR projection targets
+    magnetLevels: {
+      microLow?: number; // Lowest low (last 6-12 bars)
+      majorLow?: number; // Lowest low (last 24-36 bars)
+      vwap?: number; // Session VWAP
+      vwapMinus1Sigma?: number; // VWAP - 1σ (optional)
+      vwapMinus2Sigma?: number; // VWAP - 2σ (optional)
+    };
+    measuredMove?: number; // Measured move projection
+    expectedZone: { lower: number; upper: number }; // Weighted expected zone
+    expectedEnd: number; // Single weighted target (median)
+  };
   waitReason?: string;
   continuationExtension?: number; // Distance from pullback level when continuation detected
   entryBlocked?: boolean; // True when no-chase rules prevent entry

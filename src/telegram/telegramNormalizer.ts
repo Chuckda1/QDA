@@ -29,6 +29,22 @@ export type TelegramSnapshot = {
     details: string;
     reasons?: string[]; // Human-readable reasons array
   };
+  targetZones?: {
+    rTargets?: { t1: number; t2: number; t3: number };
+    atrTargets?: { t1: number; t2: number };
+    magnetLevels?: {
+      microLow?: number;
+      majorLow?: number;
+      microHigh?: number;
+      majorHigh?: number;
+      vwap?: number;
+    };
+    measuredMove?: number;
+    expectedZone?: { lower: number; upper: number };
+    expectedEnd?: number;
+  };
+  entryPrice?: number;
+  stopPrice?: number;
 };
 
 const formatEtTimestamp = (ts: number): string =>
@@ -63,6 +79,11 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     reasons: getHumanReadableReasons(mind.noTradeDiagnostic.reasonCode, mind.noTradeDiagnostic),
   } : undefined;
 
+  // Extract target zones if in trade
+  const targetZones = mind.targetZones ?? undefined;
+  const entryPrice = Number.isFinite(mind.entryPrice) ? Number(mind.entryPrice) : undefined;
+  const stopPrice = Number.isFinite(mind.stopPrice) ? Number(mind.stopPrice) : undefined;
+
   return {
     type: "MIND",
     symbol: event.data.symbol,
@@ -83,6 +104,9 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     expectedResolution,
     setup,
     noTradeDiagnostic,
+    targetZones,
+    entryPrice,
+    stopPrice,
   };
 }
 

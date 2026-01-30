@@ -1322,12 +1322,179 @@ export class Orchestrator {
     return { type: null, trigger: "" };
   }
 
-  private computeTargets(direction: "long" | "short", entry: number, stop: number): number[] {
+  // Enhanced target calculation with multiple methods
+  private computeTargets(
+    direction: "long" | "short",
+    entry: number,
+    stop: number,
+    atr: number,
+    closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
+    vwap?: number,
+    pullbackHigh?: number,
+    pullbackLow?: number,
+    impulseRange?: number
+  ): {
+    targets: number[]; // Legacy format [T1, T2, T3]
+    targetZones: {
+      rTargets: { t1: number; t2: number; t3: number };
+      atrTargets: { t1: number; t2: number };
+      magnetLevels: {
+        microLow?: number;
+        majorLow?: number;
+        microHigh?: number;
+        majorHigh?: number;
+        vwap?: number;
+      };
+      measuredMove?: number;
+      expectedZone: { lower: number; upper: number };
+      expectedEnd: number;
+    };
+  } {
     const risk = Math.abs(entry - stop);
-    if (!Number.isFinite(risk) || risk <= 0) return [];
-    return direction === "long"
-      ? [entry + risk, entry + risk * 2]
-      : [entry - risk, entry - risk * 2];
+    if (!Number.isFinite(risk) || risk <= 0 || atr <= 0) {
+      // Fallback to basic R targets only
+      const basicT1 = direction === "long" ? entry + risk : entry - risk;
+      const basicT2 = direction === "long" ? entry + risk * 2 : entry - risk * 2;
+      const basicT3 = direction === "long" ? entry + risk * 3 : entry - risk * 3;
+      return {
+        targets: [basicT1, basicT2, basicT3],
+        targetZones: {
+          rTargets: { t1: basicT1, t2: basicT2, t3: basicT3 },
+          atrTargets: { t1: basicT1, t2: basicT2 },
+          magnetLevels: {},
+          expectedZone: { lower: basicT1, upper: basicT2 },
+          expectedEnd: (basicT1 + basicT2) / 2,
+        },
+      };
+    }
+
+    // 1. Risk-unit targets (1R, 2R, 3R)
+    const rT1 = direction === "long" ? entry + risk : entry - risk;
+    const rT2 = direction === "long" ? entry + risk * 2 : entry - risk * 2;
+    const rT3 = direction === "long" ? entry + risk * 3 : entry - risk * 3;
+
+    // 2. ATR projection targets
+    const k1 = 0.8; // Typical: 0.8 ATR
+    const k2 = 1.6; // Typical: 1.6 ATR
+    const atrT1 = direction === "long" ? entry + k1 * atr : entry - k1 * atr;
+    const atrT2 = direction === "long" ? entry + k2 * atr : entry - k2 * atr;
+
+    // 3. Magnet levels (prior lows/highs, VWAP)
+    const magnetLevels: {
+      microLow?: number;
+      majorLow?: number;
+      microHigh?: number;
+      majorHigh?: number;
+      vwap?: number;
+    } = {};
+
+    if (closed5mBars.length >= 6) {
+      // Micro low/high (last 6-12 bars = 30-60 minutes)
+      const microBars = closed5mBars.slice(-12);
+      magnetLevels.microLow = Math.min(...microBars.map(b => b.low));
+      magnetLevels.microHigh = Math.max(...microBars.map(b => b.high));
+    }
+
+    if (closed5mBars.length >= 24) {
+      // Major low/high (last 24-36 bars = 2-3 hours)
+      const majorBars = closed5mBars.slice(-36);
+      magnetLevels.majorLow = Math.min(...majorBars.map(b => b.low));
+      magnetLevels.majorHigh = Math.max(...majorBars.map(b => b.high));
+    }
+
+    if (vwap !== undefined && vwap > 0) {
+      magnetLevels.vwap = vwap;
+    }
+
+    // 4. Measured move projection (for breakdowns/rejections)
+    let measuredMove: number | undefined;
+    if (direction === "short" && pullbackHigh !== undefined && impulseRange !== undefined && impulseRange > 0) {
+      // Bearish: projection = pullbackHigh - impulseRange
+      measuredMove = pullbackHigh - impulseRange;
+    } else if (direction === "long" && pullbackLow !== undefined && impulseRange !== undefined && impulseRange > 0) {
+      // Bullish: projection = pullbackLow + impulseRange
+      measuredMove = pullbackLow + impulseRange;
+    }
+
+    // 5. Weighted expected zone (median of multiple methods)
+    const candidateTargets: number[] = [rT1, atrT1];
+    
+    // Add magnet levels that are in the right direction
+    if (direction === "short") {
+      if (magnetLevels.microLow !== undefined && magnetLevels.microLow < entry) {
+        candidateTargets.push(magnetLevels.microLow);
+      }
+      if (magnetLevels.majorLow !== undefined && magnetLevels.majorLow < entry) {
+        candidateTargets.push(magnetLevels.majorLow);
+      }
+      if (magnetLevels.vwap !== undefined && magnetLevels.vwap < entry) {
+        candidateTargets.push(magnetLevels.vwap);
+      }
+    } else {
+      if (magnetLevels.microHigh !== undefined && magnetLevels.microHigh > entry) {
+        candidateTargets.push(magnetLevels.microHigh);
+      }
+      if (magnetLevels.majorHigh !== undefined && magnetLevels.majorHigh > entry) {
+        candidateTargets.push(magnetLevels.majorHigh);
+      }
+      if (magnetLevels.vwap !== undefined && magnetLevels.vwap > entry) {
+        candidateTargets.push(magnetLevels.vwap);
+      }
+    }
+
+    if (measuredMove !== undefined) {
+      if ((direction === "short" && measuredMove < entry) || (direction === "long" && measuredMove > entry)) {
+        candidateTargets.push(measuredMove);
+      }
+    }
+
+    // Calculate median (ignores outliers)
+    candidateTargets.sort((a, b) => a - b);
+    const median = candidateTargets.length > 0
+      ? candidateTargets[Math.floor(candidateTargets.length / 2)]
+      : rT1;
+
+    // Expected zone: median ± 0.3*ATR
+    const zoneBuffer = 0.3 * atr;
+    let expectedZone = {
+      lower: median - zoneBuffer,
+      upper: median + zoneBuffer,
+    };
+
+    // Ensure zone is in the right direction (below entry for shorts, above entry for longs)
+    if (direction === "short") {
+      // Short: zone should be below entry
+      expectedZone.lower = Math.min(expectedZone.lower, entry);
+      expectedZone.upper = Math.min(expectedZone.upper, entry);
+      // Ensure lower < upper
+      if (expectedZone.lower > expectedZone.upper) {
+        const temp = expectedZone.lower;
+        expectedZone.lower = expectedZone.upper;
+        expectedZone.upper = temp;
+      }
+    } else {
+      // Long: zone should be above entry
+      expectedZone.lower = Math.max(expectedZone.lower, entry);
+      expectedZone.upper = Math.max(expectedZone.upper, entry);
+      // Ensure lower < upper
+      if (expectedZone.lower > expectedZone.upper) {
+        const temp = expectedZone.lower;
+        expectedZone.lower = expectedZone.upper;
+        expectedZone.upper = temp;
+      }
+    }
+
+    return {
+      targets: [rT1, rT2, rT3], // Legacy format
+      targetZones: {
+        rTargets: { t1: rT1, t2: rT2, t3: rT3 },
+        atrTargets: { t1: atrT1, t2: atrT2 },
+        magnetLevels,
+        measuredMove,
+        expectedZone,
+        expectedEnd: median,
+      },
+    };
   }
 
   // Calculate derived confidence from base + structure + momentum - decay - penalty
@@ -1595,12 +1762,18 @@ export class Orchestrator {
   }
 
   // Check if entry should be blocked (no-chase rules)
+  // Includes target zone-based "don't chase" rules
   private shouldBlockEntry(
     bias: MarketBias,
     phase: MinimalExecutionPhase,
     currentPrice: number,
     pullbackHigh?: number,
-    pullbackLow?: number
+    pullbackLow?: number,
+    atr?: number,
+    targetZones?: {
+      expectedZone: { lower: number; upper: number };
+      expectedEnd: number;
+    }
   ): { blocked: boolean; reason?: string } {
     // Only check blocking during continuation
     if (phase !== "CONTINUATION_IN_PROGRESS") {
@@ -1626,6 +1799,33 @@ export class Orchestrator {
 
     if (pullbackRange > 0 && continuationExtension > pullbackRange * 1.25) {
       return { blocked: true, reason: "continuation_extended" };
+    }
+
+    // Don't-chase rule: if price is already > 0.8*ATR below ideal trigger (for shorts)
+    // or > 0.8*ATR above ideal trigger (for longs), don't enter
+    if (atr !== undefined && atr > 0) {
+      if (bias === "BEARISH" && pullbackLow !== undefined) {
+        const idealTrigger = pullbackLow;
+        const distanceBelow = idealTrigger - currentPrice;
+        if (distanceBelow > 0.8 * atr) {
+          return { blocked: true, reason: "continuation_extended" };
+        }
+      } else if (bias === "BULLISH" && pullbackHigh !== undefined) {
+        const idealTrigger = pullbackHigh;
+        const distanceAbove = currentPrice - idealTrigger;
+        if (distanceAbove > 0.8 * atr) {
+          return { blocked: true, reason: "continuation_extended" };
+        }
+      }
+    }
+
+    // Don't-chase rule: if price is already past expected zone, don't enter
+    if (targetZones !== undefined) {
+      if (bias === "BEARISH" && currentPrice < targetZones.expectedZone.lower) {
+        return { blocked: true, reason: "price_past_expected_zone" };
+      } else if (bias === "BULLISH" && currentPrice > targetZones.expectedZone.upper) {
+        return { blocked: true, reason: "price_past_expected_zone" };
+      }
     }
 
     return { blocked: false };
@@ -2116,7 +2316,22 @@ export class Orchestrator {
           exec.pullbackLow = current5m.low;
           exec.pullbackTs = ts;
           exec.stopPrice = llmDirection === "long" ? current5m.low : current5m.high;
-          exec.targets = this.computeTargets(llmDirection, exec.entryPrice, exec.stopPrice);
+          const atr = this.calculateATR(closed5mBars);
+          const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+          const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+          const targetResult = this.computeTargets(
+            llmDirection,
+            exec.entryPrice,
+            exec.stopPrice,
+            atr,
+            closedBarsWithVolume,
+            vwap,
+            exec.pullbackHigh,
+            exec.pullbackLow,
+            exec.impulseRange
+          );
+          exec.targets = targetResult.targets;
+          exec.targetZones = targetResult.targetZones;
           exec.phase = "IN_TRADE";
           exec.waitReason = "a+_maturity_flip_entry";
           shouldPublishEvent = true;
@@ -2355,7 +2570,22 @@ export class Orchestrator {
               exec.pullbackLow = reentryInfo.pullbackLow;
               exec.pullbackTs = ts;
               exec.stopPrice = exec.bias === "BULLISH" ? reentryInfo.pullbackLow : reentryInfo.pullbackHigh;
-              exec.targets = this.computeTargets(exec.bias === "BULLISH" ? "long" : "short", exec.entryPrice, exec.stopPrice);
+              const atrReentry = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeReentry = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapReentry = closedBarsWithVolumeReentry.length > 0 ? this.calculateVWAP(closedBarsWithVolumeReentry) : undefined;
+              const targetResultReentry = this.computeTargets(
+                exec.bias === "BULLISH" ? "long" : "short",
+                exec.entryPrice,
+                exec.stopPrice,
+                atrReentry,
+                closedBarsWithVolumeReentry,
+                vwapReentry,
+                exec.pullbackHigh,
+                exec.pullbackLow,
+                exec.impulseRange
+              );
+              exec.targets = targetResultReentry.targets;
+              exec.targetZones = targetResultReentry.targetZones;
               exec.phase = "IN_TRADE";
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -2682,8 +2912,17 @@ export class Orchestrator {
             console.log(
               `[ENTRY_CHECK] BULLISH bias - Entry condition met: isBearish=${isBearish} lowerLow=${lowerLow} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
             );
-            // Check no-chase rules
-            const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
+            // Check no-chase rules (with target zones if available)
+            const atrForBlock = this.calculateATR(closed5mBars);
+            const blockCheck = this.shouldBlockEntry(
+              exec.bias,
+              exec.phase,
+              current5m.close,
+              exec.pullbackHigh,
+              exec.pullbackLow,
+              atrForBlock,
+              exec.targetZones
+            );
             if (blockCheck.blocked) {
               exec.entryBlocked = true;
               exec.entryBlockReason = blockCheck.reason;
@@ -2704,7 +2943,22 @@ export class Orchestrator {
               exec.pullbackLow = current5m.low;
               exec.pullbackTs = ts;
               exec.stopPrice = current5m.low; // Stop at pullback low
-              exec.targets = this.computeTargets("long", exec.entryPrice, exec.stopPrice);
+              const atrLong = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeLong = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapLong = closedBarsWithVolumeLong.length > 0 ? this.calculateVWAP(closedBarsWithVolumeLong) : undefined;
+              const targetResultLong = this.computeTargets(
+                "long",
+                exec.entryPrice,
+                exec.stopPrice,
+                atrLong,
+                closedBarsWithVolumeLong,
+                vwapLong,
+                exec.pullbackHigh,
+                exec.pullbackLow,
+                exec.impulseRange
+              );
+              exec.targets = targetResultLong.targets;
+              exec.targetZones = targetResultLong.targetZones;
               exec.phase = "IN_TRADE";
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -2722,8 +2976,17 @@ export class Orchestrator {
             console.log(
               `[ENTRY_CHECK] BEARISH bias - Entry condition met: isBullish=${isBullish} higherHigh=${higherHigh} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
             );
-            // Check no-chase rules
-            const blockCheck = this.shouldBlockEntry(exec.bias, exec.phase, current5m.close, exec.pullbackHigh, exec.pullbackLow);
+            // Check no-chase rules (with target zones if available)
+            const atrForBlock = this.calculateATR(closed5mBars);
+            const blockCheck = this.shouldBlockEntry(
+              exec.bias,
+              exec.phase,
+              current5m.close,
+              exec.pullbackHigh,
+              exec.pullbackLow,
+              atrForBlock,
+              exec.targetZones
+            );
             if (blockCheck.blocked) {
               exec.entryBlocked = true;
               exec.entryBlockReason = blockCheck.reason;
@@ -2744,7 +3007,22 @@ export class Orchestrator {
               exec.pullbackLow = current5m.low;
               exec.pullbackTs = ts;
               exec.stopPrice = current5m.high; // Stop at pullback high
-              exec.targets = this.computeTargets("short", exec.entryPrice, exec.stopPrice);
+              const atrShort = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeShort = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapShort = closedBarsWithVolumeShort.length > 0 ? this.calculateVWAP(closedBarsWithVolumeShort) : undefined;
+              const targetResultShort = this.computeTargets(
+                "short",
+                exec.entryPrice,
+                exec.stopPrice,
+                atrShort,
+                closedBarsWithVolumeShort,
+                vwapShort,
+                exec.pullbackHigh,
+                exec.pullbackLow,
+                exec.impulseRange
+              );
+              exec.targets = targetResultShort.targets;
+              exec.targetZones = targetResultShort.targetZones;
               exec.phase = "IN_TRADE";
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -2760,6 +3038,30 @@ export class Orchestrator {
       }
 
       // Check trade management if in trade
+      // Real-time target updates: recompute targets on each 5m close
+      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && is5mClose) {
+        const atr = this.calculateATR(closed5mBars);
+        const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+        const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+        const direction = exec.bias === "BULLISH" ? "long" : "short";
+        const targetResult = this.computeTargets(
+          direction,
+          exec.entryPrice,
+          exec.stopPrice,
+          atr,
+          closedBarsWithVolume,
+          vwap,
+          exec.pullbackHigh,
+          exec.pullbackLow,
+          exec.impulseRange
+        );
+        exec.targets = targetResult.targets;
+        exec.targetZones = targetResult.targetZones;
+        console.log(
+          `[TARGETS_UPDATED] Entry=${exec.entryPrice.toFixed(2)} R_Targets: T1=${targetResult.targetZones.rTargets.t1.toFixed(2)} T2=${targetResult.targetZones.rTargets.t2.toFixed(2)} T3=${targetResult.targetZones.rTargets.t3.toFixed(2)} ExpectedZone=${targetResult.targetZones.expectedZone.lower.toFixed(2)}-${targetResult.targetZones.expectedZone.upper.toFixed(2)}`
+        );
+      }
+
       if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && exec.targets) {
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
@@ -2902,6 +3204,10 @@ export class Orchestrator {
           refPrice, // Reference price anchor
           refLabel, // Label for reference price
           noTradeDiagnostic, // Why no trade fired (when applicable)
+          // Target zones (when in trade)
+          targetZones: exec.targetZones ?? undefined,
+          entryPrice: exec.entryPrice ?? undefined,
+          stopPrice: exec.stopPrice ?? undefined,
         };
 
         events.push({
