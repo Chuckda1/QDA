@@ -2066,6 +2066,275 @@ export class Orchestrator {
     }
   }
 
+  // ============================================================================
+  // SINGLE AUTHORITATIVE 5M CLOSE REDUCER
+  // ============================================================================
+  // This function runs in strict order on every 5m close:
+  // 1. Apply bias from LLM (if available)
+  // 2. Update phase deterministically (engine-owned, never from LLM)
+  // 3. Run setup detection (closed bars only)
+  // 4. Update gate (disarm if setup is NONE, arm if setup exists)
+  // 5. Check consistency
+  // 6. Generate diagnostics
+  // ============================================================================
+  private reduce5mClose(
+    exec: MinimalExecutionState,
+    ts: number,
+    close: number,
+    closed5mBars: Array<{ ts: number; open: number; high: number; low: number; close: number; volume: number }>,
+    lastClosed5m: { ts: number; open: number; high: number; low: number; close: number; volume: number } | null,
+    forming5mBar: Forming5mBar | null,
+    llmDecision: { action: string; bias: string; confidence: number; maturity?: string; waiting_for?: string } | null
+  ): { shouldPublishEvent: boolean; noTradeReason?: string } {
+    const previousBias = exec.bias;
+    const previousPhase = exec.phase;
+    const previousSetup = exec.setup;
+    let shouldPublishEvent = false;
+
+    // ============================================================================
+    // STEP 1: Apply bias from LLM (if available)
+    // ============================================================================
+    if (llmDecision !== null) {
+      const llmDirection: "long" | "short" | "none" = 
+        llmDecision.action === "ARM_LONG" ? "long" :
+        llmDecision.action === "ARM_SHORT" ? "short" :
+        llmDecision.action === "A+" ? (llmDecision.bias === "bearish" ? "short" : "long") : "none";
+      
+      const newBias = this.llmActionToBias(llmDecision.action as "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+", llmDecision.bias as "bullish" | "bearish" | "neutral");
+      const shouldFlip = this.shouldFlipBias(
+        exec.bias,
+        newBias,
+        exec.biasInvalidationLevel,
+        close
+      );
+
+      if (shouldFlip || exec.bias === "NEUTRAL") {
+        // Deactivate gate if bias flips
+        if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
+          this.deactivateGate(exec);
+        }
+        exec.bias = newBias;
+        exec.baseBiasConfidence = llmDecision.confidence;
+        exec.biasPrice = close;
+        exec.biasTs = ts;
+        if (exec.activeCandidate) {
+          exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
+        }
+        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+        shouldPublishEvent = true;
+      }
+
+      // Legacy compatibility
+      exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
+      if (exec.bias !== "NEUTRAL") {
+        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+        exec.thesisConfidence = exec.biasConfidence;
+      }
+
+      console.log(
+        `[LLM5M] action=${llmDecision.action} bias=${exec.bias} baseConf=${exec.baseBiasConfidence ?? llmDecision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"}`
+      );
+    }
+
+    // ============================================================================
+    // STEP 2: Update phase deterministically (engine-owned, never from LLM)
+    // ============================================================================
+    // Phase transitions are based on bias, confidence, and market structure
+    // LLM never sets phase directly
+    if (exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
+      // Bias is established with sufficient confidence
+      if (exec.phase === "NEUTRAL_PHASE") {
+        exec.phase = "BIAS_ESTABLISHED";
+        exec.expectedResolution = "CONTINUATION";
+        exec.waitReason = "waiting_for_pullback";
+        shouldPublishEvent = true;
+        console.log(
+          `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence}`
+        );
+      } else if (exec.phase === "BIAS_ESTABLISHED" && lastClosed5m) {
+        // Check if pullback is developing
+        const current5m = forming5mBar ?? lastClosed5m;
+        if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+          const inPullback = (exec.bias === "BEARISH" && current5m.close < exec.pullbackHigh) ||
+                           (exec.bias === "BULLISH" && current5m.close > exec.pullbackLow);
+          if (inPullback) {
+            exec.phase = "PULLBACK_IN_PROGRESS";
+            exec.expectedResolution = "CONTINUATION";
+            shouldPublishEvent = true;
+            console.log(
+              `[PHASE_TRANSITION] ${previousPhase} -> PULLBACK_IN_PROGRESS | BIAS=${exec.bias}`
+            );
+          }
+        }
+      }
+    } else if (exec.bias === "NEUTRAL") {
+      if (exec.phase !== "NEUTRAL_PHASE") {
+        exec.phase = "NEUTRAL_PHASE";
+        exec.waitReason = "waiting_for_bias";
+        shouldPublishEvent = true;
+        console.log(
+          `[PHASE_TRANSITION] ${previousPhase} -> NEUTRAL_PHASE | BIAS=NEUTRAL`
+        );
+      }
+    }
+
+    // ============================================================================
+    // STEP 3: Run setup detection (closed bars only, with TTL persistence)
+    // ============================================================================
+    const setupTTLDuration = 2 * 5 * 60 * 1000; // 2 bars = 10 minutes
+    const setupTTLExpiry = (exec.setupDetectedAt ?? 0) + setupTTLDuration;
+    const now = ts;
+    
+    // Check if current setup should persist (TTL not expired and not invalidated)
+    if (exec.setup && exec.setup !== "NONE" && now < setupTTLExpiry) {
+      // Check for invalidation: price breaks setup stop
+      const invalidated = (exec.bias === "BEARISH" && exec.setupStopPrice !== undefined && close > exec.setupStopPrice) ||
+                         (exec.bias === "BULLISH" && exec.setupStopPrice !== undefined && close < exec.setupStopPrice);
+      
+      if (invalidated) {
+        console.log(
+          `[SETUP_INVALIDATED] ${exec.setup} -> NONE | Price broke stop - bias=${exec.bias} price=${close.toFixed(2)} stop=${exec.setupStopPrice?.toFixed(2) ?? "n/a"}`
+        );
+        exec.setup = "NONE";
+        exec.setupTriggerPrice = undefined;
+        exec.setupStopPrice = undefined;
+        exec.setupDetectedAt = undefined;
+      } else {
+        // Setup persists - skip re-detection
+        console.log(
+          `[SETUP_PERSISTS] ${exec.setup} | TTL valid until ${new Date(setupTTLExpiry).toISOString()}`
+        );
+      }
+    }
+    
+    // Only run setup detection if:
+    // - Setup is NONE, OR
+    // - Setup TTL expired, OR
+    // - Setup was invalidated above
+    if (exec.setup === "NONE" || !exec.setup || now >= setupTTLExpiry) {
+      if (exec.bias === "NEUTRAL") {
+        exec.setup = "NONE";
+        exec.setupTriggerPrice = undefined;
+        exec.setupStopPrice = undefined;
+      } else if (lastClosed5m) {
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
+        const atr = this.calculateATR(closed5mBars);
+        const setupResult = this.detectSetup(exec, lastClosed5m, previous5m, closed5mBars, atr, null); // Never use forming bar
+        
+        const oldSetup = exec.setup;
+        exec.setup = setupResult.setup;
+        exec.setupTriggerPrice = setupResult.triggerPrice;
+        exec.setupStopPrice = setupResult.stopPrice;
+        
+        if (oldSetup !== setupResult.setup) {
+          exec.setupDetectedAt = ts;
+          
+          // Store rejection candle info when REJECTION is first detected
+          if (setupResult.setup === "REJECTION") {
+            exec.rejectionCandleLow = setupResult.rejectionCandleLow;
+            exec.rejectionCandleHigh = setupResult.rejectionCandleHigh;
+            exec.rejectionBarsElapsed = 0;
+          } else {
+            exec.rejectionCandleLow = undefined;
+            exec.rejectionCandleHigh = undefined;
+            exec.rejectionBarsElapsed = undefined;
+          }
+          
+          console.log(
+            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"}`
+          );
+        } else if (exec.setup === "REJECTION") {
+          exec.rejectionBarsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
+        }
+      }
+    }
+
+    // ============================================================================
+    // STEP 4: Update gate (disarm if setup is NONE, arm if setup exists)
+    // ============================================================================
+    if (exec.setup === "NONE" || !exec.setup) {
+      // CRITICAL: Disarm gate when setup is NONE
+      if (exec.resolutionGate && exec.resolutionGate.status === "ARMED") {
+        this.deactivateGate(exec);
+        console.log(
+          `[GATE_DISARMED] Setup=NONE - gate disarmed`
+        );
+      }
+    } else if (exec.setup && exec.expectedResolution === "CONTINUATION" && 
+               exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined &&
+               (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
+      // Arm gate if setup exists and conditions are met
+      const atr = this.calculateATR(closed5mBars);
+      if (atr > 0) {
+        if (!exec.resolutionGate || exec.resolutionGate.status !== "ARMED") {
+          this.armResolutionGate(
+            exec,
+            exec.bias,
+            exec.pullbackHigh,
+            exec.pullbackLow,
+            atr,
+            ts
+          );
+          console.log(
+            `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} setup=${exec.setup} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)}`
+          );
+        }
+      }
+    }
+
+    // ============================================================================
+    // STEP 5: Consistency checks
+    // ============================================================================
+    const consistencyErrors: string[] = [];
+    
+    // Check: bias != NEUTRAL AND phase == NEUTRAL_PHASE => invalid
+    if (exec.bias !== "NEUTRAL" && exec.phase === "NEUTRAL_PHASE" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
+      consistencyErrors.push(`INVALID: bias=${exec.bias} but phase=NEUTRAL_PHASE (confidence=${exec.biasConfidence})`);
+    }
+    
+    // Check: gate == ARMED AND setup == NONE => invalid
+    if (exec.resolutionGate?.status === "ARMED" && (exec.setup === "NONE" || !exec.setup)) {
+      consistencyErrors.push(`INVALID: gate=ARMED but setup=NONE`);
+    }
+    
+    // Check: entryStatus != inactive AND setup == NONE => invalid
+    const entryStatus = exec.phase === "IN_TRADE" ? "active" : "inactive";
+    if (entryStatus === "active" && (exec.setup === "NONE" || !exec.setup)) {
+      consistencyErrors.push(`INVALID: entryStatus=active but setup=NONE`);
+    }
+    
+    if (consistencyErrors.length > 0) {
+      console.error(
+        `[CONSISTENCY_CHECK] ERROR: ${consistencyErrors.join(" | ")} | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
+      );
+    } else {
+      console.log(
+        `[CONSISTENCY_CHECK] OK | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
+      );
+    }
+
+    // ============================================================================
+    // STEP 6: Generate "why no trade" diagnostic (if applicable)
+    // ============================================================================
+    let noTradeReason: string | undefined = undefined;
+    if (exec.phase !== "IN_TRADE" && exec.bias !== "NEUTRAL") {
+      // Priority-ordered reasons
+      if (exec.biasConfidence === undefined || exec.biasConfidence < 65) {
+        noTradeReason = `bias_confidence_below_threshold (${exec.biasConfidence ?? "undefined"})`;
+      } else if (exec.phase === "NEUTRAL_PHASE") {
+        noTradeReason = `phase_not_ready (phase=NEUTRAL_PHASE)`;
+      } else if (exec.setup === "NONE" || !exec.setup) {
+        noTradeReason = `setup_none (no tradable pattern detected)`;
+      } else if (exec.resolutionGate?.status !== "ARMED" && exec.resolutionGate?.status !== "TRIGGERED") {
+        noTradeReason = `gate_not_armed (gate=${exec.resolutionGate?.status ?? "none"})`;
+      } else if (exec.resolutionGate?.status === "ARMED") {
+        noTradeReason = `price_didnt_cross_trigger (price=${close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)})`;
+      }
+    }
+
+    return { shouldPublishEvent, noTradeReason };
+  }
+
   private async handleMinimal1m(snapshot: TickSnapshot): Promise<DomainEvent[]> {
     const { ts, symbol, close } = snapshot;
     const events: DomainEvent[] = [];
@@ -2124,6 +2393,9 @@ export class Orchestrator {
     // Previous assistant replies are NEVER included in subsequent requests.
     // ============================================================================
     
+    // Declare LLM decision at function scope
+    let llmDecision: { action: string; bias: string; confidence: number; maturity?: string; waiting_for?: string } | null = null;
+    
     // Explicit guard: LLM is ONLY called on 5m bar closes
     if (!is5mClose) {
       // LLM is NOT called on 1m ticks or forming bars - this prevents request storms
@@ -2171,17 +2443,16 @@ export class Orchestrator {
           `[LLM5M] closed5m=${closed5mBars.length} callingLLM=true (5m close detected) barsWindow=60 dailyContext=${dailyContextLite ? "yes" : "no"}`
         );
         
-        let decision: any = null;
         try {
           const result = await this.llmService.getArmDecisionRaw5m({
             snapshot: llmSnapshot,
           });
-          decision = result.decision;
+          llmDecision = result.decision;
           
           // Store for debugging/logging only - NEVER sent back to LLM
           // LLM calls are stateless - no prior responses are reused
           this.state.lastLLMCallAt = ts;
-          this.state.lastLLMDecision = decision.because ?? decision.action;
+          this.state.lastLLMDecision = llmDecision.action;
           
           // Reset circuit breaker on success
           this.llmCircuitBreaker.failures = 0;
@@ -2210,102 +2481,32 @@ export class Orchestrator {
             exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
             exec.thesisConfidence = exec.biasConfidence;
           }
-          decision = null; // Signal that LLM call failed
+          llmDecision = null; // Signal that LLM call failed
         }
-        
-        // Only process LLM decision if call succeeded
-        if (decision !== null) {
-          const llmDirection: "long" | "short" | "none" = 
-            decision.action === "ARM_LONG" ? "long" :
-            decision.action === "ARM_SHORT" ? "short" :
-            decision.action === "A+" ? (decision.bias === "bearish" ? "short" : "long") : "none";
-          
-          const isMaturityFlip = decision.action === "A+";
-
-          // CRITICAL: Wire MarketBias as single source of truth
-          const newBias = this.llmActionToBias(decision.action, decision.bias);
-          const shouldFlip = this.shouldFlipBias(
-            exec.bias,
-            newBias,
-            exec.biasInvalidationLevel,
-            close
-          );
-
-          if (shouldFlip || exec.bias === "NEUTRAL") {
-            // Deactivate gate if bias flips
-            if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
-              this.deactivateGate(exec);
-            }
-            exec.bias = newBias;
-            // LLM confidence becomes base weight only
-            exec.baseBiasConfidence = decision.confidence;
-            exec.biasPrice = close;
-            exec.biasTs = ts;
-            if (exec.activeCandidate) {
-              exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
-            }
-            // Calculate derived confidence
-            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-          }
-
-          // Legacy compatibility: sync thesisDirection to bias
-          exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
-          // Update derived confidence continuously (not just on bias change)
-          if (exec.bias !== "NEUTRAL") {
-            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-            exec.thesisConfidence = exec.biasConfidence;
-          }
-
-          console.log(
-            `[LLM5M] action=${decision.action} bias=${exec.bias} maturity=${decision.maturity} baseConf=${exec.baseBiasConfidence ?? decision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"} phase=${exec.phase}`
-          );
-
-          // Track previous state to detect changes (for use in state transitions)
-          const previousBias = exec.bias;
-          const previousPhase = exec.phase;
-
-          // Generate candidates and match direction ONLY if:
-          // 1. Bias changed, OR
-          // 2. No bias exists yet (NEUTRAL)
-          const needsNewSetup = 
-            (newBias !== exec.bias) ||
-            (exec.bias === "NEUTRAL");
-
-          // Handle A+ (maturity flip) - immediate entry opportunity
-          if (isMaturityFlip && (llmDirection === "long" || llmDirection === "short")) {
-        console.log(
-          `[A+_FLIP] Maturity flip detected: ${decision.bias} bias, ${decision.maturity} maturity, immediate ${llmDirection.toUpperCase()} opportunity`
-        );
-        
-        // For A+, we can enter immediately without waiting for pullback
-        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
-          ts: forming5mBar.endTs,
-          open: forming5mBar.open,
-          high: forming5mBar.high,
-          low: forming5mBar.low,
-          close: forming5mBar.close,
-          volume: forming5mBar.volume,
-        }] : []);
-
-        const candidates = this.buildMinimalSetupCandidates({
-          closed5mBars: barsForCandidates,
-          activeDirection: exec.thesisDirection,
-        });
-
-        const matchingCandidate = candidates.find(
-          (c) => c.direction === (llmDirection === "long" ? "LONG" : "SHORT")
-        );
-
-        // A+ can enter even without perfect candidate match (maturity flips are opportunistic)
-        exec.activeCandidate = matchingCandidate; // May be undefined for A+ - that's OK
-        if (matchingCandidate) {
-          exec.biasInvalidationLevel = matchingCandidate.invalidationLevel;
-        }
-        
-        // A+ can enter immediately on the current bar
+      } // Close: if (!this.llmCircuitBreaker.isOpen)
+    } // Close: if (this.llmService && is5mClose && closed5mBars.length > 0)
+    
+    // ============================================================================
+    // Call the authoritative reducer on every 5m close
+    // CRITICAL: LLM never sets phase directly - phase is engine-owned
+    // ============================================================================
+    if (is5mClose && lastClosed5m) {
+      const reducerResult = this.reduce5mClose(
+        exec,
+        ts,
+        close,
+        closed5mBars,
+        lastClosed5m,
+        forming5mBar,
+        llmDecision
+      );
+      shouldPublishEvent = reducerResult.shouldPublishEvent || shouldPublishEvent;
+      
+      // Handle A+ immediate entry (special case - bypasses normal flow)
+      if (llmDecision && llmDecision.action === "A+" && (llmDecision.bias === "bearish" || llmDecision.bias === "bullish")) {
+        const llmDirection: "long" | "short" = llmDecision.bias === "bearish" ? "short" : "long";
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
-          const oldPhase = exec.phase;
           const entryInfo = this.detectEntryType(exec.bias, current5m, closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined);
           
           exec.entryPrice = current5m.close;
@@ -2336,147 +2537,18 @@ export class Orchestrator {
           exec.waitReason = "a+_maturity_flip_entry";
           shouldPublishEvent = true;
           console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | A+ ${exec.bias} entry at ${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-          );
-        } else {
-          exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
-          exec.waitReason = "waiting_for_pullback";
-          shouldPublishEvent = true;
-        }
-      } else if (needsNewSetup && (llmDirection === "long" || llmDirection === "short")) {
-        console.log(
-          `[SETUP_GEN] BIAS change: ${exec.bias} -> ${newBias}, generating candidates`
-        );
-
-        // Bot generates setups from raw data
-        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
-          ts: forming5mBar.endTs,
-          open: forming5mBar.open,
-          high: forming5mBar.high,
-          low: forming5mBar.low,
-          close: forming5mBar.close,
-          volume: forming5mBar.volume,
-        }] : []);
-
-        const candidates = this.buildMinimalSetupCandidates({
-          closed5mBars: barsForCandidates,
-          activeDirection: exec.thesisDirection,
-        });
-
-        debugInfo = {
-          barsClosed5m: closed5mBars.length,
-          hasForming5m: !!forming5mBar,
-          formingProgressMin: forming5mBar?.progressMinutes ?? null,
-          formingStartTs: forming5mBar?.startTs ?? null,
-          formingEndTs: forming5mBar?.endTs ?? null,
-          formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
-          lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
-          candidateBarsUsed: barsForCandidates.length,
-          candidateCount: candidates.length,
-          botPhase: exec.phase,
-          botWaitReason: exec.waitReason ?? null,
-        };
-
-        // Bot matches LLM direction to correct candidate
-        const matchingCandidate = candidates.find(
-          (c) => c.direction === (llmDirection === "long" ? "LONG" : "SHORT")
-        );
-
-        if (matchingCandidate) {
-          const oldPhase = exec.phase;
-          exec.thesisDirection = llmDirection;
-          // LLM confidence becomes base weight only
-          exec.baseBiasConfidence = decision.confidence;
-          exec.activeCandidate = matchingCandidate;
-          exec.thesisPrice = lastClosed5m?.close ?? close;
-          exec.thesisTs = ts;
-          exec.phase = "BIAS_ESTABLISHED";
-          exec.waitReason = "waiting_for_pullback";
-          // Set ExpectedResolution: expect continuation when pullback occurs
-          exec.expectedResolution = "CONTINUATION";
-          // Calculate derived confidence
-          exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-          exec.thesisConfidence = exec.biasConfidence;
-          this.clearTradeState(exec);
-          shouldPublishEvent = true; // Thesis changed - publish event
-          console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> BIAS_ESTABLISHED | ${llmDirection.toUpperCase()} bias established, candidate=${matchingCandidate.id} inv=${matchingCandidate.invalidationLevel.toFixed(2)} baseConf=${decision.confidence} derivedConf=${exec.biasConfidence} expectedResolution=${exec.expectedResolution}`
-          );
-        } else {
-          console.log(
-            `[SETUP_MATCH] FAIL: No matching candidate for ${llmDirection} (candidates=${candidates.length}, directions=${candidates.map(c => c.direction).join(",")})`
-          );
-        }
-      } else if (llmDirection === "none" || newBias === "NEUTRAL") {
-        // LLM says WAIT - but keep bias unless invalidated
-        // Only change phase, don't clear bias unless price invalidates it
-        if (exec.bias !== "NEUTRAL" && exec.phase !== "IN_TRADE") {
-          const oldPhase = exec.phase;
-          exec.activeCandidate = undefined;
-          exec.phase = "PULLBACK_IN_PROGRESS";
-          exec.waitReason = decision.waiting_for ?? "waiting_for_setup";
-          // Set ExpectedResolution: expect continuation of bias direction
-          exec.expectedResolution = exec.bias === "BEARISH" || exec.bias === "BULLISH" ? "CONTINUATION" : "UNDECIDED";
-          // Track pullback levels for failure detection
-          const current5mForPullback = forming5mBar ?? lastClosed5m;
-          if (current5mForPullback) {
-            exec.pullbackHigh = current5mForPullback.high;
-            exec.pullbackLow = current5mForPullback.low;
-            exec.pullbackTs = ts;
-          }
-          // Clear entry state but keep pullback levels
-          exec.entryPrice = undefined;
-          exec.entryTs = undefined;
-          exec.entryType = undefined;
-          exec.entryTrigger = undefined;
-          exec.stopPrice = undefined;
-          exec.targets = undefined;
-          
-          // Arm resolution gate if conditions are met
-          // For REJECTION setup, gate should be armed/updated when setup is detected
-          if (exec.expectedResolution === "CONTINUATION" && 
-              exec.pullbackHigh !== undefined && 
-              exec.pullbackLow !== undefined &&
-              (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
-            const atr = this.calculateATR(closed5mBars);
-            if (atr > 0) {
-              // Arm or re-arm gate (will use rejection candle info if setup is REJECTION)
-              this.armResolutionGate(
-                exec,
-                exec.bias,
-                exec.pullbackHigh,
-                exec.pullbackLow,
-                atr,
-                ts
-              );
-              console.log(
-                `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} setup=${exec.setup} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)} expiry=${new Date(exec.resolutionGate?.expiryTs ?? 0).toISOString()}`
-              );
-            } else {
-              console.log(
-                `[GATE_NOT_ARMED] ATR=${atr.toFixed(4)} - ATR too low, cannot arm gate`
-              );
-            }
-          } else {
-            // Log why gate wasn't armed
-            const reasons: string[] = [];
-            if (exec.expectedResolution !== "CONTINUATION") reasons.push(`expectedResolution=${exec.expectedResolution}`);
-            if (exec.pullbackHigh === undefined) reasons.push("pullbackHigh=undefined");
-            if (exec.pullbackLow === undefined) reasons.push("pullbackLow=undefined");
-            if (exec.bias !== "BEARISH" && exec.bias !== "BULLISH") reasons.push(`bias=${exec.bias}`);
-            console.log(
-              `[GATE_NOT_ARMED] Conditions not met: ${reasons.join(", ")}`
-            );
-          }
-          
-          shouldPublishEvent = true; // Phase change - publish event
-          console.log(
-            `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} entry_status=inactive`
+            `[A+_ENTRY] ${exec.bias} entry at ${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
           );
         }
       }
-      } // Close: if (!this.llmCircuitBreaker.isOpen)
-    } // Close: if (this.llmService && is5mClose && closed5mBars.length > 0)
+      
+      // Emit NO_TRADE diagnostic if applicable
+      if (reducerResult.noTradeReason) {
+        console.log(
+          `[NO_TRADE] price=${close.toFixed(2)} bias=${exec.bias} phase=${exec.phase} expected=${exec.expectedResolution ?? "n/a"} gate=${exec.resolutionGate?.status ?? "n/a"} reason=${reducerResult.noTradeReason}`
+        );
+      }
+    }
 
     // Monitor continuation progress and detect momentum pause (runs regardless of LLM)
     if (exec.phase === "CONTINUATION_IN_PROGRESS" && exec.bias !== "NEUTRAL") {
