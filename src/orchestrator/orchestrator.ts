@@ -53,6 +53,8 @@ export class Orchestrator {
   private readonly minimalLlmBars: number;
   private lastDiagnosticPrice: number | null = null; // Track price for diagnostic emission
   private lastProcessedTs: number | null = null; // Track last processed timestamp for out-of-order detection
+  private lastHeartbeatTs: number | null = null; // Track last heartbeat emission timestamp
+  private lastMessageTs: number | null = null; // Track last message emission timestamp (for silent mode detection)
   private llmCircuitBreaker: {
     failures: number;
     lastFailureTs: number | null;
@@ -2303,14 +2305,15 @@ export class Orchestrator {
       consistencyErrors.push(`INVALID: entryStatus=active but setup=NONE`);
     }
     
+    // Always log consistency check (not just on errors) - this is the "observability contract"
+    const consistencyLog = consistencyErrors.length > 0
+      ? `[CONSISTENCY_CHECK] ERROR: ${consistencyErrors.join(" | ")} | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
+      : `[CONSISTENCY_CHECK] OK | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`;
+    
     if (consistencyErrors.length > 0) {
-      console.error(
-        `[CONSISTENCY_CHECK] ERROR: ${consistencyErrors.join(" | ")} | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
-      );
+      console.error(consistencyLog);
     } else {
-      console.log(
-        `[CONSISTENCY_CHECK] OK | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
-      );
+      console.log(consistencyLog);
     }
 
     // ============================================================================
@@ -2330,6 +2333,22 @@ export class Orchestrator {
       } else if (exec.resolutionGate?.status === "ARMED") {
         noTradeReason = `price_didnt_cross_trigger (price=${close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)})`;
       }
+    }
+
+    // Determine if we should emit heartbeat (while blocked, every 5 minutes)
+    const heartbeatInterval = 5 * 60 * 1000; // 5 minutes
+    const shouldEmitHeartbeat = 
+      exec.phase !== "IN_TRADE" && 
+      exec.bias !== "NEUTRAL" && 
+      (this.lastHeartbeatTs === null || (ts - this.lastHeartbeatTs) >= heartbeatInterval) &&
+      (exec.setup === "NONE" || exec.entryBlocked || noTradeReason !== undefined);
+    
+    if (shouldEmitHeartbeat) {
+      shouldPublishEvent = true; // Force event emission for heartbeat
+      this.lastHeartbeatTs = ts;
+      console.log(
+        `[HEARTBEAT] Blocked state - bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} reason=${noTradeReason ?? "waiting"}`
+      );
     }
 
     return { shouldPublishEvent, noTradeReason };
@@ -3180,8 +3199,13 @@ export class Orchestrator {
         }
       }
 
-      // Publish event if state changed or important event occurred
-      if (shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias) {
+      // Publish event if state changed, important event occurred, or heartbeat needed
+      // CRITICAL: This ensures blocked states still emit messages (heartbeat mechanism)
+      const shouldEmit = shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias;
+      
+      if (shouldEmit) {
+        // Track last message timestamp for silent mode detection
+        this.lastMessageTs = ts;
         if (!debugInfo) {
           const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
             ts: forming5mBar.endTs,
@@ -3303,6 +3327,59 @@ export class Orchestrator {
             debug: debugInfo,
           },
         });
+      } else {
+        // Silent mode detection: if no message in 10 minutes while ACTIVE, emit heartbeat
+        const silentModeThreshold = 10 * 60 * 1000; // 10 minutes
+        const isBlocked = exec.phase !== "IN_TRADE" && exec.bias !== "NEUTRAL" && (exec.setup === "NONE" || exec.entryBlocked);
+        
+        if (isBlocked && this.lastMessageTs !== null && (ts - this.lastMessageTs) >= silentModeThreshold) {
+          // Force heartbeat emission
+          this.lastMessageTs = ts;
+          this.lastHeartbeatTs = ts;
+          
+          const atr = this.calculateATR(closed5mBars);
+          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars);
+          
+          // Build minimal heartbeat message
+          const mindState = {
+            mindId: randomUUID(),
+            direction: exec.thesisDirection ?? "none",
+            confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
+            reason: this.getPhaseAwareReason(exec.bias, exec.phase, exec.waitReason),
+            bias: exec.bias,
+            phase: exec.phase,
+            entryStatus: exec.entryBlocked ? "blocked" as const : "inactive" as const,
+            expectedResolution: exec.expectedResolution ?? undefined,
+            setup: exec.setup ?? undefined,
+            price: close,
+            noTradeDiagnostic: diagnostic ?? undefined,
+          };
+          
+          events.push({
+            type: "MIND_STATE_UPDATED",
+            timestamp: ts,
+            instanceId: this.instanceId,
+            data: {
+              timestamp: ts,
+              symbol,
+              price: close,
+              mindState,
+              thesis: {
+                direction: exec.thesisDirection ?? null,
+                confidence: exec.thesisConfidence ?? null,
+                price: exec.thesisPrice ?? null,
+                ts: exec.thesisTs ?? null,
+              },
+              candidate: exec.activeCandidate ?? null,
+              botState: exec.phase,
+              waitFor: exec.waitReason ?? null,
+            },
+          });
+          
+          console.log(
+            `[SILENT_MODE_HEARTBEAT] No message in ${Math.round((ts - (this.lastMessageTs - silentModeThreshold)) / 60000)}min - emitting heartbeat | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} reason=${diagnostic?.reasonCode ?? "waiting"}`
+          );
+        }
       }
 
     return events;
