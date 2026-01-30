@@ -312,16 +312,36 @@ export class Orchestrator {
     let stopPrice: number;
     let reason: string;
 
-    if (bias === "BEARISH") {
-      // Bearish: trigger on break below pullback low
-      triggerPrice = pullbackLow - 0.1 * atr;
-      stopPrice = pullbackHigh + 0.1 * atr;
-      reason = "Bearish pullback continuation trigger armed";
+    // For REJECTION setup, align trigger with rejection candle
+    if (exec.setup === "REJECTION" && exec.rejectionCandleLow !== undefined) {
+      if (bias === "BEARISH") {
+        // Bearish REJECTION: trigger is min(rejectionCandle.low, pullbackLow)
+        // This ensures entry triggers at rejection break, not after extended move
+        triggerPrice = Math.min(exec.rejectionCandleLow, pullbackLow);
+        stopPrice = exec.rejectionCandleHigh ?? (pullbackHigh + 0.1 * atr);
+        reason = "Bearish rejection setup - trigger at rejection break";
+      } else {
+        // Bullish REJECTION: trigger is max(rejectionCandle.high, pullbackHigh)
+        // This ensures entry triggers at rejection break, not after extended move
+        triggerPrice = exec.rejectionCandleHigh !== undefined
+          ? Math.max(exec.rejectionCandleHigh, pullbackHigh)
+          : pullbackHigh;
+        stopPrice = exec.rejectionCandleLow ?? (pullbackLow - 0.1 * atr);
+        reason = "Bullish rejection setup - trigger at rejection break";
+      }
     } else {
-      // Bullish: trigger on break above pullback high
-      triggerPrice = pullbackHigh + 0.1 * atr;
-      stopPrice = pullbackLow - 0.1 * atr;
-      reason = "Bullish pullback continuation trigger armed";
+      // Non-REJECTION setup: use standard logic
+      if (bias === "BEARISH") {
+        // Bearish: trigger on break below pullback low
+        triggerPrice = pullbackLow - 0.1 * atr;
+        stopPrice = pullbackHigh + 0.1 * atr;
+        reason = "Bearish pullback continuation trigger armed";
+      } else {
+        // Bullish: trigger on break above pullback high
+        triggerPrice = pullbackHigh + 0.1 * atr;
+        stopPrice = pullbackLow - 0.1 * atr;
+        reason = "Bullish pullback continuation trigger armed";
+      }
     }
 
     exec.resolutionGate = {
@@ -336,21 +356,49 @@ export class Orchestrator {
   }
 
   // Check if gate should be triggered (ARMED → TRIGGERED)
+  // For REJECTION setups, adds tolerance band to account for market noise
   private checkGateTrigger(
     gate: ResolutionGate,
     currentPrice: number,
     nowTs: number,
+    setup?: SetupType,
+    current5m?: { open: number; high: number; low: number; close: number },
+    bias?: MarketBias,
     maxVolThreshold: number = 2.0 // Simplified - would use actual volatility
   ): boolean {
     if (gate.status !== "ARMED") return false;
     if (nowTs > gate.expiryTs) return false;
 
-    // Check price trigger
+    // Tolerance band for REJECTION setups (default 0.05-0.10 for SPY)
+    const rejectionTolerance = 0.08; // Configurable tolerance for REJECTION setups
+    
+    // Check price trigger with tolerance for REJECTION setups
     let priceTriggered = false;
-    if (gate.direction === "short") {
-      priceTriggered = currentPrice <= gate.triggerPrice;
+    if (setup === "REJECTION") {
+      // REJECTION setup: allow tolerance band
+      if (gate.direction === "short") {
+        priceTriggered = currentPrice <= gate.triggerPrice + rejectionTolerance;
+      } else {
+        priceTriggered = currentPrice >= gate.triggerPrice - rejectionTolerance;
+      }
+      
+      // Additional momentum confirmation for REJECTION tolerance
+      if (priceTriggered && current5m && bias) {
+        const open = current5m.open ?? current5m.close;
+        const momentumAligned = (bias === "BEARISH" && current5m.close < open) ||
+                                (bias === "BULLISH" && current5m.close > open);
+        if (!momentumAligned) {
+          // Price is within tolerance but momentum not aligned - don't trigger
+          return false;
+        }
+      }
     } else {
-      priceTriggered = currentPrice >= gate.triggerPrice;
+      // Non-REJECTION setup: exact trigger only
+      if (gate.direction === "short") {
+        priceTriggered = currentPrice <= gate.triggerPrice;
+      } else {
+        priceTriggered = currentPrice >= gate.triggerPrice;
+      }
     }
 
     // Simplified volatility check (would use actual volatility calculation)
@@ -438,7 +486,7 @@ export class Orchestrator {
     previous5m: { open: number; high: number; low: number; close: number } | undefined,
     closed5mBars: Array<{ high: number; low: number; close: number }>,
     atr: number
-  ): { setup: SetupType; triggerPrice?: number; stopPrice?: number } {
+  ): { setup: SetupType; triggerPrice?: number; stopPrice?: number; rejectionCandleLow?: number; rejectionCandleHigh?: number } {
     const bias = exec.bias;
     const phase = exec.phase;
     const expectedResolution = exec.expectedResolution;
@@ -450,15 +498,55 @@ export class Orchestrator {
     
     // 1. REJECTION_SETUP (Primary Trend Continuation)
     // Allowed when: Phase = PULLBACK_IN_PROGRESS, ExpectedResolution = CONTINUATION
+    // REJECTION is PERSISTENT - once detected, it persists until resolved or invalidated
     if (phase === "PULLBACK_IN_PROGRESS" && expectedResolution === "CONTINUATION") {
-      const rejectionSetup = this.detectRejectionSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, atr);
-      if (rejectionSetup.detected) {
-        return {
-          setup: "REJECTION",
-          triggerPrice: rejectionSetup.triggerPrice,
-          stopPrice: rejectionSetup.stopPrice,
-        };
-      }
+      // If setup is already REJECTION, check for invalidation but don't re-detect
+      if (exec.setup === "REJECTION") {
+        // Check for invalidation: price breaks pullbackHigh (structure broken)
+        const invalidated = (bias === "BEARISH" && exec.pullbackHigh !== undefined && current5m.close > exec.pullbackHigh) ||
+                           (bias === "BULLISH" && exec.pullbackLow !== undefined && current5m.close < exec.pullbackLow);
+        
+        // Check for max bars elapsed (e.g., 5 bars = ~5 minutes)
+        const maxBarsElapsed = 5;
+        const barsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
+        
+        if (invalidated) {
+          // Structure broken - clear REJECTION setup
+          console.log(
+            `[REJECTION_INVALIDATED] Price broke structure - bias=${bias} price=${current5m.close.toFixed(2)} pullbackHigh=${exec.pullbackHigh?.toFixed(2) ?? "n/a"} pullbackLow=${exec.pullbackLow?.toFixed(2) ?? "n/a"}`
+          );
+          // Note: rejection candle info will be cleared in setup update logic
+          return { setup: "NONE" };
+        } else if (barsElapsed > maxBarsElapsed) {
+          // Too much time elapsed - clear REJECTION setup
+          console.log(
+            `[REJECTION_EXPIRED] Max bars elapsed (${barsElapsed} > ${maxBarsElapsed}) - clearing REJECTION setup`
+          );
+          // Note: rejection candle info will be cleared in setup update logic
+          return { setup: "NONE" };
+        } else {
+          // REJECTION persists - return existing setup with current trigger/stop and rejection candle info
+          return {
+            setup: "REJECTION",
+            triggerPrice: exec.setupTriggerPrice,
+            stopPrice: exec.setupStopPrice,
+            rejectionCandleLow: exec.rejectionCandleLow,
+            rejectionCandleHigh: exec.rejectionCandleHigh,
+          };
+        }
+        } else {
+          // Not REJECTION yet - detect it
+          const rejectionSetup = this.detectRejectionSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, atr);
+          if (rejectionSetup.detected) {
+            return {
+              setup: "REJECTION",
+              triggerPrice: rejectionSetup.triggerPrice,
+              stopPrice: rejectionSetup.stopPrice,
+              rejectionCandleLow: rejectionSetup.rejectionCandleLow,
+              rejectionCandleHigh: rejectionSetup.rejectionCandleHigh,
+            };
+          }
+        }
     }
     
     // 2. BREAKDOWN_SETUP (Structure Failure)
@@ -525,7 +613,7 @@ export class Orchestrator {
     pullbackHigh: number | undefined,
     pullbackLow: number | undefined,
     atr: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number } {
+  ): { detected: boolean; triggerPrice?: number; stopPrice?: number; rejectionCandleLow?: number; rejectionCandleHigh?: number } {
     if (!previous5m) return { detected: false };
     
     const open = current5m.open ?? current5m.close;
@@ -541,10 +629,17 @@ export class Orchestrator {
       
       if (rejectionCandle && lowerHigh && pullbackHigh !== undefined) {
         // Entry trigger: break of rejection candle low
+        // For REJECTION setup, trigger is min(rejectionCandle.low, pullbackLow)
+        const triggerPrice = pullbackLow !== undefined 
+          ? Math.min(current5m.low, pullbackLow)
+          : current5m.low;
+        
         return {
           detected: true,
-          triggerPrice: current5m.low,
+          triggerPrice,
           stopPrice: current5m.high, // Stop above rejection high
+          rejectionCandleLow: current5m.low,
+          rejectionCandleHigh: current5m.high,
         };
       }
     } else if (bias === "BULLISH") {
@@ -554,10 +649,17 @@ export class Orchestrator {
       
       if (rejectionCandle && higherLow && pullbackLow !== undefined) {
         // Entry trigger: break of rejection candle high
+        // For REJECTION setup, trigger is max(rejectionCandle.high, pullbackHigh)
+        const triggerPrice = pullbackHigh !== undefined
+          ? Math.max(current5m.high, pullbackHigh)
+          : current5m.high;
+        
         return {
           detected: true,
-          triggerPrice: current5m.high,
+          triggerPrice,
           stopPrice: current5m.low, // Stop below rejection low
+          rejectionCandleLow: current5m.low,
+          rejectionCandleHigh: current5m.high,
         };
       }
     }
@@ -1685,12 +1787,14 @@ export class Orchestrator {
           exec.targets = undefined;
           
           // Arm resolution gate if conditions are met
+          // For REJECTION setup, gate should be armed/updated when setup is detected
           if (exec.expectedResolution === "CONTINUATION" && 
               exec.pullbackHigh !== undefined && 
               exec.pullbackLow !== undefined &&
               (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
             const atr = this.calculateATR(closed5mBars);
             if (atr > 0) {
+              // Arm or re-arm gate (will use rejection candle info if setup is REJECTION)
               this.armResolutionGate(
                 exec,
                 exec.bias,
@@ -1699,7 +1803,9 @@ export class Orchestrator {
                 atr,
                 ts
               );
-              // Logging is done inside armResolutionGate
+              console.log(
+                `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} setup=${exec.setup} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)} expiry=${new Date(exec.resolutionGate?.expiryTs ?? 0).toISOString()}`
+              );
             } else {
               console.log(
                 `[GATE_NOT_ARMED] ATR=${atr.toFixed(4)} - ATR too low, cannot arm gate`
@@ -1851,12 +1957,42 @@ export class Orchestrator {
           }
           
           // Check for gate trigger (ARMED → TRIGGERED)
-          if (this.checkGateTrigger(exec.resolutionGate, current5m.close, ts)) {
+          // Pass setup, current5m, and bias for REJECTION tolerance logic
+          const triggered = this.checkGateTrigger(
+            exec.resolutionGate, 
+            current5m.close, 
+            ts, 
+            exec.setup, 
+            current5m, 
+            exec.bias
+          );
+          
+          if (triggered) {
             exec.resolutionGate.status = "TRIGGERED";
             console.log(
-              `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} - Entry permission granted`
+              `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} setup=${exec.setup} - Entry permission granted`
             );
             // Entry will be handled by normal entry logic below
+          } else if (exec.setup === "REJECTION") {
+            // Diagnostic: Check for near-miss cases (within tolerance but didn't trigger)
+            const rejectionTolerance = 0.08;
+            const distanceToTrigger = exec.resolutionGate.direction === "short"
+              ? current5m.close - exec.resolutionGate.triggerPrice
+              : exec.resolutionGate.triggerPrice - current5m.close;
+            
+            if (distanceToTrigger > 0 && distanceToTrigger <= rejectionTolerance * 2) {
+              // Within 2x tolerance - potential near-miss
+              const open = current5m.open ?? current5m.close;
+              const momentumAligned = (exec.bias === "BEARISH" && current5m.close < open) ||
+                                      (exec.bias === "BULLISH" && current5m.close > open);
+              const reason = !momentumAligned 
+                ? "momentum not confirmed" 
+                : "tolerance not met";
+              
+              console.log(
+                `[MISSED_ENTRY] setup=REJECTION bias=${exec.bias} triggerPrice=${exec.resolutionGate.triggerPrice.toFixed(2)} lowestPriceSeen=${current5m.low.toFixed(2)} distance=${distanceToTrigger.toFixed(2)} reason="${reason}"`
+              );
+            }
           }
           // Check for gate expiry (ARMED → EXPIRED)
           else if (this.checkGateExpiry(exec.resolutionGate, current5m.close, ts, atr)) {
@@ -1937,9 +2073,46 @@ export class Orchestrator {
         
         if (oldSetup !== setupResult.setup) {
           exec.setupDetectedAt = ts;
+          
+          // Store rejection candle info when REJECTION is first detected
+          if (setupResult.setup === "REJECTION") {
+            // Rejection candle info is already in setupResult
+            exec.rejectionCandleLow = setupResult.rejectionCandleLow;
+            exec.rejectionCandleHigh = setupResult.rejectionCandleHigh;
+            exec.rejectionBarsElapsed = 0; // Reset counter
+            
+            // Re-arm gate with REJECTION-specific trigger when REJECTION is first detected
+            if (exec.expectedResolution === "CONTINUATION" && 
+                exec.pullbackHigh !== undefined && 
+                exec.pullbackLow !== undefined) {
+              const atrForGate = this.calculateATR(closed5mBars);
+              if (atrForGate > 0) {
+                this.armResolutionGate(
+                  exec,
+                  exec.bias,
+                  exec.pullbackHigh,
+                  exec.pullbackLow,
+                  atrForGate,
+                  ts
+                );
+                console.log(
+                  `[GATE_REARMED] REJECTION setup detected - trigger updated to ${exec.resolutionGate?.triggerPrice.toFixed(2)} (min of rejectionCandle.low=${exec.rejectionCandleLow?.toFixed(2)} and pullbackLow=${exec.pullbackLow.toFixed(2)})`
+                );
+              }
+            }
+          } else {
+            // Clear rejection candle info when setup changes away from REJECTION
+            exec.rejectionCandleLow = undefined;
+            exec.rejectionCandleHigh = undefined;
+            exec.rejectionBarsElapsed = undefined;
+          }
+          
           console.log(
-            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"}`
+            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"}${setupResult.setup === "REJECTION" ? ` rejectionCandle=${exec.rejectionCandleLow?.toFixed(2) ?? "n/a"}-${exec.rejectionCandleHigh?.toFixed(2) ?? "n/a"}` : ""}`
           );
+        } else if (exec.setup === "REJECTION") {
+          // REJECTION persists - increment bars elapsed counter
+          exec.rejectionBarsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
         }
       }
       

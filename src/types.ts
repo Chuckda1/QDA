@@ -187,6 +187,10 @@ export type MinimalExecutionState = {
   setupDetectedAt?: number; // Timestamp when setup was detected
   setupTriggerPrice?: number; // Price level that triggers entry for this setup
   setupStopPrice?: number; // Stop price for this setup
+  // REJECTION setup persistence tracking
+  rejectionCandleLow?: number; // Low of the rejection candle (for REJECTION setups)
+  rejectionCandleHigh?: number; // High of the rejection candle (for REJECTION setups)
+  rejectionBarsElapsed?: number; // Number of 1m bars since rejection detected (for persistence)
   
   // Entry tracking
   entryType?: EntryType;
