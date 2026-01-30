@@ -2904,7 +2904,7 @@ export class Orchestrator {
             console.log(
               `[ENTRY_BLOCKED_BY_GATE] ${exec.resolutionGate.direction.toUpperCase()} gate=${exec.resolutionGate.status} price=${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} distance=${priceVsTrigger.toFixed(2)} - Waiting for gate trigger`
             );
-            return events;
+            // Don't return early - continue to event publishing below
           } else if (gateAllowsEntry && exec.resolutionGate?.status === "TRIGGERED") {
             console.log(
               `[ENTRY_PERMITTED] Gate TRIGGERED, entry logic proceeding`
@@ -3304,7 +3304,6 @@ export class Orchestrator {
           },
         });
       }
-    }
 
     return events;
   }
