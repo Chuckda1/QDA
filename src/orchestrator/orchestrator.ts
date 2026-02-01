@@ -621,7 +621,7 @@ export class Orchestrator {
     // Preconditions: must be in tradable state
     if (exec.bias === "NEUTRAL") return null;
     if (exec.phase !== "BIAS_ESTABLISHED" && exec.phase !== "PULLBACK_IN_PROGRESS") return null;
-    if (exec.phase === "IN_TRADE") return null;
+    // Note: IN_TRADE is already excluded by the above check
     if (atr <= 0) return null;
 
     const side: OpportunitySide = exec.bias === "BULLISH" ? "LONG" : "SHORT";
