@@ -1091,7 +1091,32 @@ export class Orchestrator {
       }
     }
     
-    // 6. NONE (Explicit No-Trade State)
+    // 6. PULLBACK_GENERIC (Fallback: generic pullback continuation)
+    // FIX #3: This ensures we always have a setup when bias is strong and pullback is happening
+    // This is the "old bot" behavior: pullback + signal = entry
+    // Allowed when: phase = BIAS_ESTABLISHED or PULLBACK_IN_PROGRESS (bias is already != NEUTRAL at this point)
+    if (phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS") {
+      if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+        // Simple generic pullback setup
+        if (bias === "BEARISH") {
+          // Bearish: trigger on break below pullback low
+          return {
+            setup: "PULLBACK_GENERIC",
+            triggerPrice: exec.pullbackLow - 0.1 * atr,
+            stopPrice: exec.pullbackHigh + 0.1 * atr,
+          };
+        } else {
+          // Bullish: trigger on break above pullback high
+          return {
+            setup: "PULLBACK_GENERIC",
+            triggerPrice: exec.pullbackHigh + 0.1 * atr,
+            stopPrice: exec.pullbackLow - 0.1 * atr,
+          };
+        }
+      }
+    }
+    
+    // 7. NONE (Explicit No-Trade State)
     return { setup: "NONE" };
   }
   
@@ -3263,20 +3288,38 @@ export class Orchestrator {
             );
           }
           
-          // If opportunity is TRIGGERED, proceed with entry logic
-          if (exec.opportunity && exec.opportunity.status === "TRIGGERED") {
-            // Entry signal detection (same as before, but now gated by opportunity)
-            const open = current5m.open ?? current5m.close;
-            const isBearish = current5m.close < open;
-            const isBullish = current5m.close > open;
-            
-            let lowerLow = false;
-            let higherHigh = false;
-            if (previous5m) {
-              lowerLow = current5m.low < previous5m.low;
-              higherHigh = current5m.high > previous5m.high;
-            }
+          // ============================================================================
+          // FIX #1: Collapse "Gate TRIGGERED" into "Entry Signal"
+          // ============================================================================
+          // New rule: setup != NONE + entrySignal == true => entry allowed
+          // Gate is now just a time-box + pricing guide, not a hard blocker
+          // ============================================================================
+          
+          // Entry signal detection
+          const open = current5m.open ?? current5m.close;
+          const isBearish = current5m.close < open;
+          const isBullish = current5m.close > open;
+          
+          let lowerLow = false;
+          let higherHigh = false;
+          if (previous5m) {
+            lowerLow = current5m.low < previous5m.low;
+            higherHigh = current5m.high > previous5m.high;
+          }
 
+          // Check if entry signal fires
+          const entrySignalFires = 
+            (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) ||
+            (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh)));
+
+          // FIX #1: Allow entry if setup exists and signal fires, even if opportunity is only LATCHED
+          // (Previously required TRIGGERED, which was too strict)
+          const canEnter = 
+            (exec.setup && exec.setup !== "NONE") && // Setup must exist
+            entrySignalFires && // Entry signal must fire
+            (exec.opportunity?.status === "LATCHED" || exec.opportunity?.status === "TRIGGERED" || !exec.opportunity); // Opportunity can be LATCHED, TRIGGERED, or not exist
+
+          if (canEnter) {
             // Enter ON pullback for BULLISH bias
             if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
               // Check no-chase rules (final check before entry)
@@ -3311,7 +3354,7 @@ export class Orchestrator {
                 exec.pullbackHigh = current5m.high;
                 exec.pullbackLow = current5m.low;
                 exec.pullbackTs = ts;
-                exec.stopPrice = exec.opportunity.stop.price; // Use opportunity stop
+                exec.stopPrice = exec.opportunity?.stop.price ?? current5m.low; // Use opportunity stop or fallback
                 const atrLong = this.calculateATR(closed5mBars);
                 const closedBarsWithVolumeLong = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
                 const vwapLong = closedBarsWithVolumeLong.length > 0 ? this.calculateVWAP(closedBarsWithVolumeLong) : undefined;
@@ -3332,7 +3375,9 @@ export class Orchestrator {
                 exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
-                exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                if (exec.opportunity) {
+                  exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                }
                 shouldPublishEvent = true;
                 console.log(
                   `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
@@ -3374,7 +3419,7 @@ export class Orchestrator {
                 exec.pullbackHigh = current5m.high;
                 exec.pullbackLow = current5m.low;
                 exec.pullbackTs = ts;
-                exec.stopPrice = exec.opportunity.stop.price; // Use opportunity stop
+                exec.stopPrice = exec.opportunity?.stop.price ?? current5m.high; // Use opportunity stop or fallback
                 const atrShort = this.calculateATR(closed5mBars);
                 const closedBarsWithVolumeShort = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
                 const vwapShort = closedBarsWithVolumeShort.length > 0 ? this.calculateVWAP(closedBarsWithVolumeShort) : undefined;
@@ -3395,13 +3440,30 @@ export class Orchestrator {
                 exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
-                exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                if (exec.opportunity) {
+                  exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                }
                 shouldPublishEvent = true;
                 console.log(
                   `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
                 );
               }
             }
+          } else if (exec.setup && exec.setup !== "NONE" && !entrySignalFires) {
+            // Setup exists but entry signal hasn't fired yet
+            exec.waitReason = "waiting_for_entry_signal";
+            exec.entryBlocked = false; // Not blocked, just waiting
+            console.log(
+              `[ENTRY_WAITING] Setup=${exec.setup} exists but entry signal not yet fired - BIAS=${exec.bias}`
+            );
+          } else if (!exec.setup || exec.setup === "NONE") {
+            // No setup detected (should be rare with PULLBACK_GENERIC fallback)
+            exec.waitReason = "no_setup_detected";
+            exec.entryBlocked = true;
+            exec.entryBlockReason = "No tradable setup detected - structure incomplete";
+            console.log(
+              `[ENTRY_BLOCKED] No setup detected - BIAS=${exec.bias} PHASE=${exec.phase}`
+            );
           }
         }
       }

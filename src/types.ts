@@ -159,6 +159,7 @@ export type SetupType =
   | "COMPRESSION_BREAK"  // Volatility contraction → expansion
   | "FAILED_BOUNCE"      // Counter-trend failure → reversal
   | "TREND_REENTRY"      // Post-expansion continuation entry
+  | "PULLBACK_GENERIC"   // Fallback: generic pullback continuation (bias + pullback + signal)
   | "NONE";              // Explicitly no setup
 
 // Resolution Gate - permission system for entries
