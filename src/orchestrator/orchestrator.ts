@@ -17,6 +17,10 @@ import type {
   MinimalSetupCandidate,
   NoTradeDiagnostic,
   NoTradeReasonCode,
+  OpportunityLatch,
+  OpportunitySide,
+  OpportunityStatus,
+  OpportunityTriggerType,
   RawBar,
   ResolutionGate,
   SetupType,
@@ -593,6 +597,266 @@ export class Orchestrator {
     if (exec.resolutionGate && exec.resolutionGate.status !== "TRIGGERED") {
       exec.resolutionGate.status = "INACTIVE";
     }
+  }
+
+  // ============================================================================
+  // OPPORTUNITYLATCH: Single execution intent state that composes all gates
+  // ============================================================================
+  // This replaces the "separated gate mess" by becoming the single execution gate.
+  // Phase = story, Setup = pattern label, OpportunityLatch = "I'm ready to shoot" state
+  // ============================================================================
+
+  // Create (latch) an opportunity when we're in a tradable pullback window
+  // This happens BEFORE the perfect candle prints - we latch during the pull-up
+  private latchOpportunity(
+    exec: MinimalExecutionState,
+    ts: number,
+    currentPrice: number,
+    pullbackHigh: number | undefined,
+    pullbackLow: number | undefined,
+    atr: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    forming5mBar: Forming5mBar | null
+  ): OpportunityLatch | null {
+    // Preconditions: must be in tradable state
+    if (exec.bias === "NEUTRAL") return null;
+    if (exec.phase !== "BIAS_ESTABLISHED" && exec.phase !== "PULLBACK_IN_PROGRESS") return null;
+    if (exec.phase === "IN_TRADE") return null;
+    if (atr <= 0) return null;
+
+    const side: OpportunitySide = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+    const current5m = forming5mBar ?? (closed5mBars.length > 0 ? closed5mBars[closed5mBars.length - 1] : null);
+    if (!current5m) return null;
+
+    // Determine pullback zone based on bias and available levels
+    let zoneLow: number;
+    let zoneHigh: number;
+    let triggerPrice: number;
+    let triggerType: OpportunityTriggerType;
+    let stopPrice: number;
+    let stopReason: string;
+    let notes: string;
+
+    if (exec.bias === "BEARISH") {
+      // BEARISH: We want to short on pullback into resistance
+      // Zone: price should be within 0.15-0.50 ATR below resistance
+      const resistance = pullbackHigh ?? current5m.high;
+      const zoneBuffer = 0.15 * atr; // Minimum distance from resistance
+      const zoneMaxDistance = 0.50 * atr; // Maximum distance from resistance
+      
+      zoneHigh = resistance;
+      zoneLow = resistance - zoneMaxDistance;
+      
+      // Trigger: rollover candle (bearish close) or break of prior low
+      // Use setup trigger if available, otherwise use pullback low
+      triggerPrice = exec.setupTriggerPrice ?? (pullbackLow ?? (resistance - 0.3 * atr));
+      triggerType = exec.setup === "REJECTION" || exec.setup === "EARLY_REJECTION" ? "ROLLOVER" : "BREAK";
+      
+      // Stop: above pullback high or rejection candle high
+      stopPrice = exec.setupStopPrice ?? (pullbackHigh ?? resistance) + 0.1 * atr;
+      stopReason = exec.setup === "REJECTION" ? "rejection candle high + buffer" : "pullback high + buffer";
+      
+      notes = `Bearish pullback into resistance ${resistance.toFixed(2)}`;
+      
+      // Check if price is actually in the pullback zone
+      if (currentPrice > zoneHigh || currentPrice < zoneLow) {
+        return null; // Not in pullback zone yet
+      }
+    } else {
+      // BULLISH: We want to long on pullback into support
+      // Zone: price should be within 0.15-0.50 ATR above support
+      const support = pullbackLow ?? current5m.low;
+      const zoneBuffer = 0.15 * atr;
+      const zoneMaxDistance = 0.50 * atr;
+      
+      zoneLow = support;
+      zoneHigh = support + zoneMaxDistance;
+      
+      // Trigger: rollover candle (bullish close) or break of prior high
+      triggerPrice = exec.setupTriggerPrice ?? (pullbackHigh ?? (support + 0.3 * atr));
+      triggerType = exec.setup === "REJECTION" || exec.setup === "EARLY_REJECTION" ? "ROLLOVER" : "BREAK";
+      
+      // Stop: below pullback low or rejection candle low
+      stopPrice = exec.setupStopPrice ?? (pullbackLow ?? support) - 0.1 * atr;
+      stopReason = exec.setup === "REJECTION" ? "rejection candle low + buffer" : "pullback low + buffer";
+      
+      notes = `Bullish pullback into support ${support.toFixed(2)}`;
+      
+      // Check if price is actually in the pullback zone
+      if (currentPrice < zoneLow || currentPrice > zoneHigh) {
+        return null; // Not in pullback zone yet
+      }
+    }
+
+    // TTL: 2 closed 5m bars = 10 minutes
+    const ttlMs = 2 * 5 * 60 * 1000;
+    const expiresAtTs = ts + ttlMs;
+
+    const opportunity: OpportunityLatch = {
+      status: "LATCHED",
+      side,
+      biasAtLatch: exec.bias,
+      phaseAtLatch: exec.phase,
+      setupAtLatch: exec.setup,
+      latchedAtTs: ts,
+      expiresAtTs,
+      zone: { low: zoneLow, high: zoneHigh },
+      trigger: {
+        type: triggerType,
+        price: triggerPrice,
+        description: triggerType === "ROLLOVER" ? "rollover candle" : "break of prior structure",
+      },
+      stop: {
+        price: stopPrice,
+        reason: stopReason,
+      },
+      attempts: 0,
+      bestPriceSeen: currentPrice,
+      notes,
+    };
+
+    console.log(
+      `[OPPORTUNITY_LATCHED] ${side} bias=${exec.bias} phase=${exec.phase} setup=${exec.setup ?? "NONE"} zone=[${zoneLow.toFixed(2)}, ${zoneHigh.toFixed(2)}] trigger=${triggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} expires=${new Date(expiresAtTs).toISOString()}`
+    );
+
+    return opportunity;
+  }
+
+  // Check if opportunity should be invalidated (structural checks)
+  private shouldInvalidateOpportunity(
+    opportunity: OpportunityLatch,
+    exec: MinimalExecutionState,
+    currentPrice: number,
+    ts: number,
+    atr: number
+  ): { invalidated: boolean; reason?: string } {
+    if (opportunity.status !== "LATCHED") {
+      return { invalidated: false };
+    }
+
+    // 1. Time expiry
+    if (ts >= opportunity.expiresAtTs) {
+      return { invalidated: true, reason: "time_expired" };
+    }
+
+    // 2. Bias invalidated
+    if (exec.bias !== opportunity.biasAtLatch) {
+      const shouldFlip = this.shouldFlipBias(
+        opportunity.biasAtLatch,
+        exec.bias,
+        exec.biasInvalidationLevel,
+        currentPrice
+      );
+      if (shouldFlip) {
+        return { invalidated: true, reason: "bias_invalidated" };
+      }
+    }
+
+    // 3. Stop level broken
+    if (opportunity.side === "SHORT") {
+      if (currentPrice >= opportunity.stop.price) {
+        return { invalidated: true, reason: "stop_broken" };
+      }
+    } else {
+      if (currentPrice <= opportunity.stop.price) {
+        return { invalidated: true, reason: "stop_broken" };
+      }
+    }
+
+    // 4. Zone exited (price closes outside zone + buffer)
+    const zoneBuffer = 0.1 * atr;
+    if (currentPrice < opportunity.zone.low - zoneBuffer || currentPrice > opportunity.zone.high + zoneBuffer) {
+      return { invalidated: true, reason: "zone_exited" };
+    }
+
+    return { invalidated: false };
+  }
+
+  // Check if opportunity trigger is met (becomes TRIGGERED)
+  private checkOpportunityTrigger(
+    opportunity: OpportunityLatch,
+    current5m: { open: number; high: number; low: number; close: number },
+    previous5m: { high: number; low: number; close: number } | undefined,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    atr: number
+  ): { triggered: boolean; reason?: string } {
+    if (opportunity.status !== "LATCHED") {
+      return { triggered: false };
+    }
+
+    const open = current5m.open ?? current5m.close;
+    const isBearish = current5m.close < open;
+    const isBullish = current5m.close > open;
+
+    // Update best price seen (for no-chase logic)
+    if (opportunity.side === "SHORT") {
+      opportunity.bestPriceSeen = Math.max(opportunity.bestPriceSeen ?? current5m.close, current5m.high);
+    } else {
+      opportunity.bestPriceSeen = Math.min(opportunity.bestPriceSeen ?? current5m.close, current5m.low);
+    }
+
+    // Check trigger based on type
+    if (opportunity.trigger.type === "ROLLOVER") {
+      // ROLLOVER: candle closes against bias (bearish for bullish bias, bullish for bearish bias)
+      if (opportunity.side === "SHORT" && isBearish) {
+        // Bearish rollover for short entry
+        // Additional check: close should be below EMA/VWAP if available (optional)
+        return { triggered: true, reason: "rollover_candle" };
+      } else if (opportunity.side === "LONG" && isBullish) {
+        // Bullish rollover for long entry
+        return { triggered: true, reason: "rollover_candle" };
+      }
+    } else if (opportunity.trigger.type === "BREAK") {
+      // BREAK: price breaks prior structure
+      if (previous5m) {
+        if (opportunity.side === "SHORT") {
+          // Break of prior low
+          if (current5m.low < previous5m.low) {
+            return { triggered: true, reason: "break_of_prior_low" };
+          }
+        } else {
+          // Break of prior high
+          if (current5m.high > previous5m.high) {
+            return { triggered: true, reason: "break_of_prior_high" };
+          }
+        }
+      }
+    } else if (opportunity.trigger.type === "RECLAIM_FAIL") {
+      // RECLAIM_FAIL: price tried to reclaim level but failed
+      // This is handled by EARLY_REJECTION setup detection
+      // For now, treat as ROLLOVER
+      if (opportunity.side === "SHORT" && isBearish) {
+        return { triggered: true, reason: "reclaim_failed" };
+      } else if (opportunity.side === "LONG" && isBullish) {
+        return { triggered: true, reason: "reclaim_failed" };
+      }
+    }
+
+    // Check if price crossed trigger price (with tolerance for REJECTION setups)
+    const tolerance = (opportunity.setupAtLatch === "REJECTION" || opportunity.setupAtLatch === "EARLY_REJECTION") ? 0.08 : 0.0;
+    if (opportunity.side === "SHORT") {
+      if (current5m.close <= opportunity.trigger.price + tolerance) {
+        // Price crossed trigger - check momentum alignment
+        if (isBearish) {
+          return { triggered: true, reason: "price_crossed_trigger" };
+        } else {
+          // Price crossed but momentum not aligned - increment attempts
+          opportunity.attempts = (opportunity.attempts ?? 0) + 1;
+          return { triggered: false };
+        }
+      }
+    } else {
+      if (current5m.close >= opportunity.trigger.price - tolerance) {
+        if (isBullish) {
+          return { triggered: true, reason: "price_crossed_trigger" };
+        } else {
+          opportunity.attempts = (opportunity.attempts ?? 0) + 1;
+          return { triggered: false };
+        }
+      }
+    }
+
+    return { triggered: false };
   }
 
   private clearTradeState(exec: MinimalExecutionState): void {
@@ -2252,33 +2516,92 @@ export class Orchestrator {
     }
 
     // ============================================================================
-    // STEP 4: Update gate (disarm if setup is NONE, arm if setup exists)
+    // STEP 4: OpportunityLatch Management (replaces separated gate mess)
     // ============================================================================
+    // This is the single execution gate that composes all permissions
+    // Phase = story, Setup = pattern label, OpportunityLatch = "I'm ready to shoot"
+    // ============================================================================
+    
+    const atr = this.calculateATR(closed5mBars);
+    
+    // First, check if existing opportunity should be invalidated
+    if (exec.opportunity && exec.opportunity.status === "LATCHED") {
+      const invalidationCheck = this.shouldInvalidateOpportunity(
+        exec.opportunity,
+        exec,
+        close,
+        ts,
+        atr
+      );
+      
+      if (invalidationCheck.invalidated) {
+        exec.opportunity.status = "INVALIDATED";
+        console.log(
+          `[OPPORTUNITY_INVALIDATED] ${exec.opportunity.side} reason=${invalidationCheck.reason}`
+        );
+        exec.opportunity = undefined;
+      }
+    }
+    
+    // If no opportunity exists or it was invalidated, try to latch a new one
+    if (!exec.opportunity || exec.opportunity.status !== "LATCHED") {
+      // Latch conditions: bias + phase + pullback zone entry
+      if (exec.bias !== "NEUTRAL" && 
+          (exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS") &&
+          atr > 0) {
+        
+        // Initialize pullback levels if not set (fixes chicken-egg problem)
+        if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
+          if (lastClosed5m) {
+            if (exec.bias === "BEARISH") {
+              exec.pullbackHigh = lastClosed5m.high;
+              exec.pullbackLow = lastClosed5m.low;
+            } else {
+              exec.pullbackHigh = lastClosed5m.high;
+              exec.pullbackLow = lastClosed5m.low;
+            }
+            exec.pullbackTs = ts;
+          }
+        }
+        
+        // Try to latch opportunity
+        const opportunity = this.latchOpportunity(
+          exec,
+          ts,
+          close,
+          exec.pullbackHigh,
+          exec.pullbackLow,
+          atr,
+          closed5mBars,
+          forming5mBar
+        );
+        
+        if (opportunity) {
+          exec.opportunity = opportunity;
+          shouldPublishEvent = true;
+        }
+      }
+    }
+    
+    // Legacy gate management (DEMOTED: now supporting role)
+    // Keep for backward compatibility but opportunity takes precedence
     if (exec.setup === "NONE" || !exec.setup) {
-      // CRITICAL: Disarm gate when setup is NONE
       if (exec.resolutionGate && exec.resolutionGate.status === "ARMED") {
         this.deactivateGate(exec);
-        console.log(
-          `[GATE_DISARMED] Setup=NONE - gate disarmed`
-        );
       }
     } else if (exec.setup && exec.expectedResolution === "CONTINUATION" && 
                exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined &&
                (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
-      // Arm gate if setup exists and conditions are met
-      const atr = this.calculateATR(closed5mBars);
-      if (atr > 0) {
+      const atrForGate = this.calculateATR(closed5mBars);
+      if (atrForGate > 0) {
         if (!exec.resolutionGate || exec.resolutionGate.status !== "ARMED") {
           this.armResolutionGate(
             exec,
             exec.bias,
             exec.pullbackHigh,
             exec.pullbackLow,
-            atr,
+            atrForGate,
             ts
-          );
-          console.log(
-            `[GATE_ARMED] ${exec.resolutionGate?.direction.toUpperCase()} setup=${exec.setup} trigger=${exec.resolutionGate?.triggerPrice.toFixed(2)} stop=${exec.resolutionGate?.stopPrice.toFixed(2)}`
           );
         }
       }
@@ -2890,240 +3213,195 @@ export class Orchestrator {
       // - No-chase rules triggered (continuation extended too far)
       // - Re-entry window expired
       // ============================================================================
+      // ============================================================================
+      // OPPORTUNITYLATCH-BASED ENTRY LOGIC
+      // ============================================================================
+      // Entry now uses OpportunityLatch as the single execution gate
+      // This replaces the "separated gate mess" (setup gate, resolution gate, etc.)
+      // ============================================================================
+      
       // Check for pullback entry every 1m (responsive, not just on 5m close)
       // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule)
       if (exec.bias !== "NEUTRAL" && (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED")) {
         if (current5m) {
-          // CRITICAL: No entry if no setup detected
-          if (exec.setup === "NONE" || !exec.setup) {
-            exec.waitReason = "no_setup_detected";
-            exec.entryBlocked = true;
-            exec.entryBlockReason = "No tradable setup detected - structure incomplete";
-            shouldPublishEvent = true;
-            console.log(
-              `[ENTRY_BLOCKED] No setup detected - BIAS=${exec.bias} PHASE=${exec.phase} - Waiting for setup`
-            );
-            // Skip entry logic - no setup means no trade
-            // Continue to diagnostic generation in mindState construction below
-          } else {
-            // Setup detected - proceed with entry logic
-            // Diagnostic generation moved to mindState construction (below) to pass through to Telegram
-
-            // Only allow entry if gate is TRIGGERED or no gate exists
-          const gateAllowsEntry = !exec.resolutionGate || 
-                                  exec.resolutionGate.status === "TRIGGERED" ||
-                                  exec.resolutionGate.status === "INACTIVE";
-          
-          if (!gateAllowsEntry && exec.resolutionGate) {
-            // Gate is ARMED but not triggered - wait for gate
-            exec.waitReason = `waiting_for_gate_trigger_${exec.resolutionGate.direction}`;
-            const priceVsTrigger = exec.resolutionGate.direction === "short"
-              ? current5m.close - exec.resolutionGate.triggerPrice
-              : exec.resolutionGate.triggerPrice - current5m.close;
-            console.log(
-              `[ENTRY_BLOCKED_BY_GATE] ${exec.resolutionGate.direction.toUpperCase()} gate=${exec.resolutionGate.status} price=${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} distance=${priceVsTrigger.toFixed(2)} - Waiting for gate trigger`
-            );
-            // Don't return early - continue to event publishing below
-          } else if (gateAllowsEntry && exec.resolutionGate?.status === "TRIGGERED") {
-            console.log(
-              `[ENTRY_PERMITTED] Gate TRIGGERED, entry logic proceeding`
-            );
-          }
-          // Check for pullback failure first (structure breaking against bias)
-          if (exec.phase === "PULLBACK_IN_PROGRESS" && previous5m) {
-            const pullbackFailed = this.detectPullbackFailure(
-              exec.bias,
-              exec.expectedResolution,
+          // Check if opportunity exists and is latched
+          if (exec.opportunity && exec.opportunity.status === "LATCHED") {
+            // Check for trigger (LATCHED → TRIGGERED)
+            const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
+            const triggerCheck = this.checkOpportunityTrigger(
+              exec.opportunity,
               current5m,
               previous5m,
-              exec.pullbackHigh,
-              exec.pullbackLow
+              closed5mBars,
+              this.calculateATR(closed5mBars)
             );
-
-            if (pullbackFailed) {
-              const oldPhase = exec.phase;
-              exec.expectedResolution = "FAILURE";
-              exec.phase = "CONSOLIDATION_AFTER_REJECTION";
-              exec.waitReason = "pullback_failed";
-              shouldPublishEvent = true;
+            
+            if (triggerCheck.triggered) {
+              exec.opportunity.status = "TRIGGERED";
               console.log(
-                `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Pullback failed, structure breaking against bias`
+                `[OPPORTUNITY_TRIGGERED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(2)}`
               );
+              shouldPublishEvent = true;
             } else {
-              // Check for continuation detection (expected continuation now in progress)
-              const continuationDetected = this.detectContinuation(
+              // Opportunity latched but not triggered yet
+              exec.waitReason = `waiting_for_${exec.opportunity.trigger.type.toLowerCase()}_trigger`;
+              const priceVsTrigger = exec.opportunity.side === "SHORT"
+                ? current5m.close - exec.opportunity.trigger.price
+                : exec.opportunity.trigger.price - current5m.close;
+              console.log(
+                `[OPPORTUNITY_LATCHED] ${exec.opportunity.side} price=${current5m.close.toFixed(2)} trigger=${exec.opportunity.trigger.price.toFixed(2)} distance=${priceVsTrigger.toFixed(2)}`
+              );
+            }
+          } else if (!exec.opportunity || exec.opportunity.status !== "LATCHED") {
+            // No opportunity latched - this is the new "waiting" state
+            exec.waitReason = "no_opportunity_latched";
+            exec.entryBlocked = true;
+            exec.entryBlockReason = "No tradable opportunity latched - waiting for pullback zone entry";
+            shouldPublishEvent = true;
+            console.log(
+              `[ENTRY_BLOCKED] No opportunity latched - BIAS=${exec.bias} PHASE=${exec.phase} - Waiting for pullback zone`
+            );
+          }
+          
+          // If opportunity is TRIGGERED, proceed with entry logic
+          if (exec.opportunity && exec.opportunity.status === "TRIGGERED") {
+            // Entry signal detection (same as before, but now gated by opportunity)
+            const open = current5m.open ?? current5m.close;
+            const isBearish = current5m.close < open;
+            const isBullish = current5m.close > open;
+            
+            let lowerLow = false;
+            let higherHigh = false;
+            if (previous5m) {
+              lowerLow = current5m.low < previous5m.low;
+              higherHigh = current5m.high > previous5m.high;
+            }
+
+            // Enter ON pullback for BULLISH bias
+            if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
+              // Check no-chase rules (final check before entry)
+              const atrForBlock = this.calculateATR(closed5mBars);
+              const blockCheck = this.shouldBlockEntry(
                 exec.bias,
-                exec.expectedResolution,
-                current5m,
-                previous5m,
+                exec.phase,
+                current5m.close,
                 exec.pullbackHigh,
                 exec.pullbackLow,
-                closed5mBars
+                atrForBlock,
+                exec.targetZones
               );
-
-              if (continuationDetected) {
-                const oldPhase = exec.phase;
-                exec.phase = "CONTINUATION_IN_PROGRESS";
-                exec.waitReason = "continuation_underway";
-                // Calculate continuation extension and track metrics
-                if (exec.bias === "BULLISH" && exec.pullbackHigh !== undefined) {
-                  exec.continuationExtension = current5m.close - exec.pullbackHigh;
-                  exec.continuationLow = current5m.low; // Track lowest point during continuation
-                  exec.impulseRange = current5m.high - exec.pullbackHigh; // Initial impulse range
-                } else if (exec.bias === "BEARISH" && exec.pullbackLow !== undefined) {
-                  exec.continuationExtension = exec.pullbackLow - current5m.close;
-                  exec.continuationHigh = current5m.high; // Track highest point during continuation
-                  exec.impulseRange = exec.pullbackLow - current5m.low; // Initial impulse range
-                }
-                exec.continuationStartTs = ts;
-                exec.barsSinceContinuation = 0;
+              
+              if (blockCheck.blocked) {
+                exec.entryBlocked = true;
+                exec.entryBlockReason = blockCheck.reason;
+                exec.waitReason = blockCheck.reason ?? "entry_blocked";
                 shouldPublishEvent = true;
                 console.log(
-                  `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} PRICE=${current5m.close.toFixed(2)} REF=${exec.pullbackHigh ?? exec.pullbackLow ?? "n/a"} NOTE: Expected continuation now in progress`
+                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+                );
+              } else {
+                // ENTRY EXECUTED
+                const oldPhase = exec.phase;
+                const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+                
+                exec.entryPrice = current5m.close;
+                exec.entryTs = ts;
+                exec.entryType = entryInfo.type;
+                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                exec.pullbackHigh = current5m.high;
+                exec.pullbackLow = current5m.low;
+                exec.pullbackTs = ts;
+                exec.stopPrice = exec.opportunity.stop.price; // Use opportunity stop
+                const atrLong = this.calculateATR(closed5mBars);
+                const closedBarsWithVolumeLong = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+                const vwapLong = closedBarsWithVolumeLong.length > 0 ? this.calculateVWAP(closedBarsWithVolumeLong) : undefined;
+                const targetResultLong = this.computeTargets(
+                  "long",
+                  exec.entryPrice,
+                  exec.stopPrice,
+                  atrLong,
+                  closedBarsWithVolumeLong,
+                  vwapLong,
+                  exec.pullbackHigh,
+                  exec.pullbackLow,
+                  exec.impulseRange
+                );
+                exec.targets = targetResultLong.targets;
+                exec.targetZones = targetResultLong.targetZones;
+                exec.phase = "IN_TRADE";
+                exec.waitReason = "in_trade";
+                exec.entryBlocked = false;
+                exec.entryBlockReason = undefined;
+                exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                shouldPublishEvent = true;
+                console.log(
+                  `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
                 );
               }
             }
-          }
 
-          const open = current5m.open ?? current5m.close;
-          const isBearish = current5m.close < open;
-          const isBullish = current5m.close > open;
-          
-          // For pullback detection, we need previous bar to compare, but allow entry with just current bar if it's bearish/bullish
-          let lowerLow = false;
-          let higherHigh = false;
-          if (previous5m) {
-            lowerLow = current5m.low < previous5m.low;
-            higherHigh = current5m.high > previous5m.high;
-          }
-
-          // Enter ON pullback for BULLISH bias
-          // Condition: current bar is bearish OR makes a lower low (if we have previous bar)
-          if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
-            console.log(
-              `[ENTRY_CHECK] BULLISH bias - Entry condition met: isBearish=${isBearish} lowerLow=${lowerLow} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
-            );
-            // Check no-chase rules (with target zones if available)
-            const atrForBlock = this.calculateATR(closed5mBars);
-            const blockCheck = this.shouldBlockEntry(
-              exec.bias,
-              exec.phase,
-              current5m.close,
-              exec.pullbackHigh,
-              exec.pullbackLow,
-              atrForBlock,
-              exec.targetZones
-            );
-            if (blockCheck.blocked) {
-              exec.entryBlocked = true;
-              exec.entryBlockReason = blockCheck.reason;
-              exec.waitReason = blockCheck.reason ?? "entry_blocked";
-              shouldPublishEvent = true;
-              console.log(
-                `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
-              );
-            } else {
-              const oldPhase = exec.phase;
-              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-              
-              exec.entryPrice = current5m.close;
-              exec.entryTs = ts;
-              exec.entryType = entryInfo.type;
-              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-              exec.pullbackHigh = current5m.high;
-              exec.pullbackLow = current5m.low;
-              exec.pullbackTs = ts;
-              exec.stopPrice = current5m.low; // Stop at pullback low
-              const atrLong = this.calculateATR(closed5mBars);
-              const closedBarsWithVolumeLong = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
-              const vwapLong = closedBarsWithVolumeLong.length > 0 ? this.calculateVWAP(closedBarsWithVolumeLong) : undefined;
-              const targetResultLong = this.computeTargets(
-                "long",
-                exec.entryPrice,
-                exec.stopPrice,
-                atrLong,
-                closedBarsWithVolumeLong,
-                vwapLong,
+            // Enter ON pullback for BEARISH bias
+            if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
+              // Check no-chase rules (final check before entry)
+              const atrForBlock = this.calculateATR(closed5mBars);
+              const blockCheck = this.shouldBlockEntry(
+                exec.bias,
+                exec.phase,
+                current5m.close,
                 exec.pullbackHigh,
                 exec.pullbackLow,
-                exec.impulseRange
+                atrForBlock,
+                exec.targetZones
               );
-              exec.targets = targetResultLong.targets;
-              exec.targetZones = targetResultLong.targetZones;
-              exec.phase = "IN_TRADE";
-              exec.waitReason = "in_trade";
-              exec.entryBlocked = false;
-              exec.entryBlockReason = undefined;
-              shouldPublishEvent = true; // Entry executed - publish event
-              console.log(
-                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-              );
-            }
-          }
-
-          // Enter ON pullback for BEARISH bias
-          // Condition: current bar is bullish OR makes a higher high (if we have previous bar)
-          if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
-            console.log(
-              `[ENTRY_CHECK] BEARISH bias - Entry condition met: isBullish=${isBullish} higherHigh=${higherHigh} price=${current5m.close.toFixed(2)} gate=${exec.resolutionGate?.status ?? "none"}`
-            );
-            // Check no-chase rules (with target zones if available)
-            const atrForBlock = this.calculateATR(closed5mBars);
-            const blockCheck = this.shouldBlockEntry(
-              exec.bias,
-              exec.phase,
-              current5m.close,
-              exec.pullbackHigh,
-              exec.pullbackLow,
-              atrForBlock,
-              exec.targetZones
-            );
-            if (blockCheck.blocked) {
-              exec.entryBlocked = true;
-              exec.entryBlockReason = blockCheck.reason;
-              exec.waitReason = blockCheck.reason ?? "entry_blocked";
-              shouldPublishEvent = true;
-              console.log(
-                `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
-              );
-            } else {
-              const oldPhase = exec.phase;
-              const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
               
-              exec.entryPrice = current5m.close;
-              exec.entryTs = ts;
-              exec.entryType = entryInfo.type;
-              exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-              exec.pullbackHigh = current5m.high;
-              exec.pullbackLow = current5m.low;
-              exec.pullbackTs = ts;
-              exec.stopPrice = current5m.high; // Stop at pullback high
-              const atrShort = this.calculateATR(closed5mBars);
-              const closedBarsWithVolumeShort = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
-              const vwapShort = closedBarsWithVolumeShort.length > 0 ? this.calculateVWAP(closedBarsWithVolumeShort) : undefined;
-              const targetResultShort = this.computeTargets(
-                "short",
-                exec.entryPrice,
-                exec.stopPrice,
-                atrShort,
-                closedBarsWithVolumeShort,
-                vwapShort,
-                exec.pullbackHigh,
-                exec.pullbackLow,
-                exec.impulseRange
-              );
-              exec.targets = targetResultShort.targets;
-              exec.targetZones = targetResultShort.targetZones;
-              exec.phase = "IN_TRADE";
-              exec.waitReason = "in_trade";
-              exec.entryBlocked = false;
-              exec.entryBlockReason = undefined;
-              shouldPublishEvent = true; // Entry executed - publish event
-              console.log(
-                `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-              );
+              if (blockCheck.blocked) {
+                exec.entryBlocked = true;
+                exec.entryBlockReason = blockCheck.reason;
+                exec.waitReason = blockCheck.reason ?? "entry_blocked";
+                shouldPublishEvent = true;
+                console.log(
+                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+                );
+              } else {
+                // ENTRY EXECUTED
+                const oldPhase = exec.phase;
+                const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+                
+                exec.entryPrice = current5m.close;
+                exec.entryTs = ts;
+                exec.entryType = entryInfo.type;
+                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                exec.pullbackHigh = current5m.high;
+                exec.pullbackLow = current5m.low;
+                exec.pullbackTs = ts;
+                exec.stopPrice = exec.opportunity.stop.price; // Use opportunity stop
+                const atrShort = this.calculateATR(closed5mBars);
+                const closedBarsWithVolumeShort = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+                const vwapShort = closedBarsWithVolumeShort.length > 0 ? this.calculateVWAP(closedBarsWithVolumeShort) : undefined;
+                const targetResultShort = this.computeTargets(
+                  "short",
+                  exec.entryPrice,
+                  exec.stopPrice,
+                  atrShort,
+                  closedBarsWithVolumeShort,
+                  vwapShort,
+                  exec.pullbackHigh,
+                  exec.pullbackLow,
+                  exec.impulseRange
+                );
+                exec.targets = targetResultShort.targets;
+                exec.targetZones = targetResultShort.targetZones;
+                exec.phase = "IN_TRADE";
+                exec.waitReason = "in_trade";
+                exec.entryBlocked = false;
+                exec.entryBlockReason = undefined;
+                exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
+                shouldPublishEvent = true;
+                console.log(
+                  `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+                );
+              }
             }
-          }
           }
         }
       }

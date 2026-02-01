@@ -174,6 +174,52 @@ export type ResolutionGate = {
   reason: string;
 };
 
+// ============================================================================
+// OpportunityLatch: Single execution intent state that composes all gates
+// ============================================================================
+// This replaces the "separated gate mess" by becoming the single execution gate.
+// Phase = story, Setup = pattern label, OpportunityLatch = "I'm ready to shoot" state
+// ============================================================================
+export type OpportunitySide = "LONG" | "SHORT";
+export type OpportunityStatus = "INACTIVE" | "LATCHED" | "TRIGGERED" | "INVALIDATED" | "EXPIRED" | "CONSUMED";
+export type OpportunityTriggerType = "ROLLOVER" | "BREAK" | "RECLAIM_FAIL";
+
+export type OpportunityLatch = {
+  status: OpportunityStatus;
+  
+  side: OpportunitySide;                 // derived from exec.bias
+  biasAtLatch: MarketBias;               // BEARISH/BULLISH (snapshot at latch time)
+  phaseAtLatch: MinimalExecutionPhase;   // PULLBACK_IN_PROGRESS etc. (snapshot)
+  setupAtLatch?: SetupType;              // REJECTION / PULLBACK_GENERIC / etc. (snapshot)
+  
+  latchedAtTs: number;
+  expiresAtTs: number;                   // hard TTL (2 closed 5m bars = 10 minutes)
+  
+  zone: { low: number; high: number };  // where we allow entries (pullback window)
+  trigger: { 
+    type: OpportunityTriggerType; 
+    price: number;
+    description?: string;                 // e.g., "rollover candle", "break of prior low"
+  };
+  stop: { 
+    price: number; 
+    reason: string;                       // e.g., "pullback high + buffer", "rejection candle high"
+  };
+  
+  // Optional but useful
+  attempts?: number;                     // how many times we "almost triggered"
+  bestPriceSeen?: number;                // for no-chase logic / to avoid late entries
+  notes?: string;                        // human-readable: "pullback into resistance"
+  
+  // Invalidation rules (structural checks)
+  invalidateIf?: {
+    biasInvalidated?: boolean;           // shouldFlipBias() triggers
+    stopBroken?: boolean;                 // price breaks stop level
+    zoneExited?: boolean;                // price closes outside zone + buffer
+    timeExpired?: boolean;                // nowTs >= expiresAtTs
+  };
+};
+
 // No Trade Diagnostic - explains why no trade fired
 export type NoTradeReasonCode = 
   | "NO_GATE_ARMED"
@@ -268,8 +314,11 @@ export type MinimalExecutionState = {
   continuationLow?: number; // Lowest point during continuation (bullish bias)
   continuationStartTs?: number; // When continuation was detected
   barsSinceContinuation?: number; // Counter for time decay check
-  // Resolution Gate (permission system for entries)
+  // Resolution Gate (permission system for entries) - DEMOTED: now supporting role for OpportunityLatch
   resolutionGate?: ResolutionGate;
+  // OpportunityLatch: Single execution intent state that composes all gates
+  // This is the "glue" that persists tradable moments and prevents flicker
+  opportunity?: OpportunityLatch;
 };
 
 export interface BotState {
