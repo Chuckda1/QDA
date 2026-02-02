@@ -610,13 +610,25 @@ export class Orchestrator {
       );
     }
     
-    // Clear gate state
+    // Clear gate state (critical: prevents stale INVALIDATED/ARMED states)
     exec.resolutionGate = undefined;
     
     // Clear setup-specific cached fields
     exec.setupTriggerPrice = undefined;
     exec.setupStopPrice = undefined;
     exec.setupDetectedAt = ts; // Track when new setup started
+    
+    // Clear entry state if not in trade
+    if (exec.phase !== "IN_TRADE") {
+      exec.entryPrice = undefined;
+      exec.entryTs = undefined;
+      exec.entryType = undefined;
+      exec.entryTrigger = undefined;
+      exec.stopPrice = undefined;
+    }
+    
+    // Note: We do NOT clear pullbackHigh/pullbackLow here because they are structure-based,
+    // not setup-specific. They should only be cleared when structure actually breaks.
     
     // Update wait reason
     if (nextSetup === "NONE") {
@@ -625,6 +637,7 @@ export class Orchestrator {
   }
 
   // Explicit arming criteria for PULLBACK_CONTINUATION setup
+  // Supports both 5m and 1m turn signals for responsive arming
   private tryArmPullbackGate(
     exec: MinimalExecutionState,
     currentPrice: number,
@@ -632,7 +645,10 @@ export class Orchestrator {
     previous5m: { open: number; high: number; low: number; close: number } | undefined,
     closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
     atr: number,
-    ts: number
+    ts: number,
+    // Optional 1m bar data for responsive arming (allows 1m turn signals)
+    current1mBar?: { open: number; high: number; low: number; close: number } | null,
+    previous1mBar?: { open: number; high: number; low: number; close: number } | undefined
   ): { armed: true; trigger: number; stop: number; reason: string } | { armed: false; reason: string } {
     // Precondition checks
     if (exec.setup !== "PULLBACK_CONTINUATION") {
@@ -662,11 +678,6 @@ export class Orchestrator {
     // Phase must allow arming
     if (exec.phase !== "BIAS_ESTABLISHED" && exec.phase !== "PULLBACK_IN_PROGRESS") {
       return { armed: false, reason: `phase_disallows_arming (${exec.phase})` };
-    }
-    
-    // Need closed bar for analysis
-    if (!lastClosed5m) {
-      return { armed: false, reason: "no_closed_bar" };
     }
     
     // Calculate EMA and VWAP for pullback zone detection
@@ -715,33 +726,83 @@ export class Orchestrator {
       };
     }
     
-    // Rejection/turn condition: need rejection signal on 5m bar
-    const open = lastClosed5m.open ?? lastClosed5m.close;
-    const isBearish = lastClosed5m.close < open;
-    const isBullish = lastClosed5m.close > open;
-    
+    // Rejection/turn condition: check for turn signal (prefer 1m for responsiveness, fallback to 5m)
     let hasTurnSignal = false;
-    if (exec.bias === "BEARISH") {
-      // Bearish: need lower-high + bearish close
-      const lowerHigh = previous5m ? lastClosed5m.high < previous5m.high : false;
-      hasTurnSignal = lowerHigh && isBearish;
+    let turnSignalSource = "";
+    
+    // First, try 1m turn signal (more responsive - allows arming before 5m confirms)
+    if (current1mBar && previous1mBar) {
+      const open1m = current1mBar.open ?? current1mBar.close;
+      const isBearish1m = current1mBar.close < open1m;
+      const isBullish1m = current1mBar.close > open1m;
       
-      // Alternative: price closes back below EMA_FAST after being above
-      if (!hasTurnSignal && emaFast !== undefined && previous5m) {
-        const wasAboveEma = previous5m.close >= emaFast;
-        const nowBelowEma = lastClosed5m.close < emaFast;
-        hasTurnSignal = wasAboveEma && nowBelowEma && isBearish;
+      if (exec.bias === "BEARISH") {
+        // Bearish 1m turn: lower-high + bearish close
+        const lowerHigh1m = current1mBar.high < previous1mBar.high;
+        if (lowerHigh1m && isBearish1m) {
+          hasTurnSignal = true;
+          turnSignalSource = "1m_rejection";
+        }
+        // Alternative: price closes back below EMA_FAST after being above (1m)
+        if (!hasTurnSignal && emaFast !== undefined) {
+          const wasAboveEma = previous1mBar.close >= emaFast;
+          const nowBelowEma = current1mBar.close < emaFast;
+          if (wasAboveEma && nowBelowEma && isBearish1m) {
+            hasTurnSignal = true;
+            turnSignalSource = "1m_ema_reclaim_fail";
+          }
+        }
+      } else {
+        // BULLISH 1m turn: higher-low + bullish close
+        const higherLow1m = current1mBar.low > previous1mBar.low;
+        if (higherLow1m && isBullish1m) {
+          hasTurnSignal = true;
+          turnSignalSource = "1m_rejection";
+        }
+        // Alternative: price closes back above EMA_FAST after being below (1m)
+        if (!hasTurnSignal && emaFast !== undefined) {
+          const wasBelowEma = previous1mBar.close <= emaFast;
+          const nowAboveEma = current1mBar.close > emaFast;
+          if (wasBelowEma && nowAboveEma && isBullish1m) {
+            hasTurnSignal = true;
+            turnSignalSource = "1m_ema_reclaim_fail";
+          }
+        }
       }
-    } else {
-      // BULLISH: need higher-low + bullish close
-      const higherLow = previous5m ? lastClosed5m.low > previous5m.low : false;
-      hasTurnSignal = higherLow && isBullish;
+    }
+    
+    // Fallback to 5m turn signal if 1m didn't trigger and we have 5m data
+    if (!hasTurnSignal && lastClosed5m && previous5m) {
+      const open5m = lastClosed5m.open ?? lastClosed5m.close;
+      const isBearish5m = lastClosed5m.close < open5m;
+      const isBullish5m = lastClosed5m.close > open5m;
       
-      // Alternative: price closes back above EMA_FAST after being below
-      if (!hasTurnSignal && emaFast !== undefined && previous5m) {
-        const wasBelowEma = previous5m.close <= emaFast;
-        const nowAboveEma = lastClosed5m.close > emaFast;
-        hasTurnSignal = wasBelowEma && nowAboveEma && isBullish;
+      if (exec.bias === "BEARISH") {
+        // Bearish: need lower-high + bearish close
+        const lowerHigh = lastClosed5m.high < previous5m.high;
+        hasTurnSignal = lowerHigh && isBearish5m;
+        if (hasTurnSignal) turnSignalSource = "5m_rejection";
+        
+        // Alternative: price closes back below EMA_FAST after being above
+        if (!hasTurnSignal && emaFast !== undefined) {
+          const wasAboveEma = previous5m.close >= emaFast;
+          const nowBelowEma = lastClosed5m.close < emaFast;
+          hasTurnSignal = wasAboveEma && nowBelowEma && isBearish5m;
+          if (hasTurnSignal) turnSignalSource = "5m_ema_reclaim_fail";
+        }
+      } else {
+        // BULLISH: need higher-low + bullish close
+        const higherLow = lastClosed5m.low > previous5m.low;
+        hasTurnSignal = higherLow && isBullish5m;
+        if (hasTurnSignal) turnSignalSource = "5m_rejection";
+        
+        // Alternative: price closes back above EMA_FAST after being below
+        if (!hasTurnSignal && emaFast !== undefined) {
+          const wasBelowEma = previous5m.close <= emaFast;
+          const nowAboveEma = lastClosed5m.close > emaFast;
+          hasTurnSignal = wasBelowEma && nowAboveEma && isBullish5m;
+          if (hasTurnSignal) turnSignalSource = "5m_ema_reclaim_fail";
+        }
       }
     }
     
@@ -749,12 +810,41 @@ export class Orchestrator {
       return { armed: false, reason: "no_turn_signal" };
     }
     
-    // Check for "too extended" condition (don't enter when already extended)
+    // Check for "too extended" condition (refined for trend days)
+    // In strong trends, price can stay > 1.5 ATR from VWAP while pullbacks occur around EMA
+    // Only block if: distance > 1.5 ATR AND price is making new highs/lows without pullback structure
     if (vwap !== undefined) {
       const distanceFromVwap = Math.abs(currentPrice - vwap);
-      const maxDistance = 1.5 * atr; // Don't arm if > 1.5 ATR from VWAP
+      const maxDistance = 1.5 * atr;
+      
       if (distanceFromVwap > maxDistance) {
-        return { armed: false, reason: `too_extended_from_vwap (${distanceFromVwap.toFixed(2)} > ${maxDistance.toFixed(2)})` };
+        // Check if we're in a pullback structure (not just extended)
+        const inPullbackStructure = exec.bias === "BULLISH"
+          ? (exec.pullbackLow !== undefined && currentPrice > exec.pullbackLow && currentPrice < exec.pullbackHigh)
+          : (exec.pullbackHigh !== undefined && currentPrice < exec.pullbackHigh && currentPrice > exec.pullbackLow);
+        
+        // Also check if price is making new extremes without pullback
+        let makingNewExtremes = false;
+        if (closed5mBars.length >= 3) {
+          const recentBars = closed5mBars.slice(-5);
+          const recentHigh = Math.max(...recentBars.map(b => b.high));
+          const recentLow = Math.min(...recentBars.map(b => b.low));
+          
+          if (exec.bias === "BULLISH") {
+            makingNewExtremes = currentPrice >= recentHigh * 0.998; // Near recent high
+          } else {
+            makingNewExtremes = currentPrice <= recentLow * 1.002; // Near recent low
+          }
+        }
+        
+        // Only block if extended AND making new extremes without pullback structure
+        if (!inPullbackStructure && makingNewExtremes) {
+          return { 
+            armed: false, 
+            reason: `too_extended_from_vwap (${distanceFromVwap.toFixed(2)} > ${maxDistance.toFixed(2)}) AND making_new_extremes` 
+          };
+        }
+        // If we're in pullback structure, allow arming even if extended (trend day scenario)
       }
     }
     
@@ -767,12 +857,12 @@ export class Orchestrator {
       // Bullish: trigger on break above pullback high (or rejection candle high)
       trigger = exec.pullbackHigh + 0.1 * atr;
       stop = exec.pullbackLow - 0.1 * atr;
-      reason = "bull_pullback_turn";
+      reason = `bull_pullback_turn_${turnSignalSource}`;
     } else {
       // BEARISH: trigger on break below pullback low (or rejection candle low)
       trigger = exec.pullbackLow - 0.1 * atr;
       stop = exec.pullbackHigh + 0.1 * atr;
-      reason = "bear_pullback_turn";
+      reason = `bear_pullback_turn_${turnSignalSource}`;
     }
     
     return { armed: true, trigger, stop, reason };
@@ -2261,7 +2351,7 @@ export class Orchestrator {
       const atrForGate = this.calculateATR(closed5mBars);
       const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
       
-      // Use the new explicit arming function
+      // Use the new explicit arming function (5m close - no 1m data available here)
       const armResult = this.tryArmPullbackGate(
         exec,
         close,
@@ -2269,7 +2359,9 @@ export class Orchestrator {
         previous5m,
         closed5mBars,
         atrForGate,
-        ts
+        ts,
+        undefined, // No 1m bar data on 5m close
+        undefined
       );
       
       if (armResult.armed && !exec.resolutionGate) {
@@ -2284,8 +2376,9 @@ export class Orchestrator {
           reason: armResult.reason,
         };
         
+        const expiryInMin = Math.floor((exec.resolutionGate.expiryTs - ts) / (60 * 1000));
         console.log(
-          `[GATE_ARMED] setup=PULLBACK_CONTINUATION bias=${exec.bias} trigger=${armResult.trigger.toFixed(2)} stop=${armResult.stop.toFixed(2)} reason=${armResult.reason}`
+          `[GATE_ARMED] setup=PULLBACK_CONTINUATION bias=${exec.bias} trigger=${armResult.trigger.toFixed(2)} stop=${armResult.stop.toFixed(2)} reason=${armResult.reason} expiryInMin=${expiryInMin}`
         );
       } else if (!armResult.armed) {
         // Gate not armed - log why with enhanced details
@@ -2882,6 +2975,71 @@ export class Orchestrator {
       // - No-chase rules triggered (continuation extended too far)
       // - Re-entry window expired
       // ============================================================================
+      // ============================================================================
+      // 1M ARMING: Attempt to arm gate on 1m turn signals (responsive arming)
+      // ============================================================================
+      // Setup is detected on 5m close, but gate can be armed on 1m turn signals
+      // This prevents missing best entries that happen on 1m/2m structure
+      // ============================================================================
+      if (exec.setup === "PULLBACK_CONTINUATION" && 
+          !exec.resolutionGate && 
+          exec.bias !== "NEUTRAL" &&
+          (exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS") &&
+          forming5mBar && 
+          forming5mBar.progressMinutes >= 1 && 
+          forming5mBar.progressMinutes <= 4) {
+        // Use forming5mBar as "current 1m bar" and lastClosed5m as "previous 1m bar" proxy
+        // This allows responsive arming on 1m turn signals before 5m confirms
+        const atrFor1mArming = this.calculateATR(closed5mBars);
+        const previous5mFor1m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
+        
+        // Convert forming5mBar to bar format for tryArmPullbackGate
+        const current1mBar = {
+          open: forming5mBar.open,
+          high: forming5mBar.high,
+          low: forming5mBar.low,
+          close: forming5mBar.close,
+        };
+        
+        // Use last closed 5m as previous 1m proxy (or previous 5m if available)
+        const previous1mBar = lastClosed5m ? {
+          open: lastClosed5m.open,
+          high: lastClosed5m.high,
+          low: lastClosed5m.low,
+          close: lastClosed5m.close,
+        } : undefined;
+        
+        const armResult1m = this.tryArmPullbackGate(
+          exec,
+          close,
+          lastClosed5m,
+          previous5mFor1m,
+          closed5mBars,
+          atrFor1mArming,
+          ts,
+          current1mBar,
+          previous1mBar
+        );
+        
+        if (armResult1m.armed && !exec.resolutionGate) {
+          // Gate doesn't exist - create/arm it
+          exec.resolutionGate = {
+            status: "ARMED",
+            direction: exec.bias === "BULLISH" ? "long" : "short",
+            triggerPrice: armResult1m.trigger,
+            stopPrice: armResult1m.stop,
+            expiryTs: ts + 2 * 5 * 60 * 1000, // 2 timeframes (10 minutes)
+            armedTs: ts,
+            reason: armResult1m.reason,
+          };
+          
+          const expiryInMin = Math.floor((exec.resolutionGate.expiryTs - ts) / (60 * 1000));
+          console.log(
+            `[GATE_ARMED] setup=PULLBACK_CONTINUATION bias=${exec.bias} trigger=${armResult1m.trigger.toFixed(2)} stop=${armResult1m.stop.toFixed(2)} reason=${armResult1m.reason} expiryInMin=${expiryInMin} (1m_turn_signal)`
+          );
+        }
+      }
+      
       // ============================================================================
       // OPPORTUNITYLATCH-BASED ENTRY LOGIC
       // ============================================================================
