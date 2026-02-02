@@ -1903,7 +1903,8 @@ export class Orchestrator {
     exec: MinimalExecutionState,
     currentPrice: number,
     atr: number,
-    closed5mBars: Array<{ high: number; low: number; close: number }>
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    ts: number // FIX: Pass timestamp to avoid split-brain (system time vs tick time)
   ): NoTradeDiagnostic | null {
     // Emit when: phase === PULLBACK_IN_PROGRESS OR setup === "NONE" (with bias)
     // Only if price moved > 0.75 ATR (to prevent spam)
@@ -1940,7 +1941,8 @@ export class Orchestrator {
       details = "Structure broke against bias";
     } else if (exec.resolutionGate.status === "ARMED") {
       // Gate is armed but not triggered - check why
-      const timeExpired = Date.now() > exec.resolutionGate.expiryTs;
+      // FIX: Use tick timestamp instead of Date.now() to avoid split-brain
+      const timeExpired = ts > exec.resolutionGate.expiryTs;
       const priceBeyondTrigger = exec.resolutionGate.direction === "short"
         ? currentPrice < exec.resolutionGate.triggerPrice - 0.5 * atr
         : currentPrice > exec.resolutionGate.triggerPrice + 0.5 * atr;
@@ -1961,8 +1963,15 @@ export class Orchestrator {
     }
 
     // Check for session constraints (simplified - would check actual session times)
-    const regime = getMarketRegime(new Date());
+    // FIX: Use tick timestamp instead of system time to avoid split-brain
+    const regime = getMarketRegime(new Date(ts));
     if (!regime.isRTH) {
+      // DEBUG: Log timezone/clock mismatch
+      const nowDate = new Date(ts);
+      const nowET = getETDateString(nowDate);
+      console.log(
+        `[NO_TRADE_DIAGNOSTIC] Market closed check: ts=${ts} nowDate=${nowDate.toISOString()} nowET=${nowET} nowETTime=${regime.nowEt} isRTH=${regime.isRTH} regime=${regime.regime}`
+      );
       reasonCode = "SESSION_CONSTRAINT";
       details = "Market closed or outside trading hours";
     }
@@ -2718,7 +2727,19 @@ export class Orchestrator {
     this.lastProcessedTs = ts;
     
     const regime = getMarketRegime(new Date(ts));
+    
+    // DEBUG: Log timezone/clock mismatch detection
+    const nowDate = new Date(ts);
+    const nowET = getETDateString(nowDate);
+    const nowETTime = regime.nowEt;
+    const mode = this.state.mode;
+    
     if (!regime.isRTH) {
+      // DEBUG: Log why market is considered closed
+      console.log(
+        `[MARKET_CLOSED_CHECK] ts=${ts} nowDate=${nowDate.toISOString()} nowET=${nowET} nowETTime=${nowETTime} isRTH=${regime.isRTH} isWeekday=${regime.regime !== "CLOSED"} mode=${mode} regime=${regime.regime}`
+      );
+      
       this.state.minimalExecution.phase = "NEUTRAL_PHASE";
       this.state.minimalExecution.waitReason = "market_closed";
       return events;
@@ -3613,7 +3634,7 @@ export class Orchestrator {
         let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
         if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
           const atr = this.calculateATR(closed5mBars);
-          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars);
+          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
           if (diagnostic) {
             noTradeDiagnostic = diagnostic;
             // Also emit to console for logging
@@ -3678,7 +3699,7 @@ export class Orchestrator {
           this.lastHeartbeatTs = ts;
           
           const atr = this.calculateATR(closed5mBars);
-          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars);
+          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
           
           // Build minimal heartbeat message
           const mindState = {
