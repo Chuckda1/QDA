@@ -1047,8 +1047,8 @@ export class Orchestrator {
     ts: number,
     currentPrice: number,
     atr: number
-  ): void {
-    if (exec.bias === "NEUTRAL") return;
+  ): boolean {
+    if (exec.bias === "NEUTRAL") return false;
 
     // Check if we need to create/refresh opportunity latch
     const needsLatch = !exec.opportunity || 
@@ -1095,10 +1095,19 @@ export class Orchestrator {
         notes: "automatic_latch",
       };
       
+      // Clear waitReason when opportunity is latched (fix for stale Telegram messages)
+      if (exec.waitReason === "no_opportunity_latched") {
+        exec.waitReason = exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger";
+      }
+      
       console.log(
         `[OPP_LATCHED] direction=${exec.bias} expiresInMin=${expiresInMin} automatic`
       );
+      
+      return true; // Latch was created
     }
+    
+    return false; // No latch created
   }
 
   // Check if opportunity trigger is met (becomes TRIGGERED)
@@ -2332,7 +2341,14 @@ export class Orchestrator {
     // For pullback engine, automatically ensure opportunity latch when bias is established
     // This removes "no_opportunity_latched" blocking for basic pullback continuation
     // ============================================================================
-    this.ensureOpportunityLatch(exec, ts, close, atr);
+    const latchCreated = this.ensureOpportunityLatch(exec, ts, close, atr);
+    if (latchCreated) {
+      // Force event emission after latching to update Telegram immediately
+      shouldPublishEvent = true;
+      console.log(
+        `[OPP_LATCHED_EVENT] Forcing state snapshot after opportunity latch - bias=${exec.bias} phase=${exec.phase}`
+      );
+    }
     
     // ============================================================================
     // STEP 5: Gate Arming (explicit criteria for PULLBACK_CONTINUATION)
@@ -3445,6 +3461,11 @@ export class Orchestrator {
           targetZones: exec.targetZones ?? undefined,
           entryPrice: exec.entryPrice ?? undefined,
           stopPrice: exec.stopPrice ?? undefined,
+          // Opportunity latch timestamps (for debugging Telegram timing)
+          oppLatchedAt: exec.opportunity?.latchedAtTs,
+          oppExpiresAt: exec.opportunity?.expiresAtTs,
+          last5mCloseTs: lastClosed5m?.ts,
+          source: is5mClose ? "5m" as const : "1m" as const,
         };
 
         events.push({
@@ -3494,6 +3515,11 @@ export class Orchestrator {
             setup: exec.setup ?? undefined,
             price: close,
             noTradeDiagnostic: diagnostic ?? undefined,
+            // Opportunity latch timestamps (for debugging Telegram timing)
+            oppLatchedAt: exec.opportunity?.latchedAtTs,
+            oppExpiresAt: exec.opportunity?.expiresAtTs,
+            last5mCloseTs: lastClosed5m?.ts,
+            source: is5mClose ? "5m" as const : "1m" as const,
           };
           
           events.push({

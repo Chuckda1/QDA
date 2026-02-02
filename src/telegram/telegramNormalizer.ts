@@ -45,9 +45,13 @@ export type TelegramSnapshot = {
   };
   entryPrice?: number;
   stopPrice?: number;
+  oppLatchedAt?: number; // Timestamp when opportunity was latched
+  oppExpiresAt?: number; // Timestamp when opportunity expires
+  last5mCloseTs?: number; // Timestamp of last 5m bar close
+  source?: "1m" | "5m"; // Source of this state update (1m tick or 5m close)
 };
 
-const formatEtTimestamp = (ts: number): string =>
+export const formatEtTimestamp = (ts: number): string =>
   new Date(ts).toLocaleTimeString("en-US", {
     timeZone: "America/New_York",
     hour: "2-digit",
@@ -83,6 +87,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const targetZones = mind.targetZones ?? undefined;
   const entryPrice = Number.isFinite(mind.entryPrice) ? Number(mind.entryPrice) : undefined;
   const stopPrice = Number.isFinite(mind.stopPrice) ? Number(mind.stopPrice) : undefined;
+  
+  // Extract opportunity timestamps
+  const oppLatchedAt = Number.isFinite(mind.oppLatchedAt) ? Number(mind.oppLatchedAt) : undefined;
+  const oppExpiresAt = Number.isFinite(mind.oppExpiresAt) ? Number(mind.oppExpiresAt) : undefined;
+  const last5mCloseTs = Number.isFinite(mind.last5mCloseTs) ? Number(mind.last5mCloseTs) : undefined;
+  const source = mind.source as "1m" | "5m" | undefined;
 
   return {
     type: "MIND",
@@ -107,6 +117,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     targetZones,
     entryPrice,
     stopPrice,
+    oppLatchedAt,
+    oppExpiresAt,
+    last5mCloseTs,
+    source,
   };
 }
 

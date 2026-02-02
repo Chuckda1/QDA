@@ -1,4 +1,5 @@
 import type { TelegramSnapshot } from "./telegramNormalizer.js";
+import { formatEtTimestamp } from "./telegramNormalizer.js";
 
 export type TelegramAlert = {
   type: "MIND";
@@ -109,6 +110,32 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     snapshot.noTradeDiagnostic.reasons.forEach(reason => {
       lines.push(`• ${reason}`);
     });
+  }
+
+  // Add timestamps for debugging (if available)
+  if (snapshot.oppLatchedAt || snapshot.oppExpiresAt || snapshot.last5mCloseTs || snapshot.source) {
+    const timestampLines: string[] = [];
+    if (snapshot.source) {
+      timestampLines.push(`📡 SOURCE: ${snapshot.source.toUpperCase()}`);
+    }
+    if (snapshot.last5mCloseTs) {
+      const last5mCloseTime = formatEtTimestamp(snapshot.last5mCloseTs);
+      timestampLines.push(`🕐 LAST 5M CLOSE: ${last5mCloseTime}`);
+    }
+    if (snapshot.oppLatchedAt) {
+      const latchedTime = formatEtTimestamp(snapshot.oppLatchedAt);
+      timestampLines.push(`🔒 OPP LATCHED: ${latchedTime}`);
+    }
+    if (snapshot.oppExpiresAt) {
+      const expiresTime = formatEtTimestamp(snapshot.oppExpiresAt);
+      const timeUntilExpiry = snapshot.oppExpiresAt - Date.now();
+      const minutesUntilExpiry = Math.floor(timeUntilExpiry / (60 * 1000));
+      timestampLines.push(`⏰ OPP EXPIRES: ${expiresTime} (${minutesUntilExpiry > 0 ? `in ${minutesUntilExpiry}m` : 'expired'})`);
+    }
+    if (timestampLines.length > 0) {
+      lines.push(""); // Blank line separator
+      lines.push(...timestampLines);
+    }
   }
 
   // Add target zones if in trade

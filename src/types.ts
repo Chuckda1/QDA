@@ -121,6 +121,11 @@ export interface MinimalMindStateResponse {
   refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
   refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
   noTradeDiagnostic?: NoTradeDiagnostic; // Why no trade fired (when applicable)
+  // Opportunity latch timestamps (for debugging Telegram timing)
+  oppLatchedAt?: number; // Timestamp when opportunity was latched
+  oppExpiresAt?: number; // Timestamp when opportunity expires
+  last5mCloseTs?: number; // Timestamp of last 5m bar close
+  source?: "1m" | "5m"; // Source of this state update (1m tick or 5m close)
 }
 
 export type MinimalMindStateResult = {
