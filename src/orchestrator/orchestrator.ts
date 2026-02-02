@@ -1992,7 +1992,7 @@ export class Orchestrator {
 
   // Emit diagnostic log
   private emitNoTradeDiagnostic(diagnostic: NoTradeDiagnostic): void {
-    console.log(
+      console.log(
       `NO_TRADE: price=${diagnostic.price.toFixed(2)} bias=${diagnostic.bias} phase=${diagnostic.phase} expected=${diagnostic.expectedResolution ?? "n/a"} gate=${diagnostic.gateStatus ?? "n/a"} reason=${diagnostic.reasonCode} details="${diagnostic.details}"`
     );
   }
@@ -2428,7 +2428,7 @@ export class Orchestrator {
       exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
       if (exec.bias !== "NEUTRAL") {
         exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-        exec.thesisConfidence = exec.biasConfidence;
+      exec.thesisConfidence = exec.biasConfidence;
       }
 
       console.log(
@@ -2747,6 +2747,12 @@ export class Orchestrator {
 
       // Update forming5mBar state
     const previousBucketStart = this.formingBucketStart;
+    // Capture the just-closed bar BEFORE rollover (if rollover is about to happen)
+    // We need to check if the bucket will change by comparing current bucket start with previous
+    const currentBucketStart = Math.floor(snapshot.ts / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    const willRollover = previousBucketStart !== null && currentBucketStart !== previousBucketStart;
+    const justClosedBar = willRollover && this.forming5mBar ? this.forming5mBar : null;
+    
     const forming5mBar = this.updateForming5mBar(snapshot);
     const is5mClose = previousBucketStart !== null && this.formingBucketStart !== previousBucketStart;
     
@@ -2757,6 +2763,8 @@ export class Orchestrator {
       );
     }
 
+    // Build closed5mBars: use buffer + just-closed bar (if available) for LLM snapshot
+    // This fixes the "one bar behind" issue - LLM gets the most recent close
     const closed5mBars = this.recentBars5m;
     const lastClosed5m = closed5mBars[closed5mBars.length - 1] ?? null;
     const exec = this.state.minimalExecution;
@@ -2764,8 +2772,8 @@ export class Orchestrator {
     let debugInfo: MinimalDebugInfo | undefined = undefined;
     
     // Track previous state to detect changes (for use in state transitions)
-    const previousBias = exec.bias;
-    const previousPhase = exec.phase;
+      const previousBias = exec.bias;
+      const previousPhase = exec.phase;
 
     // ============================================================================
     // ============================================================================
@@ -2788,7 +2796,7 @@ export class Orchestrator {
     if (!is5mClose) {
       // LLM is NOT called on 1m ticks or forming bars - this prevents request storms
       // All processing continues normally, just without LLM input
-    } else if (this.llmService && closed5mBars.length > 0) {
+    } else if (this.llmService && closed5mBars.length >= this.minimalLlmBars) {
       // ============================================================================
       // RULE 3: LLM errors must be NON-FATAL (graceful degradation)
       // ============================================================================
@@ -2806,7 +2814,7 @@ export class Orchestrator {
           this.llmCircuitBreaker.failures = 0;
           console.log(`[CIRCUIT_BREAKER] Resetting - attempting LLM call`);
         } else {
-          console.log(
+        console.log(
             `[CIRCUIT_BREAKER] OPEN - skipping LLM call (failures=${this.llmCircuitBreaker.failures} lastFailure=${timeSinceFailure}ms ago)`
           );
           // Graceful degradation: maintain current bias and phase, continue without LLM
@@ -2819,16 +2827,32 @@ export class Orchestrator {
         const exec = this.state.minimalExecution;
         const dailyContextLite = this.buildDailyContextLite(exec, closed5mBars, currentETDate);
         
+        // Fix B: Include just-closed bar in LLM snapshot to eliminate 1-bar lag
+        // Build snapshot bars: buffer + just-closed bar (if rollover happened)
+        let snapshotBars = closed5mBars.slice(-60); // Last 60 from buffer
+        if (justClosedBar) {
+          // Convert Forming5mBar to closed bar format and append
+          const closedBarForSnapshot = {
+            ts: justClosedBar.endTs - 1, // Use endTs - 1ms to ensure it's before the new bucket
+            open: justClosedBar.open,
+            high: justClosedBar.high,
+            low: justClosedBar.low,
+            close: justClosedBar.close,
+            volume: justClosedBar.volume,
+          };
+          snapshotBars = [...snapshotBars, closedBarForSnapshot].slice(-60); // Keep last 60
+        }
+        
         const llmSnapshot: MinimalLLMSnapshot = {
           symbol,
           nowTs: ts,
-          closed5mBars: closed5mBars.slice(-60), // Last 60 closed bars (≈ 5 hours)
+          closed5mBars: snapshotBars, // Includes just-closed bar (no lag)
           forming5mBar: null, // Never pass forming bar to LLM
           dailyContextLite, // Lightweight daily anchor
         };
 
         console.log(
-          `[LLM5M] closed5m=${closed5mBars.length} callingLLM=true (5m close detected) barsWindow=60 dailyContext=${dailyContextLite ? "yes" : "no"}`
+          `[LLM5M] bufferClosed5m=${closed5mBars.length} snapshotClosed5m=${snapshotBars.length} callingLLM=true (5m close detected) barsWindow=60 dailyContext=${dailyContextLite ? "yes" : "no"}${justClosedBar ? " [JUST_CLOSED_INCLUDED]" : ""}`
         );
         
         try {
@@ -2960,7 +2984,7 @@ export class Orchestrator {
           // Increment bars counter
           if (exec.barsSinceContinuation !== undefined) {
             exec.barsSinceContinuation++;
-          } else {
+        } else {
             exec.barsSinceContinuation = 1;
           }
 
@@ -2977,7 +3001,7 @@ export class Orchestrator {
             const oldPhase = exec.phase;
             exec.phase = "REENTRY_WINDOW";
             exec.waitReason = "waiting_for_reentry_pullback";
-            shouldPublishEvent = true;
+          shouldPublishEvent = true;
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} NOTE: Continuation paused, monitoring for re-entry`
             );
@@ -3004,7 +3028,7 @@ export class Orchestrator {
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = blockCheck.reason ?? "reentry_window_expired";
             shouldPublishEvent = true;
-            console.log(
+        console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} reason=${exec.waitReason} - Re-entry window expired`
             );
           } else {
@@ -3118,7 +3142,7 @@ export class Orchestrator {
           // Check for gate expiry (ARMED → EXPIRED)
           else if (this.checkGateExpiry(exec.resolutionGate, current5m.close, ts, atr)) {
             exec.resolutionGate.status = "EXPIRED";
-            const oldPhase = exec.phase;
+          const oldPhase = exec.phase;
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = "continuation_without_structure";
             exec.expectedResolution = "FAILURE";
@@ -3126,10 +3150,10 @@ export class Orchestrator {
             const expiryReason = ts > exec.resolutionGate.expiryTs 
               ? "Time expired" 
               : "Continuation occurred without structure";
-            console.log(
+          console.log(
               `[GATE_EXPIRED] ${exec.resolutionGate.direction.toUpperCase()} - ${expiryReason}, not chaseable`
-            );
-            console.log(
+          );
+          console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} (maintained) expectedResolution=${exec.expectedResolution} - Gate expired`
             );
           }
@@ -3143,7 +3167,7 @@ export class Orchestrator {
             exec.biasInvalidationLevel
           )) {
             exec.resolutionGate.status = "INVALIDATED";
-            const oldPhase = exec.phase;
+          const oldPhase = exec.phase;
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = "structure_broken";
             exec.expectedResolution = "FAILURE";
@@ -3153,7 +3177,7 @@ export class Orchestrator {
               : exec.bias === "BULLISH" && exec.pullbackLow && current5m.close < exec.pullbackLow
               ? `Price ${current5m.close.toFixed(2)} < pullbackLow ${exec.pullbackLow.toFixed(2)}`
               : "Structure broken against bias";
-            console.log(
+          console.log(
               `[GATE_INVALIDATED] ${exec.resolutionGate.direction.toUpperCase()} - ${invalidationReason}`
             );
             console.log(
@@ -3170,9 +3194,9 @@ export class Orchestrator {
       // No setup = no trade (even if bias is strong)
       // Only one setup may be active at a time
       // ============================================================================
-      const current5m = forming5mBar ?? lastClosed5m;
-      const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
-      
+        const current5m = forming5mBar ?? lastClosed5m;
+        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
+
       // Setup detection: only when bias is not NEUTRAL
       if (exec.bias === "NEUTRAL") {
         // Clear setup when bias is neutral
@@ -3341,8 +3365,8 @@ export class Orchestrator {
             (exec.opportunity?.status === "LATCHED" || exec.opportunity?.status === "TRIGGERED" || !exec.opportunity); // Opportunity can be LATCHED, TRIGGERED, or not exist
 
           if (canEnter) {
-            // Enter ON pullback for BULLISH bias
-            if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
+          // Enter ON pullback for BULLISH bias
+          if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
               // Check no-chase rules (final check before entry)
               const atrForBlock = this.calculateATR(closed5mBars);
               const blockCheck = this.shouldBlockEntry(
@@ -3365,16 +3389,16 @@ export class Orchestrator {
                 );
               } else {
                 // ENTRY EXECUTED
-                const oldPhase = exec.phase;
-                const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-                
-                exec.entryPrice = current5m.close;
-                exec.entryTs = ts;
-                exec.entryType = entryInfo.type;
-                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                exec.pullbackHigh = current5m.high;
-                exec.pullbackLow = current5m.low;
-                exec.pullbackTs = ts;
+            const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
                 exec.stopPrice = exec.opportunity?.stop.price ?? current5m.low; // Use opportunity stop or fallback
                 const atrLong = this.calculateATR(closed5mBars);
                 const closedBarsWithVolumeLong = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
@@ -3392,22 +3416,22 @@ export class Orchestrator {
                 );
                 exec.targets = targetResultLong.targets;
                 exec.targetZones = targetResultLong.targetZones;
-                exec.phase = "IN_TRADE";
-                exec.waitReason = "in_trade";
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
                 if (exec.opportunity) {
                   exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
                 }
                 shouldPublishEvent = true;
-                console.log(
+            console.log(
                   `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-                );
+            );
               }
-            }
+          }
 
-            // Enter ON pullback for BEARISH bias
-            if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
+          // Enter ON pullback for BEARISH bias
+          if (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh))) {
               // Check no-chase rules (final check before entry)
               const atrForBlock = this.calculateATR(closed5mBars);
               const blockCheck = this.shouldBlockEntry(
@@ -3430,16 +3454,16 @@ export class Orchestrator {
                 );
               } else {
                 // ENTRY EXECUTED
-                const oldPhase = exec.phase;
-                const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
-                
-                exec.entryPrice = current5m.close;
-                exec.entryTs = ts;
-                exec.entryType = entryInfo.type;
-                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                exec.pullbackHigh = current5m.high;
-                exec.pullbackLow = current5m.low;
-                exec.pullbackTs = ts;
+            const oldPhase = exec.phase;
+            const entryInfo = this.detectEntryType(exec.bias, current5m, previous5m ?? undefined);
+            
+            exec.entryPrice = current5m.close;
+            exec.entryTs = ts;
+            exec.entryType = entryInfo.type;
+            exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+            exec.pullbackHigh = current5m.high;
+            exec.pullbackLow = current5m.low;
+            exec.pullbackTs = ts;
                 exec.stopPrice = exec.opportunity?.stop.price ?? current5m.high; // Use opportunity stop or fallback
                 const atrShort = this.calculateATR(closed5mBars);
                 const closedBarsWithVolumeShort = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
@@ -3457,15 +3481,15 @@ export class Orchestrator {
                 );
                 exec.targets = targetResultShort.targets;
                 exec.targetZones = targetResultShort.targetZones;
-                exec.phase = "IN_TRADE";
-                exec.waitReason = "in_trade";
+            exec.phase = "IN_TRADE";
+            exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
                 if (exec.opportunity) {
                   exec.opportunity.status = "CONSUMED"; // Mark opportunity as consumed
                 }
                 shouldPublishEvent = true;
-                console.log(
+            console.log(
                   `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
                 );
               }
@@ -3740,10 +3764,56 @@ export class Orchestrator {
           console.log(
             `[SILENT_MODE_HEARTBEAT] No message in ${Math.round((ts - (this.lastMessageTs - silentModeThreshold)) / 60000)}min - emitting heartbeat | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} reason=${diagnostic?.reasonCode ?? "waiting"}`
           );
-        }
       }
+    }
 
     return events;
+  }
+
+  /**
+   * Preloads historical 5m bars and daily context on startup.
+   * This allows the bot to be "ready" immediately instead of waiting for history to build.
+   * 
+   * @param bars Array of historical 5m bars (should be last 60 bars)
+   * @param dailyContext Daily context (prevClose, prevHigh, prevLow, overnightHigh, overnightLow, prevSessionVWAP)
+   */
+  public preloadHistory(
+    bars: Array<{ ts: number; open: number; high: number; low: number; close: number; volume: number }>,
+    dailyContext?: {
+      prevClose: number;
+      prevHigh: number;
+      prevLow: number;
+      overnightHigh: number;
+      overnightLow: number;
+      prevSessionVWAP: number;
+    }
+  ): void {
+    if (bars.length === 0) {
+      console.log(`[PRELOAD] No bars provided - starting with empty history`);
+      return;
+    }
+    
+    // Hydrate recentBars5m
+    this.recentBars5m = bars.slice(-120); // Keep last 120 bars (10 hours)
+    console.log(`[PRELOAD] Loaded ${this.recentBars5m.length} historical 5m bars`);
+    
+    // Hydrate daily context
+    if (dailyContext) {
+      this.prevDayClose = dailyContext.prevClose;
+      this.prevDayHigh = dailyContext.prevHigh;
+      this.prevDayLow = dailyContext.prevLow;
+      this.overnightHigh = dailyContext.overnightHigh;
+      this.overnightLow = dailyContext.overnightLow;
+      this.prevSessionVWAP = dailyContext.prevSessionVWAP;
+      console.log(`[PRELOAD] Daily context loaded: prevClose=${dailyContext.prevClose.toFixed(2)} prevHigh=${dailyContext.prevHigh.toFixed(2)} prevLow=${dailyContext.prevLow.toFixed(2)}`);
+    }
+    
+    // If we have enough bars, log readiness
+    if (this.recentBars5m.length >= this.minimalLlmBars) {
+      console.log(`[PRELOAD] Ready for LLM call: ${this.recentBars5m.length} bars >= ${this.minimalLlmBars} minimal`);
+    } else {
+      console.log(`[PRELOAD] Not ready for LLM call: ${this.recentBars5m.length} bars < ${this.minimalLlmBars} minimal`);
+    }
   }
 
   private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {

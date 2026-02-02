@@ -147,6 +147,88 @@ const publisher = new MessagePublisher(governor, bot, chatId);
 const commands = new CommandHandler(orch, instanceId, llmService);
 const agg5m = new BarAggregator(5);
 
+// Preload historical bars on startup (if Alpaca credentials available)
+const alpacaKey = process.env.ALPACA_API_KEY;
+const alpacaSecret = process.env.ALPACA_API_SECRET;
+const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+
+if (alpacaKey && alpacaSecret) {
+  (async () => {
+    try {
+      const { AlpacaDataFeed } = await import("./datafeed/alpacaFeed.js");
+      const alpacaFeed = new AlpacaDataFeed({
+        apiKey: alpacaKey,
+        apiSecret: alpacaSecret,
+        baseUrl: process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets",
+        dataBaseUrl: process.env.ALPACA_DATA_BASE_URL || "https://data.alpaca.markets",
+        feed: (process.env.ALPACA_FEED || "iex") as "iex" | "sip",
+      });
+
+      // Fetch last 60 closed 5m bars
+      console.log(`[PRELOAD] Fetching historical 5m bars for ${symbol}...`);
+      const historicalBars = await alpacaFeed.fetchHistoricalBars(symbol, "5Min", 60);
+      
+      if (historicalBars && historicalBars.length > 0) {
+        const normalizedBars = historicalBars.map(bar => ({
+          ts: bar.ts,
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: bar.volume,
+        }));
+
+        // Fetch previous day's daily bar for context
+        const prevDayBars = await alpacaFeed.fetchHistoricalBars(symbol, "1Min", 1); // Get 1 bar, but we'll use daily timeframe
+        // Note: Alpaca's fetchHistoricalBars doesn't support daily timeframe directly
+        // We'll calculate daily context from the 5m bars we have
+        const overnightHigh = Math.max(...normalizedBars.map(b => b.high));
+        const overnightLow = Math.min(...normalizedBars.map(b => b.low));
+        
+        // Calculate VWAP from the historical bars
+        const calculateVWAP = (bars: Array<{ high: number; low: number; close: number; volume: number }>): number => {
+          if (bars.length === 0) return 0;
+          let cumulativeTPV = 0;
+          let cumulativeVolume = 0;
+          for (const bar of bars) {
+            const typicalPrice = (bar.high + bar.low + bar.close) / 3;
+            cumulativeTPV += typicalPrice * bar.volume;
+            cumulativeVolume += bar.volume;
+          }
+          return cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : 0;
+        };
+
+        const prevSessionVWAP = calculateVWAP(normalizedBars);
+        
+        // Use the first bar's open as prevClose approximation, last bar's close as current
+        // For a more accurate prevClose, we'd need to fetch actual daily bars, but this is a reasonable approximation
+        const prevClose = normalizedBars.length > 0 ? normalizedBars[0].open : undefined;
+        const prevHigh = overnightHigh;
+        const prevLow = overnightLow;
+
+        const dailyContext = prevClose !== undefined ? {
+          prevClose,
+          prevHigh,
+          prevLow,
+          overnightHigh,
+          overnightLow,
+          prevSessionVWAP,
+        } : undefined;
+
+        orch.preloadHistory(normalizedBars, dailyContext);
+        console.log(`[STARTUP] Preloaded ${normalizedBars.length} bars${dailyContext ? ` and daily context (prevClose=${dailyContext.prevClose.toFixed(2)})` : ""}`);
+      } else {
+        console.log(`[STARTUP] No historical bars available for preload - starting with empty history`);
+      }
+    } catch (error: any) {
+      console.warn(`[STARTUP] Preload failed: ${error.message} - starting with empty history`);
+      // Don't throw - allow bot to continue with empty history
+    }
+  })().catch(err => {
+    console.warn(`[STARTUP] Preload error: ${err?.message || String(err)} - starting with empty history`);
+  });
+}
+
 // Initialize scheduler
 const scheduler = new Scheduler(governor, instanceId, (mode) => {
   orch.setMode(mode);
@@ -157,7 +239,7 @@ const scheduler = new Scheduler(governor, instanceId, (mode) => {
 });
 
 // STAGE 3: Start structured pulse timer (every 60 seconds, runs in all modes)
-const symbol = process.env.SYMBOLS?.split(",")[0]?.trim() || "SPY";
+// Note: symbol is already defined above in preload section
 
 // Start scheduler
 scheduler.start();
@@ -250,8 +332,7 @@ setInterval(() => {
 
 // Main loop: process ticks (connect to your data feed)
 // Option 1: Alpaca data feed (if credentials provided)
-const alpacaKey = process.env.ALPACA_API_KEY;
-const alpacaSecret = process.env.ALPACA_API_SECRET;
+// Note: alpacaKey and alpacaSecret are already defined above in preload section
 
 if (alpacaKey && alpacaSecret) {
   (async () => {
