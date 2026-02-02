@@ -153,14 +153,9 @@ export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
 // Only one setup may be active at a time
 // No setup = no trade (even if bias is strong)
 export type SetupType = 
-  | "EARLY_REJECTION"    // Early rejection at resistance (failed reclaim of EMA/VWAP)
-  | "REJECTION"          // Trend continuation via pullback rejection
-  | "BREAKDOWN"          // Structural level break
-  | "COMPRESSION_BREAK"  // Volatility contraction → expansion
-  | "FAILED_BOUNCE"      // Counter-trend failure → reversal
-  | "TREND_REENTRY"      // Post-expansion continuation entry
-  | "PULLBACK_GENERIC"   // Fallback: generic pullback continuation (bias + pullback + signal)
-  | "NONE";              // Explicitly no setup
+  | "PULLBACK_CONTINUATION"  // Trend pullback then continuation (primary setup)
+  | "RIP_REVERSION"          // Extended rip then fade / extended dump then bounce (optional, phase 2)
+  | "NONE";                  // Explicitly no setup
 
 // Resolution Gate - permission system for entries
 export type ResolutionGateStatus = "INACTIVE" | "ARMED" | "TRIGGERED" | "EXPIRED" | "INVALIDATED";

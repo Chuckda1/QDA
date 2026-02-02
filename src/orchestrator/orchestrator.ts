@@ -454,25 +454,8 @@ export class Orchestrator {
     let stopPrice: number;
     let reason: string;
 
-    // For REJECTION setup, align trigger with rejection candle
-    if (exec.setup === "REJECTION" && exec.rejectionCandleLow !== undefined) {
-      if (bias === "BEARISH") {
-        // Bearish REJECTION: trigger is min(rejectionCandle.low, pullbackLow)
-        // This ensures entry triggers at rejection break, not after extended move
-        triggerPrice = Math.min(exec.rejectionCandleLow, pullbackLow);
-        stopPrice = exec.rejectionCandleHigh ?? (pullbackHigh + 0.1 * atr);
-        reason = "Bearish rejection setup - trigger at rejection break";
-      } else {
-        // Bullish REJECTION: trigger is max(rejectionCandle.high, pullbackHigh)
-        // This ensures entry triggers at rejection break, not after extended move
-        triggerPrice = exec.rejectionCandleHigh !== undefined
-          ? Math.max(exec.rejectionCandleHigh, pullbackHigh)
-          : pullbackHigh;
-        stopPrice = exec.rejectionCandleLow ?? (pullbackLow - 0.1 * atr);
-        reason = "Bullish rejection setup - trigger at rejection break";
-      }
-    } else {
-      // Non-REJECTION setup: use standard logic
+    // PULLBACK_CONTINUATION setup: use standard pullback continuation logic
+    if (exec.setup === "PULLBACK_CONTINUATION") {
       if (bias === "BEARISH") {
         // Bearish: trigger on break below pullback low
         triggerPrice = pullbackLow - 0.1 * atr;
@@ -483,6 +466,17 @@ export class Orchestrator {
         triggerPrice = pullbackHigh + 0.1 * atr;
         stopPrice = pullbackLow - 0.1 * atr;
         reason = "Bullish pullback continuation trigger armed";
+      }
+    } else {
+      // Fallback for any other setup type (shouldn't happen with simplified setup)
+      if (bias === "BEARISH") {
+        triggerPrice = pullbackLow - 0.1 * atr;
+        stopPrice = pullbackHigh + 0.1 * atr;
+        reason = "Bearish pullback continuation trigger armed (fallback)";
+      } else {
+        triggerPrice = pullbackHigh + 0.1 * atr;
+        stopPrice = pullbackLow - 0.1 * atr;
+        reason = "Bullish pullback continuation trigger armed (fallback)";
       }
     }
 
@@ -514,9 +508,9 @@ export class Orchestrator {
     // Tolerance band for REJECTION setups (default 0.05-0.10 for SPY)
     const rejectionTolerance = 0.08; // Configurable tolerance for REJECTION setups
     
-    // Check price trigger with tolerance for REJECTION setups
+    // Check price trigger with tolerance for PULLBACK_CONTINUATION setups
     let priceTriggered = false;
-    if (setup === "REJECTION") {
+    if (setup === "PULLBACK_CONTINUATION") {
       // REJECTION setup: allow tolerance band
       if (gate.direction === "short") {
         priceTriggered = currentPrice <= gate.triggerPrice + rejectionTolerance;
@@ -599,6 +593,191 @@ export class Orchestrator {
     }
   }
 
+  // Handle setup transitions: reset gate cleanly when setup changes
+  private onSetupTransition(
+    exec: MinimalExecutionState,
+    prevSetup: SetupType | undefined,
+    nextSetup: SetupType,
+    ts: number
+  ): void {
+    if (prevSetup === nextSetup) return;
+
+    // Always clear any armed/invalidated gate when setup changes
+    if (exec.resolutionGate) {
+      const prevGateStatus = exec.resolutionGate.status;
+      console.log(
+        `[GATE_RESET] setup ${prevSetup ?? "NONE"} -> ${nextSetup} | prevGate=${prevGateStatus}`
+      );
+    }
+    
+    // Clear gate state
+    exec.resolutionGate = undefined;
+    
+    // Clear setup-specific cached fields
+    exec.setupTriggerPrice = undefined;
+    exec.setupStopPrice = undefined;
+    exec.setupDetectedAt = ts; // Track when new setup started
+    
+    // Update wait reason
+    if (nextSetup === "NONE") {
+      exec.waitReason = "setup_none";
+    }
+  }
+
+  // Explicit arming criteria for PULLBACK_CONTINUATION setup
+  private tryArmPullbackGate(
+    exec: MinimalExecutionState,
+    currentPrice: number,
+    lastClosed5m: { open: number; high: number; low: number; close: number } | null,
+    previous5m: { open: number; high: number; low: number; close: number } | undefined,
+    closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
+    atr: number,
+    ts: number
+  ): { armed: true; trigger: number; stop: number; reason: string } | { armed: false; reason: string } {
+    // Precondition checks
+    if (exec.setup !== "PULLBACK_CONTINUATION") {
+      return { armed: false, reason: "wrong_setup" };
+    }
+    
+    if (exec.bias === "NEUTRAL") {
+      return { armed: false, reason: "missing_bias" };
+    }
+    
+    // Confidence threshold (adjustable)
+    const minConfidence = 65;
+    if ((exec.biasConfidence ?? 0) < minConfidence) {
+      return { armed: false, reason: `confidence_too_low (${exec.biasConfidence ?? 0} < ${minConfidence})` };
+    }
+    
+    // Pullback levels must be defined
+    if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
+      return { armed: false, reason: "missing_pullback_levels" };
+    }
+    
+    // ATR must be valid
+    if (atr <= 0) {
+      return { armed: false, reason: "invalid_atr" };
+    }
+    
+    // Phase must allow arming
+    if (exec.phase !== "BIAS_ESTABLISHED" && exec.phase !== "PULLBACK_IN_PROGRESS") {
+      return { armed: false, reason: `phase_disallows_arming (${exec.phase})` };
+    }
+    
+    // Need closed bar for analysis
+    if (!lastClosed5m) {
+      return { armed: false, reason: "no_closed_bar" };
+    }
+    
+    // Calculate EMA and VWAP for pullback zone detection
+    const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+    const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+    
+    // Calculate EMA9 (fast EMA)
+    let emaFast: number | undefined;
+    if (closed5mBars.length >= 9) {
+      const closes = closed5mBars.slice(-20).map(b => b.close);
+      const alpha = 2 / (9 + 1);
+      let ema = closes[0];
+      for (let i = 1; i < closes.length; i++) {
+        ema = alpha * closes[i] + (1 - alpha) * ema;
+      }
+      emaFast = ema;
+    }
+    
+    // Pullback zone condition: price must be in pullback zone
+    // Bullish: between VWAP and EMA_FAST (or slightly below EMA_FAST but above VWAP)
+    // Bearish: between VWAP and EMA_FAST on underside (or slightly above EMA_FAST but below VWAP)
+    let inPullbackZone = false;
+    if (exec.bias === "BULLISH") {
+      if (vwap !== undefined && emaFast !== undefined) {
+        // Bullish pullback zone: price between VWAP and EMA_FAST
+        inPullbackZone = currentPrice >= vwap && currentPrice <= emaFast + 0.1 * atr;
+      } else {
+        // Fallback: price must be below pullback high (in pullback range)
+        inPullbackZone = currentPrice < exec.pullbackHigh && currentPrice > exec.pullbackLow;
+      }
+    } else {
+      // BEARISH
+      if (vwap !== undefined && emaFast !== undefined) {
+        // Bearish pullback zone: price between EMA_FAST and VWAP (on underside)
+        inPullbackZone = currentPrice <= vwap && currentPrice >= emaFast - 0.1 * atr;
+      } else {
+        // Fallback: price must be above pullback low (in pullback range)
+        inPullbackZone = currentPrice > exec.pullbackLow && currentPrice < exec.pullbackHigh;
+      }
+    }
+    
+    if (!inPullbackZone) {
+      return { 
+        armed: false, 
+        reason: `not_in_pullback_zone (price=${currentPrice.toFixed(2)} vwap=${vwap?.toFixed(2) ?? "n/a"} emaFast=${emaFast?.toFixed(2) ?? "n/a"})` 
+      };
+    }
+    
+    // Rejection/turn condition: need rejection signal on 5m bar
+    const open = lastClosed5m.open ?? lastClosed5m.close;
+    const isBearish = lastClosed5m.close < open;
+    const isBullish = lastClosed5m.close > open;
+    
+    let hasTurnSignal = false;
+    if (exec.bias === "BEARISH") {
+      // Bearish: need lower-high + bearish close
+      const lowerHigh = previous5m ? lastClosed5m.high < previous5m.high : false;
+      hasTurnSignal = lowerHigh && isBearish;
+      
+      // Alternative: price closes back below EMA_FAST after being above
+      if (!hasTurnSignal && emaFast !== undefined && previous5m) {
+        const wasAboveEma = previous5m.close >= emaFast;
+        const nowBelowEma = lastClosed5m.close < emaFast;
+        hasTurnSignal = wasAboveEma && nowBelowEma && isBearish;
+      }
+    } else {
+      // BULLISH: need higher-low + bullish close
+      const higherLow = previous5m ? lastClosed5m.low > previous5m.low : false;
+      hasTurnSignal = higherLow && isBullish;
+      
+      // Alternative: price closes back above EMA_FAST after being below
+      if (!hasTurnSignal && emaFast !== undefined && previous5m) {
+        const wasBelowEma = previous5m.close <= emaFast;
+        const nowAboveEma = lastClosed5m.close > emaFast;
+        hasTurnSignal = wasBelowEma && nowAboveEma && isBullish;
+      }
+    }
+    
+    if (!hasTurnSignal) {
+      return { armed: false, reason: "no_turn_signal" };
+    }
+    
+    // Check for "too extended" condition (don't enter when already extended)
+    if (vwap !== undefined) {
+      const distanceFromVwap = Math.abs(currentPrice - vwap);
+      const maxDistance = 1.5 * atr; // Don't arm if > 1.5 ATR from VWAP
+      if (distanceFromVwap > maxDistance) {
+        return { armed: false, reason: `too_extended_from_vwap (${distanceFromVwap.toFixed(2)} > ${maxDistance.toFixed(2)})` };
+      }
+    }
+    
+    // All criteria met - calculate trigger and stop
+    let trigger: number;
+    let stop: number;
+    let reason: string;
+    
+    if (exec.bias === "BULLISH") {
+      // Bullish: trigger on break above pullback high (or rejection candle high)
+      trigger = exec.pullbackHigh + 0.1 * atr;
+      stop = exec.pullbackLow - 0.1 * atr;
+      reason = "bull_pullback_turn";
+    } else {
+      // BEARISH: trigger on break below pullback low (or rejection candle low)
+      trigger = exec.pullbackLow - 0.1 * atr;
+      stop = exec.pullbackHigh + 0.1 * atr;
+      reason = "bear_pullback_turn";
+    }
+    
+    return { armed: true, trigger, stop, reason };
+  }
+
   // ============================================================================
   // OPPORTUNITYLATCH: Single execution intent state that composes all gates
   // ============================================================================
@@ -650,11 +829,11 @@ export class Orchestrator {
       // Trigger: rollover candle (bearish close) or break of prior low
       // Use setup trigger if available, otherwise use pullback low
       triggerPrice = exec.setupTriggerPrice ?? (pullbackLow ?? (resistance - 0.3 * atr));
-      triggerType = exec.setup === "REJECTION" || exec.setup === "EARLY_REJECTION" ? "ROLLOVER" : "BREAK";
+      triggerType = exec.setup === "PULLBACK_CONTINUATION" ? "BREAK" : "BREAK";
       
-      // Stop: above pullback high or rejection candle high
+      // Stop: above pullback high
       stopPrice = exec.setupStopPrice ?? (pullbackHigh ?? resistance) + 0.1 * atr;
-      stopReason = exec.setup === "REJECTION" ? "rejection candle high + buffer" : "pullback high + buffer";
+      stopReason = "pullback high + buffer";
       
       notes = `Bearish pullback into resistance ${resistance.toFixed(2)}`;
       
@@ -674,11 +853,11 @@ export class Orchestrator {
       
       // Trigger: rollover candle (bullish close) or break of prior high
       triggerPrice = exec.setupTriggerPrice ?? (pullbackHigh ?? (support + 0.3 * atr));
-      triggerType = exec.setup === "REJECTION" || exec.setup === "EARLY_REJECTION" ? "ROLLOVER" : "BREAK";
+      triggerType = exec.setup === "PULLBACK_CONTINUATION" ? "BREAK" : "BREAK";
       
-      // Stop: below pullback low or rejection candle low
+      // Stop: below pullback low
       stopPrice = exec.setupStopPrice ?? (pullbackLow ?? support) - 0.1 * atr;
-      stopReason = exec.setup === "REJECTION" ? "rejection candle low + buffer" : "pullback low + buffer";
+      stopReason = "pullback low + buffer";
       
       notes = `Bullish pullback into support ${support.toFixed(2)}`;
       
@@ -704,7 +883,7 @@ export class Orchestrator {
       trigger: {
         type: triggerType,
         price: triggerPrice,
-        description: triggerType === "ROLLOVER" ? "rollover candle" : "break of prior structure",
+        description: "break of prior structure",
       },
       stop: {
         price: stopPrice,
@@ -772,6 +951,66 @@ export class Orchestrator {
     return { invalidated: false };
   }
 
+  // Ensure opportunity latch exists when bias is established (automatic/optional)
+  private ensureOpportunityLatch(
+    exec: MinimalExecutionState,
+    ts: number,
+    currentPrice: number,
+    atr: number
+  ): void {
+    if (exec.bias === "NEUTRAL") return;
+
+    // Check if we need to create/refresh opportunity latch
+    const needsLatch = !exec.opportunity || 
+                       exec.opportunity.status !== "LATCHED" ||
+                       exec.opportunity.biasAtLatch !== exec.bias ||
+                       exec.opportunity.expiresAtTs < ts;
+
+    if (needsLatch && 
+        (exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS") &&
+        atr > 0) {
+      
+      // Create simple automatic latch
+      const side = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+      const expiresInMin = 45; // 45 minutes
+      
+      exec.opportunity = {
+        status: "LATCHED",
+        side,
+        biasAtLatch: exec.bias,
+        phaseAtLatch: exec.phase,
+        setupAtLatch: exec.setup ?? "NONE",
+        latchedAtTs: ts,
+        expiresAtTs: ts + expiresInMin * 60 * 1000,
+        zone: {
+          low: exec.pullbackLow ?? currentPrice - 0.5 * atr,
+          high: exec.pullbackHigh ?? currentPrice + 0.5 * atr,
+        },
+        trigger: {
+          type: "BREAK",
+          price: exec.bias === "BULLISH" 
+            ? (exec.pullbackHigh ?? currentPrice) + 0.1 * atr
+            : (exec.pullbackLow ?? currentPrice) - 0.1 * atr,
+          description: "break of prior structure",
+        },
+        stop: {
+          price: exec.bias === "BULLISH"
+            ? (exec.pullbackLow ?? currentPrice) - 0.1 * atr
+            : (exec.pullbackHigh ?? currentPrice) + 0.1 * atr,
+          reason: "pullback_level_buffer",
+        },
+        attempts: 0,
+        bestPriceSeen: currentPrice,
+        invalidateIf: {},
+        notes: "automatic_latch",
+      };
+      
+      console.log(
+        `[OPP_LATCHED] direction=${exec.bias} expiresInMin=${expiresInMin} automatic`
+      );
+    }
+  }
+
   // Check if opportunity trigger is met (becomes TRIGGERED)
   private checkOpportunityTrigger(
     opportunity: OpportunityLatch,
@@ -832,8 +1071,8 @@ export class Orchestrator {
       }
     }
 
-    // Check if price crossed trigger price (with tolerance for REJECTION setups)
-    const tolerance = (opportunity.setupAtLatch === "REJECTION" || opportunity.setupAtLatch === "EARLY_REJECTION") ? 0.08 : 0.0;
+    // Check if price crossed trigger price (with tolerance for PULLBACK_CONTINUATION setups)
+    const tolerance = (opportunity.setupAtLatch === "PULLBACK_CONTINUATION") ? 0.08 : 0.0;
     if (opportunity.side === "SHORT") {
       if (current5m.close <= opportunity.trigger.price + tolerance) {
         // Price crossed trigger - check momentum alignment
@@ -875,11 +1114,11 @@ export class Orchestrator {
   }
 
   // ============================================================================
-  // SETUP DETECTION: Explicit, mutually-exclusive tradable patterns
+  // SETUP DETECTION: Simplified to only PULLBACK_CONTINUATION (and optional RIP_REVERSION)
   // ============================================================================
-  // Order matters: REJECTION > BREAKDOWN > COMPRESSION_BREAK > FAILED_BOUNCE > TREND_REENTRY > NONE
   // Only one setup may be active at a time
   // No setup = no trade (even if bias is strong)
+  // Setup detection uses ONLY closed 5m bars (never forming bars) to prevent flicker
   // ============================================================================
   
   private detectSetup(
@@ -888,8 +1127,8 @@ export class Orchestrator {
     previous5m: { open: number; high: number; low: number; close: number } | undefined,
     closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
     atr: number,
-    forming5mBar: Forming5mBar | null
-  ): { setup: SetupType; triggerPrice?: number; stopPrice?: number; rejectionCandleLow?: number; rejectionCandleHigh?: number } {
+    forming5mBar: Forming5mBar | null // IGNORED - never used to prevent flicker
+  ): { setup: SetupType; triggerPrice?: number; stopPrice?: number } {
     const bias = exec.bias;
     const phase = exec.phase;
     const expectedResolution = exec.expectedResolution;
@@ -898,656 +1137,56 @@ export class Orchestrator {
     if (bias === "NEUTRAL") {
       return { setup: "NONE" };
     }
-
-    // Calculate indicators needed for EARLY_REJECTION detection
-    const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ open: number; high: number; low: number; close: number; volume: number }>;
-    const ema9 = closedBarsWithVolume.length >= 9 
-      ? this.calculateEMA(closedBarsWithVolume.map(bar => ({ close: bar.close })), 9)
-      : 0;
-    const ema21 = closedBarsWithVolume.length >= 21
-      ? this.calculateEMA(closedBarsWithVolume.map(bar => ({ close: bar.close })), 21)
-      : 0;
-    const vwap = closedBarsWithVolume.length > 0
-      ? this.calculateVWAP(closedBarsWithVolume)
-      : 0;
-    const volSMA20 = closedBarsWithVolume.length >= 20
-      ? this.calculateVolumeSMA(closedBarsWithVolume.map(bar => ({ volume: bar.volume })), 20)
-      : 0;
-
-    // Setup hold mechanism: if EARLY_REJECTION is active, check hold TTL before re-detecting
-    if (exec.setup === "EARLY_REJECTION") {
-      const setupHoldDuration = 2 * 5 * 60 * 1000; // 2 bars = 10 minutes
-      const setupHoldUntil = (exec.setupDetectedAt ?? 0) + setupHoldDuration;
-      const now = Date.now();
-      
-      // Check for invalidation: price closes above stop (for bearish) or below stop (for bullish)
-      const invalidated = (bias === "BEARISH" && exec.setupStopPrice !== undefined && current5m.close > exec.setupStopPrice) ||
-                         (bias === "BULLISH" && exec.setupStopPrice !== undefined && current5m.close < exec.setupStopPrice);
-      
-      if (invalidated) {
-        console.log(
-          `[EARLY_REJECTION_INVALIDATED] Price broke stop - bias=${bias} price=${current5m.close.toFixed(2)} stop=${exec.setupStopPrice?.toFixed(2) ?? "n/a"}`
-        );
-        return { setup: "NONE" };
-      } else if (now < setupHoldUntil) {
-        // EARLY_REJECTION persists - return existing setup
-        return {
-          setup: "EARLY_REJECTION",
-          triggerPrice: exec.setupTriggerPrice,
-          stopPrice: exec.setupStopPrice,
-        };
-      }
-      // Hold expired - allow re-detection below
-    }
     
-    // Priority order: BREAKDOWN > EARLY_REJECTION > REJECTION > COMPRESSION_BREAK > FAILED_BOUNCE > TREND_REENTRY > NONE
-    
-    // 0. EARLY_REJECTION_SETUP (Failed reclaim of EMA/VWAP at resistance)
-    // Allowed when: Phase = BIAS_ESTABLISHED, PULLBACK_IN_PROGRESS, or CONSOLIDATION_AFTER_REJECTION
-    // ExpectedResolution = CONTINUATION
-    // Priority: Check before REJECTION to catch early signals
-    // Note: phase !== "IN_TRADE" is implicit in the phase checks above
-    if ((phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS" || phase === "CONSOLIDATION_AFTER_REJECTION") &&
+    // PULLBACK_CONTINUATION: Trend pullback then continuation
+    // Allowed when: bias is established, phase indicates pullback, and expected resolution is continuation
+    if ((phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS") &&
         expectedResolution === "CONTINUATION" &&
-        ema9 > 0 && vwap > 0 && volSMA20 > 0) {
+        exec.pullbackHigh !== undefined &&
+        exec.pullbackLow !== undefined &&
+        atr > 0) {
       
-      const current5mWithVolume = {
-        ...current5m,
-        volume: 'volume' in current5m ? (current5m as any).volume : 0,
-      };
-      const previous5mWithVolume = previous5m && 'volume' in previous5m
-        ? { ...previous5m, volume: (previous5m as any).volume }
-        : undefined;
+      // Calculate trigger and stop based on bias
+      let triggerPrice: number;
+      let stopPrice: number;
       
-      const earlyRejection = this.detectEarlyRejection(
-        bias,
-        current5mWithVolume,
-        previous5mWithVolume,
-        forming5mBar,
-        closedBarsWithVolume,
-        exec.pullbackHigh,
-        exec.pullbackLow,
-        atr,
-        ema9,
-        ema21,
-        vwap,
-        volSMA20
-      );
-      
-      if (earlyRejection.detected) {
-        console.log(
-          `[EARLY_REJECTION_DETECTED] bias=${bias} trigger=${earlyRejection.triggerPrice?.toFixed(2)} stop=${earlyRejection.stopPrice?.toFixed(2)} strength=${earlyRejection.strength}`
-        );
-        return {
-          setup: "EARLY_REJECTION",
-          triggerPrice: earlyRejection.triggerPrice,
-          stopPrice: earlyRejection.stopPrice,
-        };
-      }
-    }
-    
-    // 1. REJECTION_SETUP (Primary Trend Continuation)
-    // Allowed when: Phase = PULLBACK_IN_PROGRESS, ExpectedResolution = CONTINUATION
-    // REJECTION is PERSISTENT - once detected, it persists until resolved or invalidated
-    if (phase === "PULLBACK_IN_PROGRESS" && expectedResolution === "CONTINUATION") {
-      // If setup is already REJECTION, check for invalidation but don't re-detect
-      if (exec.setup === "REJECTION") {
-        // Check for invalidation: price breaks pullbackHigh (structure broken)
-        const invalidated = (bias === "BEARISH" && exec.pullbackHigh !== undefined && current5m.close > exec.pullbackHigh) ||
-                           (bias === "BULLISH" && exec.pullbackLow !== undefined && current5m.close < exec.pullbackLow);
-        
-        // Check for max bars elapsed (e.g., 5 bars = ~5 minutes)
-        const maxBarsElapsed = 5;
-        const barsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
-        
-        if (invalidated) {
-          // Structure broken - clear REJECTION setup
-          console.log(
-            `[REJECTION_INVALIDATED] Price broke structure - bias=${bias} price=${current5m.close.toFixed(2)} pullbackHigh=${exec.pullbackHigh?.toFixed(2) ?? "n/a"} pullbackLow=${exec.pullbackLow?.toFixed(2) ?? "n/a"}`
-          );
-          // Note: rejection candle info will be cleared in setup update logic
-          return { setup: "NONE" };
-        } else if (barsElapsed > maxBarsElapsed) {
-          // Too much time elapsed - clear REJECTION setup
-          console.log(
-            `[REJECTION_EXPIRED] Max bars elapsed (${barsElapsed} > ${maxBarsElapsed}) - clearing REJECTION setup`
-          );
-          // Note: rejection candle info will be cleared in setup update logic
-          return { setup: "NONE" };
-        } else {
-          // REJECTION persists - return existing setup with current trigger/stop and rejection candle info
-          return {
-            setup: "REJECTION",
-            triggerPrice: exec.setupTriggerPrice,
-            stopPrice: exec.setupStopPrice,
-            rejectionCandleLow: exec.rejectionCandleLow,
-            rejectionCandleHigh: exec.rejectionCandleHigh,
-          };
-        }
+      if (bias === "BEARISH") {
+        // Bearish: trigger on break below pullback low
+        triggerPrice = exec.pullbackLow - 0.1 * atr;
+        stopPrice = exec.pullbackHigh + 0.1 * atr;
       } else {
-        // Not REJECTION yet - detect it
-        const rejectionSetup = this.detectRejectionSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, atr);
-        if (rejectionSetup.detected) {
-          return {
-            setup: "REJECTION",
-            triggerPrice: rejectionSetup.triggerPrice,
-            stopPrice: rejectionSetup.stopPrice,
-            rejectionCandleLow: rejectionSetup.rejectionCandleLow,
-            rejectionCandleHigh: rejectionSetup.rejectionCandleHigh,
-          };
-        }
+        // Bullish: trigger on break above pullback high
+        triggerPrice = exec.pullbackHigh + 0.1 * atr;
+        stopPrice = exec.pullbackLow - 0.1 * atr;
       }
+      
+      return {
+        setup: "PULLBACK_CONTINUATION",
+        triggerPrice,
+        stopPrice,
+      };
     }
     
-    // 2. BREAKDOWN_SETUP (Structure Failure)
-    // Allowed when: Phase = CONSOLIDATION_AFTER_REJECTION OR BIAS_ESTABLISHED
-    if (phase === "CONSOLIDATION_AFTER_REJECTION" || phase === "BIAS_ESTABLISHED") {
-      const breakdownSetup = this.detectBreakdownSetup(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, closed5mBars, atr);
-      if (breakdownSetup.detected) {
-        return {
-          setup: "BREAKDOWN",
-          triggerPrice: breakdownSetup.triggerPrice,
-          stopPrice: breakdownSetup.stopPrice,
-        };
-      }
-    }
+    // TODO: RIP_REVERSION setup (optional, phase 2)
+    // Extended rip then fade / extended dump then bounce
     
-    // 3. COMPRESSION_BREAK (Energy Release)
-    // Allowed when: ATR compressing, Phase = CONSOLIDATION_AFTER_REJECTION
-    if (phase === "CONSOLIDATION_AFTER_REJECTION") {
-      const compressionSetup = this.detectCompressionBreak(bias, current5m, previous5m, closed5mBars, atr);
-      if (compressionSetup.detected) {
-        return {
-          setup: "COMPRESSION_BREAK",
-          triggerPrice: compressionSetup.triggerPrice,
-          stopPrice: compressionSetup.stopPrice,
-        };
-      }
-    }
-    
-    // 4. FAILED_BOUNCE (Counter-Trend Failure)
-    // Allowed when: Bias = BEARISH/BULLISH, ExpectedResolution = FAILURE
-    if (expectedResolution === "FAILURE" && (bias === "BEARISH" || bias === "BULLISH")) {
-      const failedBounceSetup = this.detectFailedBounce(bias, current5m, previous5m, exec.pullbackHigh, exec.pullbackLow, closed5mBars);
-      if (failedBounceSetup.detected) {
-        return {
-          setup: "FAILED_BOUNCE",
-          triggerPrice: failedBounceSetup.triggerPrice,
-          stopPrice: failedBounceSetup.stopPrice,
-        };
-      }
-    }
-    
-    // 5. TREND_REENTRY (Late Continuation)
-    // Allowed when: Phase = BIAS_ESTABLISHED, Previous move already ran
-    if (phase === "BIAS_ESTABLISHED" || phase === "REENTRY_WINDOW") {
-      const reentrySetup = this.detectTrendReentry(bias, current5m, previous5m, closed5mBars, exec.continuationHigh, exec.continuationLow, atr);
-      if (reentrySetup.detected) {
-        return {
-          setup: "TREND_REENTRY",
-          triggerPrice: reentrySetup.triggerPrice,
-          stopPrice: reentrySetup.stopPrice,
-        };
-      }
-    }
-    
-    // 6. PULLBACK_GENERIC (Fallback: generic pullback continuation)
-    // FIX #3: This ensures we always have a setup when bias is strong and pullback is happening
-    // This is the "old bot" behavior: pullback + signal = entry
-    // Allowed when: phase = BIAS_ESTABLISHED or PULLBACK_IN_PROGRESS (bias is already != NEUTRAL at this point)
-    if (phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS") {
-      if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
-        // Simple generic pullback setup
-        if (bias === "BEARISH") {
-          // Bearish: trigger on break below pullback low
-          return {
-            setup: "PULLBACK_GENERIC",
-            triggerPrice: exec.pullbackLow - 0.1 * atr,
-            stopPrice: exec.pullbackHigh + 0.1 * atr,
-          };
-        } else {
-          // Bullish: trigger on break above pullback high
-          return {
-            setup: "PULLBACK_GENERIC",
-            triggerPrice: exec.pullbackHigh + 0.1 * atr,
-            stopPrice: exec.pullbackLow - 0.1 * atr,
-          };
-        }
-      }
-    }
-    
-    // 7. NONE (Explicit No-Trade State)
+    // No setup detected
     return { setup: "NONE" };
   }
   
-  // Helper: Detect EARLY_REJECTION setup (failed reclaim of EMA/VWAP at resistance)
-  private detectEarlyRejection(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number; volume: number },
-    previous5m: { open: number; high: number; low: number; close: number; volume: number } | undefined,
-    forming5mBar: Forming5mBar | null,
-    closed5mBars: Array<{ open: number; high: number; low: number; close: number; volume: number }>,
-    pullbackHigh: number | undefined,
-    pullbackLow: number | undefined,
-    atr: number,
-    ema9: number,
-    ema21: number,
-    vwap: number,
-    volSMA20: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number; strength?: number } {
-    // Use forming bar if available, otherwise use current5m
-    const b = forming5mBar && forming5mBar.progressMinutes >= 2
-      ? {
-          open: forming5mBar.open,
-          high: forming5mBar.high,
-          low: forming5mBar.low,
-          close: forming5mBar.close,
-          volume: forming5mBar.volume,
-          progress: forming5mBar.progressMinutes,
-        }
-      : {
-          open: current5m.open ?? current5m.close,
-          high: current5m.high,
-          low: current5m.low,
-          close: current5m.close,
-          volume: current5m.volume,
-          progress: 5, // Closed bar
-        };
-
-    if (!previous5m || atr <= 0 || volSMA20 <= 0) return { detected: false };
-
-    // Calculate candlestick geometry
-    const body = Math.abs(b.close - b.open);
-    const range = Math.max(b.high - b.low, 0.01);
-    const upperWick = b.high - Math.max(b.open, b.close);
-    const lowerWick = Math.min(b.open, b.close) - b.low;
-    
-    const bodyPct = body / range;
-    const upperPct = upperWick / range;
-    const lowerPct = lowerWick / range;
-
-    // Noise filter: ignore tiny candles
-    if (range < 0.35 * atr) return { detected: false };
-    
-    // Don't decide on minute 1 noise
-    if (b.progress < 2) return { detected: false };
-
-    if (bias === "BEARISH") {
-      // Bearish EARLY_REJECTION: failed reclaim of EMA/VWAP with upper wick rejection
-      
-      // Rejection candle shape requirements
-      const closeWeak = (b.close <= b.open) || (b.close <= (b.high - 0.5 * range));
-      const wickOk = upperPct >= 0.35;
-      const bodyOk = bodyPct <= 0.45;
-      
-      if (!(wickOk && bodyOk && closeWeak)) return { detected: false };
-
-      // Reclaim-fail of key levels (EMA9 or VWAP)
-      const eps = 0.01; // Small epsilon for level comparison
-      const taggedEma = b.high >= ema9 - eps && b.close < ema9;
-      const taggedVwap = b.high >= vwap - eps && b.close < vwap;
-      
-      if (!(taggedEma || taggedVwap)) return { detected: false };
-
-      // Require cross attempt (was below, tried to reclaim, failed)
-      const wasBelowEma = previous5m.close <= ema9 || b.open <= ema9;
-      const wasBelowVwap = previous5m.close <= vwap || b.open <= vwap;
-      if (!((taggedEma && wasBelowEma) || (taggedVwap && wasBelowVwap))) return { detected: false };
-
-      // Structure: higher-high attempt or local pop
-      const higherHigh = b.high > previous5m.high;
-      const highestHigh3Bars = closed5mBars.length >= 3
-        ? Math.max(...closed5mBars.slice(-3).map(bar => bar.high))
-        : previous5m.high;
-      const taggedLocalHigh = b.high >= highestHigh3Bars - eps;
-      const taggedPullbackRes = pullbackHigh !== undefined && b.high >= pullbackHigh - 0.02;
-      
-      if (!(higherHigh || taggedLocalHigh || taggedPullbackRes)) return { detected: false };
-
-      // Volume confirmation (progress-adjusted if forming)
-      const volAdj = b.progress < 5 ? b.volume * (5 / b.progress) : b.volume;
-      const relVol = volAdj / volSMA20;
-
-      const aPlus = (upperPct >= 0.45) && (bodyPct <= 0.35);
-      const closeInBottom40 = b.close <= b.low + 0.60 * range;
-      
-      // Volume tiers
-      const volOk = (relVol >= 1.10) || (aPlus && relVol >= 0.90);
-      if (!volOk) return { detected: false };
-
-      // Calculate strength score
-      let strength = 0;
-      if (taggedEma && taggedVwap) strength += 2; // Tagged both
-      if (relVol >= 1.3) strength += 2;
-      else if (relVol >= 1.1) strength += 1;
-      if (upperPct >= 0.5) strength += 2;
-      else if (upperPct >= 0.45) strength += 1;
-      if (closeInBottom40) strength += 1;
-      if (higherHigh) strength += 1;
-
-      // Build setup
-      const stop = b.high + 0.05 * atr; // Buffer above rejection high
-      // Entry trigger: use close for strong setups, break-low for weaker
-      const triggerPrice = strength >= 6 ? b.close : b.low - 0.02;
-
-      return {
-        detected: true,
-        triggerPrice,
-        stopPrice: stop,
-        strength,
-      };
-    } else if (bias === "BULLISH") {
-      // Bullish EARLY_REJECTION: failed breakdown of EMA/VWAP with lower wick rejection
-      
-      // Rejection candle shape requirements (symmetric)
-      const closeStrong = (b.close >= b.open) || (b.close >= (b.low + 0.5 * range));
-      const wickOk = lowerPct >= 0.35;
-      const bodyOk = bodyPct <= 0.45;
-      
-      if (!(wickOk && bodyOk && closeStrong)) return { detected: false };
-
-      // Reclaim-fail of key levels (EMA9 or VWAP) - bullish version
-      const eps = 0.01;
-      const taggedEma = b.low <= ema9 + eps && b.close > ema9;
-      const taggedVwap = b.low <= vwap + eps && b.close > vwap;
-      
-      if (!(taggedEma || taggedVwap)) return { detected: false };
-
-      // Require cross attempt (was above, tried to break down, failed)
-      const wasAboveEma = previous5m.close >= ema9 || b.open >= ema9;
-      const wasAboveVwap = previous5m.close >= vwap || b.open >= vwap;
-      if (!((taggedEma && wasAboveEma) || (taggedVwap && wasAboveVwap))) return { detected: false };
-
-      // Structure: lower-low attempt or local pop
-      const lowerLow = b.low < previous5m.low;
-      const lowestLow3Bars = closed5mBars.length >= 3
-        ? Math.min(...closed5mBars.slice(-3).map(bar => bar.low))
-        : previous5m.low;
-      const taggedLocalLow = b.low <= lowestLow3Bars + eps;
-      const taggedPullbackSup = pullbackLow !== undefined && b.low <= pullbackLow + 0.02;
-      
-      if (!(lowerLow || taggedLocalLow || taggedPullbackSup)) return { detected: false };
-
-      // Volume confirmation (progress-adjusted if forming)
-      const volAdj = b.progress < 5 ? b.volume * (5 / b.progress) : b.volume;
-      const relVol = volAdj / volSMA20;
-
-      const aPlus = (lowerPct >= 0.45) && (bodyPct <= 0.35);
-      const closeInTop40 = b.close >= b.high - 0.60 * range;
-      
-      // Volume tiers
-      const volOk = (relVol >= 1.10) || (aPlus && relVol >= 0.90);
-      if (!volOk) return { detected: false };
-
-      // Calculate strength score
-      let strength = 0;
-      if (taggedEma && taggedVwap) strength += 2; // Tagged both
-      if (relVol >= 1.3) strength += 2;
-      else if (relVol >= 1.1) strength += 1;
-      if (lowerPct >= 0.5) strength += 2;
-      else if (lowerPct >= 0.45) strength += 1;
-      if (closeInTop40) strength += 1;
-      if (lowerLow) strength += 1;
-
-      // Build setup
-      const stop = b.low - 0.05 * atr; // Buffer below rejection low
-      // Entry trigger: use close for strong setups, break-high for weaker
-      const triggerPrice = strength >= 6 ? b.close : b.high + 0.02;
-
-      return {
-        detected: true,
-        triggerPrice,
-        stopPrice: stop,
-        strength,
-      };
-    }
-
-    return { detected: false };
-  }
-
-  // Helper: Detect REJECTION setup
-  private detectRejectionSetup(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number },
-    previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    pullbackHigh: number | undefined,
-    pullbackLow: number | undefined,
-    atr: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number; rejectionCandleLow?: number; rejectionCandleHigh?: number } {
-    if (!previous5m) return { detected: false };
-    
-    const open = current5m.open ?? current5m.close;
-    const isBearish = current5m.close < open;
-    const isBullish = current5m.close > open;
-    const hasUpperWick = current5m.high > Math.max(current5m.open ?? current5m.close, current5m.close);
-    const hasLowerWick = current5m.low < Math.min(current5m.open ?? current5m.close, current5m.close);
-    
-    if (bias === "BEARISH") {
-      // Bearish rejection: upper wick rejection, bearish close near highs
-      const rejectionCandle = hasUpperWick && isBearish;
-      const lowerHigh = current5m.high < (previous5m.high ?? previous5m.close);
-      
-      if (rejectionCandle && lowerHigh && pullbackHigh !== undefined) {
-        // Entry trigger: break of rejection candle low
-        // For REJECTION setup, trigger is min(rejectionCandle.low, pullbackLow)
-        const triggerPrice = pullbackLow !== undefined 
-          ? Math.min(current5m.low, pullbackLow)
-          : current5m.low;
-        
-        return {
-          detected: true,
-          triggerPrice,
-          stopPrice: current5m.high, // Stop above rejection high
-          rejectionCandleLow: current5m.low,
-          rejectionCandleHigh: current5m.high,
-        };
-      }
-    } else if (bias === "BULLISH") {
-      // Bullish rejection: lower wick rejection, bullish close near lows
-      const rejectionCandle = hasLowerWick && isBullish;
-      const higherLow = current5m.low > (previous5m.low ?? previous5m.close);
-      
-      if (rejectionCandle && higherLow && pullbackLow !== undefined) {
-        // Entry trigger: break of rejection candle high
-        // For REJECTION setup, trigger is max(rejectionCandle.high, pullbackHigh)
-        const triggerPrice = pullbackHigh !== undefined
-          ? Math.max(current5m.high, pullbackHigh)
-          : current5m.high;
-        
-        return {
-          detected: true,
-          triggerPrice,
-          stopPrice: current5m.low, // Stop below rejection low
-          rejectionCandleLow: current5m.low,
-          rejectionCandleHigh: current5m.high,
-        };
-      }
-    }
-    
-    return { detected: false };
-  }
+  // ============================================================================
+  // OLD SETUP DETECTION METHODS (DISABLED - removed after simplifying to PULLBACK_CONTINUATION only)
+  // ============================================================================
+  // The following methods are no longer used but kept for reference:
+  // - detectEarlyRejection()
+  // - detectRejectionSetup()
+  // - detectBreakdownSetup()
+  // - detectCompressionBreak()
+  // - detectFailedBounce()
+  // - detectTrendReentry()
+  // All code between here and detectEntryType() has been removed
+  // ============================================================================
   
-  // Helper: Detect BREAKDOWN setup
-  private detectBreakdownSetup(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number },
-    previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    pullbackHigh: number | undefined,
-    pullbackLow: number | undefined,
-    closed5mBars: Array<{ high: number; low: number; close: number }>,
-    atr: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number } {
-    if (!previous5m || closed5mBars.length < 3) return { detected: false };
-    
-    // Find consolidation low/high (last N bars range)
-    const recentBars = closed5mBars.slice(-5);
-    const consolidationLow = Math.min(...recentBars.map(b => b.low));
-    const consolidationHigh = Math.max(...recentBars.map(b => b.high));
-    const consolidationRange = consolidationHigh - consolidationLow;
-    
-    if (bias === "BEARISH") {
-      // Bearish breakdown: breaks below consolidation low
-      if (current5m.close < consolidationLow && consolidationRange < atr * 2) {
-        // Entry trigger: first pullback after break OR break-and-hold candle close
-        return {
-          detected: true,
-          triggerPrice: current5m.close, // Enter on break
-          stopPrice: consolidationLow + 0.5 * atr, // Stop above consolidation
-        };
-      }
-    } else if (bias === "BULLISH") {
-      // Bullish breakdown: breaks above consolidation high
-      if (current5m.close > consolidationHigh && consolidationRange < atr * 2) {
-        return {
-          detected: true,
-          triggerPrice: current5m.close, // Enter on break
-          stopPrice: consolidationHigh - 0.5 * atr, // Stop below consolidation
-        };
-      }
-    }
-    
-    return { detected: false };
-  }
-  
-  // Helper: Detect COMPRESSION_BREAK
-  private detectCompressionBreak(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number },
-    previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    closed5mBars: Array<{ high: number; low: number; close: number }>,
-    atr: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number } {
-    if (closed5mBars.length < 10) return { detected: false };
-    
-    // Check for compression (decreasing ATR)
-    const recentBars = closed5mBars.slice(-10);
-    const recentATRs = recentBars.slice(0, -1).map((bar, i) => {
-      if (i === 0) return 0;
-      return Math.abs(bar.high - bar.low);
-    });
-    const avgRecentATR = recentATRs.reduce((sum, r) => sum + r, 0) / recentATRs.length;
-    
-    // Current bar range
-    const currentRange = Math.abs(current5m.high - current5m.low);
-    
-    // Compression detected if recent ATR < current ATR * 0.7
-    const compressionDetected = avgRecentATR < atr * 0.7;
-    
-    // Expansion detected if current range > avgRecentATR * 1.5
-    const expansionCandle = currentRange > avgRecentATR * 1.5;
-    
-    if (compressionDetected && expansionCandle) {
-      // Check direction aligns with bias
-      const directionAligns = (bias === "BEARISH" && current5m.close < (previous5m?.close ?? current5m.close)) ||
-                              (bias === "BULLISH" && current5m.close > (previous5m?.close ?? current5m.close));
-      
-      if (directionAligns) {
-        return {
-          detected: true,
-          triggerPrice: current5m.close, // Enter on expansion candle close
-          stopPrice: bias === "BEARISH" ? current5m.high + 0.5 * atr : current5m.low - 0.5 * atr,
-        };
-      }
-    }
-    
-    return { detected: false };
-  }
-  
-  // Helper: Detect FAILED_BOUNCE
-  private detectFailedBounce(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number },
-    previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    pullbackHigh: number | undefined,
-    pullbackLow: number | undefined,
-    closed5mBars: Array<{ high: number; low: number; close: number }>
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number } {
-    if (!previous5m || closed5mBars.length < 3) return { detected: false };
-    
-    const recentBars = closed5mBars.slice(-5);
-    
-    if (bias === "BEARISH" && pullbackHigh !== undefined) {
-      // Bearish failed bounce: bounce fails below previous high
-      const prevHigh = Math.max(...recentBars.map(b => b.high));
-      const bounceFails = current5m.close < prevHigh && current5m.high < pullbackHigh;
-      
-      if (bounceFails) {
-        return {
-          detected: true,
-          triggerPrice: current5m.low, // Enter on break of bounce low
-          stopPrice: pullbackHigh, // Stop above bounce high
-        };
-      }
-    } else if (bias === "BULLISH" && pullbackLow !== undefined) {
-      // Bullish failed bounce: bounce fails above previous low
-      const prevLow = Math.min(...recentBars.map(b => b.low));
-      const bounceFails = current5m.close > prevLow && current5m.low > pullbackLow;
-      
-      if (bounceFails) {
-        return {
-          detected: true,
-          triggerPrice: current5m.high, // Enter on break of bounce high
-          stopPrice: pullbackLow, // Stop below bounce low
-        };
-      }
-    }
-    
-    return { detected: false };
-  }
-  
-  // Helper: Detect TREND_REENTRY
-  private detectTrendReentry(
-    bias: MarketBias,
-    current5m: { open: number; high: number; low: number; close: number },
-    previous5m: { open: number; high: number; low: number; close: number } | undefined,
-    closed5mBars: Array<{ high: number; low: number; close: number }>,
-    continuationHigh: number | undefined,
-    continuationLow: number | undefined,
-    atr: number
-  ): { detected: boolean; triggerPrice?: number; stopPrice?: number } {
-    if (!previous5m || closed5mBars.length < 5) return { detected: false };
-    
-    const recentBars = closed5mBars.slice(-5);
-    
-    if (bias === "BEARISH") {
-      // Bearish re-entry: shallow pullback, lower high holds
-      const recentHigh = Math.max(...recentBars.map(b => b.high));
-      const recentLow = Math.min(...recentBars.map(b => b.low));
-      const pullbackDepth = recentHigh - recentLow;
-      
-      // Shallow pullback: depth < 0.5 * ATR
-      const shallowPullback = pullbackDepth < 0.5 * atr;
-      const lowerHighHolds = current5m.high < recentHigh;
-      
-      if (shallowPullback && lowerHighHolds && continuationHigh !== undefined) {
-        return {
-          detected: true,
-          triggerPrice: current5m.close, // Enter on continuation candle break
-          stopPrice: recentHigh + 0.5 * atr, // Stop above pullback high
-        };
-      }
-    } else if (bias === "BULLISH") {
-      // Bullish re-entry: shallow pullback, higher low holds
-      const recentHigh = Math.max(...recentBars.map(b => b.high));
-      const recentLow = Math.min(...recentBars.map(b => b.low));
-      const pullbackDepth = recentHigh - recentLow;
-      
-      // Shallow pullback: depth < 0.5 * ATR
-      const shallowPullback = pullbackDepth < 0.5 * atr;
-      const higherLowHolds = current5m.low > recentLow;
-      
-      if (shallowPullback && higherLowHolds && continuationLow !== undefined) {
-        return {
-          detected: true,
-          triggerPrice: current5m.close, // Enter on continuation candle break
-          stopPrice: recentLow - 0.5 * atr, // Stop below pullback low
-        };
-      }
-    }
-    
-    return { detected: false };
-  }
-
   // Map LLM action to market bias (sticky, only flips on invalidation)
   // Helper to normalize LLM bias string to MarketBias enum (handles casing safely)
   private normalizeBias(llmBias: string | undefined): "BEARISH" | "BULLISH" | "NEUTRAL" {
@@ -1604,7 +1243,7 @@ export class Orchestrator {
 
     if (bias === "BEARISH") {
       // Rejection entry: bearish candle with upper wick at resistance
-      if (isBearish && hasUpperWick && previous5m && current5m.high > previous5m.high) {
+      if (isBearish && hasUpperWick && previous5m && current5m.high < previous5m.high) {
         return { type: "REJECTION_ENTRY", trigger: "Bearish rejection at resistance" };
       }
       // Breakdown entry: breaks below previous low
@@ -1613,7 +1252,7 @@ export class Orchestrator {
       }
     } else if (bias === "BULLISH") {
       // Rejection entry: bullish candle with lower wick at support
-      if (isBullish && hasLowerWick && previous5m && current5m.low < previous5m.low) {
+      if (isBullish && hasLowerWick && previous5m && current5m.low > previous5m.low) {
         return { type: "REJECTION_ENTRY", trigger: "Bullish rejection at support" };
       }
       // Breakdown entry: breaks above previous high
@@ -2537,6 +2176,10 @@ export class Orchestrator {
         const setupResult = this.detectSetup(exec, lastClosed5m, previous5m, closed5mBars, atr, null); // Never use forming bar
         
         const oldSetup = exec.setup;
+        
+        // Handle setup transition (resets gate cleanly)
+        this.onSetupTransition(exec, oldSetup, setupResult.setup, ts);
+        
         exec.setup = setupResult.setup;
         exec.setupTriggerPrice = setupResult.triggerPrice;
         exec.setupStopPrice = setupResult.stopPrice;
@@ -2544,22 +2187,23 @@ export class Orchestrator {
         if (oldSetup !== setupResult.setup) {
           exec.setupDetectedAt = ts;
           
-          // Store rejection candle info when REJECTION is first detected
-          if (setupResult.setup === "REJECTION") {
-            exec.rejectionCandleLow = setupResult.rejectionCandleLow;
-            exec.rejectionCandleHigh = setupResult.rejectionCandleHigh;
-            exec.rejectionBarsElapsed = 0;
-          } else {
-            exec.rejectionCandleLow = undefined;
-            exec.rejectionCandleHigh = undefined;
-            exec.rejectionBarsElapsed = undefined;
-          }
-          
+          // Log setup change with reason
+          const setupChangeReason = setupResult.setup === "NONE" 
+            ? (oldSetup ? `setup_invalidated` : `no_setup_detected`)
+            : `setup_detected`;
           console.log(
-            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"}`
+            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"} reason=${setupChangeReason}`
           );
-        } else if (exec.setup === "REJECTION") {
-          exec.rejectionBarsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
+          
+          // Enhanced [SETUP_CLEARED] log with more context
+          if (setupResult.setup === "NONE" && oldSetup && oldSetup !== "NONE") {
+            const pullbackInfo = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined
+              ? `pullbackLow=${exec.pullbackLow.toFixed(2)} pullbackHigh=${exec.pullbackHigh.toFixed(2)}`
+              : "pullbackLevels=undefined";
+            console.log(
+              `[SETUP_CLEARED] priorSetup=${oldSetup} bias=${exec.bias} phase=${exec.phase} reason=${setupChangeReason} price=${close.toFixed(2)} ${pullbackInfo}`
+            );
+          }
         }
       }
     }
@@ -2592,67 +2236,66 @@ export class Orchestrator {
       }
     }
     
-    // If no opportunity exists or it was invalidated, try to latch a new one
-    if (!exec.opportunity || exec.opportunity.status !== "LATCHED") {
-      // Latch conditions: bias + phase + pullback zone entry
-      if (exec.bias !== "NEUTRAL" && 
-          (exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS") &&
-          atr > 0) {
-        
-        // Initialize pullback levels if not set (fixes chicken-egg problem)
-        if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
-          if (lastClosed5m) {
-            if (exec.bias === "BEARISH") {
-              exec.pullbackHigh = lastClosed5m.high;
-              exec.pullbackLow = lastClosed5m.low;
-            } else {
-              exec.pullbackHigh = lastClosed5m.high;
-              exec.pullbackLow = lastClosed5m.low;
-            }
-            exec.pullbackTs = ts;
-          }
-        }
-        
-        // Try to latch opportunity
-        const opportunity = this.latchOpportunity(
-          exec,
-          ts,
-          close,
-          exec.pullbackHigh,
-          exec.pullbackLow,
-          atr,
-          closed5mBars,
-          forming5mBar
-        );
-        
-        if (opportunity) {
-          exec.opportunity = opportunity;
-          shouldPublishEvent = true;
-        }
-      }
-    }
+    // ============================================================================
+    // OPPORTUNITYLATCH: Make optional/automatic when bias is established
+    // ============================================================================
+    // For pullback engine, automatically ensure opportunity latch when bias is established
+    // This removes "no_opportunity_latched" blocking for basic pullback continuation
+    // ============================================================================
+    this.ensureOpportunityLatch(exec, ts, close, atr);
     
-    // Legacy gate management (DEMOTED: now supporting role)
-    // Keep for backward compatibility but opportunity takes precedence
+    // ============================================================================
+    // STEP 5: Gate Arming (explicit criteria for PULLBACK_CONTINUATION)
+    // ============================================================================
+    // Gate lifecycle must reset on setup change (handled above)
+    // Now attempt to ARM if setup is PULLBACK_CONTINUATION and criteria are met
+    // ============================================================================
     if (exec.setup === "NONE" || !exec.setup) {
+      // No setup - ensure gate is disarmed
       if (exec.resolutionGate && exec.resolutionGate.status === "ARMED") {
         this.deactivateGate(exec);
+        console.log(`[GATE_DEACTIVATED] Setup=NONE - gate disarmed`);
       }
-    } else if (exec.setup && exec.expectedResolution === "CONTINUATION" && 
-               exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined &&
-               (exec.bias === "BEARISH" || exec.bias === "BULLISH")) {
+    } else if (exec.setup === "PULLBACK_CONTINUATION") {
+      // Attempt to arm gate for PULLBACK_CONTINUATION setup using explicit criteria
       const atrForGate = this.calculateATR(closed5mBars);
-      if (atrForGate > 0) {
-        if (!exec.resolutionGate || exec.resolutionGate.status !== "ARMED") {
-          this.armResolutionGate(
-            exec,
-            exec.bias,
-            exec.pullbackHigh,
-            exec.pullbackLow,
-            atrForGate,
-            ts
-          );
-        }
+      const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
+      
+      // Use the new explicit arming function
+      const armResult = this.tryArmPullbackGate(
+        exec,
+        close,
+        lastClosed5m,
+        previous5m,
+        closed5mBars,
+        atrForGate,
+        ts
+      );
+      
+      if (armResult.armed && !exec.resolutionGate) {
+        // Gate doesn't exist - create/arm it
+        exec.resolutionGate = {
+          status: "ARMED",
+          direction: exec.bias === "BULLISH" ? "long" : "short",
+          triggerPrice: armResult.trigger,
+          stopPrice: armResult.stop,
+          expiryTs: ts + 2 * 5 * 60 * 1000, // 2 timeframes (10 minutes)
+          armedTs: ts,
+          reason: armResult.reason,
+        };
+        
+        console.log(
+          `[GATE_ARMED] setup=PULLBACK_CONTINUATION bias=${exec.bias} trigger=${armResult.trigger.toFixed(2)} stop=${armResult.stop.toFixed(2)} reason=${armResult.reason}`
+        );
+      } else if (!armResult.armed) {
+        // Gate not armed - log why with enhanced details
+        const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+        const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+        const confidence = exec.biasConfidence ?? 0;
+        
+        console.log(
+          `[GATE_NOT_ARMED] bias=${exec.bias} phase=${exec.phase} conf=${confidence} setup=${exec.setup} reason=${armResult.reason} price=${close.toFixed(2)} vwap=${vwap?.toFixed(2) ?? "n/a"} pullbackLow=${exec.pullbackLow?.toFixed(2) ?? "n/a"} pullbackHigh=${exec.pullbackHigh?.toFixed(2) ?? "n/a"}`
+        );
       }
     }
 
@@ -3133,7 +2776,7 @@ export class Orchestrator {
               `[GATE_TRIGGERED] ${exec.resolutionGate.direction.toUpperCase()} at ${current5m.close.toFixed(2)} trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} setup=${exec.setup} - Entry permission granted`
             );
             // Entry will be handled by normal entry logic below
-          } else if (exec.setup === "REJECTION") {
+          } else if (exec.setup === "PULLBACK_CONTINUATION") {
             // Diagnostic: Check for near-miss cases (within tolerance but didn't trigger)
             const rejectionTolerance = 0.08;
             const distanceToTrigger = exec.resolutionGate.direction === "short"
@@ -3209,76 +2852,13 @@ export class Orchestrator {
       // No setup = no trade (even if bias is strong)
       // Only one setup may be active at a time
       // ============================================================================
-        const current5m = forming5mBar ?? lastClosed5m;
-        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
+      const current5m = forming5mBar ?? lastClosed5m;
+      const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : (closed5mBars.length >= 1 ? closed5mBars[closed5mBars.length - 1] : null);
 
-      // Setup detection: only when bias is not NEUTRAL
-      // FIX 1: Make setup detection read-only on 1m ticks (only update if setup is NONE)
-      // This prevents flicker - setup is authoritative from reduce5mClose() on 5m closes
-      if (exec.bias === "NEUTRAL") {
-        // Clear setup when bias is neutral
-        if (exec.setup && exec.setup !== "NONE") {
-          console.log(`[SETUP_CLEARED] ${exec.setup} -> NONE | BIAS=NEUTRAL`);
-        }
-        exec.setup = "NONE";
-        exec.setupTriggerPrice = undefined;
-        exec.setupStopPrice = undefined;
-      } else if (current5m && exec.setup === "NONE") {
-        // Only detect setup if it's currently NONE (read-only otherwise to prevent flicker)
-        // Authoritative setup detection happens in reduce5mClose() on 5m closes
-        const atr = this.calculateATR(closed5mBars);
-        const setupResult = this.detectSetup(exec, current5m, previous5m ?? undefined, closed5mBars, atr, forming5mBar);
-        
-        // Update setup state
-        const oldSetup = exec.setup;
-        exec.setup = setupResult.setup;
-        exec.setupTriggerPrice = setupResult.triggerPrice;
-        exec.setupStopPrice = setupResult.stopPrice;
-        
-        if (oldSetup !== setupResult.setup) {
-          exec.setupDetectedAt = ts;
-          
-          // Store rejection candle info when REJECTION is first detected
-          if (setupResult.setup === "REJECTION") {
-            // Rejection candle info is already in setupResult
-            exec.rejectionCandleLow = setupResult.rejectionCandleLow;
-            exec.rejectionCandleHigh = setupResult.rejectionCandleHigh;
-            exec.rejectionBarsElapsed = 0; // Reset counter
-            
-            // Re-arm gate with REJECTION-specific trigger when REJECTION is first detected
-            if (exec.expectedResolution === "CONTINUATION" && 
-                exec.pullbackHigh !== undefined && 
-                exec.pullbackLow !== undefined) {
-              const atrForGate = this.calculateATR(closed5mBars);
-              if (atrForGate > 0) {
-                this.armResolutionGate(
-                  exec,
-                  exec.bias,
-                  exec.pullbackHigh,
-                  exec.pullbackLow,
-                  atrForGate,
-                  ts
-                );
-                console.log(
-                  `[GATE_REARMED] REJECTION setup detected - trigger updated to ${exec.resolutionGate?.triggerPrice.toFixed(2)} (min of rejectionCandle.low=${exec.rejectionCandleLow?.toFixed(2)} and pullbackLow=${exec.pullbackLow.toFixed(2)})`
-                );
-              }
-            }
-          } else {
-            // Clear rejection candle info when setup changes away from REJECTION
-            exec.rejectionCandleLow = undefined;
-            exec.rejectionCandleHigh = undefined;
-            exec.rejectionBarsElapsed = undefined;
-          }
-          
-          console.log(
-            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"}${setupResult.setup === "REJECTION" ? ` rejectionCandle=${exec.rejectionCandleLow?.toFixed(2) ?? "n/a"}-${exec.rejectionCandleHigh?.toFixed(2) ?? "n/a"}` : ""}`
-          );
-        } else if (exec.setup === "REJECTION") {
-          // REJECTION persists - increment bars elapsed counter
-          exec.rejectionBarsElapsed = (exec.rejectionBarsElapsed ?? 0) + 1;
-        }
-      }
+      // Setup detection: REMOVED from 1m path
+      // Setup detection ONLY happens in reduce5mClose() on 5m closes using closed bars only
+      // This prevents flicker from forming bars changing shape on every 1m tick
+      // Setup state is authoritative from reduce5mClose() - never override here
       
       // ============================================================================
       // ENTRY LOGIC: Find and Enter Setups
@@ -3366,12 +2946,13 @@ export class Orchestrator {
               (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) ||
               (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh)));
 
-            // FIX 2: Remove fallback - opportunity must be LATCHED or TRIGGERED (no || !exec.opportunity)
-            // This makes OpportunityLatch a true gate
+            // Entry permission: setup exists + entry signal fires + (opportunity latched OR gate armed)
+            // OpportunityLatch is optional - gate arming is the primary gate
             const canEnter = 
               (exec.setup && exec.setup !== "NONE") && // Setup must exist
               entrySignalFires && // Entry signal must fire
-              (exec.opportunity.status === "LATCHED" || exec.opportunity.status === "TRIGGERED"); // Opportunity must be latched or triggered
+              ((exec.opportunity && (exec.opportunity.status === "LATCHED" || exec.opportunity.status === "TRIGGERED")) || // Opportunity latched/triggered
+               (exec.resolutionGate && exec.resolutionGate.status === "ARMED")); // OR gate is armed (primary gate)
 
             if (canEnter) {
               // Enter ON pullback for BULLISH bias
