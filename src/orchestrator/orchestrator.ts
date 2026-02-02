@@ -1549,11 +1549,23 @@ export class Orchestrator {
   }
 
   // Map LLM action to market bias (sticky, only flips on invalidation)
+  // Helper to normalize LLM bias string to MarketBias enum (handles casing safely)
+  private normalizeBias(llmBias: string | undefined): "BEARISH" | "BULLISH" | "NEUTRAL" {
+    if (!llmBias) return "NEUTRAL";
+    const normalized = llmBias.toLowerCase();
+    if (normalized === "bullish") return "BULLISH";
+    if (normalized === "bearish") return "BEARISH";
+    return "NEUTRAL";
+  }
+
   private llmActionToBias(action: "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+", llmBias: "bullish" | "bearish" | "neutral"): "BEARISH" | "BULLISH" | "NEUTRAL" {
     if (action === "ARM_LONG" || (action === "A+" && llmBias === "bullish")) {
       return "BULLISH";
     } else if (action === "ARM_SHORT" || (action === "A+" && llmBias === "bearish")) {
       return "BEARISH";
+    } else if (action === "WAIT") {
+      // WAIT action: use llmBias directly (LLM can output WAIT with directional bias)
+      return this.normalizeBias(llmBias);
     }
     return "NEUTRAL";
   }
@@ -2401,6 +2413,9 @@ export class Orchestrator {
         llmDecision.action === "A+" ? (llmDecision.bias === "bearish" ? "short" : "long") : "none";
       
       const newBias = this.llmActionToBias(llmDecision.action as "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+", llmDecision.bias as "bullish" | "bearish" | "neutral");
+      console.log(
+        `[LLM_BIAS_MAP] action=${llmDecision.action} llmBias=${llmDecision.bias} -> execBias=${newBias}`
+      );
       const shouldFlip = this.shouldFlipBias(
         exec.bias,
         newBias,
