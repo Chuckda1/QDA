@@ -337,6 +337,29 @@ IMPORTANT:
 - Reserve BIAS=neutral ONLY for true chop / balanced auction / no edge conditions.
 
 ---
+## CONF Semantics (Hard rule)
+CONF is confidence in BIAS (directional edge), not confidence in CONTROL (timing).
+- You may output CONTROL=WAIT with high CONF if bias is clear but timing is bad.
+- If you output BIAS=neutral, CONF must be <= 55. Neutral means no edge.
+
+---
+## Neutral Escape Hatch (Restricted)
+BIAS=neutral is allowed ONLY when price action is truly balanced/mean-reverting.
+If there is a directional drift (higher closes/lower closes) or sustained hold on one side of the recent range,
+you MUST choose bullish or bearish bias and express caution via CONTROL=WAIT and/or reduced CONF.
+
+Examples of when you MUST choose directional bias:
+- Price making higher highs and higher lows → BIAS=bullish (even if CONF is 60-65)
+- Price making lower highs and lower lows → BIAS=bearish (even if CONF is 60-65)
+- Price holding above/below key levels (VWAP, EMA, prior close) for multiple bars → BIAS=bullish/bearish
+- Clear gap direction with follow-through → BIAS=bullish/bearish
+
+Only choose BIAS=neutral when:
+- Price is truly mean-reverting (oscillating around a center)
+- Both sides are winning/losing equally
+- No sustained directional drift exists
+
+---
 ## Required Internal Lens (do not output explicitly)
 Always evaluate MOVE MATURITY:
 - Is the current move early, developing, mature, extended, exhausting, or unclear?
