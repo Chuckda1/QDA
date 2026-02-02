@@ -1,7 +1,7 @@
-# Startup Slowness & Quietness Audit Report
+#  Slowness & Quietness Audit Report
 
 ## Executive Summary
-
+Startup
 **Symptom:** At open, `closed5mBars.length` is 1-2, bias stays `NEUTRAL`, setup `NONE`, Telegram says `waiting_for_bias`, and `lastLLMCallAt` is `null`.
 
 **Root Cause:** The bot starts with an empty `recentBars5m` array and requires building history from scratch. LLM calls are blocked until a 5m bar closes AND `closed5mBars.length > 0`. With only 1-2 bars, the bot cannot establish bias, so it remains in `NEUTRAL_PHASE` indefinitely.
