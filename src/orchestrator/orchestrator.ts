@@ -3274,7 +3274,11 @@ export class Orchestrator {
           } else if (!exec.opportunity || exec.opportunity.status !== "LATCHED") {
             // FIX 2: No opportunity latched - this is a hard blocker
             // Do not proceed to entry evaluation
-            exec.waitReason = "no_opportunity_latched";
+            // BUT: Only set waitReason if it's not already set to something more specific
+            // This prevents overriding a valid waitReason that was set on 5m close
+            if (!exec.waitReason || exec.waitReason === "no_opportunity_latched") {
+              exec.waitReason = "no_opportunity_latched";
+            }
             exec.entryBlocked = true;
             exec.entryBlockReason = "No tradable opportunity latched - waiting for pullback zone entry";
             shouldPublishEvent = true;
@@ -3440,11 +3444,28 @@ export class Orchestrator {
           }
         }
 
+        // CRITICAL: Override waitReason if opportunity is actually latched (fixes Telegram state sync)
+        // This prevents stale "no_opportunity_latched" from 1m handler overriding the correct state
+        let effectiveWaitReason = exec.waitReason;
+        if (exec.opportunity && exec.opportunity.status === "LATCHED") {
+          // Opportunity exists and is latched - override any stale "no_opportunity_latched"
+          if (effectiveWaitReason === "no_opportunity_latched") {
+            effectiveWaitReason = exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger";
+            // Also update exec.waitReason to prevent future stale reads
+            exec.waitReason = effectiveWaitReason;
+          }
+        }
+        
+        // Debug logging to verify state sync (as requested)
+        console.log(
+          `[TELEGRAM_STATE] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} oppExpires=${exec.opportunity?.expiresAtTs ? new Date(exec.opportunity.expiresAtTs).toISOString() : "n/a"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
+        );
+
         const mindState = {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none", // Legacy compatibility
           confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-          reason: this.getPhaseAwareReason(exec.bias, exec.phase, exec.waitReason),
+          reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason),
           bias: exec.bias,
           phase: exec.phase,
           entryStatus: exec.entryBlocked 
@@ -3502,12 +3523,26 @@ export class Orchestrator {
           const atr = this.calculateATR(closed5mBars);
           const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
           
+          // CRITICAL: Override waitReason if opportunity is actually latched (fixes Telegram state sync)
+          let effectiveWaitReason = exec.waitReason;
+          if (exec.opportunity && exec.opportunity.status === "LATCHED") {
+            if (effectiveWaitReason === "no_opportunity_latched") {
+              effectiveWaitReason = exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger";
+              exec.waitReason = effectiveWaitReason;
+            }
+          }
+          
+          // Debug logging for heartbeat
+          console.log(
+            `[TELEGRAM_STATE_HEARTBEAT] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
+          );
+          
           // Build minimal heartbeat message
           const mindState = {
             mindId: randomUUID(),
             direction: exec.thesisDirection ?? "none",
             confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-            reason: this.getPhaseAwareReason(exec.bias, exec.phase, exec.waitReason),
+            reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason),
             bias: exec.bias,
             phase: exec.phase,
             entryStatus: exec.entryBlocked ? "blocked" as const : "inactive" as const,
