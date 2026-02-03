@@ -149,7 +149,7 @@ export type MinimalExecutionPhase =
   | "CONSOLIDATION_AFTER_REJECTION";
 
 // Entry Types (explicit, not implied)
-export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | null;
+export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | "BIAS_FLIP_ENTRY" | null;
 
 // Expected Resolution (what should happen next in a pullback)
 export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
@@ -320,6 +320,24 @@ export type MinimalExecutionState = {
   // OpportunityLatch: Single execution intent state that composes all gates
   // This is the "glue" that persists tradable moments and prevents flicker
   opportunity?: OpportunityLatch;
+  // BiasFlipEntry: Independent entry path for bias flips (regime-break trades)
+  biasFlipGate?: BiasFlipGate;
+  lastBiasFlipArmTs?: number; // Cooldown tracking to prevent flip-flop spam
+};
+
+// BiasFlipEntry Gate State
+export type BiasFlipGateState = "NONE" | "ARMED" | "TRIGGERED" | "EXPIRED" | "CANCELLED";
+
+export type BiasFlipGate = {
+  state: BiasFlipGateState;
+  direction: "long" | "short";     // maps to exec.thesisDirection
+  armedAtTs: number;               // 5m close ts
+  expiresAtTs: number;             // TTL
+  trigger: number;                 // breakout level
+  stop: number;                    // protective stop
+  basis5m: { o: number; h: number; l: number; c: number; ts: number };
+  conf: number;
+  reason: "bias_flip";
 };
 
 export interface BotState {

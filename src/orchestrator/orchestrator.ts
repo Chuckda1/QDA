@@ -73,6 +73,12 @@ export class Orchestrator {
   private overnightLow?: number; // Overnight/pre-market low
   private prevSessionVWAP?: number; // Previous session VWAP
 
+  // BiasFlipEntry constants
+  private readonly BIAS_FLIP_MIN_CONF = 60;
+  private readonly BIAS_FLIP_TTL_MS = 12 * 60 * 1000;       // 12 minutes
+  private readonly BIAS_FLIP_COOLDOWN_MS = 10 * 60 * 1000;  // 10 minutes
+  private readonly BIAS_FLIP_MIN_RANGE_ATR = 0.20;          // avoid micro candles
+
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
     this.orchId = randomUUID();
@@ -1210,6 +1216,209 @@ export class Orchestrator {
     exec.targets = undefined;
     exec.entryType = undefined;
     exec.entryTrigger = undefined;
+    // Clear bias flip gate on exit
+    exec.biasFlipGate = undefined;
+  }
+
+  // ============================================================================
+  // BIAS FLIP ENTRY: Independent entry path for bias flips (regime-break trades)
+  // ============================================================================
+  // This module is independent of "setup" types - it doesn't care if exec.setup=NONE
+  // ============================================================================
+
+  private didBiasFlip(prevBias: MarketBias, newBias: MarketBias): boolean {
+    // Ignore neutral transitions (optional: can remove these guards if you want neutral->dir flips)
+    if (prevBias === "NEUTRAL") return false;
+    if (newBias === "NEUTRAL") return false;
+    return prevBias !== newBias;
+  }
+
+  private maybeArmBiasFlipGate(
+    exec: MinimalExecutionState,
+    prevBias: MarketBias,
+    closed5m: { ts: number; open: number; high: number; low: number; close: number; volume: number },
+    atr: number,
+    vwap: number | undefined,
+    ts: number
+  ): void {
+    // Don't arm if already in trade
+    if (exec.phase === "IN_TRADE") return;
+
+    // Must be a flip
+    if (!this.didBiasFlip(prevBias, exec.bias)) return;
+
+    // Confidence gate
+    if ((exec.biasConfidence ?? 0) < this.BIAS_FLIP_MIN_CONF) {
+      console.log(
+        `[BIAS_FLIP_BLOCKED] reason=conf_too_low conf=${exec.biasConfidence ?? 0} prev=${prevBias} next=${exec.bias}`
+      );
+      return;
+    }
+
+    // Cooldown to avoid flip-flop spam
+    if (exec.lastBiasFlipArmTs && (ts - exec.lastBiasFlipArmTs) < this.BIAS_FLIP_COOLDOWN_MS) {
+      const dtMs = ts - exec.lastBiasFlipArmTs;
+      console.log(
+        `[BIAS_FLIP_BLOCKED] reason=cooldown dtMs=${dtMs} cooldownMs=${this.BIAS_FLIP_COOLDOWN_MS}`
+      );
+      return;
+    }
+
+    // Basic ATR sanity
+    if (!atr || atr <= 0) {
+      console.log(`[BIAS_FLIP_BLOCKED] reason=no_atr`);
+      return;
+    }
+
+    // Candle range check (avoid micro candles)
+    const range = closed5m.high - closed5m.low;
+    if (range < this.BIAS_FLIP_MIN_RANGE_ATR * atr) {
+      console.log(
+        `[BIAS_FLIP_BLOCKED] reason=candle_too_small range=${range.toFixed(2)} atr=${atr.toFixed(2)} minRange=${(this.BIAS_FLIP_MIN_RANGE_ATR * atr).toFixed(2)}`
+      );
+      return;
+    }
+
+    // Optional: Don't arm if already too extended from VWAP
+    if (vwap !== undefined && Math.abs(closed5m.close - vwap) > 1.5 * atr) {
+      console.log(
+        `[BIAS_FLIP_BLOCKED] reason=too_extended_from_vwap close=${closed5m.close.toFixed(2)} vwap=${vwap.toFixed(2)} atr=${atr.toFixed(2)} distance=${Math.abs(closed5m.close - vwap).toFixed(2)}`
+      );
+      return;
+    }
+
+    const dir: "long" | "short" = exec.bias === "BULLISH" ? "long" : "short";
+
+    // Trigger is breakout of the FLIP candle in direction of new bias
+    const trigger = dir === "long" ? closed5m.high : closed5m.low;
+
+    // Stop is the opposite end of that flip candle (tight + deterministic)
+    const stop = dir === "long" ? closed5m.low : closed5m.high;
+
+    exec.biasFlipGate = {
+      state: "ARMED",
+      direction: dir,
+      armedAtTs: closed5m.ts,
+      expiresAtTs: closed5m.ts + this.BIAS_FLIP_TTL_MS,
+      trigger,
+      stop,
+      basis5m: {
+        o: closed5m.open,
+        h: closed5m.high,
+        l: closed5m.low,
+        c: closed5m.close,
+        ts: closed5m.ts,
+      },
+      conf: exec.biasConfidence ?? 0,
+      reason: "bias_flip",
+    };
+
+    exec.lastBiasFlipArmTs = ts;
+
+    const expiresInMin = Math.round(this.BIAS_FLIP_TTL_MS / 60000);
+    console.log(
+      `[BIAS_FLIP_ARMED] dir=${dir} conf=${exec.biasConfidence ?? 0} trigger=${trigger.toFixed(2)} stop=${stop.toFixed(2)} expiresInMin=${expiresInMin} prevBias=${prevBias} newBias=${exec.bias} basis5m={o=${closed5m.open.toFixed(2)} h=${closed5m.high.toFixed(2)} l=${closed5m.low.toFixed(2)} c=${closed5m.close.toFixed(2)}}`
+    );
+  }
+
+  private maybeExecuteBiasFlipEntry(
+    exec: MinimalExecutionState,
+    current5m: { open: number; high: number; low: number; close: number },
+    last1m: { high: number; low: number; close: number } | undefined,
+    closed5mBars: Array<{ high: number; low: number; close: number; volume: number }>,
+    ts: number
+  ): boolean {
+    const gate = exec.biasFlipGate;
+    if (!gate || gate.state !== "ARMED") return false;
+
+    // Expire
+    if (ts >= gate.expiresAtTs) {
+      console.log(
+        `[BIAS_FLIP_EXPIRED] dir=${gate.direction} armedAt=${gate.armedAtTs} nowTs=${ts}`
+      );
+      if (exec.biasFlipGate) {
+        exec.biasFlipGate.state = "EXPIRED";
+      }
+      return false;
+    }
+
+    // Cancel if bias no longer matches gate direction
+    const desiredDir = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
+    if (desiredDir !== gate.direction) {
+      console.log(
+        `[BIAS_FLIP_CANCELLED] reason=bias_changed_after_arm gateDir=${gate.direction} execBias=${exec.bias}`
+      );
+      if (exec.biasFlipGate) {
+        exec.biasFlipGate.state = "CANCELLED";
+      }
+      return false;
+    }
+
+    // Don't double-enter
+    if (exec.phase === "IN_TRADE") {
+      if (exec.biasFlipGate) {
+        exec.biasFlipGate.state = "CANCELLED";
+      }
+      return false;
+    }
+
+    // Trigger check using 1m extremes (prefer last1m if available, else use current5m)
+    const checkBar = last1m ?? current5m;
+    const triggered =
+      gate.direction === "long"
+        ? checkBar.high >= gate.trigger
+        : checkBar.low <= gate.trigger;
+
+    if (!triggered) return false;
+
+    // Execute "alerts-only" entry using existing structure
+    const oldPhase = exec.phase;
+
+    exec.phase = "IN_TRADE";
+    exec.thesisDirection = gate.direction;
+
+    exec.entryPrice = current5m.close;
+    exec.entryTs = ts;
+
+    exec.entryType = "BIAS_FLIP_ENTRY";
+    exec.entryTrigger = `Bias flip breakout ${gate.direction === "long" ? "above" : "below"} flip candle`;
+
+    exec.stopPrice = gate.stop;
+
+    // Targets: reuse existing computeTargets helper
+    const atr = this.calculateATR(closed5mBars);
+    const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+    const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+    const targetResult = this.computeTargets(
+      gate.direction,
+      exec.entryPrice,
+      exec.stopPrice,
+      atr,
+      closedBarsWithVolume,
+      vwap,
+      exec.pullbackHigh,
+      exec.pullbackLow,
+      exec.impulseRange
+    );
+    exec.targets = targetResult.targets;
+    exec.targetZones = targetResult.targetZones;
+
+    if (exec.opportunity) {
+      exec.opportunity.status = "CONSUMED";
+    }
+
+    exec.entryBlocked = false;
+    exec.waitReason = "in_trade";
+
+    if (exec.biasFlipGate) {
+      exec.biasFlipGate.state = "TRIGGERED";
+    }
+
+    console.log(
+      `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup ?? "NONE"} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+    );
+
+    return true; // Entry executed
   }
 
   // ============================================================================
@@ -2336,6 +2545,18 @@ export class Orchestrator {
     }
     
     // ============================================================================
+    // BIAS FLIP ENTRY: Arm gate on bias flip (independent of setup detection)
+    // ============================================================================
+    // This runs AFTER bias is updated but BEFORE setup detection
+    // It's independent - doesn't care if exec.setup=NONE
+    // ============================================================================
+    if (lastClosed5m && exec.bias !== "NEUTRAL") {
+      const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+      const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+      this.maybeArmBiasFlipGate(exec, previousBias, lastClosed5m, atr, vwap, ts);
+    }
+
+    // ============================================================================
     // OPPORTUNITYLATCH: Make optional/automatic when bias is established
     // ============================================================================
     // For pullback engine, automatically ensure opportunity latch when bias is established
@@ -2970,7 +3191,38 @@ export class Orchestrator {
       // Setup state is authoritative from reduce5mClose() - never override here
       
       // ============================================================================
-      // ENTRY LOGIC: Find and Enter Setups
+      // BIAS FLIP ENTRY: Execute on 1m trigger (BEFORE pullback entry logic)
+      // ============================================================================
+      // This is independent of setup detection - gives bias flips first shot
+      // ============================================================================
+      if (exec.phase !== "IN_TRADE" && exec.bias !== "NEUTRAL") {
+        const current5m = forming5mBar ?? lastClosed5m;
+        if (current5m) {
+          // Get last 1m bar for trigger check (use forming5mBar as proxy if available)
+          const last1m = forming5mBar ? {
+            high: forming5mBar.high,
+            low: forming5mBar.low,
+            close: forming5mBar.close,
+          } : undefined;
+          
+          const biasFlipExecuted = this.maybeExecuteBiasFlipEntry(
+            exec,
+            current5m,
+            last1m,
+            closed5mBars,
+            ts
+          );
+          
+          if (biasFlipExecuted) {
+            shouldPublishEvent = true;
+            // Skip pullback entry logic if bias flip executed
+            // Continue to stop/target checks below
+          }
+        }
+      }
+
+      // ============================================================================
+      // ENTRY LOGIC: Find and Enter Setups (only if not already in trade from bias flip)
       // ============================================================================
       // The bot finds setups by:
       // 1. Establishing bias (BEARISH/BULLISH) from LLM analysis
@@ -2991,6 +3243,8 @@ export class Orchestrator {
       // - No-chase rules triggered (continuation extended too far)
       // - Re-entry window expired
       // ============================================================================
+      // Only run pullback entry logic if not already in trade
+      if (exec.phase !== "IN_TRADE") {
       // ============================================================================
       // 1M ARMING: Attempt to arm gate on 1m turn signals (responsive arming)
       // ============================================================================
@@ -3317,21 +3571,21 @@ export class Orchestrator {
       if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && exec.targets) {
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
-          // Check stop
-          if (exec.thesisDirection === "long" && current5m.low <= exec.stopPrice) {
+          // Check stop (FIXED: use close instead of wick for close-based logic)
+          if (exec.thesisDirection === "long" && current5m.close <= exec.stopPrice) {
             const oldPhase = exec.phase;
             const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Stop hit at ${current5m.low.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+              `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
             );
             exec.phase = newPhase;
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
             shouldPublishEvent = true; // Exit - publish event
-          } else if (exec.thesisDirection === "short" && current5m.high >= exec.stopPrice) {
+          } else if (exec.thesisDirection === "short" && current5m.close >= exec.stopPrice) {
             const oldPhase = exec.phase;
             console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.high.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)})`
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
             );
             exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
@@ -3359,6 +3613,7 @@ export class Orchestrator {
           }
         }
       }
+      } // Close: if (exec.phase !== "IN_TRADE") for pullback entry logic
 
       // Publish event if state changed, important event occurred, or heartbeat needed
       // CRITICAL: This ensures blocked states still emit messages (heartbeat mechanism)
