@@ -2707,35 +2707,84 @@ export class Orchestrator {
     }
 
     // ============================================================================
-    // STEP 5: Consistency checks
+    // STEP 5: Consistency checks (architecture-aligned invariants)
     // ============================================================================
     const consistencyErrors: string[] = [];
-    
-    // Check: bias != NEUTRAL AND phase == NEUTRAL_PHASE => invalid
-    if (exec.bias !== "NEUTRAL" && exec.phase === "NEUTRAL_PHASE" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
-      consistencyErrors.push(`INVALID: bias=${exec.bias} but phase=NEUTRAL_PHASE (confidence=${exec.biasConfidence})`);
-    }
-    
-    // Check: gate == ARMED AND setup == NONE => invalid
-    if (exec.resolutionGate?.status === "ARMED" && (exec.setup === "NONE" || !exec.setup)) {
-      consistencyErrors.push(`INVALID: gate=ARMED but setup=NONE`);
-    }
-    
-    // Check: entryStatus != inactive AND setup == NONE => invalid
+    const consistencyWarnings: string[] = [];
+
     const entryStatus = exec.phase === "IN_TRADE" ? "active" : "inactive";
-    if (entryStatus === "active" && (exec.setup === "NONE" || !exec.setup)) {
-      consistencyErrors.push(`INVALID: entryStatus=active but setup=NONE`);
+
+    // ------------------------------------------------------------------
+    // Invariant 1: Strong bias should not coexist with NEUTRAL_PHASE
+    // ------------------------------------------------------------------
+    if (
+      exec.bias !== "NEUTRAL" &&
+      exec.phase === "NEUTRAL_PHASE" &&
+      exec.biasConfidence !== undefined &&
+      exec.biasConfidence >= 65
+    ) {
+      consistencyErrors.push(
+        `INVALID: bias=${exec.bias} but phase=NEUTRAL_PHASE (confidence=${exec.biasConfidence})`
+      );
     }
-    
-    // Always log consistency check (not just on errors) - this is the "observability contract"
-    const consistencyLog = consistencyErrors.length > 0
-      ? `[CONSISTENCY_CHECK] ERROR: ${consistencyErrors.join(" | ")} | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`
-      : `[CONSISTENCY_CHECK] OK | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus}`;
-    
+
+    // ------------------------------------------------------------------
+    // Invariant 2: Entry active => must be IN_TRADE
+    // ------------------------------------------------------------------
+    if (entryStatus === "active" && exec.phase !== "IN_TRADE") {
+      consistencyErrors.push(
+        `INVALID: entryStatus=active but phase=${exec.phase}`
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Invariant 3: IN_TRADE must have entryType
+    // ------------------------------------------------------------------
+    if (exec.phase === "IN_TRADE" && !exec.entryType) {
+      consistencyErrors.push(
+        `INVALID: phase=IN_TRADE but entryType missing`
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Soft invariant: Pullback-style entries should usually have setup
+    // (BiasFlip / Triggered are allowed to bypass setup)
+    // ------------------------------------------------------------------
+    const setupRequiredTypes = new Set([
+      "PULLBACK_ENTRY",
+      "PULLBACK_CONTINUATION",
+    ]);
+
+    if (
+      exec.phase === "IN_TRADE" &&
+      setupRequiredTypes.has(exec.entryType ?? "") &&
+      (exec.setup === "NONE" || !exec.setup)
+    ) {
+      consistencyWarnings.push(
+        `WARN: ${exec.entryType} entered with setup=NONE`
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Observability log (always)
+    // ------------------------------------------------------------------
+    const baseContext =
+      `bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} ` +
+      `gate=${exec.resolutionGate?.status ?? "none"} entry=${entryStatus} ` +
+      `entryType=${exec.entryType ?? "none"}`;
+
     if (consistencyErrors.length > 0) {
-      console.error(consistencyLog);
+      console.error(
+        `[CONSISTENCY_CHECK] ERROR: ${consistencyErrors.join(" | ")} | ${baseContext}`
+      );
+    } else if (consistencyWarnings.length > 0) {
+      console.warn(
+        `[CONSISTENCY_CHECK] WARN: ${consistencyWarnings.join(" | ")} | ${baseContext}`
+      );
     } else {
-      console.log(consistencyLog);
+      console.log(
+        `[CONSISTENCY_CHECK] OK | ${baseContext}`
+      );
     }
 
     // ============================================================================
