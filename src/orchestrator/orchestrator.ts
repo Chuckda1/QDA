@@ -1614,7 +1614,7 @@ export class Orchestrator {
     bias: MarketBias,
     current5m: { open: number; high: number; low: number; close: number },
     previous5m?: { open: number; high: number; low: number; close: number }
-  ): { type: EntryType; trigger: string } {
+  ): { type: EntryType | null; trigger: string } {
     const open = current5m.open ?? current5m.close;
     const isBearish = current5m.close < open;
     const isBullish = current5m.close > open;
@@ -1641,7 +1641,7 @@ export class Orchestrator {
       }
     }
 
-    return { type: null, trigger: "" };
+    return { type: null, trigger: "Pullback entry" };
   }
 
   // Enhanced target calculation with multiple methods
@@ -2890,6 +2890,147 @@ export class Orchestrator {
       const previousPhase = exec.phase;
 
     // ============================================================================
+    // MICRO INDICATORS (1m timeframe for countertrend detection)
+    // ============================================================================
+    // Compute minimal 1m micro indicators for deployment pause mechanism
+    // This is a risk throttle, not a bias override - it only pauses entries
+    // during strong countertrend moves to avoid fighting the tape
+    // ============================================================================
+    const current1mBar = {
+      ts,
+      open: snapshot.open ?? close,
+      high: snapshot.high ?? close,
+      low: snapshot.low ?? close,
+      close,
+      volume: snapshot.volume ?? 0,
+    };
+
+    // Maintain rolling window of last 30 1m bars
+    exec.microBars1m = (exec.microBars1m ?? []).slice(-29);
+    exec.microBars1m.push(current1mBar);
+
+    // Initialize micro state
+    exec.micro = exec.micro ?? {};
+
+    // Compute 1m VWAP (session running)
+    // Reset VWAP accumulators at session start (detect by ET date change)
+    const currentETDate = nowET;
+    if (exec.microLastETDate !== currentETDate) {
+      exec.microVwapPv = 0;
+      exec.microVwapVol = 0;
+      exec.microLastETDate = currentETDate;
+    }
+    exec.microVwapPv = (exec.microVwapPv ?? 0) + current1mBar.close * current1mBar.volume;
+    exec.microVwapVol = (exec.microVwapVol ?? 0) + current1mBar.volume;
+    exec.micro.vwap1m = exec.microVwapVol > 0 ? exec.microVwapPv / exec.microVwapVol : undefined;
+
+    // Compute 1m ATR (14 period)
+    if (exec.microBars1m.length >= 15) {
+      exec.micro.atr1m = this.calculateATR(exec.microBars1m, 14);
+    }
+
+    // Compute 1m EMA Fast (9 period)
+    if (exec.microBars1m.length >= 9) {
+      exec.micro.emaFast1m = this.calculateEMA(exec.microBars1m, 9);
+    }
+
+    // Compute simple swing highs/lows (max/min of last 10 bars)
+    const lookback = 10;
+    if (exec.microBars1m.length >= lookback) {
+      const recent = exec.microBars1m.slice(-lookback);
+      exec.micro.lastSwingHigh1m = Math.max(...recent.map(b => b.high));
+      exec.micro.lastSwingLow1m = Math.min(...recent.map(b => b.low));
+    }
+
+    // Update counters for VWAP/EMA reclaim detection
+    const vwap = exec.micro.vwap1m;
+    const ema1m = exec.micro.emaFast1m;
+    exec.micro.aboveVwapCount = vwap ? (close > vwap ? (exec.micro.aboveVwapCount ?? 0) + 1 : 0) : 0;
+    exec.micro.belowVwapCount = vwap ? (close < vwap ? (exec.micro.belowVwapCount ?? 0) + 1 : 0) : 0;
+    exec.micro.aboveEmaCount = ema1m ? (close > ema1m ? (exec.micro.aboveEmaCount ?? 0) + 1 : 0) : 0;
+    exec.micro.belowEmaCount = ema1m ? (close < ema1m ? (exec.micro.belowEmaCount ?? 0) + 1 : 0) : 0;
+
+    // ============================================================================
+    // DEPLOYMENT PAUSE MECHANISM (micro countertrend throttle)
+    // ============================================================================
+    // Pauses entries during strong countertrend moves to avoid fighting the tape
+    // Never flips macro bias - only temporarily blocks entries for 10 minutes
+    // ============================================================================
+    const now = ts;
+    const inTrade = exec.phase === "IN_TRADE";
+    const paused = (exec.deploymentPauseUntilTs ?? 0) > now;
+    const atr1m = exec.micro.atr1m;
+    const sh = exec.micro.lastSwingHigh1m;
+    const sl = exec.micro.lastSwingLow1m;
+
+    // Countertrend pause trigger conditions (bearish macro example)
+    if (!inTrade && exec.bias === "BEARISH") {
+      const holdReclaim = (exec.micro.aboveVwapCount ?? 0) >= 3 || (exec.micro.aboveEmaCount ?? 0) >= 3;
+      const brokeUp = sh ? close > sh : false;
+      const meaningful = (atr1m && sl) ? (close - sl) >= 0.8 * atr1m : false;
+      const countertrendUp = holdReclaim && brokeUp && meaningful;
+
+      if (countertrendUp) {
+        exec.deploymentPauseUntilTs = now + 10 * 60 * 1000; // 10 minutes
+        exec.deploymentPauseReason = "micro_countertrend_up_pause";
+        console.log(
+          `[DEPLOYMENT_PAUSE] BEARISH bias paused - countertrend up detected | vwap=${vwap?.toFixed(2) ?? "n/a"} ema=${ema1m?.toFixed(2) ?? "n/a"} sh=${sh?.toFixed(2) ?? "n/a"} atr1m=${atr1m?.toFixed(2) ?? "n/a"}`
+        );
+      }
+
+      // Early release if price returns below VWAP for 2 bars
+      if (paused && vwap) {
+        exec.micro.belowVwapCount = close < vwap ? (exec.micro.belowVwapCount ?? 0) + 1 : 0;
+        if ((exec.micro.belowVwapCount ?? 0) >= 2) {
+          exec.deploymentPauseUntilTs = undefined;
+          exec.deploymentPauseReason = undefined;
+          console.log(`[DEPLOYMENT_PAUSE_RELEASED] BEARISH bias - price returned below VWAP`);
+        }
+      }
+    }
+
+    // Countertrend pause trigger conditions (bullish macro example)
+    if (!inTrade && exec.bias === "BULLISH") {
+      const holdDump = (exec.micro.belowVwapCount ?? 0) >= 3 || (exec.micro.belowEmaCount ?? 0) >= 3;
+      const brokeDown = sl ? close < sl : false;
+      const meaningfulDown = (atr1m && sh) ? (sh - close) >= 0.8 * atr1m : false;
+      const countertrendDown = holdDump && brokeDown && meaningfulDown;
+
+      if (countertrendDown) {
+        exec.deploymentPauseUntilTs = now + 10 * 60 * 1000; // 10 minutes
+        exec.deploymentPauseReason = "micro_countertrend_down_pause";
+        console.log(
+          `[DEPLOYMENT_PAUSE] BULLISH bias paused - countertrend down detected | vwap=${vwap?.toFixed(2) ?? "n/a"} ema=${ema1m?.toFixed(2) ?? "n/a"} sl=${sl?.toFixed(2) ?? "n/a"} atr1m=${atr1m?.toFixed(2) ?? "n/a"}`
+        );
+      }
+
+      // Early release if price returns above VWAP for 2 bars
+      if (paused && vwap) {
+        exec.micro.aboveVwapCount = close > vwap ? (exec.micro.aboveVwapCount ?? 0) + 1 : 0;
+        if ((exec.micro.aboveVwapCount ?? 0) >= 2) {
+          exec.deploymentPauseUntilTs = undefined;
+          exec.deploymentPauseReason = undefined;
+          console.log(`[DEPLOYMENT_PAUSE_RELEASED] BULLISH bias - price returned above VWAP`);
+        }
+      }
+    }
+
+    // Log micro state for observability
+    console.log("[MICRO]", {
+      vwap1m: exec.micro.vwap1m?.toFixed(2),
+      ema1m: exec.micro.emaFast1m?.toFixed(2),
+      atr1m: exec.micro.atr1m?.toFixed(2),
+      sh1m: exec.micro.lastSwingHigh1m?.toFixed(2),
+      sl1m: exec.micro.lastSwingLow1m?.toFixed(2),
+      aboveVwap: exec.micro.aboveVwapCount,
+      aboveEma: exec.micro.aboveEmaCount,
+      belowVwap: exec.micro.belowVwapCount,
+      belowEma: exec.micro.belowEmaCount,
+      pausedUntil: exec.deploymentPauseUntilTs ? new Date(exec.deploymentPauseUntilTs).toISOString() : undefined,
+      pauseReason: exec.deploymentPauseReason,
+    });
+
+    // ============================================================================
     // ============================================================================
     // RULE 1: LLM must NEVER be called on 1m path - ONLY on 5m closes
     // ============================================================================
@@ -3037,7 +3178,7 @@ export class Orchestrator {
           
           exec.entryPrice = current5m.close;
           exec.entryTs = ts;
-          exec.entryType = entryInfo.type;
+          exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
           exec.entryTrigger = entryInfo.trigger || "A+ maturity flip";
           exec.pullbackHigh = current5m.high;
           exec.pullbackLow = current5m.low;
@@ -3498,21 +3639,43 @@ export class Orchestrator {
         }
 
         // ------------------------------------------------------------
-        // 2) Readiness invariant (no more latch-only scoping)
+        // 2) Deployment pause check (micro countertrend throttle)
         // ------------------------------------------------------------
-        const hasOpportunity = !!exec.opportunity;
-        const oppReady =
-          hasOpportunity &&
-          (exec.opportunity!.status === "LATCHED" ||
-            exec.opportunity!.status === "TRIGGERED");
+        const now = ts;
+        const deploymentPaused = (exec.deploymentPauseUntilTs ?? 0) > now;
+        
+        // Clear pause state if expired
+        if (exec.deploymentPauseUntilTs && now >= exec.deploymentPauseUntilTs) {
+          exec.deploymentPauseUntilTs = undefined;
+          exec.deploymentPauseReason = undefined;
+        }
 
-        const gateReady = exec.resolutionGate?.status === "ARMED";
+        if (deploymentPaused) {
+          exec.waitReason = exec.deploymentPauseReason ?? "deployment_pause";
+          exec.entryBlocked = true;
+          exec.entryBlockReason = `Deployment paused: ${exec.deploymentPauseReason ?? "micro_countertrend"}`;
+          shouldPublishEvent = true;
+          console.log(
+            `[ENTRY_BLOCKED] Deployment pause active - ${exec.deploymentPauseReason} | pausedUntil=${new Date(exec.deploymentPauseUntilTs!).toISOString()}`
+          );
+          // Skip entry evaluation while paused - exit early
+        } else {
+          // ------------------------------------------------------------
+          // 3) Readiness invariant (no more latch-only scoping)
+          // ------------------------------------------------------------
+          const hasOpportunity = !!exec.opportunity;
+          const oppReady =
+            hasOpportunity &&
+            (exec.opportunity!.status === "LATCHED" ||
+              exec.opportunity!.status === "TRIGGERED");
 
-        // If you want OpportunityLatch optional and gate primary, this keeps that:
-        const readyToEvaluateEntry = oppReady || gateReady;
+          const gateReady = exec.resolutionGate?.status === "ARMED";
+
+          // If you want OpportunityLatch optional and gate primary, this keeps that:
+          const readyToEvaluateEntry = oppReady || gateReady;
 
         // ------------------------------------------------------------
-        // 3) Hard blocker: not ready -> block + exit (prevents fallthrough)
+        // 4) Hard blocker: not ready -> block + exit (prevents fallthrough)
         // ------------------------------------------------------------
         // Debug log to verify opportunity status before blocker check
         const oppStatus = exec.opportunity?.status ?? "none";
@@ -3641,7 +3804,7 @@ export class Orchestrator {
 
                 exec.entryPrice = current5m.close;
                 exec.entryTs = ts;
-                exec.entryType = entryInfo.type;
+                exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
                 exec.entryTrigger = entryInfo.trigger || "Pullback entry";
                 exec.pullbackHigh = current5m.high;
                 exec.pullbackLow = current5m.low;
@@ -3734,7 +3897,7 @@ export class Orchestrator {
 
                 exec.entryPrice = current5m.close;
                 exec.entryTs = ts;
-                exec.entryType = entryInfo.type;
+                exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
                 exec.entryTrigger = entryInfo.trigger || "Pullback entry";
                 exec.pullbackHigh = current5m.high;
                 exec.pullbackLow = current5m.low;

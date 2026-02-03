@@ -311,6 +311,26 @@ export type MinimalExecutionState = {
   continuationExtension?: number; // Distance from pullback level when continuation detected
   entryBlocked?: boolean; // True when no-chase rules prevent entry
   entryBlockReason?: string; // Reason for entry blocking
+  // Deployment pause (micro countertrend throttle)
+  deploymentPauseUntilTs?: number; // Timestamp when deployment pause expires
+  deploymentPauseReason?: string; // Reason for deployment pause
+  // Micro indicators (1m timeframe for countertrend detection)
+  micro?: {
+    vwap1m?: number; // Session VWAP on 1m bars
+    emaFast1m?: number; // Fast EMA on 1m bars
+    atr1m?: number; // ATR(14) on 1m bars
+    lastSwingHigh1m?: number; // Max high of last 10 1m bars
+    lastSwingLow1m?: number; // Min low of last 10 1m bars
+    aboveVwapCount?: number; // Consecutive closes above VWAP
+    belowVwapCount?: number; // Consecutive closes below VWAP
+    aboveEmaCount?: number; // Consecutive closes above EMA
+    belowEmaCount?: number; // Consecutive closes below EMA
+  };
+  // Rolling window for 1m micro indicators
+  microBars1m?: Array<{ ts: number; open: number; high: number; low: number; close: number; volume: number }>;
+  microVwapPv?: number; // Running sum of price * volume for VWAP
+  microVwapVol?: number; // Running sum of volume for VWAP
+  microLastETDate?: string; // Last ET date for session VWAP reset
   // Re-entry tracking
   impulseRange?: number; // Range of the continuation impulse move
   continuationHigh?: number; // Highest point during continuation (bearish bias)
