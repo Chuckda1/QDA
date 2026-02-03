@@ -210,6 +210,7 @@ export type OpportunityLatch = {
   // Optional but useful
   attempts?: number;                     // how many times we "almost triggered"
   bestPriceSeen?: number;                // for no-chase logic / to avoid late entries
+  armedAtPrice?: number;                 // price when latched (for cross-based trigger validation)
   notes?: string;                        // human-readable: "pullback into resistance"
   
   // Invalidation rules (structural checks)
