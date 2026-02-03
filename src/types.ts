@@ -149,7 +149,7 @@ export type MinimalExecutionPhase =
   | "CONSOLIDATION_AFTER_REJECTION";
 
 // Entry Types (explicit, not implied)
-export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | "BIAS_FLIP_ENTRY" | null;
+export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | "BIAS_FLIP_ENTRY" | "PULLBACK_ENTRY";
 
 // Expected Resolution (what should happen next in a pullback)
 export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";

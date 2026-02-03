@@ -1614,7 +1614,7 @@ export class Orchestrator {
     bias: MarketBias,
     current5m: { open: number; high: number; low: number; close: number },
     previous5m?: { open: number; high: number; low: number; close: number }
-  ): { type: EntryType | null; trigger: string } {
+  ): { type: EntryType; trigger: string } {
     const open = current5m.open ?? current5m.close;
     const isBearish = current5m.close < open;
     const isBullish = current5m.close > open;
@@ -1641,7 +1641,7 @@ export class Orchestrator {
       }
     }
 
-    return { type: null, trigger: "Pullback entry" };
+    return { type: "PULLBACK_ENTRY", trigger: "Pullback entry" };
   }
 
   // Enhanced target calculation with multiple methods
@@ -3957,7 +3957,8 @@ export class Orchestrator {
             }
           }
         }
-      }
+        } // Close: else block for entry evaluation (readyToEvaluateEntry) - line 3704
+      } // Close: else block for deployment pause (not paused) - line 3662
 
       // Check trade management if in trade
       // Real-time target updates: recompute targets on each 5m close
@@ -4028,18 +4029,18 @@ export class Orchestrator {
             shouldPublishEvent = true; // Exit - publish event
           }
         }
-      }
-      } // Close: if (exec.phase !== "IN_TRADE") for pullback entry logic
+      } // Close: if (exec.phase === "IN_TRADE" && ...) for trade management (line 3987)
+      } // Close: if (exec.bias !== "NEUTRAL" && ...) for pullback entry logic - line 3596
 
-      // Publish event if state changed, important event occurred, or heartbeat needed
-      // CRITICAL: This ensures blocked states still emit messages (heartbeat mechanism)
-      const shouldEmit = shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias;
-      
-      if (shouldEmit) {
-        // Track last message timestamp for silent mode detection
-        this.lastMessageTs = ts;
-        if (!debugInfo) {
-          const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
+    // Publish event if state changed, important event occurred, or heartbeat needed
+    // CRITICAL: This ensures blocked states still emit messages (heartbeat mechanism)
+    const shouldEmit = shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias;
+    
+    if (shouldEmit) {
+      // Track last message timestamp for silent mode detection
+      this.lastMessageTs = ts;
+      if (!debugInfo) {
+        const barsForCandidates = closed5mBars.length > 0 ? closed5mBars : (forming5mBar ? [{
             ts: forming5mBar.endTs,
             open: forming5mBar.open,
             high: forming5mBar.high,
@@ -4047,76 +4048,166 @@ export class Orchestrator {
             close: forming5mBar.close,
             volume: forming5mBar.volume,
           }] : []);
-          debugInfo = {
-            barsClosed5m: closed5mBars.length,
-            hasForming5m: !!forming5mBar,
-            formingProgressMin: forming5mBar?.progressMinutes ?? null,
-            formingStartTs: forming5mBar?.startTs ?? null,
-            formingEndTs: forming5mBar?.endTs ?? null,
-            formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
-            lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
-            candidateBarsUsed: barsForCandidates.length,
-            candidateCount: exec.activeCandidate ? 1 : 0,
-            botPhase: exec.phase,
-            botWaitReason: exec.waitReason ?? null,
-          };
-        }
+        debugInfo = {
+          barsClosed5m: closed5mBars.length,
+          hasForming5m: !!forming5mBar,
+          formingProgressMin: forming5mBar?.progressMinutes ?? null,
+          formingStartTs: forming5mBar?.startTs ?? null,
+          formingEndTs: forming5mBar?.endTs ?? null,
+          formingRange: forming5mBar ? (forming5mBar.high - forming5mBar.low) : null,
+          lastClosedRange: lastClosed5m ? (lastClosed5m.high - lastClosed5m.low) : null,
+          candidateBarsUsed: barsForCandidates.length,
+          candidateCount: exec.activeCandidate ? 1 : 0,
+          botPhase: exec.phase,
+          botWaitReason: exec.waitReason ?? null,
+        };
+      }
 
-        // Determine reference price and label based on phase/state
-        let refPrice: number | undefined = undefined;
-        let refLabel: string | undefined = undefined;
-        
-        if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined) {
-          refPrice = exec.entryPrice;
-          refLabel = "entry";
-        } else if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "CONTINUATION_IN_PROGRESS" || exec.phase === "REENTRY_WINDOW") {
-          if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
-            refPrice = exec.pullbackHigh;
-            if (exec.phase === "CONTINUATION_IN_PROGRESS") {
-              refLabel = "pullback high (continuation)";
-            } else if (exec.phase === "REENTRY_WINDOW") {
-              refLabel = "pullback high (re-entry window)";
-            } else {
-              refLabel = "pullback high";
-            }
-          } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
-            refPrice = exec.pullbackLow;
-            if (exec.phase === "CONTINUATION_IN_PROGRESS") {
-              refLabel = "pullback low (continuation)";
-            } else if (exec.phase === "REENTRY_WINDOW") {
-              refLabel = "pullback low (re-entry window)";
-            } else {
-              refLabel = "pullback low";
-            }
-          } else if (exec.biasPrice !== undefined) {
-            refPrice = exec.biasPrice;
-            refLabel = "bias established";
+      // Determine reference price and label based on phase/state
+      let refPrice: number | undefined = undefined;
+      let refLabel: string | undefined = undefined;
+      
+      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined) {
+        refPrice = exec.entryPrice;
+        refLabel = "entry";
+      } else if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "CONTINUATION_IN_PROGRESS" || exec.phase === "REENTRY_WINDOW") {
+        if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
+          refPrice = exec.pullbackHigh;
+          if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+            refLabel = "pullback high (continuation)";
+          } else if (exec.phase === "REENTRY_WINDOW") {
+            refLabel = "pullback high (re-entry window)";
+          } else {
+            refLabel = "pullback high";
+          }
+        } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
+          refPrice = exec.pullbackLow;
+          if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+            refLabel = "pullback low (continuation)";
+          } else if (exec.phase === "REENTRY_WINDOW") {
+            refLabel = "pullback low (re-entry window)";
+          } else {
+            refLabel = "pullback low";
           }
         } else if (exec.biasPrice !== undefined) {
           refPrice = exec.biasPrice;
           refLabel = "bias established";
-        } else if (exec.thesisPrice !== undefined) {
-          refPrice = exec.thesisPrice;
-          refLabel = "bias established";
         }
+      } else if (exec.biasPrice !== undefined) {
+        refPrice = exec.biasPrice;
+        refLabel = "bias established";
+      } else if (exec.thesisPrice !== undefined) {
+        refPrice = exec.thesisPrice;
+        refLabel = "bias established";
+      }
 
-        // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
-        // Also generate if no setup detected (setup === "NONE")
-        let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
-        if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
-          const atr = this.calculateATR(closed5mBars);
-          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
-          if (diagnostic) {
-            noTradeDiagnostic = diagnostic;
-            // Also emit to console for logging
-            this.emitNoTradeDiagnostic(diagnostic);
-            // Update last diagnostic price to prevent spam
-            this.lastDiagnosticPrice = close;
-          }
+      // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
+      // Also generate if no setup detected (setup === "NONE")
+      let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
+      if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
+        const atr = this.calculateATR(closed5mBars);
+        const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
+        if (diagnostic) {
+          noTradeDiagnostic = diagnostic;
+          // Also emit to console for logging
+          this.emitNoTradeDiagnostic(diagnostic);
+          // Update last diagnostic price to prevent spam
+          this.lastDiagnosticPrice = close;
         }
+      }
 
+      // STEP 4 FIX: Override waitReason if opportunity is actually ready (LATCHED or TRIGGERED) (fixes Telegram state sync)
+      // This prevents stale "no_opportunity_latched" from 1m handler overriding the correct state
+      // GUARDRAIL: If hasOpp===true, effectiveWaitReason can NEVER be no_opportunity_latched
+      let effectiveWaitReason = exec.waitReason;
+      const hasOpp = !!exec.opportunity;
+      const oppReady = hasOpp && 
+        (exec.opportunity!.status === "LATCHED" || exec.opportunity!.status === "TRIGGERED");
+      
+      if (hasOpp) {
+        // STEP 4 GUARDRAIL: If opportunity exists, never show "no_opportunity_latched"
+        if (effectiveWaitReason === "no_opportunity_latched") {
+          effectiveWaitReason = oppReady 
+            ? (exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger")
+            : `opportunity_${exec.opportunity!.status.toLowerCase()}`;
+          // Also update exec.waitReason to prevent future stale reads
+          exec.waitReason = effectiveWaitReason;
+        }
+      }
+      
+      // Debug logging to verify state sync (as requested)
+      console.log(
+        `[TELEGRAM_STATE] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} oppExpires=${exec.opportunity?.expiresAtTs ? new Date(exec.opportunity.expiresAtTs).toISOString() : "n/a"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
+      );
+
+      const entryStatusValue: "blocked" | "active" | "inactive" = 
+        exec.entryBlocked 
+          ? "blocked"
+          : exec.phase === "IN_TRADE" 
+            ? "active" 
+            : "inactive";
+
+      const mindState = {
+        mindId: randomUUID(),
+        direction: exec.thesisDirection ?? "none", // Legacy compatibility
+        confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
+        reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
+        bias: exec.bias,
+        phase: exec.phase,
+        entryStatus: entryStatusValue,
+        entryType: exec.entryType ?? undefined,
+        expectedResolution: exec.expectedResolution ?? undefined,
+        setup: exec.setup ?? undefined, // Explicit setup type
+        price: close, // Current price (first-class)
+        refPrice, // Reference price anchor
+        refLabel, // Label for reference price
+        noTradeDiagnostic, // Why no trade fired (when applicable)
+        // Target zones (when in trade)
+        targetZones: exec.targetZones ?? undefined,
+        entryPrice: exec.entryPrice ?? undefined,
+        stopPrice: exec.stopPrice ?? undefined,
+        // Opportunity latch timestamps (for debugging Telegram timing)
+        oppLatchedAt: exec.opportunity?.latchedAtTs,
+        oppExpiresAt: exec.opportunity?.expiresAtTs,
+        last5mCloseTs: lastClosed5m?.ts,
+        source: is5mClose ? ("5m" as const) : ("1m" as const),
+      };
+
+      events.push({
+        type: "MIND_STATE_UPDATED",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: {
+          timestamp: ts,
+          symbol,
+          price: close,
+          mindState,
+          thesis: {
+            direction: exec.thesisDirection ?? null,
+            confidence: exec.thesisConfidence ?? null,
+            price: exec.thesisPrice ?? null,
+            ts: exec.thesisTs ?? null,
+          },
+          candidate: exec.activeCandidate ?? null,
+          botState: exec.phase,
+          waitFor: exec.waitReason ?? null,
+          debug: debugInfo,
+        },
+      });
+    } else {
+      // Silent mode detection: if no message in 10 minutes while ACTIVE, emit heartbeat
+      const silentModeThreshold = 10 * 60 * 1000; // 10 minutes
+      const isBlocked = exec.phase !== "IN_TRADE" && exec.bias !== "NEUTRAL" && (exec.setup === "NONE" || exec.entryBlocked);
+      
+      if (isBlocked && this.lastMessageTs !== null && (ts - this.lastMessageTs) >= silentModeThreshold) {
+        // Force heartbeat emission
+        this.lastMessageTs = ts;
+        this.lastHeartbeatTs = ts;
+        
+        const atr = this.calculateATR(closed5mBars);
+        const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
+        
         // STEP 4 FIX: Override waitReason if opportunity is actually ready (LATCHED or TRIGGERED) (fixes Telegram state sync)
-        // This prevents stale "no_opportunity_latched" from 1m handler overriding the correct state
         // GUARDRAIL: If hasOpp===true, effectiveWaitReason can NEVER be no_opportunity_latched
         let effectiveWaitReason = exec.waitReason;
         const hasOpp = !!exec.opportunity;
@@ -4129,44 +4220,35 @@ export class Orchestrator {
             effectiveWaitReason = oppReady 
               ? (exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger")
               : `opportunity_${exec.opportunity!.status.toLowerCase()}`;
-            // Also update exec.waitReason to prevent future stale reads
             exec.waitReason = effectiveWaitReason;
           }
         }
         
-        // Debug logging to verify state sync (as requested)
+        // Debug logging for heartbeat
         console.log(
-          `[TELEGRAM_STATE] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} oppExpires=${exec.opportunity?.expiresAtTs ? new Date(exec.opportunity.expiresAtTs).toISOString() : "n/a"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
+          `[TELEGRAM_STATE_HEARTBEAT] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
         );
-
+        
+        // Build minimal heartbeat message
         const mindState = {
           mindId: randomUUID(),
-          direction: exec.thesisDirection ?? "none", // Legacy compatibility
+          direction: exec.thesisDirection ?? "none",
           confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
           reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
           bias: exec.bias,
           phase: exec.phase,
-          entryStatus: exec.entryBlocked 
-            ? "blocked" as const 
-            : (exec.phase === "IN_TRADE" ? "active" as const : "inactive" as const),
-          entryType: exec.entryType ?? undefined,
+          entryStatus: exec.entryBlocked ? ("blocked" as const) : ("inactive" as const),
           expectedResolution: exec.expectedResolution ?? undefined,
-          setup: exec.setup ?? undefined, // Explicit setup type
-          price: close, // Current price (first-class)
-          refPrice, // Reference price anchor
-          refLabel, // Label for reference price
-          noTradeDiagnostic, // Why no trade fired (when applicable)
-          // Target zones (when in trade)
-          targetZones: exec.targetZones ?? undefined,
-          entryPrice: exec.entryPrice ?? undefined,
-          stopPrice: exec.stopPrice ?? undefined,
+          setup: exec.setup ?? undefined,
+          price: close,
+          noTradeDiagnostic: diagnostic ?? undefined,
           // Opportunity latch timestamps (for debugging Telegram timing)
           oppLatchedAt: exec.opportunity?.latchedAtTs,
           oppExpiresAt: exec.opportunity?.expiresAtTs,
           last5mCloseTs: lastClosed5m?.ts,
-          source: is5mClose ? "5m" as const : "1m" as const,
+          source: is5mClose ? ("5m" as const) : ("1m" as const),
         };
-
+        
         events.push({
           type: "MIND_STATE_UPDATED",
           timestamp: ts,
@@ -4185,92 +4267,16 @@ export class Orchestrator {
             candidate: exec.activeCandidate ?? null,
             botState: exec.phase,
             waitFor: exec.waitReason ?? null,
-            debug: debugInfo,
           },
         });
-      } else {
-        // Silent mode detection: if no message in 10 minutes while ACTIVE, emit heartbeat
-        const silentModeThreshold = 10 * 60 * 1000; // 10 minutes
-        const isBlocked = exec.phase !== "IN_TRADE" && exec.bias !== "NEUTRAL" && (exec.setup === "NONE" || exec.entryBlocked);
         
-        if (isBlocked && this.lastMessageTs !== null && (ts - this.lastMessageTs) >= silentModeThreshold) {
-          // Force heartbeat emission
-          this.lastMessageTs = ts;
-          this.lastHeartbeatTs = ts;
-          
-          const atr = this.calculateATR(closed5mBars);
-          const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
-          
-          // STEP 4 FIX: Override waitReason if opportunity is actually ready (LATCHED or TRIGGERED) (fixes Telegram state sync)
-          // GUARDRAIL: If hasOpp===true, effectiveWaitReason can NEVER be no_opportunity_latched
-          let effectiveWaitReason = exec.waitReason;
-          const hasOpp = !!exec.opportunity;
-          const oppReady = hasOpp && 
-            (exec.opportunity!.status === "LATCHED" || exec.opportunity!.status === "TRIGGERED");
-          
-          if (hasOpp) {
-            // STEP 4 GUARDRAIL: If opportunity exists, never show "no_opportunity_latched"
-            if (effectiveWaitReason === "no_opportunity_latched") {
-              effectiveWaitReason = oppReady 
-                ? (exec.setup === "NONE" ? "waiting_for_pullback" : "waiting_for_trigger")
-                : `opportunity_${exec.opportunity!.status.toLowerCase()}`;
-              exec.waitReason = effectiveWaitReason;
-            }
-          }
-          
-          // Debug logging for heartbeat
-          console.log(
-            `[TELEGRAM_STATE_HEARTBEAT] hasOpp=${!!exec.opportunity} oppStatus=${exec.opportunity?.status ?? "none"} setup=${exec.setup} phase=${exec.phase} waitReason=${exec.waitReason} effectiveWaitReason=${effectiveWaitReason}`
-          );
-          
-          // Build minimal heartbeat message
-          const mindState = {
-            mindId: randomUUID(),
-            direction: exec.thesisDirection ?? "none",
-            confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-            reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
-            bias: exec.bias,
-            phase: exec.phase,
-            entryStatus: exec.entryBlocked ? "blocked" as const : "inactive" as const,
-            expectedResolution: exec.expectedResolution ?? undefined,
-            setup: exec.setup ?? undefined,
-            price: close,
-            noTradeDiagnostic: diagnostic ?? undefined,
-            // Opportunity latch timestamps (for debugging Telegram timing)
-            oppLatchedAt: exec.opportunity?.latchedAtTs,
-            oppExpiresAt: exec.opportunity?.expiresAtTs,
-            last5mCloseTs: lastClosed5m?.ts,
-            source: is5mClose ? "5m" as const : "1m" as const,
-          };
-          
-          events.push({
-            type: "MIND_STATE_UPDATED",
-            timestamp: ts,
-            instanceId: this.instanceId,
-            data: {
-              timestamp: ts,
-              symbol,
-              price: close,
-              mindState,
-              thesis: {
-                direction: exec.thesisDirection ?? null,
-                confidence: exec.thesisConfidence ?? null,
-                price: exec.thesisPrice ?? null,
-                ts: exec.thesisTs ?? null,
-              },
-              candidate: exec.activeCandidate ?? null,
-              botState: exec.phase,
-              waitFor: exec.waitReason ?? null,
-            },
-          });
-          
-          console.log(
-            `[SILENT_MODE_HEARTBEAT] No message in ${Math.round((ts - (this.lastMessageTs - silentModeThreshold)) / 60000)}min - emitting heartbeat | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} reason=${diagnostic?.reasonCode ?? "waiting"}`
-          );
-        }
+        console.log(
+          `[SILENT_MODE_HEARTBEAT] No message in ${Math.round((ts - (this.lastMessageTs - silentModeThreshold)) / 60000)}min - emitting heartbeat | bias=${exec.bias} phase=${exec.phase} setup=${exec.setup} reason=${diagnostic?.reasonCode ?? "waiting"}`
+        );
       }
+    }
 
-      return events;
+    return events;
   }
 
   /**
