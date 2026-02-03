@@ -1286,6 +1286,7 @@ export class Orchestrator {
     exec.targets = undefined;
     exec.entryType = undefined;
     exec.entryTrigger = undefined;
+    exec.reason = undefined; // Clear entry-aligned narrative on exit
     // Clear bias flip gate on exit
     exec.biasFlipGate = undefined;
   }
@@ -1452,6 +1453,7 @@ export class Orchestrator {
 
     exec.entryType = "BIAS_FLIP_ENTRY";
     exec.entryTrigger = `Bias flip breakout ${gate.direction === "long" ? "above" : "below"} flip candle`;
+    exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
 
     exec.stopPrice = gate.stop;
 
@@ -2350,7 +2352,12 @@ export class Orchestrator {
   }
 
   // Generate phase-aware reason that never contradicts bias
-  private getPhaseAwareReason(bias: MarketBias, phase: MinimalExecutionPhase, waitReason?: string): string {
+  private getPhaseAwareReason(bias: MarketBias, phase: MinimalExecutionPhase, waitReason?: string, execReason?: string): string {
+    // If in trade and entry-aligned reason exists, use it (single pipeline proof)
+    if (phase === "IN_TRADE" && execReason) {
+      return execReason;
+    }
+
     // Never infer bias from phase - bias is authoritative
     if (bias === "NEUTRAL") {
       return "No bias established, waiting for market structure";
@@ -3004,6 +3011,7 @@ export class Orchestrator {
           exec.targets = targetResult.targets;
           exec.targetZones = targetResult.targetZones;
           exec.phase = "IN_TRADE";
+          exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
           exec.waitReason = "a+_maturity_flip_entry";
           shouldPublishEvent = true;
           console.log(
@@ -3129,6 +3137,7 @@ export class Orchestrator {
               exec.targets = targetResultReentry.targets;
               exec.targetZones = targetResultReentry.targetZones;
               exec.phase = "IN_TRADE";
+              exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
               exec.entryBlockReason = undefined;
@@ -3621,6 +3630,7 @@ export class Orchestrator {
                 exec.targetZones = targetResultLong.targetZones;
 
                 exec.phase = "IN_TRADE";
+                exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                 exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
@@ -3713,6 +3723,7 @@ export class Orchestrator {
                 exec.targetZones = targetResultShort.targetZones;
 
                 exec.phase = "IN_TRADE";
+                exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                 exec.waitReason = "in_trade";
                 exec.entryBlocked = false;
                 exec.entryBlockReason = undefined;
@@ -3920,7 +3931,7 @@ export class Orchestrator {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none", // Legacy compatibility
           confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-          reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason),
+          reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
           bias: exec.bias,
           phase: exec.phase,
           entryStatus: exec.entryBlocked 
@@ -4005,7 +4016,7 @@ export class Orchestrator {
             mindId: randomUUID(),
             direction: exec.thesisDirection ?? "none",
             confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-            reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason),
+            reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
             bias: exec.bias,
             phase: exec.phase,
             entryStatus: exec.entryBlocked ? "blocked" as const : "inactive" as const,

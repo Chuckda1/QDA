@@ -307,6 +307,7 @@ export type MinimalExecutionState = {
     expectedEnd: number; // Single weighted target (median)
   };
   waitReason?: string;
+  reason?: string; // Entry-aligned narrative (set on entry, cleared on exit)
   continuationExtension?: number; // Distance from pullback level when continuation detected
   entryBlocked?: boolean; // True when no-chase rules prevent entry
   entryBlockReason?: string; // Reason for entry blocking

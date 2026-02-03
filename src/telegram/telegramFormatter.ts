@@ -96,8 +96,10 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     `⏳ WAITING FOR: ${waitFor}`,
   ].filter(Boolean) as string[];
   
-  // If no setup, add explicit message
-  if (snapshot.setup === "NONE" || (!snapshot.setup && snapshot.entryStatus !== "active")) {
+  const inTrade = snapshot.botState === "IN_TRADE" || snapshot.entryStatus === "active";
+
+  // If no setup, add explicit message (only when NOT in a trade)
+  if (!inTrade && (!snapshot.setup || snapshot.setup === "NONE")) {
     lines.push("⚪ SETUP: NONE");
     lines.push("🚫 NO TRADE — structure incomplete");
   }
