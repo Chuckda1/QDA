@@ -3722,12 +3722,10 @@ export class Orchestrator {
 
           // Entry permission: setup exists + entry signal fires
           // (readyToEvaluateEntry already guaranteed above via else block, so oppReady || gateReady is true)
-          // STEP 5: Setup is informational for pullback continuation, not a hard gate if opportunity is ready
-          // If setup is NONE but opportunity is TRIGGERED and entry signal fires, allow entry
-          const canEnter = entrySignalFires && (
-            (exec.setup && exec.setup !== "NONE") ||  // Setup exists (preferred)
-            (oppReady && exec.opportunity?.status === "TRIGGERED")  // OR opportunity is TRIGGERED (fresh break)
-          );
+          // STEP 5: Setup is required for pullback entries (high-prob continuation only)
+          // TRIGGERED opportunities only affect waitReason/instrumentation, not entry permission
+          // Lock pullback continuation: require explicit PULLBACK_CONTINUATION setup
+          const canEnter = entrySignalFires && exec.setup === "PULLBACK_CONTINUATION";
 
           // ------------------------------------------------------------
           // 4.5) EXPLICIT WAIT HANDLING when canEnter is false
@@ -3795,71 +3793,80 @@ export class Orchestrator {
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
               } else {
-                const oldPhase = exec.phase;
-                const entryInfo = this.detectEntryType(
-                  exec.bias,
-                  current5m,
-                  previous5m ?? undefined
-                );
+                // Hard assert: PULLBACK_ENTRY requires PULLBACK_CONTINUATION setup
+                if (exec.setup !== "PULLBACK_CONTINUATION") {
+                  console.error(`[ENTRY_ABORTED] PULLBACK_ENTRY blocked: setup=${exec.setup ?? "NONE"} (required: PULLBACK_CONTINUATION)`);
+                  exec.entryBlocked = true;
+                  exec.entryBlockReason = "setup_not_pullback_continuation";
+                  exec.waitReason = "setup_not_pullback_continuation";
+                  shouldPublishEvent = true;
+                } else {
+                  const oldPhase = exec.phase;
+                  const entryInfo = this.detectEntryType(
+                    exec.bias,
+                    current5m,
+                    previous5m ?? undefined
+                  );
 
-                exec.entryPrice = current5m.close;
-                exec.entryTs = ts;
-                exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
-                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                exec.pullbackHigh = current5m.high;
-                exec.pullbackLow = current5m.low;
-                exec.pullbackTs = ts;
+                  exec.entryPrice = current5m.close;
+                  exec.entryTs = ts;
+                  exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
+                  exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                  exec.pullbackHigh = current5m.high;
+                  exec.pullbackLow = current5m.low;
+                  exec.pullbackTs = ts;
 
-                const atrLong = this.calculateATR(closed5mBars);
-                const stopFallback = previous5m
-                  ? Math.min(previous5m.low, current5m.low) - atrLong * 0.1
-                  : current5m.low - atrLong * 0.1;
+                  const atrLong = this.calculateATR(closed5mBars);
+                  const stopFallback = previous5m
+                    ? Math.min(previous5m.low, current5m.low) - atrLong * 0.1
+                    : current5m.low - atrLong * 0.1;
 
-                exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
+                  exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
 
-                const closedBarsWithVolumeLong = closed5mBars.filter(
-                  (bar) => "volume" in bar
-                ) as Array<{ high: number; low: number; close: number; volume: number }>;
+                  const closedBarsWithVolumeLong = closed5mBars.filter(
+                    (bar) => "volume" in bar
+                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
 
-                const vwapLong =
-                  closedBarsWithVolumeLong.length > 0
-                    ? this.calculateVWAP(closedBarsWithVolumeLong)
-                    : undefined;
+                  const vwapLong =
+                    closedBarsWithVolumeLong.length > 0
+                      ? this.calculateVWAP(closedBarsWithVolumeLong)
+                      : undefined;
 
-                const targetResultLong = this.computeTargets(
-                  "long",
-                  exec.entryPrice,
-                  exec.stopPrice,
-                  atrLong,
-                  closedBarsWithVolumeLong,
-                  vwapLong,
-                  exec.pullbackHigh,
-                  exec.pullbackLow,
-                  exec.impulseRange
-                );
+                  const targetResultLong = this.computeTargets(
+                    "long",
+                    exec.entryPrice,
+                    exec.stopPrice,
+                    atrLong,
+                    closedBarsWithVolumeLong,
+                    vwapLong,
+                    exec.pullbackHigh,
+                    exec.pullbackLow,
+                    exec.impulseRange
+                  );
 
-                exec.targets = targetResultLong.targets;
-                exec.targetZones = targetResultLong.targetZones;
+                  exec.targets = targetResultLong.targets;
+                  exec.targetZones = targetResultLong.targetZones;
 
-                exec.phase = "IN_TRADE";
-                exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-                exec.waitReason = "in_trade";
-                exec.entryBlocked = false;
-                exec.entryBlockReason = undefined;
+                  exec.phase = "IN_TRADE";
+                  exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
+                  exec.waitReason = "in_trade";
+                  exec.entryBlocked = false;
+                  exec.entryBlockReason = undefined;
 
-                if (exec.opportunity) {
-                  exec.opportunity.status = "CONSUMED";
+                  if (exec.opportunity) {
+                    exec.opportunity.status = "CONSUMED";
+                  }
+
+                  shouldPublishEvent = true;
+
+                  console.log(
+                    `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
+                      2
+                    )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
+                      2
+                    )}`
+                  );
                 }
-
-                shouldPublishEvent = true;
-
-                console.log(
-                  `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
-                    2
-                  )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
-                    2
-                  )}`
-                );
               }
             }
 
@@ -3888,71 +3895,80 @@ export class Orchestrator {
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
               } else {
-                const oldPhase = exec.phase;
-                const entryInfo = this.detectEntryType(
-                  exec.bias,
-                  current5m,
-                  previous5m ?? undefined
-                );
+                // Hard assert: PULLBACK_ENTRY requires PULLBACK_CONTINUATION setup
+                if (exec.setup !== "PULLBACK_CONTINUATION") {
+                  console.error(`[ENTRY_ABORTED] PULLBACK_ENTRY blocked: setup=${exec.setup ?? "NONE"} (required: PULLBACK_CONTINUATION)`);
+                  exec.entryBlocked = true;
+                  exec.entryBlockReason = "setup_not_pullback_continuation";
+                  exec.waitReason = "setup_not_pullback_continuation";
+                  shouldPublishEvent = true;
+                } else {
+                  const oldPhase = exec.phase;
+                  const entryInfo = this.detectEntryType(
+                    exec.bias,
+                    current5m,
+                    previous5m ?? undefined
+                  );
 
-                exec.entryPrice = current5m.close;
-                exec.entryTs = ts;
-                exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
-                exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                exec.pullbackHigh = current5m.high;
-                exec.pullbackLow = current5m.low;
-                exec.pullbackTs = ts;
+                  exec.entryPrice = current5m.close;
+                  exec.entryTs = ts;
+                  exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
+                  exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                  exec.pullbackHigh = current5m.high;
+                  exec.pullbackLow = current5m.low;
+                  exec.pullbackTs = ts;
 
-                const atrShort = this.calculateATR(closed5mBars);
-                const stopFallback = previous5m
-                  ? Math.max(previous5m.high, current5m.high) + atrShort * 0.1
-                  : current5m.high + atrShort * 0.1;
+                  const atrShort = this.calculateATR(closed5mBars);
+                  const stopFallback = previous5m
+                    ? Math.max(previous5m.high, current5m.high) + atrShort * 0.1
+                    : current5m.high + atrShort * 0.1;
 
-                exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
+                  exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
 
-                const closedBarsWithVolumeShort = closed5mBars.filter(
-                  (bar) => "volume" in bar
-                ) as Array<{ high: number; low: number; close: number; volume: number }>;
+                  const closedBarsWithVolumeShort = closed5mBars.filter(
+                    (bar) => "volume" in bar
+                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
 
-                const vwapShort =
-                  closedBarsWithVolumeShort.length > 0
-                    ? this.calculateVWAP(closedBarsWithVolumeShort)
-                    : undefined;
+                  const vwapShort =
+                    closedBarsWithVolumeShort.length > 0
+                      ? this.calculateVWAP(closedBarsWithVolumeShort)
+                      : undefined;
 
-                const targetResultShort = this.computeTargets(
-                  "short",
-                  exec.entryPrice,
-                  exec.stopPrice,
-                  atrShort,
-                  closedBarsWithVolumeShort,
-                  vwapShort,
-                  exec.pullbackHigh,
-                  exec.pullbackLow,
-                  exec.impulseRange
-                );
+                  const targetResultShort = this.computeTargets(
+                    "short",
+                    exec.entryPrice,
+                    exec.stopPrice,
+                    atrShort,
+                    closedBarsWithVolumeShort,
+                    vwapShort,
+                    exec.pullbackHigh,
+                    exec.pullbackLow,
+                    exec.impulseRange
+                  );
 
-                exec.targets = targetResultShort.targets;
-                exec.targetZones = targetResultShort.targetZones;
+                  exec.targets = targetResultShort.targets;
+                  exec.targetZones = targetResultShort.targetZones;
 
-                exec.phase = "IN_TRADE";
-                exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-                exec.waitReason = "in_trade";
-                exec.entryBlocked = false;
-                exec.entryBlockReason = undefined;
+                  exec.phase = "IN_TRADE";
+                  exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
+                  exec.waitReason = "in_trade";
+                  exec.entryBlocked = false;
+                  exec.entryBlockReason = undefined;
 
-                if (exec.opportunity) {
-                  exec.opportunity.status = "CONSUMED";
+                  if (exec.opportunity) {
+                    exec.opportunity.status = "CONSUMED";
+                  }
+
+                  shouldPublishEvent = true;
+
+                  console.log(
+                    `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
+                      2
+                    )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
+                      2
+                    )}`
+                  );
                 }
-
-                shouldPublishEvent = true;
-
-                console.log(
-                  `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
-                    2
-                  )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
-                    2
-                  )}`
-                );
               }
             }
           }
