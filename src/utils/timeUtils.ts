@@ -64,10 +64,14 @@ function getNthSunday(year: number, month: number, n: number): number {
  */
 export function getETParts(date: Date): { hour: number; minute: number; weekday: number } {
   const etOffset = isDSTInEffect(date) ? 4 : 5;
-  const etTime = new Date(date.getTime() - etOffset * 60 * 60 * 1000);
+  const utcHour = date.getUTCHours();
+  const utcMinute = date.getUTCMinutes();
+  // ET = UTC - offset (ET is behind UTC)
+  let etHour = utcHour - etOffset;
+  if (etHour < 0) etHour += 24;
   return {
-    hour: etTime.getUTCHours(),
-    minute: etTime.getUTCMinutes(),
+    hour: etHour,
+    minute: utcMinute,
     weekday: date.getUTCDay() // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
   };
 }
@@ -84,9 +88,10 @@ export function getETClock(date: Date = new Date()): { hour: number; minute: num
  */
 export function getETDateString(date: Date = new Date()): string {
   const etOffset = isDSTInEffect(date) ? 4 : 5;
+  // Create a date in ET by subtracting offset hours
   const etTime = new Date(date.getTime() - etOffset * 60 * 60 * 1000);
   
-  // Get the ET date components (using UTC methods since we've already offset)
+  // Get the ET date components (this works because we've shifted the timestamp)
   const year = etTime.getUTCFullYear();
   const month = String(etTime.getUTCMonth() + 1).padStart(2, '0');
   const day = String(etTime.getUTCDate()).padStart(2, '0');
