@@ -114,11 +114,17 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
   }
 
+  // Market condition line (if available)
+  const marketConditionLine = snapshot.marketCondition
+    ? `📊 MARKET: ${snapshot.marketCondition}${snapshot.conditionReason ? ` (${snapshot.conditionReason})` : ""}`
+    : undefined;
+
   const lines = [
     `${biasEmoji} PRICE: ${price}`, // Always first with bias emoji
     refLine, // Reference price if available
     `${biasEmoji} BIAS: ${biasLabel} (${conf})`,
     `${phaseEmoji} PHASE: ${snapshot.botState ?? "n/a"}`,
+    marketConditionLine, // Market condition if available
     setupLine, // Setup type if available
     entryLine, // Entry status
     snapshot.reason ? `NOTE: ${snapshot.reason}` : undefined,
