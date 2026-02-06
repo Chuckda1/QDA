@@ -128,20 +128,23 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   
   const inTrade = snapshot.botState === "IN_TRADE" || snapshot.entryStatus === "active";
 
-  // If no setup, add explicit message (only when NOT in a trade)
-  if (!inTrade && (!snapshot.setup || snapshot.setup === "NONE")) {
-    lines.push("⚪ SETUP: NONE");
-    lines.push("🚫 NO TRADE — structure incomplete");
-  }
-  
-  // Add no-trade diagnostic if present (using new blocker system)
-  if (snapshot.noTradeDiagnostic && snapshot.noTradeDiagnostic.blockers) {
-    const now = Date.now();
-    // Filter out expired blockers and INFO blockers (never show INFO as "No trade fired reason")
-    const activeBlockers = snapshot.noTradeDiagnostic.blockers.filter(
-      b => now <= b.expiresAtTs && b.severity !== "INFO"
-    );
+  // ============================================================================
+  // Single-state NO_TRADE reducer (prevents double-reporting)
+  // ============================================================================
+  // Precedence: IN_TRADE > entry blocked > gate not armed > no setup
+  // Returns exactly ONE NO_TRADE headline to prevent contradictions
+  // ============================================================================
+  const formatNoTrade = (): string[] => {
+    if (inTrade) return []; // Never show NO_TRADE when in trade
 
+    const now = Date.now();
+    
+    // Get active non-INFO blockers (these are the authoritative NO_TRADE reasons)
+    const activeBlockers = snapshot.noTradeDiagnostic?.blockers?.filter(
+      b => now <= b.expiresAtTs && b.severity !== "INFO"
+    ) ?? [];
+
+    // If blockers exist, they own NO_TRADE messaging (highest priority)
     if (activeBlockers.length > 0) {
       // Sort by severity (HARD > SOFT) then by weight (descending)
       activeBlockers.sort((a, b) => {
@@ -151,33 +154,53 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
         return b.weight - a.weight;
       });
 
+      const result: string[] = [];
+      result.push(""); // Blank line separator
+
       // Show ONE primary blocker (highest weight + HARD beats SOFT)
       const primary = activeBlockers[0];
       const severityEmoji = primary.severity === "HARD" ? "🚫" : "⚠️";
-      lines.push(""); // Blank line separator
-      lines.push(`${severityEmoji} NO TRADE — ${primary.severity}: ${primary.message}`);
+      result.push(`${severityEmoji} NO TRADE — ${primary.severity}: ${primary.message}`);
 
       // Show up to 2 secondary blockers
       const secondary = activeBlockers.slice(1, 3);
       if (secondary.length > 0) {
-        lines.push("Secondary:");
+        result.push("Secondary:");
         secondary.forEach(blocker => {
           const emoji = blocker.severity === "HARD" ? "🚫" : "⚠️";
-          lines.push(`${emoji} ${blocker.severity}: ${blocker.message}`);
+          result.push(`${emoji} ${blocker.severity}: ${blocker.message}`);
         });
       }
 
       // Show INFO blockers as hints (not as "No trade fired reason")
-      const infoBlockers = snapshot.noTradeDiagnostic.blockers.filter(
+      const infoBlockers = snapshot.noTradeDiagnostic?.blockers?.filter(
         b => b.severity === "INFO" && now <= b.expiresAtTs
-      );
+      ) ?? [];
       if (infoBlockers.length > 0) {
-        lines.push("Info:");
+        result.push("Info:");
         infoBlockers.forEach(blocker => {
-          lines.push(`💡 ${blocker.message}`);
+          result.push(`💡 ${blocker.message}`);
         });
       }
+
+      return result;
     }
+
+    // Fallback: No setup (only if no diagnostic/blockers exist)
+    if (!snapshot.setup || snapshot.setup === "NONE") {
+      return [
+        "⚪ SETUP: NONE",
+        "🚫 NO TRADE — structure incomplete"
+      ];
+    }
+
+    return [];
+  };
+
+  // Add NO_TRADE section (single authoritative source)
+  const noTradeLines = formatNoTrade();
+  if (noTradeLines.length > 0) {
+    lines.push(...noTradeLines);
   }
 
   // Add timestamps for debugging (if available)
