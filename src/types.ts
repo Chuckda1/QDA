@@ -117,6 +117,10 @@ export interface MinimalMindStateResponse {
   entryType?: EntryType; // New: entry type
   expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
   setup?: SetupType; // New: explicit setup type (REJECTION, BREAKDOWN, etc.)
+  setupTriggerPrice?: number; // Price level that triggers entry for this setup
+  setupStopPrice?: number; // Stop price for this setup
+  setupDetectedAt?: number; // Timestamp when setup was detected
+  lastBiasFlipTs?: number; // Timestamp of last bias flip (for IGNITION window)
   price?: number; // Current price (first-class)
   refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
   refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
