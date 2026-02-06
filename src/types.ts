@@ -422,6 +422,10 @@ export type MinimalExecutionState = {
   llmMaturityHint?: string;  // "early" | "developing" | "mature" | "extended" | "exhausting" | "unclear" (flexible)
   llmWaitingForHint?: string;
   llmConfidenceHint?: number;
+  // Market condition (deterministic, 1m-based)
+  marketCondition?: MarketCondition;
+  conditionReason?: string;
+  conditionExpiresAtTs?: number;
 };
 
 // BiasFlipEntry Gate State
