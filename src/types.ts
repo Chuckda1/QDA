@@ -177,6 +177,7 @@ export type ExpectedResolution = "CONTINUATION" | "FAILURE" | "UNDECIDED";
 export type SetupType = 
   | "PULLBACK_CONTINUATION"  // Trend pullback then continuation (primary setup)
   | "RIP_REVERSION"          // Extended rip then fade / extended dump then bounce (optional, phase 2)
+  | "IGNITION"               // Immediate entry after bias flip when momentum is strong
   | "NONE";                  // Explicitly no setup
 
 // Resolution Gate - permission system for entries
@@ -282,6 +283,7 @@ export type MinimalExecutionState = {
   // Only one setup may be active at a time
   // No setup = no trade (even if bias is strong)
   setup?: SetupType;
+  setupVariant?: "LONG" | "SHORT"; // Direction for IGNITION setup (optional, can infer from bias)
   setupDetectedAt?: number; // Timestamp when setup was detected
   setupTriggerPrice?: number; // Price level that triggers entry for this setup
   setupStopPrice?: number; // Stop price for this setup

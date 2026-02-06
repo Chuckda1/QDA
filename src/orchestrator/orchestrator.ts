@@ -85,6 +85,14 @@ export class Orchestrator {
   private readonly BIAS_ENGINE_EXIT_ACCEPT = 3;  // Minutes to exit regime (hysteresis)
   private readonly BIAS_ENGINE_REPAIR_CONFIRM_MIN = 2;  // Minimum minutes in REPAIR before finalizing (confirmation period)
   private readonly BIAS_ENGINE_COOLDOWN_MS = 5 * 60 * 1000;  // 5 minutes cooldown between full flips
+  
+  // Ignition setup constants
+  private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
+  private readonly IGNITION_MIN_ATR = 0.18;                // avoid dead tape
+  private readonly IGNITION_MIN_DIST_ATR = 0.25;           // distance from VWAP/EMA as fraction of ATR
+  private readonly IGNITION_MIN_ACCEPT = 8;                // stronger than bias flip threshold (6)
+  private readonly IGNITION_RISK_ATR = 0.9;                // stop distance
+  private readonly IGNITION_TTL_MS = 2 * 60 * 1000;        // must trigger soon or drop it
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -1813,6 +1821,69 @@ export class Orchestrator {
     }
   }
 
+  // ============================================================================
+  // IGNITION SETUP: Immediate entry after bias flip when momentum is strong
+  // ============================================================================
+  private maybeDetectIgnition(exec: MinimalExecutionState, ts: number, close: number): void {
+    if (exec.phase === "IN_TRADE") return;
+    if (exec.bias === "NEUTRAL") return;
+
+    const micro = exec.micro;
+    if (!micro) return;
+
+    const vwap = micro.vwap1m;
+    const ema = micro.emaFast1m;
+    const atr = micro.atr1m;
+
+    if (vwap === undefined || ema === undefined || atr === undefined) return;
+    if (atr < this.IGNITION_MIN_ATR) return;
+
+    // must be right after a flip
+    const flipAge = exec.lastBiasFlipTs ? (ts - exec.lastBiasFlipTs) : Infinity;
+    if (flipAge > this.IGNITION_WINDOW_MS) return;
+
+    const minDist = Math.max(0.05, this.IGNITION_MIN_DIST_ATR * atr);
+
+    const strongBull =
+      exec.bias === "BULLISH" &&
+      (micro.aboveVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      (micro.aboveEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      close > Math.max(vwap, ema) + minDist;
+
+    const strongBear =
+      exec.bias === "BEARISH" &&
+      (micro.belowVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      (micro.belowEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      close < Math.min(vwap, ema) - minDist;
+
+    if (!strongBull && !strongBear) return;
+
+    // Don't overwrite a real setup
+    if (exec.setup && exec.setup !== "NONE") return;
+
+    // Create a very short-lived setup: "enter if we break the last 1m swing"
+    const trigger =
+      exec.bias === "BULLISH"
+        ? (micro.lastSwingHigh1m ?? close)
+        : (micro.lastSwingLow1m ?? close);
+
+    // Stop: behind VWAP/EMA or ATR-based, whichever is tighter but meaningful
+    const stop =
+      exec.bias === "BULLISH"
+        ? Math.min(vwap, ema) - this.IGNITION_RISK_ATR * atr
+        : Math.max(vwap, ema) + this.IGNITION_RISK_ATR * atr;
+
+    exec.setup = "IGNITION";
+    exec.setupVariant = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+    exec.setupTriggerPrice = trigger;
+    exec.setupStopPrice = stop;
+    exec.setupDetectedAt = ts;
+
+    console.log(
+      `[IGNITION_SETUP] bias=${exec.bias} flipAgeMs=${flipAge} trigger=${trigger.toFixed(2)} stop=${stop.toFixed(2)} atr=${atr.toFixed(2)}`
+    );
+  }
+
   // Map LLM action to market bias (sticky, only flips on invalidation)
   // Helper to normalize LLM bias string to MarketBias enum (handles casing safely)
   private normalizeBias(llmBias: string | undefined): "BEARISH" | "BULLISH" | "NEUTRAL" {
@@ -3289,6 +3360,7 @@ export class Orchestrator {
     // Don't flip bias while in trade (protect active positions)
     if (exec.phase !== "IN_TRADE") {
       this.updateBiasEngine(exec, ts, close);
+      this.maybeDetectIgnition(exec, ts, close);
     }
 
     // ============================================================================
@@ -3977,16 +4049,40 @@ export class Orchestrator {
             higherHigh = current5m.high > previous5m.high;
           }
 
+          // Check if IGNITION setup expired
+          const ignitionExpired =
+            exec.setup === "IGNITION" &&
+            exec.setupDetectedAt !== undefined &&
+            (ts - exec.setupDetectedAt) > this.IGNITION_TTL_MS;
+
+          if (ignitionExpired) {
+            exec.setup = "NONE";
+            exec.setupVariant = undefined;
+            exec.setupTriggerPrice = undefined;
+            exec.setupStopPrice = undefined;
+            exec.setupDetectedAt = undefined;
+            console.log(`[IGNITION_EXPIRED] cleared after TTL`);
+          }
+
+          // Entry signal for pullback continuation (5m-based)
           const entrySignalFires =
             (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) ||
             (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh)));
 
-          // Entry permission: setup exists + entry signal fires
-          // (readyToEvaluateEntry already guaranteed above via else block, so oppReady || gateReady is true)
-          // STEP 5: Setup is required for pullback entries (high-prob continuation only)
-          // TRIGGERED opportunities only affect waitReason/instrumentation, not entry permission
-          // Lock pullback continuation: require explicit PULLBACK_CONTINUATION setup
-          const canEnter = entrySignalFires && exec.setup === "PULLBACK_CONTINUATION";
+          // Ignition signal (1m-based, immediate after flip)
+          const ignitionSignal =
+            exec.setup === "IGNITION" &&
+            exec.setupTriggerPrice !== undefined &&
+            ((exec.bias === "BULLISH" && close > exec.setupTriggerPrice) ||
+             (exec.bias === "BEARISH" && close < exec.setupTriggerPrice));
+
+          // Entry permission: setup exists + appropriate signal fires
+          // Pullback continuation uses 5m entry signal, ignition uses 1m trigger break
+          const isPullback = exec.setup === "PULLBACK_CONTINUATION";
+          const isIgnition = exec.setup === "IGNITION";
+          const canEnter = 
+            (isPullback && entrySignalFires) ||
+            (isIgnition && ignitionSignal);
 
           // ------------------------------------------------------------
           // 4.5) EXPLICIT WAIT HANDLING when canEnter is false
@@ -4006,7 +4102,7 @@ export class Orchestrator {
             // console.log(`[NO_TRADE] ... reason=setup_none ...`) // you already emit similar
           }
           // If setup exists but entry signal hasn't fired yet, this is "waiting", not blocked.
-          else if (exec.setup && !entrySignalFires) {
+          else if (exec.setup === "PULLBACK_CONTINUATION" && !entrySignalFires) {
             exec.waitReason = "waiting_for_entry_signal";
             exec.entryBlocked = false;
             exec.entryBlockReason = undefined;
@@ -4016,9 +4112,17 @@ export class Orchestrator {
               `[ENTRY_WAITING] Setup=${exec.setup} exists but entry signal not yet fired - BIAS=${exec.bias}`
             );
           }
+          else if (exec.setup === "IGNITION" && !ignitionSignal) {
+            exec.waitReason = "waiting_for_ignition_trigger";
+            exec.entryBlocked = false;
+            exec.entryBlockReason = undefined;
+            console.log(
+              `[ENTRY_WAITING] IGNITION setup exists but trigger not yet broken - BIAS=${exec.bias} trigger=${exec.setupTriggerPrice?.toFixed(2) ?? "n/a"} close=${close.toFixed(2)}`
+            );
+          }
           // If setup exists and signal fires, but canEnter is still false, explain why.
           // With the flattened readiness check, this should be rare, but keep it for safety.
-          else if (exec.setup && entrySignalFires && !canEnter) {
+          else if (exec.setup && ((isPullback && entrySignalFires) || (isIgnition && ignitionSignal)) && !canEnter) {
             exec.waitReason = gateReady ? "gate_armed_but_entry_blocked" : "opp_ready_but_entry_blocked";
             exec.entryBlocked = true;
             exec.entryBlockReason = "Entry conditions incomplete (diagnostic)";
