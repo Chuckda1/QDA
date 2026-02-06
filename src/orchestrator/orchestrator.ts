@@ -1586,8 +1586,45 @@ export class Orchestrator {
   // BIAS ENGINE: Deterministic 1m-based bias with hysteresis
   // ============================================================================
   // Runs on every 1m ingest, uses acceptance counters + hysteresis
-  // Bias engine owns exec.bias - LLM is advisory only
+  // HIERARCHY: 1m can only NEUTRALIZE (enter REPAIR), never finalize
+  // Only 5m structure breaks can finalize a full flip (BULLISH/BEARISH)
   // ============================================================================
+  private enterRepair(exec: MinimalExecutionState, ts: number, close: number, repairState: BiasEngineState): void {
+    const be = exec.biasEngine!;
+    if (be.state === repairState) return;
+
+    be.state = repairState;
+    be.repairStartTs = ts;
+    be.acceptBullCount = 0;
+    be.acceptBearCount = 0;
+
+    // Clear wrong-side artifacts
+    this.deactivateGate(exec);
+    exec.setup = "NONE";
+    exec.setupTriggerPrice = undefined;
+    exec.setupStopPrice = undefined;
+    exec.setupDetectedAt = undefined;
+    if (exec.opportunity) {
+      exec.opportunity.status = "INVALIDATED";
+      exec.opportunity = undefined;
+    }
+
+    // Neutralize regime (do not commit - 5m will finalize)
+    exec.bias = "NEUTRAL";
+    exec.baseBiasConfidence = undefined;
+    exec.biasConfidence = undefined;
+    exec.biasInvalidationLevel = undefined;
+    exec.biasPrice = close;
+    exec.biasTs = ts;
+
+    // Clear stale resolution/phase expectations
+    exec.expectedResolution = undefined;
+    if (exec.phase !== "IN_TRADE") {
+      exec.phase = "NEUTRAL_PHASE";
+      exec.waitReason = "waiting_for_bias";
+    }
+  }
+
   private updateBiasEngine(exec: MinimalExecutionState, ts: number, close: number): void {
     const micro = exec.micro;
     if (!micro) return;
@@ -1666,144 +1703,24 @@ export class Orchestrator {
       }
     };
 
-    const enterRepair = (repairState: BiasEngineState) => {
-      if (be.state === repairState) return;
-
-      be.state = repairState;
-      be.repairStartTs = ts;
-      be.acceptBullCount = 0;
-      be.acceptBearCount = 0;
-
-      // Remove wrong-side active artifacts
-      this.deactivateGate(exec);
-      clearSetup();
-      invalidateOpp();
-
-      // Neutralize immediately to prevent fighting the flip
-      exec.bias = "NEUTRAL";
-      exec.baseBiasConfidence = undefined;
-      exec.biasConfidence = undefined;
-      exec.biasInvalidationLevel = undefined;
-
-      exec.biasPrice = close;
-      exec.biasTs = ts;
-
-      if (exec.phase !== "IN_TRADE") {
-        exec.phase = "NEUTRAL_PHASE";
-        exec.waitReason = "waiting_for_bias";
-        exec.expectedResolution = undefined;  // Clear stale resolution
-      }
-    };
-
-    const finalizeFlip = (newBias: MarketBias, newState: BiasEngineState) => {
-      be.state = newState;
-      be.lastFlipTs = ts;
-      be.repairStartTs = undefined;
-      be.acceptBullCount = 0;
-      be.acceptBearCount = 0;
-
-      // Set bias flip cooldown (prevent setup arming on same bar)
-      exec.lastBiasFlipTs = ts;
-
-      // Clear stale artifacts that could cause accidental entries
-      this.deactivateGate(exec);
-      clearSetup();
-      invalidateOpp();
-
-      exec.bias = newBias;
-      exec.biasPrice = close;
-      exec.biasTs = ts;
-
-      // Deterministic baseline; LLM can grade setups later
-      exec.baseBiasConfidence = 65;
-      exec.biasConfidence = 65;
-
-      exec.biasInvalidationLevel = undefined;
-
-      if (exec.phase !== "IN_TRADE") {
-        exec.phase = "BIAS_ESTABLISHED";
-        exec.expectedResolution = "CONTINUATION";
-        exec.waitReason = "waiting_for_pullback";
-      }
-    };
+    // Removed finalizeFlip - only 5m structure can finalize
 
     // --- Score (optional, for observability) ---
     if (bullAccept) be.score = Math.min(10, be.score + 2);
     else if (bearAccept) be.score = Math.max(-10, be.score - 2);
     else be.score = be.score * 0.8;
 
-    // --- State machine ---
-    switch (be.state) {
-      case "BEARISH": {
-        if (bullAccept) enterRepair("REPAIR_BULL");
-        break;
-      }
-
-      case "BULLISH": {
-        if (bearAccept) enterRepair("REPAIR_BEAR");
-        break;
-      }
-
-      case "REPAIR_BULL": {
-        // Track persistence while repairing
-        if (bullAccept) be.acceptBullCount += 1;
-        else be.acceptBullCount = 0;
-
-        // If opposite exit evidence appears, repair failed
-        if (bullExitEvidence) {
-          if (!inCooldown) finalizeFlip("BEARISH", "BEARISH");
-          else {
-            be.state = "NEUTRAL";
-            exec.bias = "NEUTRAL";
-            if (exec.phase !== "IN_TRADE") exec.phase = "NEUTRAL_PHASE";
-          }
-          break;
-        }
-
-        // Finalize after enough time in repair (confirmation period)
-        const repairAgeMs = be.repairStartTs ? (ts - be.repairStartTs) : 0;
-        const enoughTime = repairAgeMs >= this.BIAS_ENGINE_REPAIR_CONFIRM_MIN * 60 * 1000;
-
-        if (bullAccept && enoughTime && !inCooldown) {
-          finalizeFlip("BULLISH", "BULLISH");
-        } else {
-          exec.bias = "NEUTRAL";
-        }
-        break;
-      }
-
-      case "REPAIR_BEAR": {
-        if (bearAccept) be.acceptBearCount += 1;
-        else be.acceptBearCount = 0;
-
-        if (bearExitEvidence) {
-          if (!inCooldown) finalizeFlip("BULLISH", "BULLISH");
-          else {
-            be.state = "NEUTRAL";
-            exec.bias = "NEUTRAL";
-            if (exec.phase !== "IN_TRADE") exec.phase = "NEUTRAL_PHASE";
-          }
-          break;
-        }
-
-        const repairAgeMs = be.repairStartTs ? (ts - be.repairStartTs) : 0;
-        const enoughTime = repairAgeMs >= this.BIAS_ENGINE_REPAIR_CONFIRM_MIN * 60 * 1000;
-
-        if (bearAccept && enoughTime && !inCooldown) {
-          finalizeFlip("BEARISH", "BEARISH");
-        } else {
-          exec.bias = "NEUTRAL";
-        }
-        break;
-      }
-
-      case "NEUTRAL": {
-        // From neutral, finalize only when acceptance is strong and cooldown allows
-        if (bullAccept && !inCooldown) finalizeFlip("BULLISH", "BULLISH");
-        else if (bearAccept && !inCooldown) finalizeFlip("BEARISH", "BEARISH");
-        break;
-      }
+    // --- State machine: ONLY neutralize, never finalize ---
+    // 1m can only kick you out of a wrong thesis, not declare a new one
+    if (be.state === "BEARISH" && bullAccept) {
+      this.enterRepair(exec, ts, close, "REPAIR_BULL");
     }
+    if (be.state === "BULLISH" && bearAccept) {
+      this.enterRepair(exec, ts, close, "REPAIR_BEAR");
+    }
+
+    // If already in REPAIR, just track state; NO finalization here
+    // (5m structure will finalize when it breaks)
 
     // --- Observability ---
     if (prevExecBias !== exec.bias) {
@@ -1904,6 +1821,100 @@ export class Orchestrator {
       return this.normalizeBias(llmBias);
     }
     return "NEUTRAL";
+  }
+
+  // ============================================================================
+  // 5M STRUCTURE FINALIZATION: Only authority for full bias flips
+  // ============================================================================
+  // 1m engine can only neutralize (enter REPAIR), never finalize
+  // Only 5m structure breaks can finalize a full flip (BULLISH/BEARISH)
+  // ============================================================================
+  private finalizeBiasFrom5m(exec: MinimalExecutionState, ts: number, close: number): void {
+    const be = exec.biasEngine;
+    if (!be) return;
+
+    // Only finalize if we are in REPAIR
+    if (be.state !== "REPAIR_BULL" && be.state !== "REPAIR_BEAR") return;
+
+    // Require actual 5m structure break
+    const sh = exec.swingHigh5m;
+    const sl = exec.swingLow5m;
+    if (sh === undefined || sl === undefined) return;
+
+    const breakUp = close > sh;
+    const breakDown = close < sl;
+
+    if (be.state === "REPAIR_BULL" && breakUp) {
+      be.state = "BULLISH";
+      be.lastFlipTs = ts;
+      be.repairStartTs = undefined;
+      be.acceptBullCount = 0;
+      be.acceptBearCount = 0;
+
+      exec.bias = "BULLISH";
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+      exec.baseBiasConfidence = 65;
+      exec.biasConfidence = 65;
+      exec.lastBiasFlipTs = ts;
+
+      // Clear stale artifacts
+      this.deactivateGate(exec);
+      exec.setup = "NONE";
+      exec.setupTriggerPrice = undefined;
+      exec.setupStopPrice = undefined;
+      exec.setupDetectedAt = undefined;
+      if (exec.opportunity) {
+        exec.opportunity.status = "INVALIDATED";
+        exec.opportunity = undefined;
+      }
+
+      if (exec.phase !== "IN_TRADE") {
+        exec.phase = "BIAS_ESTABLISHED";
+        exec.expectedResolution = "CONTINUATION";
+        exec.waitReason = "waiting_for_pullback";
+      }
+
+      console.log(
+        `[BIAS_FINALIZE_5M] REPAIR_BULL -> BULLISH | close=${close.toFixed(2)} > swingHigh5m=${sh.toFixed(2)}`
+      );
+    }
+
+    if (be.state === "REPAIR_BEAR" && breakDown) {
+      be.state = "BEARISH";
+      be.lastFlipTs = ts;
+      be.repairStartTs = undefined;
+      be.acceptBullCount = 0;
+      be.acceptBearCount = 0;
+
+      exec.bias = "BEARISH";
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+      exec.baseBiasConfidence = 65;
+      exec.biasConfidence = 65;
+      exec.lastBiasFlipTs = ts;
+
+      // Clear stale artifacts
+      this.deactivateGate(exec);
+      exec.setup = "NONE";
+      exec.setupTriggerPrice = undefined;
+      exec.setupStopPrice = undefined;
+      exec.setupDetectedAt = undefined;
+      if (exec.opportunity) {
+        exec.opportunity.status = "INVALIDATED";
+        exec.opportunity = undefined;
+      }
+
+      if (exec.phase !== "IN_TRADE") {
+        exec.phase = "BIAS_ESTABLISHED";
+        exec.expectedResolution = "CONTINUATION";
+        exec.waitReason = "waiting_for_pullback";
+      }
+
+      console.log(
+        `[BIAS_FINALIZE_5M] REPAIR_BEAR -> BEARISH | close=${close.toFixed(2)} < swingLow5m=${sl.toFixed(2)}`
+      );
+    }
   }
 
   // Check if bias should flip (only on structural invalidation)
@@ -2778,6 +2789,21 @@ export class Orchestrator {
       exec.biasConfidence = undefined;
       exec.thesisConfidence = undefined;
     }
+
+    // ============================================================================
+    // STEP 1.75: Update 5m structure anchors (used for finalizing bias flips)
+    // ============================================================================
+    const lookback = 12; // last 60 minutes (12 * 5m bars)
+    const recent = closed5mBars.slice(-lookback);
+    if (recent.length >= 3) {
+      exec.swingHigh5m = Math.max(...recent.map(b => b.high));
+      exec.swingLow5m = Math.min(...recent.map(b => b.low));
+    }
+
+    // ============================================================================
+    // STEP 1.8: Finalize bias from 5m structure (ONLY authority for full flips)
+    // ============================================================================
+    this.finalizeBiasFrom5m(exec, ts, close);
 
     // ============================================================================
     // STEP 2: Update phase deterministically (engine-owned, never from LLM)

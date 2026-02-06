@@ -372,6 +372,9 @@ export type MinimalExecutionState = {
   biasEngine?: BiasEngine;
   // Bias flip cooldown (prevent setup arming immediately after flip)
   lastBiasFlipTs?: number;  // Timestamp of last bias flip (for setup cooldown)
+  // 5m structure anchors (engine-owned, used for finalizing bias flips)
+  swingHigh5m?: number; // Recent structure high (last 12 bars = 60 minutes)
+  swingLow5m?: number;  // Recent structure low (last 12 bars = 60 minutes)
   // LLM advisory hints (bias engine owns exec.bias now)
   llmBiasHint?: "bullish" | "bearish" | "neutral";
   llmActionHint?: "WAIT" | "ARM_LONG" | "ARM_SHORT" | "A+";
