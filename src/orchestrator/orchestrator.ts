@@ -1581,11 +1581,6 @@ export class Orchestrator {
   // Bias engine owns exec.bias - LLM is advisory only
   // ============================================================================
   private updateBiasEngine(exec: MinimalExecutionState, ts: number, close: number): void {
-    // Don't flip bias while in trade (protect active positions)
-    if (exec.phase === "IN_TRADE") {
-      return;
-    }
-
     const micro = exec.micro;
     if (!micro) return;
 
@@ -3291,7 +3286,10 @@ export class Orchestrator {
     // ============================================================================
     // Update bias engine (deterministic, 1m-based)
     // ============================================================================
-    this.updateBiasEngine(exec, ts, close);
+    // Don't flip bias while in trade (protect active positions)
+    if (exec.phase !== "IN_TRADE") {
+      this.updateBiasEngine(exec, ts, close);
+    }
 
     // ============================================================================
     // ============================================================================
