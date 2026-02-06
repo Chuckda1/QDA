@@ -124,7 +124,7 @@ export interface MinimalMindStateResponse {
   price?: number; // Current price (first-class)
   refPrice?: number; // Reference price anchor (bias price, pullback level, etc.)
   refLabel?: string; // Label for reference price (e.g., "bias established", "pullback low")
-  noTradeDiagnostic?: NoTradeDiagnostic; // Why no trade fired (when applicable)
+  noTradeDiagnostic?: NoTradeDiagnosticResponse; // Why no trade fired (when applicable) - includes blockers array
   // Opportunity latch timestamps (for debugging Telegram timing)
   oppLatchedAt?: number; // Timestamp when opportunity was latched
   oppExpiresAt?: number; // Timestamp when opportunity expires
@@ -271,6 +271,16 @@ export type Blocker = {
   weight: number;                // 0-100 (higher = more blocking)
 };
 
+// Blocker types for Telegram/API response (matches internal Blocker type)
+export type NoTradeBlocker = {
+  code: string;
+  message: string;
+  severity: BlockerSeverity;
+  updatedAtTs: number;
+  expiresAtTs: number;
+  weight: number;
+};
+
 export type NoTradeDiagnostic = {
   price: number;
   bias: MarketBias;
@@ -279,7 +289,15 @@ export type NoTradeDiagnostic = {
   gateStatus?: ResolutionGateStatus;
   reasonCode: NoTradeReasonCode; // Legacy - kept for backward compatibility
   details: string;               // Legacy - kept for backward compatibility
-  blockers: Blocker[];           // NEW: Typed blockers with TTL + severity
+  blockers: Blocker[];           // Internal: Typed blockers with TTL + severity
+};
+
+// Response type for Telegram/API (serialized version)
+export type NoTradeDiagnosticResponse = {
+  reasonCode: string;
+  details: string;
+  reasons?: string[]; // Legacy: Human-readable reasons array
+  blockers?: NoTradeBlocker[]; // Serialized blockers for Telegram
 };
 
 export type MinimalExecutionState = {

@@ -134,21 +134,36 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   // Precedence: IN_TRADE > entry blocked > gate not armed > no setup
   // Returns exactly ONE NO_TRADE headline to prevent contradictions
   // ============================================================================
+  type BlockerType = {
+    code: string;
+    message: string;
+    severity: "HARD" | "SOFT" | "INFO";
+    updatedAtTs: number;
+    expiresAtTs: number;
+    weight: number;
+  };
+
   const formatNoTrade = (): string[] => {
     if (inTrade) return []; // Never show NO_TRADE when in trade
 
     const now = Date.now();
     
     // Get active non-INFO blockers (these are the authoritative NO_TRADE reasons)
-    const activeBlockers = snapshot.noTradeDiagnostic?.blockers?.filter(
-      b => now <= b.expiresAtTs && b.severity !== "INFO"
-    ) ?? [];
+    const blockers: BlockerType[] = snapshot.noTradeDiagnostic?.blockers ?? [];
+    const activeBlockers: BlockerType[] = blockers.filter(
+      (b: BlockerType) => now <= b.expiresAtTs && b.severity !== "INFO"
+    );
 
     // If blockers exist, they own NO_TRADE messaging (highest priority)
     if (activeBlockers.length > 0) {
       // Sort by severity (HARD > SOFT) then by weight (descending)
-      activeBlockers.sort((a, b) => {
-        const severityOrder = { HARD: 2, SOFT: 1, INFO: 0 };
+      const severityOrder: Record<"HARD" | "SOFT" | "INFO", number> = {
+        HARD: 2,
+        SOFT: 1,
+        INFO: 0,
+      };
+      
+      activeBlockers.sort((a: BlockerType, b: BlockerType) => {
         const severityDiff = severityOrder[b.severity] - severityOrder[a.severity];
         if (severityDiff !== 0) return severityDiff;
         return b.weight - a.weight;
@@ -158,27 +173,27 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       result.push(""); // Blank line separator
 
       // Show ONE primary blocker (highest weight + HARD beats SOFT)
-      const primary = activeBlockers[0];
+      const primary: BlockerType = activeBlockers[0];
       const severityEmoji = primary.severity === "HARD" ? "🚫" : "⚠️";
       result.push(`${severityEmoji} NO TRADE — ${primary.severity}: ${primary.message}`);
 
       // Show up to 2 secondary blockers
-      const secondary = activeBlockers.slice(1, 3);
+      const secondary: BlockerType[] = activeBlockers.slice(1, 3);
       if (secondary.length > 0) {
         result.push("Secondary:");
-        secondary.forEach(blocker => {
+        secondary.forEach((blocker: BlockerType) => {
           const emoji = blocker.severity === "HARD" ? "🚫" : "⚠️";
           result.push(`${emoji} ${blocker.severity}: ${blocker.message}`);
         });
       }
 
       // Show INFO blockers as hints (not as "No trade fired reason")
-      const infoBlockers = snapshot.noTradeDiagnostic?.blockers?.filter(
-        b => b.severity === "INFO" && now <= b.expiresAtTs
-      ) ?? [];
+      const infoBlockers: BlockerType[] = blockers.filter(
+        (b: BlockerType) => b.severity === "INFO" && now <= b.expiresAtTs
+      );
       if (infoBlockers.length > 0) {
         result.push("Info:");
-        infoBlockers.forEach(blocker => {
+        infoBlockers.forEach((blocker: BlockerType) => {
           result.push(`💡 ${blocker.message}`);
         });
       }

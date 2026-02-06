@@ -4588,6 +4588,7 @@ export class Orchestrator {
       // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
       // Also generate if no setup detected (setup === "NONE")
       let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
+      let noTradeDiagnosticResponse: NoTradeDiagnosticResponse | undefined = undefined;
       if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
         const atr = this.calculateATR(closed5mBars);
         const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
@@ -4649,7 +4650,19 @@ export class Orchestrator {
         price: close, // Current price (first-class)
         refPrice, // Reference price anchor
         refLabel, // Label for reference price
-        noTradeDiagnostic, // Why no trade fired (when applicable)
+        // Serialize noTradeDiagnostic for Telegram/API (convert internal Blocker[] to NoTradeBlocker[])
+        noTradeDiagnostic: noTradeDiagnostic ? {
+          reasonCode: noTradeDiagnostic.reasonCode,
+          details: noTradeDiagnostic.details,
+          blockers: noTradeDiagnostic.blockers.map(b => ({
+            code: b.code,
+            message: b.message,
+            severity: b.severity,
+            updatedAtTs: b.updatedAtTs,
+            expiresAtTs: b.expiresAtTs,
+            weight: b.weight,
+          })),
+        } : undefined,
         // Target zones (when in trade)
         targetZones: exec.targetZones ?? undefined,
         entryPrice: exec.entryPrice ?? undefined,
