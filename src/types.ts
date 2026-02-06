@@ -136,6 +136,23 @@ export type MinimalMindStateResult = {
 // Market Bias (sticky, changes slowly, only on structural invalidation)
 export type MarketBias = "BEARISH" | "BULLISH" | "NEUTRAL";
 
+// Bias Engine State (deterministic, 1m-based)
+export type BiasEngineState = 
+  | "BEARISH"
+  | "REPAIR_BULL"  // Neutralizing from bearish, moving toward bullish
+  | "NEUTRAL"
+  | "REPAIR_BEAR"  // Neutralizing from bullish, moving toward bearish
+  | "BULLISH";
+
+export type BiasEngine = {
+  state: BiasEngineState;
+  score: number;  // Signed regime score (positive = bullish, negative = bearish)
+  lastFlipTs?: number;  // Timestamp of last full flip (for cooldown)
+  repairStartTs?: number;  // When REPAIR state started
+  acceptBullCount: number;  // Consecutive minutes of bull acceptance
+  acceptBearCount: number;  // Consecutive minutes of bear acceptance
+};
+
 // Trade Phase (fast, changes quickly)
 export type MinimalExecutionPhase =
   | "NEUTRAL_PHASE"
@@ -345,6 +362,16 @@ export type MinimalExecutionState = {
   // BiasFlipEntry: Independent entry path for bias flips (regime-break trades)
   biasFlipGate?: BiasFlipGate;
   lastBiasFlipArmTs?: number; // Cooldown tracking to prevent flip-flop spam
+  // Bias Engine (deterministic, 1m-based)
+  biasEngine?: BiasEngine;
+  // Bias flip cooldown (prevent setup arming immediately after flip)
+  lastBiasFlipTs?: number;  // Timestamp of last bias flip (for setup cooldown)
+  // LLM advisory hints (bias engine owns exec.bias now)
+  llmBiasHint?: "bullish" | "bearish" | "neutral";
+  llmActionHint?: "WAIT" | "ARM_LONG" | "ARM_SHORT" | "A+";
+  llmMaturityHint?: string;  // "early" | "developing" | "mature" | "extended" | "exhausting" | "unclear" (flexible)
+  llmWaitingForHint?: string;
+  llmConfidenceHint?: number;
 };
 
 // BiasFlipEntry Gate State

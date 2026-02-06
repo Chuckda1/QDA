@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { getMarketRegime, getMarketSessionLabel, getETDateString } from "../utils/timeUtils.js";
 import { extractSwings, lastSwings } from "../utils/swing.js";
 import type {
+  BiasEngineState,
   BotMode,
   BotState,
   DailyContextLite,
@@ -78,6 +79,12 @@ export class Orchestrator {
   private readonly BIAS_FLIP_TTL_MS = 12 * 60 * 1000;       // 12 minutes
   private readonly BIAS_FLIP_COOLDOWN_MS = 10 * 60 * 1000;  // 10 minutes
   private readonly BIAS_FLIP_MIN_RANGE_ATR = 0.20;          // avoid micro candles
+  
+  // Bias Engine constants
+  private readonly BIAS_ENGINE_ENTER_ACCEPT = 6;  // Minutes to enter regime
+  private readonly BIAS_ENGINE_EXIT_ACCEPT = 3;  // Minutes to exit regime (hysteresis)
+  private readonly BIAS_ENGINE_REPAIR_CONFIRM_MIN = 2;  // Minimum minutes in REPAIR before finalizing (confirmation period)
+  private readonly BIAS_ENGINE_COOLDOWN_MS = 5 * 60 * 1000;  // 5 minutes cooldown between full flips
 
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
@@ -1567,6 +1574,250 @@ export class Orchestrator {
   // All code between here and detectEntryType() has been removed
   // ============================================================================
   
+  // ============================================================================
+  // BIAS ENGINE: Deterministic 1m-based bias with hysteresis
+  // ============================================================================
+  // Runs on every 1m ingest, uses acceptance counters + hysteresis
+  // Bias engine owns exec.bias - LLM is advisory only
+  // ============================================================================
+  private updateBiasEngine(exec: MinimalExecutionState, ts: number, close: number): void {
+    // Don't flip bias while in trade (protect active positions)
+    if (exec.phase === "IN_TRADE") {
+      return;
+    }
+
+    const micro = exec.micro;
+    if (!micro) return;
+
+    // Track bias change for debugging
+    const prevExecBias = exec.bias;
+
+    // Init biasEngine if missing
+    if (!exec.biasEngine) {
+      exec.biasEngine = {
+        state: exec.bias === "BULLISH" ? "BULLISH" : exec.bias === "BEARISH" ? "BEARISH" : "NEUTRAL",
+        score: 0,
+        acceptBullCount: 0,
+        acceptBearCount: 0,
+      };
+    }
+
+    const be = exec.biasEngine;
+
+    const vwap = micro.vwap1m;
+    const ema = micro.emaFast1m;
+    const atr = micro.atr1m;
+
+    if (vwap === undefined || ema === undefined) return;
+
+    const aboveVwap = micro.aboveVwapCount ?? 0;
+    const aboveEma  = micro.aboveEmaCount ?? 0;
+    const belowVwap = micro.belowVwapCount ?? 0;
+    const belowEma  = micro.belowEmaCount ?? 0;
+
+    // Small distance filter to avoid "acceptance" while hugging VWAP/EMA
+    const minDist = atr ? Math.max(0.05, 0.10 * atr) : 0.05;
+    const farAbove = close > vwap + minDist && close > ema + minDist;
+    const farBelow = close < vwap - minDist && close < ema - minDist;
+
+    // Entry acceptance (fast)
+    const bullAccept =
+      aboveVwap >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      aboveEma  >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      farAbove;
+
+    const bearAccept =
+      belowVwap >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      belowEma  >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      farBelow;
+
+    // Exit evidence (hysteresis; slower)
+    const bullExitEvidence =
+      belowVwap >= this.BIAS_ENGINE_EXIT_ACCEPT &&
+      belowEma  >= this.BIAS_ENGINE_EXIT_ACCEPT &&
+      farBelow;
+
+    const bearExitEvidence =
+      aboveVwap >= this.BIAS_ENGINE_EXIT_ACCEPT &&
+      aboveEma  >= this.BIAS_ENGINE_EXIT_ACCEPT &&
+      farAbove;
+
+    const inCooldown =
+      be.lastFlipTs !== undefined &&
+      (ts - be.lastFlipTs) < this.BIAS_ENGINE_COOLDOWN_MS;
+
+    const prevState = be.state;
+
+    // --- Helpers that match your types exactly ---
+    const clearSetup = () => {
+      exec.setup = "NONE";
+      exec.setupTriggerPrice = undefined;
+      exec.setupStopPrice = undefined;
+      exec.setupDetectedAt = undefined;
+    };
+
+    const invalidateOpp = () => {
+      if (exec.opportunity) {
+        exec.opportunity.status = "INVALIDATED";
+        exec.opportunity = undefined;
+      }
+    };
+
+    const enterRepair = (repairState: BiasEngineState) => {
+      if (be.state === repairState) return;
+
+      be.state = repairState;
+      be.repairStartTs = ts;
+      be.acceptBullCount = 0;
+      be.acceptBearCount = 0;
+
+      // Remove wrong-side active artifacts
+      this.deactivateGate(exec);
+      clearSetup();
+      invalidateOpp();
+
+      // Neutralize immediately to prevent fighting the flip
+      exec.bias = "NEUTRAL";
+      exec.baseBiasConfidence = undefined;
+      exec.biasConfidence = undefined;
+      exec.biasInvalidationLevel = undefined;
+
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+
+      if (exec.phase !== "IN_TRADE") {
+        exec.phase = "NEUTRAL_PHASE";
+        exec.waitReason = "waiting_for_bias";
+        exec.expectedResolution = undefined;  // Clear stale resolution
+      }
+    };
+
+    const finalizeFlip = (newBias: MarketBias, newState: BiasEngineState) => {
+      be.state = newState;
+      be.lastFlipTs = ts;
+      be.repairStartTs = undefined;
+      be.acceptBullCount = 0;
+      be.acceptBearCount = 0;
+
+      // Set bias flip cooldown (prevent setup arming on same bar)
+      exec.lastBiasFlipTs = ts;
+
+      // Clear stale artifacts that could cause accidental entries
+      this.deactivateGate(exec);
+      clearSetup();
+      invalidateOpp();
+
+      exec.bias = newBias;
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+
+      // Deterministic baseline; LLM can grade setups later
+      exec.baseBiasConfidence = 65;
+      exec.biasConfidence = 65;
+
+      exec.biasInvalidationLevel = undefined;
+
+      if (exec.phase !== "IN_TRADE") {
+        exec.phase = "BIAS_ESTABLISHED";
+        exec.expectedResolution = "CONTINUATION";
+        exec.waitReason = "waiting_for_pullback";
+      }
+    };
+
+    // --- Score (optional, for observability) ---
+    if (bullAccept) be.score = Math.min(10, be.score + 2);
+    else if (bearAccept) be.score = Math.max(-10, be.score - 2);
+    else be.score = be.score * 0.8;
+
+    // --- State machine ---
+    switch (be.state) {
+      case "BEARISH": {
+        if (bullAccept) enterRepair("REPAIR_BULL");
+        break;
+      }
+
+      case "BULLISH": {
+        if (bearAccept) enterRepair("REPAIR_BEAR");
+        break;
+      }
+
+      case "REPAIR_BULL": {
+        // Track persistence while repairing
+        if (bullAccept) be.acceptBullCount += 1;
+        else be.acceptBullCount = 0;
+
+        // If opposite exit evidence appears, repair failed
+        if (bullExitEvidence) {
+          if (!inCooldown) finalizeFlip("BEARISH", "BEARISH");
+          else {
+            be.state = "NEUTRAL";
+            exec.bias = "NEUTRAL";
+            if (exec.phase !== "IN_TRADE") exec.phase = "NEUTRAL_PHASE";
+          }
+          break;
+        }
+
+        // Finalize after enough time in repair (confirmation period)
+        const repairAgeMs = be.repairStartTs ? (ts - be.repairStartTs) : 0;
+        const enoughTime = repairAgeMs >= this.BIAS_ENGINE_REPAIR_CONFIRM_MIN * 60 * 1000;
+
+        if (bullAccept && enoughTime && !inCooldown) {
+          finalizeFlip("BULLISH", "BULLISH");
+        } else {
+          exec.bias = "NEUTRAL";
+        }
+        break;
+      }
+
+      case "REPAIR_BEAR": {
+        if (bearAccept) be.acceptBearCount += 1;
+        else be.acceptBearCount = 0;
+
+        if (bearExitEvidence) {
+          if (!inCooldown) finalizeFlip("BULLISH", "BULLISH");
+          else {
+            be.state = "NEUTRAL";
+            exec.bias = "NEUTRAL";
+            if (exec.phase !== "IN_TRADE") exec.phase = "NEUTRAL_PHASE";
+          }
+          break;
+        }
+
+        const repairAgeMs = be.repairStartTs ? (ts - be.repairStartTs) : 0;
+        const enoughTime = repairAgeMs >= this.BIAS_ENGINE_REPAIR_CONFIRM_MIN * 60 * 1000;
+
+        if (bearAccept && enoughTime && !inCooldown) {
+          finalizeFlip("BEARISH", "BEARISH");
+        } else {
+          exec.bias = "NEUTRAL";
+        }
+        break;
+      }
+
+      case "NEUTRAL": {
+        // From neutral, finalize only when acceptance is strong and cooldown allows
+        if (bullAccept && !inCooldown) finalizeFlip("BULLISH", "BULLISH");
+        else if (bearAccept && !inCooldown) finalizeFlip("BEARISH", "BEARISH");
+        break;
+      }
+    }
+
+    // --- Observability ---
+    if (prevExecBias !== exec.bias) {
+      console.log(
+        `[BIAS_CHANGE] ${prevExecBias} -> ${exec.bias} | engineState=${be.state} px=${close.toFixed(2)}`
+      );
+    }
+
+    if (prevState !== be.state) {
+      console.log(
+        `[BIAS_ENGINE] ${prevState} -> ${be.state} | execBias=${exec.bias} px=${close.toFixed(2)} ` +
+        `vwap=${vwap.toFixed(2)} ema=${ema.toFixed(2)} av=${aboveVwap} ae=${aboveEma} bv=${belowVwap} be=${belowEma} ` +
+        `bullAccept=${bullAccept} bearAccept=${bearAccept} cooldown=${inCooldown}`
+      );
+    }
+  }
+
   // Map LLM action to market bias (sticky, only flips on invalidation)
   // Helper to normalize LLM bias string to MarketBias enum (handles casing safely)
   private normalizeBias(llmBias: string | undefined): "BEARISH" | "BULLISH" | "NEUTRAL" {
@@ -2428,51 +2679,38 @@ export class Orchestrator {
     let shouldPublishEvent = false;
 
     // ============================================================================
-    // STEP 1: Apply bias from LLM (if available)
+    // STEP 1: Store LLM advisory hints (LLM does NOT own exec.bias anymore)
     // ============================================================================
     if (llmDecision !== null) {
-      const llmDirection: "long" | "short" | "none" = 
-        llmDecision.action === "ARM_LONG" ? "long" :
-        llmDecision.action === "ARM_SHORT" ? "short" :
-        llmDecision.action === "A+" ? (llmDecision.bias === "bearish" ? "short" : "long") : "none";
-      
-      const newBias = this.llmActionToBias(llmDecision.action as "ARM_LONG" | "ARM_SHORT" | "WAIT" | "A+", llmDecision.bias as "bullish" | "bearish" | "neutral");
+      exec.llmBiasHint = llmDecision.bias as "bullish" | "bearish" | "neutral";
+      exec.llmActionHint = llmDecision.action as "WAIT" | "ARM_LONG" | "ARM_SHORT" | "A+";
+      exec.llmMaturityHint = llmDecision.maturity;
+      exec.llmWaitingForHint = llmDecision.waiting_for;
+      exec.llmConfidenceHint = llmDecision.confidence;
+
+      // Legacy compatibility derived from engine-owned bias
+      exec.thesisDirection =
+        exec.bias === "BULLISH" ? "long" :
+        exec.bias === "BEARISH" ? "short" : "none";
+
       console.log(
-        `[LLM_BIAS_MAP] action=${llmDecision.action} llmBias=${llmDecision.bias} -> execBias=${newBias}`
+        `[LLM_HINT] action=${exec.llmActionHint} biasHint=${exec.llmBiasHint} execBias=${exec.bias} ` +
+        `maturity=${exec.llmMaturityHint ?? "n/a"} waiting_for=${exec.llmWaitingForHint ?? "n/a"} ` +
+        `llmConf=${exec.llmConfidenceHint ?? "n/a"}`
       );
-      const shouldFlip = this.shouldFlipBias(
-        exec.bias,
-        newBias,
-        exec.biasInvalidationLevel,
-        close
-      );
+    }
 
-      if (shouldFlip || exec.bias === "NEUTRAL") {
-        // Deactivate gate if bias flips
-        if (exec.bias !== newBias && exec.bias !== "NEUTRAL") {
-          this.deactivateGate(exec);
-        }
-        exec.bias = newBias;
-        exec.baseBiasConfidence = llmDecision.confidence;
-        exec.biasPrice = close;
-        exec.biasTs = ts;
-        if (exec.activeCandidate) {
-          exec.biasInvalidationLevel = exec.activeCandidate.invalidationLevel;
-        }
-        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-        shouldPublishEvent = true;
-      }
-
-      // Legacy compatibility
-      exec.thesisDirection = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "none";
-      if (exec.bias !== "NEUTRAL") {
-        exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
+    // ============================================================================
+    // STEP 1.5: Always compute derived confidence (bias engine can flip without LLM)
+    // ============================================================================
+    // Bias confidence should not depend on LLM availability anymore
+    // This ensures Step 2 has consistent inputs and logs don't lie
+    if (exec.bias !== "NEUTRAL") {
+      exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
       exec.thesisConfidence = exec.biasConfidence;
-      }
-
-      console.log(
-        `[LLM5M] action=${llmDecision.action} bias=${exec.bias} baseConf=${exec.baseBiasConfidence ?? llmDecision.confidence} derivedConf=${exec.biasConfidence ?? "n/a"}`
-      );
+    } else {
+      exec.biasConfidence = undefined;
+      exec.thesisConfidence = undefined;
     }
 
     // ============================================================================
@@ -2480,15 +2718,19 @@ export class Orchestrator {
     // ============================================================================
     // Phase transitions are based on bias, confidence, and market structure
     // LLM never sets phase directly
-    if (exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
-      // Bias is established with sufficient confidence
+    // Guard: Only transition to BIAS_ESTABLISHED if bias engine is in stable state (not REPAIR)
+    const beState = exec.biasEngine?.state;
+    const stable = beState === "BULLISH" || beState === "BEARISH";
+
+    if (stable && exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
+      // Bias is established with sufficient confidence AND bias engine is stable
       if (exec.phase === "NEUTRAL_PHASE") {
         exec.phase = "BIAS_ESTABLISHED";
         exec.expectedResolution = "CONTINUATION";
         exec.waitReason = "waiting_for_pullback";
         shouldPublishEvent = true;
         console.log(
-          `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence}`
+          `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence} engineState=${beState}`
         );
       } else if (exec.phase === "BIAS_ESTABLISHED" && lastClosed5m) {
         // Check if pullback is developing
@@ -2556,38 +2798,54 @@ export class Orchestrator {
         exec.setupTriggerPrice = undefined;
         exec.setupStopPrice = undefined;
       } else if (lastClosed5m) {
-        const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
-        const atr = this.calculateATR(closed5mBars);
-        const setupResult = this.detectSetup(exec, lastClosed5m, previous5m, closed5mBars, atr, null); // Never use forming bar
+        // Optional: Bias flip cooldown - don't arm setup on same bar as flip
+        const biasFlipCooldownMs = 5 * 60 * 1000;  // 5 minutes (one 5m bar)
+        const timeSinceBiasFlip = exec.lastBiasFlipTs ? (ts - exec.lastBiasFlipTs) : Infinity;
+        const inBiasFlipCooldown = timeSinceBiasFlip < biasFlipCooldownMs;
         
-        const oldSetup = exec.setup;
-        
-        // Handle setup transition (resets gate cleanly)
-        this.onSetupTransition(exec, oldSetup, setupResult.setup, ts);
-        
-        exec.setup = setupResult.setup;
-        exec.setupTriggerPrice = setupResult.triggerPrice;
-        exec.setupStopPrice = setupResult.stopPrice;
-        
-        if (oldSetup !== setupResult.setup) {
-          exec.setupDetectedAt = ts;
-          
-          // Log setup change with reason
-          const setupChangeReason = setupResult.setup === "NONE" 
-            ? (oldSetup ? `setup_invalidated` : `no_setup_detected`)
-            : `setup_detected`;
+        if (inBiasFlipCooldown) {
+          // Bias just flipped - wait one bar before arming new setup
+          exec.setup = "NONE";
+          exec.setupTriggerPrice = undefined;
+          exec.setupStopPrice = undefined;
           console.log(
-            `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"} reason=${setupChangeReason}`
+            `[SETUP_COOLDOWN] Bias flipped ${Math.round(timeSinceBiasFlip / 1000)}s ago - skipping setup detection (cooldown=${biasFlipCooldownMs}ms)`
           );
+        } else {
+          // Normal setup detection
+          const previous5m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
+          const atr = this.calculateATR(closed5mBars);
+          const setupResult = this.detectSetup(exec, lastClosed5m, previous5m, closed5mBars, atr, null); // Never use forming bar
           
-          // Enhanced [SETUP_CLEARED] log with more context
-          if (setupResult.setup === "NONE" && oldSetup && oldSetup !== "NONE") {
-            const pullbackInfo = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined
-              ? `pullbackLow=${exec.pullbackLow.toFixed(2)} pullbackHigh=${exec.pullbackHigh.toFixed(2)}`
-              : "pullbackLevels=undefined";
+          const oldSetup = exec.setup;
+          
+          // Handle setup transition (resets gate cleanly)
+          this.onSetupTransition(exec, oldSetup, setupResult.setup, ts);
+          
+          exec.setup = setupResult.setup;
+          exec.setupTriggerPrice = setupResult.triggerPrice;
+          exec.setupStopPrice = setupResult.stopPrice;
+          
+          if (oldSetup !== setupResult.setup) {
+            exec.setupDetectedAt = ts;
+            
+            // Log setup change with reason
+            const setupChangeReason = setupResult.setup === "NONE" 
+              ? (oldSetup ? `setup_invalidated` : `no_setup_detected`)
+              : `setup_detected`;
             console.log(
-              `[SETUP_CLEARED] priorSetup=${oldSetup} bias=${exec.bias} phase=${exec.phase} reason=${setupChangeReason} price=${close.toFixed(2)} ${pullbackInfo}`
+              `[SETUP_DETECTED] ${oldSetup ?? "NONE"} -> ${setupResult.setup} | BIAS=${exec.bias} PHASE=${exec.phase} trigger=${setupResult.triggerPrice?.toFixed(2) ?? "n/a"} stop=${setupResult.stopPrice?.toFixed(2) ?? "n/a"} reason=${setupChangeReason}`
             );
+            
+            // Enhanced [SETUP_CLEARED] log with more context
+            if (setupResult.setup === "NONE" && oldSetup && oldSetup !== "NONE") {
+              const pullbackInfo = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined
+                ? `pullbackLow=${exec.pullbackLow.toFixed(2)} pullbackHigh=${exec.pullbackHigh.toFixed(2)}`
+                : "pullbackLevels=undefined";
+              console.log(
+                `[SETUP_CLEARED] priorSetup=${oldSetup} bias=${exec.bias} phase=${exec.phase} reason=${setupChangeReason} price=${close.toFixed(2)} ${pullbackInfo}`
+              );
+            }
           }
         }
       }
@@ -3029,6 +3287,11 @@ export class Orchestrator {
       pausedUntil: exec.deploymentPauseUntilTs ? new Date(exec.deploymentPauseUntilTs).toISOString() : undefined,
       pauseReason: exec.deploymentPauseReason,
     });
+
+    // ============================================================================
+    // Update bias engine (deterministic, 1m-based)
+    // ============================================================================
+    this.updateBiasEngine(exec, ts, close);
 
     // ============================================================================
     // ============================================================================
