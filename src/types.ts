@@ -169,6 +169,9 @@ export type MinimalExecutionPhase =
   | "IN_TRADE"
   | "CONSOLIDATION_AFTER_REJECTION";
 
+// Market condition (deterministic, 1m-based)
+export type MarketCondition = "TRENDING" | "COMPRESSION" | "TRANSITION" | "UNKNOWN";
+
 // Entry Types (explicit, not implied)
 export type EntryType = "REJECTION_ENTRY" | "BREAKDOWN_ENTRY" | "REENTRY_AFTER_CONTINUATION" | "BIAS_FLIP_ENTRY" | "PULLBACK_ENTRY" | "IGNITION_ENTRY";
 
@@ -274,14 +277,14 @@ export type Blocker = {
 // Blocker types for Telegram/API response (matches internal Blocker type)
 export type NoTradeBlockerSeverity = "HARD" | "SOFT" | "INFO";
 
-export interface NoTradeBlockerResponse {
+export type NoTradeBlocker = {
   code: string;
   message: string;
   severity: NoTradeBlockerSeverity;
   updatedAtTs: number;
   expiresAtTs: number;
   weight: number;
-}
+};
 
 export type NoTradeDiagnostic = {
   price: number;
@@ -295,12 +298,12 @@ export type NoTradeDiagnostic = {
 };
 
 // Response type for Telegram/API (serialized version)
-export interface NoTradeDiagnosticResponse {
+export type NoTradeDiagnosticResponse = {
   reasonCode: string;
   details: string;
+  blockers: NoTradeBlocker[];
   reasons?: string[]; // Legacy: Human-readable reasons array
-  blockers?: NoTradeBlockerResponse[]; // Serialized blockers for Telegram
-}
+};
 
 export type MinimalExecutionState = {
   // Market Bias (sticky)

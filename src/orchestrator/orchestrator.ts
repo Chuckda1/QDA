@@ -3414,6 +3414,11 @@ export class Orchestrator {
     }
 
     // ============================================================================
+    // Update market condition (COMPRESSION vs TRENDING)
+    // ============================================================================
+    this.updateMarketCondition(exec, ts, close);
+
+    // ============================================================================
     // ============================================================================
     // RULE 1: LLM must NEVER be called on 1m path - ONLY on 5m closes
     // ============================================================================
@@ -4662,6 +4667,9 @@ export class Orchestrator {
             weight: b.weight,
           })),
         } : undefined,
+        marketCondition: exec.marketCondition,
+        conditionReason: exec.conditionReason,
+        conditionExpiresAtTs: exec.conditionExpiresAtTs,
         // Target zones (when in trade)
         targetZones: exec.targetZones ?? undefined,
         entryPrice: exec.entryPrice ?? undefined,

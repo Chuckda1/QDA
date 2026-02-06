@@ -1,5 +1,6 @@
 import type { TelegramSnapshot } from "./telegramNormalizer.js";
 import { formatEtTimestamp } from "./telegramNormalizer.js";
+import type { NoTradeBlocker, NoTradeBlockerSeverity } from "../types.js";
 
 export type TelegramAlert = {
   type: "MIND";
@@ -129,75 +130,112 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   const inTrade = snapshot.botState === "IN_TRADE" || snapshot.entryStatus === "active";
 
   // ============================================================================
-  // NO_TRADE: single source of truth (prevents double-reporting)
+  // Single reducer: ONE state, ONE headline, no contradictions
   // ============================================================================
-  // Only print NO_TRADE if there is an active primary blocker.
-  // If no blockers exist, fallback to generic message (but never both).
-  // ============================================================================
-  type BlockerSeverity = "HARD" | "SOFT" | "INFO";
+  type Severity = NoTradeBlockerSeverity;
 
-  type SnapshotBlocker = {
-    code: string;
-    message: string;
-    severity: BlockerSeverity;
-    updatedAtTs: number;
-    expiresAtTs: number;
-    weight: number;
+  type TradeReadinessView = {
+    headline?: string;          // e.g. "🚫 NO TRADE — HARD: No setup armed"
+    secondary?: string[];       // up to 2
+    info?: string[];            // hints only
+    primary?: NoTradeBlocker;
   };
 
-  function pickActiveBlockers(blockers: SnapshotBlocker[], now: number): SnapshotBlocker[] {
-    return blockers
-      .filter(b => now <= b.expiresAtTs && b.severity !== "INFO")
-      .sort((a, b) => {
-        const severityOrder: Record<BlockerSeverity, number> = { HARD: 2, SOFT: 1, INFO: 0 };
-        const sdiff = severityOrder[b.severity] - severityOrder[a.severity];
-        if (sdiff !== 0) return sdiff;
-        return b.weight - a.weight;
+  const severityOrder: Record<Severity, number> = { HARD: 2, SOFT: 1, INFO: 0 };
+
+  function buildTradeReadinessView(
+    inTrade: boolean,
+    setup: string | undefined,
+    noTradeDiagnostic: { blockers?: NoTradeBlocker[] } | undefined,
+    now: number = Date.now()
+  ): TradeReadinessView {
+    if (inTrade) return {};
+
+    // 1) Collect blockers (diagnostic is source of truth)
+    const blockers: NoTradeBlocker[] = (noTradeDiagnostic?.blockers ?? [])
+      .filter((b: NoTradeBlocker) => now <= b.expiresAtTs);
+
+    // 2) If there is no setup, treat it as a HARD blocker (but DO NOT print separate NO_TRADE text)
+    // This replaces the old direct "NO TRADE — structure incomplete" line.
+    const hasSetup = !!setup && setup !== "NONE";
+    if (!hasSetup) {
+      blockers.push({
+        code: "NO_SETUP",
+        message: "No setup armed",
+        severity: "HARD",
+        updatedAtTs: now,
+        expiresAtTs: now + 5 * 60 * 1000,
+        weight: 100,
       });
+    }
+
+    if (blockers.length === 0) return {};
+
+    // 3) Separate info vs actionable
+    const info = blockers.filter((b: NoTradeBlocker) => b.severity === "INFO");
+    const actionable = blockers.filter((b: NoTradeBlocker) => b.severity !== "INFO");
+
+    // If only info blockers exist, don't show "NO TRADE fired"
+    if (actionable.length === 0) {
+      return {
+        info: info.slice(0, 3).map((b: NoTradeBlocker) => `💡 ${b.message}`),
+      };
+    }
+
+    // 4) Sort actionable blockers: severity first, then weight
+    actionable.sort((a: NoTradeBlocker, b: NoTradeBlocker) => {
+      const sev = severityOrder[b.severity] - severityOrder[a.severity];
+      if (sev !== 0) return sev;
+      return b.weight - a.weight;
+    });
+
+    const primary = actionable[0];
+    const secondary = actionable.slice(1, 3);
+
+    const severityEmoji = primary.severity === "HARD" ? "🚫" : "⚠️";
+
+    return {
+      primary,
+      headline: `${severityEmoji} NO TRADE — ${primary.severity}: ${primary.message}`,
+      secondary: secondary.map((b: NoTradeBlocker) => {
+        const e = b.severity === "HARD" ? "🚫" : "⚠️";
+        return `${e} ${b.severity}: ${b.message}`;
+      }),
+      info: info.slice(0, 3).map((b: NoTradeBlocker) => `💡 ${b.message}`),
+    };
   }
 
   // ------------------------------
   // NO_TRADE: single source of truth
   // ------------------------------
   if (!inTrade) {
-    const now = Date.now();
-    const blockers = (snapshot.noTradeDiagnostic?.blockers ?? []) as SnapshotBlocker[];
-    const active = pickActiveBlockers(blockers, now);
+    // Always show setup line as STATUS only (not a reason)
+    lines.push(`⚪ SETUP: ${snapshot.setup ?? "NONE"}`);
 
-    if (active.length > 0) {
-      const primary = active[0];
-      const emoji = primary.severity === "HARD" ? "🚫" : "⚠️";
+    const view = buildTradeReadinessView(
+      inTrade,
+      snapshot.setup,
+      snapshot.noTradeDiagnostic
+    );
 
-      lines.push(""); // spacer
-      lines.push(`${emoji} NO TRADE — ${primary.severity}: ${primary.message}`);
+    // Print exactly one NO_TRADE headline max
+    if (view.headline) {
+      lines.push("");
+      lines.push(view.headline);
 
-      const secondary = active.slice(1, 3);
-      if (secondary.length > 0) {
+      if (view.secondary && view.secondary.length > 0) {
         lines.push("Secondary:");
-        secondary.forEach((b: SnapshotBlocker) => {
-          const e = b.severity === "HARD" ? "🚫" : "⚠️";
-          lines.push(`${e} ${b.severity}: ${b.message}`);
-        });
+        view.secondary.forEach((s: string) => lines.push(s));
       }
 
-      // Show INFO blockers as hints (not as "No trade fired reason")
-      const infoBlockers = blockers.filter(
-        (b: SnapshotBlocker) => b.severity === "INFO" && now <= b.expiresAtTs
-      );
-      if (infoBlockers.length > 0) {
+      if (view.info && view.info.length > 0) {
         lines.push("Info:");
-        infoBlockers.forEach((b: SnapshotBlocker) => {
-          lines.push(`💡 ${b.message}`);
-        });
+        view.info.forEach((s: string) => lines.push(s));
       }
-    } else {
-      // Fallback: if no blocker system is present, show a single generic message.
-      // IMPORTANT: do NOT print this if blocker system exists but is empty for a moment
-      // unless you explicitly want that behavior.
-      if (!snapshot.setup || snapshot.setup === "NONE") {
-        lines.push("⚪ SETUP: NONE");
-        lines.push("🚫 NO TRADE — structure incomplete");
-      }
+    } else if (view.info && view.info.length > 0) {
+      // Only hints, no "NO TRADE" headline
+      lines.push("");
+      view.info.forEach((s: string) => lines.push(s));
     }
   }
 
