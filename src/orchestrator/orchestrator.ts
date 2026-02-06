@@ -19,7 +19,6 @@ import type {
   MinimalLLMSnapshot,
   MinimalSetupCandidate,
   NoTradeDiagnostic,
-  NoTradeDiagnosticResponse,
   NoTradeReasonCode,
   OpportunityLatch,
   OpportunitySide,
