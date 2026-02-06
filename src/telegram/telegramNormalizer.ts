@@ -27,6 +27,9 @@ export type TelegramSnapshot = {
   setupStopPrice?: number;
   setupDetectedAt?: number;
   lastBiasFlipTs?: number;
+  marketCondition?: string;
+  conditionReason?: string;
+  conditionExpiresAtTs?: number;
   noTradeDiagnostic?: {
     reasonCode: string;
     details: string;
@@ -137,6 +140,9 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     setupStopPrice,
     setupDetectedAt,
     lastBiasFlipTs,
+    marketCondition,
+    conditionReason,
+    conditionExpiresAtTs,
     noTradeDiagnostic,
     targetZones,
     entryPrice,

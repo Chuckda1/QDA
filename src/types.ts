@@ -130,6 +130,10 @@ export interface MinimalMindStateResponse {
   oppExpiresAt?: number; // Timestamp when opportunity expires
   last5mCloseTs?: number; // Timestamp of last 5m bar close
   source?: "1m" | "5m"; // Source of this state update (1m tick or 5m close)
+  // Market condition (deterministic, 1m-based)
+  marketCondition?: MarketCondition; // Market condition (TRENDING, COMPRESSION, etc.)
+  conditionReason?: string; // Reason for current market condition
+  conditionExpiresAtTs?: number; // When condition expires (TTL)
 }
 
 export type MinimalMindStateResult = {
