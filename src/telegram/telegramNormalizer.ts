@@ -24,6 +24,9 @@ export type TelegramSnapshot = {
   expectedResolution?: string;
   setup?: string;
   setupTriggerPrice?: number;
+  setupStopPrice?: number;
+  setupDetectedAt?: number;
+  lastBiasFlipTs?: number;
   noTradeDiagnostic?: {
     reasonCode: string;
     details: string;
@@ -71,6 +74,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const refLabel = typeof mind.refLabel === "string" ? mind.refLabel : undefined;
   const expectedResolution = mind.expectedResolution ?? undefined;
   const setup = mind.setup ?? undefined;
+  const setupTriggerPrice = Number.isFinite(mind.setupTriggerPrice) ? Number(mind.setupTriggerPrice) : undefined;
+  const setupStopPrice = Number.isFinite(mind.setupStopPrice) ? Number(mind.setupStopPrice) : undefined;
+  const setupDetectedAt = Number.isFinite(mind.setupDetectedAt) ? Number(mind.setupDetectedAt) : undefined;
+  const lastBiasFlipTs = Number.isFinite(mind.lastBiasFlipTs) ? Number(mind.lastBiasFlipTs) : undefined;
   const trigger = event.data.candidate?.entryTrigger;
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)
@@ -113,6 +120,10 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     refLabel,
     expectedResolution,
     setup,
+    setupTriggerPrice,
+    setupStopPrice,
+    setupDetectedAt,
+    lastBiasFlipTs,
     noTradeDiagnostic,
     targetZones,
     entryPrice,

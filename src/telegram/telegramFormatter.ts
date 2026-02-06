@@ -74,14 +74,44 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
 
   // Format setup with emoji
   const setupEmoji = snapshot.setup && snapshot.setup !== "NONE" ? "🎯" : "⚪";
-  const setupLine = snapshot.setup 
-    ? `${setupEmoji} SETUP: ${snapshot.setup}${snapshot.setupTriggerPrice ? ` (trigger: ${formatPrice(snapshot.setupTriggerPrice)})` : ""}`
-    : undefined;
+  let setupLine: string | undefined;
+  let entryLine: string | undefined;
   
-  // Format entry status with trigger info
-  const entryLine = snapshot.setup && snapshot.setup !== "NONE" && snapshot.setupTriggerPrice
-    ? `${entryEmoji} ENTRY: WAITING (trigger: ${formatPrice(snapshot.setupTriggerPrice)})`
-    : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
+  // Special handling for IGNITION setup with actionable info
+  if (snapshot.setup === "IGNITION" && snapshot.setupDetectedAt && snapshot.lastBiasFlipTs && snapshot.ts) {
+    const now = Date.now();
+    const flipAge = now - snapshot.lastBiasFlipTs;
+    const setupAge = snapshot.setupDetectedAt ? (now - snapshot.setupDetectedAt) : 0;
+    const windowMs = 3 * 60 * 1000; // IGNITION_WINDOW_MS
+    const ttlMs = 2 * 60 * 1000; // IGNITION_TTL_MS
+    const windowRemaining = Math.max(0, windowMs - flipAge);
+    const ttlRemaining = snapshot.setupDetectedAt ? Math.max(0, ttlMs - setupAge) : undefined;
+    
+    const windowText = windowRemaining > 0 
+      ? `window open (${Math.round(windowRemaining / 1000)}s left)`
+      : "window closed";
+    const ttlText = ttlRemaining !== undefined && ttlRemaining > 0
+      ? `expires in ${Math.round(ttlRemaining / 1000)}s`
+      : ttlRemaining === 0 ? "expired" : undefined;
+    
+    setupLine = `${setupEmoji} SETUP: IGNITION ${windowText}${ttlText ? ` | ${ttlText}` : ""}`;
+    
+    if (snapshot.setupTriggerPrice && snapshot.setupStopPrice) {
+      const triggerDir = snapshot.bias === "BULLISH" ? ">" : "<";
+      entryLine = `${entryEmoji} ENTRY: WAITING | Trigger ${triggerDir} ${formatPrice(snapshot.setupTriggerPrice)} | Stop ${triggerDir === ">" ? "<" : ">"} ${formatPrice(snapshot.setupStopPrice)}`;
+    } else {
+      entryLine = `${entryEmoji} ENTRY: WAITING (trigger: ${snapshot.setupTriggerPrice ? formatPrice(snapshot.setupTriggerPrice) : "n/a"})`;
+    }
+  } else {
+    // Standard setup formatting
+    setupLine = snapshot.setup 
+      ? `${setupEmoji} SETUP: ${snapshot.setup}${snapshot.setupTriggerPrice ? ` (trigger: ${formatPrice(snapshot.setupTriggerPrice)})` : ""}`
+      : undefined;
+    
+    entryLine = snapshot.setup && snapshot.setup !== "NONE" && snapshot.setupTriggerPrice
+      ? `${entryEmoji} ENTRY: WAITING (trigger: ${formatPrice(snapshot.setupTriggerPrice)})`
+      : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
+  }
 
   const lines = [
     `${biasEmoji} PRICE: ${price}`, // Always first with bias emoji

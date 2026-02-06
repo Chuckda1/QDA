@@ -4136,8 +4136,61 @@ export class Orchestrator {
           // 6) Entry execution (unchanged from your block)
           // ------------------------------------------------------------
           if (canEnter) {
+            // IGNITION entry (1m-based, immediate after flip)
+            if (isIgnition && ignitionSignal) {
+              const oldPhase = exec.phase;
+              const micro = exec.micro;
+              const atr = micro?.atr1m ?? this.calculateATR(closed5mBars);
+              
+              exec.entryPrice = close;
+              exec.entryTs = ts;
+              exec.entryType = "IGNITION_ENTRY";
+              exec.entryTrigger = `IGNITION: ${exec.bias === "BULLISH" ? "Breakout above" : "Breakdown below"} swing ${exec.bias === "BULLISH" ? "high" : "low"}`;
+              exec.stopPrice = exec.setupStopPrice ?? (exec.bias === "BULLISH" 
+                ? close - this.IGNITION_RISK_ATR * atr
+                : close + this.IGNITION_RISK_ATR * atr);
+
+              const closedBarsWithVolume = closed5mBars.filter(
+                (bar) => "volume" in bar
+              ) as Array<{ high: number; low: number; close: number; volume: number }>;
+
+              const vwap = closedBarsWithVolume.length > 0
+                ? this.calculateVWAP(closedBarsWithVolume)
+                : undefined;
+
+              const targetResult = this.computeTargets(
+                exec.bias === "BULLISH" ? "long" : "short",
+                exec.entryPrice,
+                exec.stopPrice,
+                atr,
+                closedBarsWithVolume,
+                vwap,
+                undefined,
+                undefined,
+                undefined
+              );
+
+              exec.targets = targetResult.targets;
+              exec.targetZones = targetResult.targetZones;
+
+              exec.phase = "IN_TRADE";
+              exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
+              exec.waitReason = "in_trade";
+              exec.entryBlocked = false;
+              exec.entryBlockReason = undefined;
+
+              if (exec.opportunity) {
+                exec.opportunity.status = "CONSUMED";
+              }
+
+              shouldPublishEvent = true;
+
+              console.log(
+                `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
+              );
+            }
             // Enter ON pullback for BULLISH bias
-            if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
+            else if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
               const atrForBlock = this.calculateATR(closed5mBars);
               const blockCheck = this.shouldBlockEntry(
                 exec.bias,
@@ -4539,6 +4592,10 @@ export class Orchestrator {
         entryType: exec.entryType ?? undefined,
         expectedResolution: exec.expectedResolution ?? undefined,
         setup: exec.setup ?? undefined, // Explicit setup type
+        setupTriggerPrice: exec.setupTriggerPrice,
+        setupStopPrice: exec.setupStopPrice,
+        setupDetectedAt: exec.setupDetectedAt,
+        lastBiasFlipTs: exec.lastBiasFlipTs,
         price: close, // Current price (first-class)
         refPrice, // Reference price anchor
         refLabel, // Label for reference price
