@@ -258,14 +258,28 @@ export type NoTradeReasonCode =
   | "RR_UNFAVORABLE"
   | "PRICE_DRIFT_TOO_SMALL";
 
+// Blocker severity for prioritization
+export type BlockerSeverity = "HARD" | "SOFT" | "INFO";
+
+// Typed blocker with TTL and severity
+export type Blocker = {
+  code: string;                  // "NO_PULLBACK_REJECTION", "NO_GATE_ARMED"
+  message: string;               // Human readable
+  severity: BlockerSeverity;
+  updatedAtTs: number;
+  expiresAtTs: number;           // TTL (e.g. 2 bars = 10 minutes)
+  weight: number;                // 0-100 (higher = more blocking)
+};
+
 export type NoTradeDiagnostic = {
   price: number;
   bias: MarketBias;
   phase: MinimalExecutionPhase;
   expectedResolution?: ExpectedResolution;
   gateStatus?: ResolutionGateStatus;
-  reasonCode: NoTradeReasonCode;
-  details: string;
+  reasonCode: NoTradeReasonCode; // Legacy - kept for backward compatibility
+  details: string;               // Legacy - kept for backward compatibility
+  blockers: Blocker[];           // NEW: Typed blockers with TTL + severity
 };
 
 export type MinimalExecutionState = {

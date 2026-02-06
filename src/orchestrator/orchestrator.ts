@@ -3,6 +3,8 @@ import { getMarketRegime, getMarketSessionLabel, getETDateString } from "../util
 import { extractSwings, lastSwings } from "../utils/swing.js";
 import type {
   BiasEngineState,
+  Blocker,
+  BlockerSeverity,
   BotMode,
   BotState,
   DailyContextLite,
@@ -2281,62 +2283,83 @@ export class Orchestrator {
 
     if (!priceMoved && this.lastDiagnosticPrice !== null) return null;
 
-    // Determine reason code (canonical, no ambiguity)
+    // Determine reason code (canonical, no ambiguity) - legacy support
     let reasonCode: NoTradeReasonCode;
     let details: string;
+    const blockers: Blocker[] = [];
+    const blockerTTL = 2 * 5 * 60 * 1000; // 2 bars = 10 minutes
 
-    // First check: No setup detected
-    if (exec.setup === "NONE" || !exec.setup) {
-      reasonCode = "NO_GATE_ARMED"; // Reuse this code for "no setup"
-      details = "No tradable setup detected - structure incomplete";
-    } else if (!exec.resolutionGate || exec.resolutionGate.status === "INACTIVE") {
-      reasonCode = "NO_GATE_ARMED";
-      details = "Structure not mature - pullback levels not locked";
-    } else if (exec.resolutionGate.status === "EXPIRED") {
-      reasonCode = "GATE_EXPIRED";
-      details = "Continuation occurred before trigger — move not chaseable";
-    } else if (exec.resolutionGate.status === "INVALIDATED") {
-      reasonCode = "GATE_INVALIDATED";
-      details = "Structure broke against bias";
-    } else if (exec.resolutionGate.status === "ARMED") {
-      // Gate is armed but not triggered - check why
-      // FIX: Use tick timestamp instead of Date.now() to avoid split-brain
-      const timeExpired = ts > exec.resolutionGate.expiryTs;
-      const priceBeyondTrigger = exec.resolutionGate.direction === "short"
-        ? currentPrice < exec.resolutionGate.triggerPrice - 0.5 * atr
-        : currentPrice > exec.resolutionGate.triggerPrice + 0.5 * atr;
-      
-      if (timeExpired) {
-        reasonCode = "GATE_EXPIRED";
-        details = "Gate expired - continuation window closed";
-      } else if (priceBeyondTrigger) {
-        reasonCode = "GATE_EXPIRED";
-        details = "Continuation occurred without structure — move not chaseable";
-      } else {
-        reasonCode = "AWAITING_PULLBACK_COMPLETION";
-        details = "Gate armed, awaiting trigger price";
-      }
-    } else {
-      reasonCode = "AWAITING_PULLBACK_COMPLETION";
-      details = "Awaiting pullback completion";
-    }
+    // Helper to create blocker
+    const createBlocker = (
+      code: string,
+      message: string,
+      severity: BlockerSeverity,
+      weight: number
+    ): Blocker => ({
+      code,
+      message,
+      severity,
+      updatedAtTs: ts,
+      expiresAtTs: ts + blockerTTL,
+      weight,
+    });
 
-    // Check for session constraints (simplified - would check actual session times)
-    // FIX: Use tick timestamp instead of system time to avoid split-brain
+    // Check for session constraints (HARD blocker, highest priority)
     const regime = getMarketRegime(new Date(ts));
     if (!regime.isRTH) {
-      // DEBUG: Log timezone/clock mismatch
-      const nowDate = new Date(ts);
-      const nowET = getETDateString(nowDate);
-      console.log(
-        `[NO_TRADE_DIAGNOSTIC] Market closed check: ts=${ts} nowDate=${nowDate.toISOString()} nowET=${nowET} nowETTime=${regime.nowEt} isRTH=${regime.isRTH} regime=${regime.regime}`
-      );
       reasonCode = "SESSION_CONSTRAINT";
       details = "Market closed or outside trading hours";
-    }
+      blockers.push(createBlocker("SESSION_CONSTRAINT", "Market closed or outside trading hours", "HARD", 100));
+    } else {
+      // First check: No setup detected (HARD blocker)
+      if (exec.setup === "NONE" || !exec.setup) {
+        reasonCode = "NO_GATE_ARMED";
+        details = "No tradable setup detected - structure incomplete";
+        blockers.push(createBlocker("NO_SETUP", "No setup armed (gate not armed)", "HARD", 90));
+      } else if (!exec.resolutionGate || exec.resolutionGate.status === "INACTIVE") {
+        reasonCode = "NO_GATE_ARMED";
+        details = "Structure not mature - pullback levels not locked";
+        blockers.push(createBlocker("NO_GATE_ARMED", "No setup armed (gate not armed)", "HARD", 90));
+        blockers.push(createBlocker("STRUCTURE_IMMATURE", "Structure not mature", "SOFT", 40));
+      } else if (exec.resolutionGate.status === "EXPIRED") {
+        reasonCode = "GATE_EXPIRED";
+        details = "Continuation occurred before trigger — move not chaseable";
+        blockers.push(createBlocker("GATE_EXPIRED", "Gate expired - continuation window closed", "HARD", 85));
+      } else if (exec.resolutionGate.status === "INVALIDATED") {
+        reasonCode = "GATE_INVALIDATED";
+        details = "Structure broke against bias";
+        blockers.push(createBlocker("GATE_INVALIDATED", "Structure broke against bias", "HARD", 80));
+      } else if (exec.resolutionGate.status === "ARMED") {
+        // Gate is armed but not triggered - check why
+        const timeExpired = ts > exec.resolutionGate.expiryTs;
+        const priceBeyondTrigger = exec.resolutionGate.direction === "short"
+          ? currentPrice < exec.resolutionGate.triggerPrice - 0.5 * atr
+          : currentPrice > exec.resolutionGate.triggerPrice + 0.5 * atr;
+        
+        if (timeExpired) {
+          reasonCode = "GATE_EXPIRED";
+          details = "Gate expired - continuation window closed";
+          blockers.push(createBlocker("GATE_EXPIRED", "Gate expired - continuation window closed", "HARD", 85));
+        } else if (priceBeyondTrigger) {
+          reasonCode = "GATE_EXPIRED";
+          details = "Continuation occurred without structure — move not chaseable";
+          blockers.push(createBlocker("GATE_EXPIRED", "Continuation occurred without structure", "HARD", 85));
+        } else {
+          reasonCode = "AWAITING_PULLBACK_COMPLETION";
+          details = "Gate armed, awaiting trigger price";
+          blockers.push(createBlocker("AWAITING_TRIGGER", "Gate armed, awaiting trigger price", "SOFT", 30));
+        }
+      } else {
+        reasonCode = "AWAITING_PULLBACK_COMPLETION";
+        details = "Awaiting pullback completion";
+        blockers.push(createBlocker("AWAITING_PULLBACK", "Awaiting pullback completion", "SOFT", 30));
+      }
 
-    // Volatility check (simplified - would use actual volatility calculation)
-    // For now, we'll skip VOL_TOO_HIGH as it requires more sophisticated volatility tracking
+      // Add INFO blockers (hints, not blockers)
+      if (exec.llmMaturityHint) {
+        blockers.push(createBlocker("LLM_MATURITY_HINT", `LLM thinks "${exec.llmMaturityHint}"`, "INFO", 10));
+      }
+    }
 
     return {
       price: currentPrice,
@@ -2346,6 +2369,7 @@ export class Orchestrator {
       gateStatus: exec.resolutionGate?.status,
       reasonCode,
       details,
+      blockers,
     };
   }
 

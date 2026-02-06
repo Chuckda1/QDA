@@ -134,14 +134,50 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     lines.push("🚫 NO TRADE — structure incomplete");
   }
   
-  // Add no-trade diagnostic if present
-  if (snapshot.noTradeDiagnostic && snapshot.noTradeDiagnostic.reasons && snapshot.noTradeDiagnostic.reasons.length > 0) {
-    lines.push(""); // Blank line separator
-    lines.push("🚫 NO TRADE FIRED");
-    lines.push("Reason:");
-    snapshot.noTradeDiagnostic.reasons.forEach(reason => {
-      lines.push(`• ${reason}`);
-    });
+  // Add no-trade diagnostic if present (using new blocker system)
+  if (snapshot.noTradeDiagnostic && snapshot.noTradeDiagnostic.blockers) {
+    const now = Date.now();
+    // Filter out expired blockers and INFO blockers (never show INFO as "No trade fired reason")
+    const activeBlockers = snapshot.noTradeDiagnostic.blockers.filter(
+      b => now <= b.expiresAtTs && b.severity !== "INFO"
+    );
+
+    if (activeBlockers.length > 0) {
+      // Sort by severity (HARD > SOFT) then by weight (descending)
+      activeBlockers.sort((a, b) => {
+        const severityOrder = { HARD: 2, SOFT: 1, INFO: 0 };
+        const severityDiff = severityOrder[b.severity] - severityOrder[a.severity];
+        if (severityDiff !== 0) return severityDiff;
+        return b.weight - a.weight;
+      });
+
+      // Show ONE primary blocker (highest weight + HARD beats SOFT)
+      const primary = activeBlockers[0];
+      const severityEmoji = primary.severity === "HARD" ? "🚫" : "⚠️";
+      lines.push(""); // Blank line separator
+      lines.push(`${severityEmoji} NO TRADE — ${primary.severity}: ${primary.message}`);
+
+      // Show up to 2 secondary blockers
+      const secondary = activeBlockers.slice(1, 3);
+      if (secondary.length > 0) {
+        lines.push("Secondary:");
+        secondary.forEach(blocker => {
+          const emoji = blocker.severity === "HARD" ? "🚫" : "⚠️";
+          lines.push(`${emoji} ${blocker.severity}: ${blocker.message}`);
+        });
+      }
+
+      // Show INFO blockers as hints (not as "No trade fired reason")
+      const infoBlockers = snapshot.noTradeDiagnostic.blockers.filter(
+        b => b.severity === "INFO" && now <= b.expiresAtTs
+      );
+      if (infoBlockers.length > 0) {
+        lines.push("Info:");
+        infoBlockers.forEach(blocker => {
+          lines.push(`💡 ${blocker.message}`);
+        });
+      }
+    }
   }
 
   // Add timestamps for debugging (if available)

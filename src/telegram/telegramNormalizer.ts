@@ -83,10 +83,12 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     ? Number(event.data.candidate?.invalidationLevel)
     : undefined;
   
-  // Extract no-trade diagnostic if present
+  // Extract no-trade diagnostic if present (include blockers array)
   const noTradeDiagnostic = mind.noTradeDiagnostic ? {
     reasonCode: mind.noTradeDiagnostic.reasonCode,
     details: mind.noTradeDiagnostic.details,
+    blockers: mind.noTradeDiagnostic.blockers ?? [],
+    // Legacy support for old formatter
     reasons: getHumanReadableReasons(mind.noTradeDiagnostic.reasonCode, mind.noTradeDiagnostic),
   } : undefined;
 
