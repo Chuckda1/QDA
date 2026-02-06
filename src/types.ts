@@ -272,14 +272,16 @@ export type Blocker = {
 };
 
 // Blocker types for Telegram/API response (matches internal Blocker type)
-export type NoTradeBlocker = {
+export type NoTradeBlockerSeverity = "HARD" | "SOFT" | "INFO";
+
+export interface NoTradeBlockerResponse {
   code: string;
   message: string;
-  severity: BlockerSeverity;
+  severity: NoTradeBlockerSeverity;
   updatedAtTs: number;
   expiresAtTs: number;
   weight: number;
-};
+}
 
 export type NoTradeDiagnostic = {
   price: number;
@@ -293,12 +295,12 @@ export type NoTradeDiagnostic = {
 };
 
 // Response type for Telegram/API (serialized version)
-export type NoTradeDiagnosticResponse = {
+export interface NoTradeDiagnosticResponse {
   reasonCode: string;
   details: string;
   reasons?: string[]; // Legacy: Human-readable reasons array
-  blockers?: NoTradeBlocker[]; // Serialized blockers for Telegram
-};
+  blockers?: NoTradeBlockerResponse[]; // Serialized blockers for Telegram
+}
 
 export type MinimalExecutionState = {
   // Market Bias (sticky)

@@ -91,14 +91,15 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     ? Number(event.data.candidate?.invalidationLevel)
     : undefined;
   
-  // Extract no-trade diagnostic if present (include blockers array)
-  const noTradeDiagnostic = mind.noTradeDiagnostic ? {
-    reasonCode: mind.noTradeDiagnostic.reasonCode,
-    details: mind.noTradeDiagnostic.details,
-    blockers: mind.noTradeDiagnostic.blockers ?? [],
-    // Legacy support for old formatter
-    reasons: getHumanReadableReasons(mind.noTradeDiagnostic.reasonCode, mind.noTradeDiagnostic),
-  } : undefined;
+  // Extract no-trade diagnostic if present (include blockers array, always as array)
+  const noTradeDiagnostic = mind.noTradeDiagnostic
+    ? {
+        reasonCode: mind.noTradeDiagnostic.reasonCode,
+        details: mind.noTradeDiagnostic.details,
+        reasons: getHumanReadableReasons(mind.noTradeDiagnostic.reasonCode, mind.noTradeDiagnostic),
+        blockers: mind.noTradeDiagnostic.blockers ?? [], // Always present as array (empty if none)
+      }
+    : undefined;
 
   // Extract target zones if in trade
   const targetZones = mind.targetZones ?? undefined;
