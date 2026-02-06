@@ -19,6 +19,7 @@ import type {
   MinimalLLMSnapshot,
   MinimalSetupCandidate,
   NoTradeDiagnostic,
+  NoTradeDiagnosticResponse,
   NoTradeReasonCode,
   OpportunityLatch,
   OpportunitySide,
@@ -4588,7 +4589,6 @@ export class Orchestrator {
       // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
       // Also generate if no setup detected (setup === "NONE")
       let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
-      let noTradeDiagnosticResponse: NoTradeDiagnosticResponse | undefined = undefined;
       if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
         const atr = this.calculateATR(closed5mBars);
         const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);

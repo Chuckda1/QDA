@@ -30,7 +30,15 @@ export type TelegramSnapshot = {
   noTradeDiagnostic?: {
     reasonCode: string;
     details: string;
-    reasons?: string[]; // Human-readable reasons array
+    reasons?: string[]; // Legacy: Human-readable reasons array
+    blockers?: Array<{
+      code: string;
+      message: string;
+      severity: "HARD" | "SOFT" | "INFO";
+      updatedAtTs: number;
+      expiresAtTs: number;
+      weight: number;
+    }>;
   };
   targetZones?: {
     rTargets?: { t1: number; t2: number; t3: number };
