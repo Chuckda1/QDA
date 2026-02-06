@@ -91,6 +91,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const lastBiasFlipTs = Number.isFinite(mind.lastBiasFlipTs) ? Number(mind.lastBiasFlipTs) : undefined;
   const marketCondition = mind.marketCondition ?? undefined;
   const conditionReason = typeof mind.conditionReason === "string" ? mind.conditionReason : undefined;
+  const conditionExpiresAtTs = Number.isFinite(mind.conditionExpiresAtTs) ? Number(mind.conditionExpiresAtTs) : undefined;
   const trigger = event.data.candidate?.entryTrigger;
   const invalidation = Number.isFinite(event.data.candidate?.invalidationLevel)
     ? Number(event.data.candidate?.invalidationLevel)

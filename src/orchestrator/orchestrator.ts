@@ -1974,6 +1974,45 @@ export class Orchestrator {
     return { type: "PULLBACK_ENTRY", trigger: "Pullback entry" };
   }
 
+  // ============================================================================
+  // MARKET CONDITION: Detect COMPRESSION vs TRENDING
+  // ============================================================================
+  private updateMarketCondition(exec: MinimalExecutionState, ts: number, close: number): void {
+    const micro = exec.micro;
+    if (!micro?.vwap1m || !micro?.emaFast1m || !micro?.atr1m) return;
+
+    const price = close;
+    const atr = micro.atr1m;
+    const vwap = micro.vwap1m;
+    const ema = micro.emaFast1m;
+
+    // "Glue" distance: price sitting near mean
+    const distToMean = Math.abs(price - vwap);
+    const meanTight = distToMean < 0.25 * atr;
+
+    // "Compression": ATR is small (simple heuristic - can enhance with ATR baseline later)
+    // For now, just check if ATR is very small (less than 0.15) as a compression signal
+    const atrCompressed = atr < 0.15;
+
+    // "Chop": mixed acceptance counts (not building stable acceptance)
+    const aboveVwap = micro.aboveVwapCount ?? 0;
+    const belowVwap = micro.belowVwapCount ?? 0;
+    const aboveEma = micro.aboveEmaCount ?? 0;
+    const belowEma = micro.belowEmaCount ?? 0;
+    const mixed = (aboveVwap > 0 && belowVwap > 0) || (aboveEma > 0 && belowEma > 0);
+
+    if (meanTight && (atrCompressed || mixed)) {
+      exec.marketCondition = "COMPRESSION";
+      exec.conditionReason = "price glued to VWAP/EMA; ATR compressed";
+      exec.conditionExpiresAtTs = ts + 3 * 60 * 1000; // 3m TTL
+      exec.waitReason = "waiting_for_expansion";
+    } else {
+      exec.marketCondition = "TRENDING";
+      exec.conditionReason = undefined;
+      exec.conditionExpiresAtTs = undefined;
+    }
+  }
+
   // Enhanced target calculation with multiple methods
   private computeTargets(
     direction: "long" | "short",
