@@ -1,8 +1,15 @@
-import type { DomainEvent } from "../types.js";
+import type { DomainEvent, MinimalMindStateResponse } from "../types.js";
 
-export type TelegramSnapshotType = "MIND";
+export type TelegramSnapshotType = "MIND" | "LLM_1M_OPINION";
 
 import type { MinimalDebugInfo } from "../types.js";
+
+// Type guard for MIND_STATE_UPDATED events
+function hasMindState(
+  evt: { type: string; data?: any }
+): evt is { type: "MIND_STATE_UPDATED"; data: { mindState: MinimalMindStateResponse; [key: string]: any } } {
+  return evt.type === "MIND_STATE_UPDATED" && !!evt.data?.mindState;
+}
 
 export type TelegramSnapshot = {
   type: TelegramSnapshotType;
@@ -74,8 +81,26 @@ export const formatEtTimestamp = (ts: number): string =>
   });
 
 export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot | null {
+  // Handle LLM_1M_OPINION events separately
+  if (event.type === "LLM_1M_OPINION") {
+    return {
+      type: "LLM_1M_OPINION",
+      symbol: event.data.symbol,
+      price: event.data.price,
+      direction: event.data.direction ?? "NEUTRAL",
+      confidence: event.data.confidence ?? 0,
+      ts: formatEtTimestamp(event.timestamp),
+    };
+  }
+
+  // Original MIND_STATE_UPDATED handling
   if (event.type !== "MIND_STATE_UPDATED") return null;
-  const mind = event.data.mindState ?? {};
+  
+  // Type guard ensures mindState exists
+  if (!hasMindState(event)) {
+    return null;
+  }
+  const mind = event.data.mindState;
   const direction = mind.direction ?? "none";
   const confidence = Number.isFinite(mind.confidence) ? Math.round(mind.confidence) : undefined;
   const reason = typeof mind.reason === "string" ? mind.reason : undefined;

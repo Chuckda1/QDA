@@ -426,6 +426,14 @@ export type MinimalExecutionState = {
   marketCondition?: MarketCondition;
   conditionReason?: string;
   conditionExpiresAtTs?: number;
+  // LLM 1m direction opinion (additive, does not affect bias/phase/setup)
+  llm1mDirection?: "LONG" | "SHORT" | "NEUTRAL";
+  llm1mConfidence?: number;
+  llm1mTs?: number;
+  llm1mLastCallTs?: number;
+  llm1mLastPublishedDir?: "LONG" | "SHORT" | "NEUTRAL";
+  llm1mLastPublishedConf?: number;
+  llm1mLastPublishedTs?: number;
 };
 
 // BiasFlipEntry Gate State
@@ -455,7 +463,7 @@ export interface BotState {
   lastLLMDecision?: string;
 }
 
-export type DomainEventType = "MIND_STATE_UPDATED";
+export type DomainEventType = "MIND_STATE_UPDATED" | "LLM_1M_OPINION";
 
 export type MinimalDebugInfo = {
   barsClosed5m: number;
@@ -479,7 +487,11 @@ export interface DomainEvent {
     timestamp: number;
     symbol: string;
     price: number;
-    mindState: MinimalMindStateResponse;
+    // For LLM_1M_OPINION events (optional, only present when type is LLM_1M_OPINION)
+    direction?: "LONG" | "SHORT" | "NEUTRAL";
+    confidence?: number;
+    // For MIND_STATE_UPDATED events (optional, only present when type is MIND_STATE_UPDATED)
+    mindState?: MinimalMindStateResponse;
     thesis?: {
       direction?: string | null;
       confidence?: number | null;
@@ -487,7 +499,7 @@ export interface DomainEvent {
       ts?: number | null;
     };
     candidate?: MinimalSetupCandidate | null;
-    botState: MinimalExecutionPhase;
+    botState?: MinimalExecutionPhase; // Optional for LLM_1M_OPINION events
     waitFor?: string | null;
     debug?: MinimalDebugInfo;
   };

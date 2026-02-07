@@ -3,7 +3,7 @@ import { formatEtTimestamp } from "./telegramNormalizer.js";
 import type { NoTradeBlocker, NoTradeBlockerSeverity } from "../types.js";
 
 export type TelegramAlert = {
-  type: "MIND";
+  type: "MIND" | "LLM_1M_OPINION";
   lines: string[];
   text: string;
 };
@@ -43,6 +43,19 @@ function getExpectedEmoji(expectedResolution?: string, bias?: string): string {
 }
 
 export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | null {
+  // Handle LLM_1M_OPINION messages
+  if (snapshot.type === "LLM_1M_OPINION") {
+    const price = formatPrice(snapshot.price);
+    const direction = snapshot.direction ?? "NEUTRAL";
+    const confidence = snapshot.confidence ?? 0;
+    const text = `🧠 LLM(1m): ${direction} ${confidence} | px=${price} | based on 5m candles`;
+    return {
+      type: "LLM_1M_OPINION",
+      lines: [text],
+      text,
+    };
+  }
+
   if (snapshot.type !== "MIND") return null;
   const price = formatPrice(snapshot.price);
   const conf = Number.isFinite(snapshot.confidence) ? `${snapshot.confidence}%` : "n/a";

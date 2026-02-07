@@ -3444,6 +3444,36 @@ export class Orchestrator {
     });
 
     // ============================================================================
+    // LLM 1m direction opinion (additive, does not affect bias/phase/setup)
+    // ============================================================================
+    if (this.llmService) {
+      const { maybeUpdateLlmDirection1m } = await import("../llm/llmDirection1m.js");
+      const result = await maybeUpdateLlmDirection1m(
+        exec,
+        ts,
+        close,
+        closed5mBars,
+        forming5mBar,
+        this.llmService,
+        symbol
+      );
+      if (result.shouldPublish && result.direction && result.confidence !== undefined) {
+        events.push({
+          type: "LLM_1M_OPINION",
+          timestamp: ts,
+          instanceId: this.instanceId,
+          data: {
+            timestamp: ts,
+            symbol,
+            price: close,
+            direction: result.direction,
+            confidence: result.confidence,
+          },
+        });
+      }
+    }
+
+    // ============================================================================
     // Update bias engine (deterministic, 1m-based)
     // ============================================================================
     // Don't flip bias while in trade (protect active positions)
