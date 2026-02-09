@@ -390,6 +390,12 @@ export type MinimalExecutionState = {
     expectedZone: { lower: number; upper: number }; // Weighted expected zone
     expectedEnd: number; // Single weighted target (median)
   };
+  // Target hit tracking for partial profit-taking
+  targetsHit?: { t1: boolean; t2: boolean; t3: boolean };
+  // Momentum slowing exit tracking (after 1R hit)
+  t1HitAt?: number; // Timestamp when 1R was hit
+  barsSince1R?: number; // Number of 5m bars since 1R hit
+  highestHighSince1R?: number; // Highest high (long) or lowest low (short) since 1R hit
   waitReason?: string;
   reason?: string; // Entry-aligned narrative (set on entry, cleared on exit)
   continuationExtension?: number; // Distance from pullback level when continuation detected

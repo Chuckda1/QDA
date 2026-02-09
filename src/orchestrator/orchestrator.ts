@@ -1318,6 +1318,11 @@ export class Orchestrator {
     exec.reason = undefined; // Clear entry-aligned narrative on exit
     // Clear bias flip gate on exit
     exec.biasFlipGate = undefined;
+    // Clear target hit tracking and momentum tracking
+    exec.targetsHit = undefined;
+    exec.t1HitAt = undefined;
+    exec.barsSince1R = undefined;
+    exec.highestHighSince1R = undefined;
   }
 
   // ============================================================================
@@ -4905,10 +4910,18 @@ export class Orchestrator {
       }
 
       if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined) {
-        const current5m = forming5mBar ?? lastClosed5m;
+        // Prefer forming bar for real-time high/low, fallback to last closed
+        const current5m = forming5mBar || lastClosed5m;
         if (current5m) {
+          // Ensure we use the most up-to-date high/low from forming bar if available
+          if (forming5mBar && lastClosed5m) {
+            current5m.high = Math.max(current5m.high, forming5mBar.high);
+            current5m.low = Math.min(current5m.low, forming5mBar.low);
+          }
+          
           // Derive direction from bias if thesisDirection not set (defensive)
           const direction = exec.thesisDirection ?? (exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : undefined);
+          
           // Check stop (FIXED: use close instead of wick for close-based logic)
           if (direction === "long" && current5m.close <= exec.stopPrice) {
             const oldPhase = exec.phase;
@@ -4928,23 +4941,103 @@ export class Orchestrator {
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
           }
-          // Check targets (only if targets exist)
-          else if (exec.targets && exec.targets.some(target => 
-            (direction === "long" && current5m.high >= target) ||
-            (direction === "short" && current5m.low <= target)
-          )) {
-            const hitTarget = exec.targets.find(target =>
-              (direction === "long" && current5m.high >= target) ||
-              (direction === "short" && current5m.low <= target)
-            );
-            const oldPhase = exec.phase;
-            const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
-            console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Target hit at ${hitTarget?.toFixed(2)}`
-            );
-            exec.phase = newPhase;
-            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
-            this.clearTradeState(exec);
+          // Check targets with partial profit-taking logic
+          else if (exec.targets && exec.targets.length > 0) {
+            // Find which target was hit (if any)
+            const targetHit = exec.targets.find((target, index) => {
+              const targetKey = index === 0 ? 't1' : index === 1 ? 't2' : 't3';
+              const alreadyHit = exec.targetsHit?.[targetKey];
+              if (alreadyHit) return false; // Skip if already alerted
+              
+              const hit = (direction === "long" && current5m.high >= target) ||
+                          (direction === "short" && current5m.low <= target);
+              return hit;
+            });
+            
+            if (targetHit !== undefined) {
+              const targetIndex = exec.targets.indexOf(targetHit);
+              const targetKey = targetIndex === 0 ? 't1' : targetIndex === 1 ? 't2' : 't3';
+              
+              // Initialize targetsHit if needed
+              if (!exec.targetsHit) exec.targetsHit = { t1: false, t2: false, t3: false };
+              
+              // Mark target as hit
+              exec.targetsHit[targetKey] = true;
+              
+              // Alert for partial profit-taking
+              console.log(
+                `[TARGET_HIT] ${targetKey.toUpperCase()} hit at ${targetHit.toFixed(2)} - Consider scaling out`
+              );
+              
+              // For 1R: move stop to breakeven
+              if (targetKey === 't1') {
+                if (direction === "long") {
+                  exec.stopPrice = Math.max(exec.stopPrice, exec.entryPrice);
+                  console.log(
+                    `[TRADE_MANAGEMENT] 1R hit at ${targetHit.toFixed(2)} - Stop moved to breakeven (${exec.stopPrice.toFixed(2)})`
+                  );
+                } else {
+                  exec.stopPrice = Math.min(exec.stopPrice, exec.entryPrice);
+                  console.log(
+                    `[TRADE_MANAGEMENT] 1R hit at ${targetHit.toFixed(2)} - Stop moved to breakeven (${exec.stopPrice.toFixed(2)})`
+                  );
+                }
+                
+                // Initialize momentum tracking after 1R hit
+                if (!exec.t1HitAt) {
+                  exec.t1HitAt = ts;
+                  exec.barsSince1R = 0;
+                  exec.highestHighSince1R = direction === "long" ? current5m.high : current5m.low;
+                }
+              }
+              
+              // Full exit only on 3R hit
+              if (targetKey === 't3') {
+                const oldPhase = exec.phase;
+                const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
+                console.log(
+                  `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Target 3R hit at ${targetHit.toFixed(2)}`
+                );
+                exec.phase = newPhase;
+                exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
+                this.clearTradeState(exec);
+              }
+            }
+          }
+          
+          // Momentum slowing exit rule (after 1R hit, check on 5m close)
+          if (exec.t1HitAt && is5mClose && exec.phase === "IN_TRADE") {
+            exec.barsSince1R = (exec.barsSince1R ?? 0) + 1;
+            
+            // Track highest high (long) or lowest low (short) since 1R
+            const currentExtreme = direction === "long" ? current5m.high : current5m.low;
+            if (direction === "long") {
+              exec.highestHighSince1R = Math.max(exec.highestHighSince1R ?? currentExtreme, currentExtreme);
+            } else {
+              exec.highestHighSince1R = Math.min(exec.highestHighSince1R ?? currentExtreme, currentExtreme);
+            }
+            
+            // Simple rule: If 3+ bars since 1R and no new high/low, exit
+            if (exec.barsSince1R >= 3) {
+              const lastExtreme = exec.highestHighSince1R ?? (direction === "long" ? exec.entryPrice : exec.entryPrice);
+              
+              // Check if current bar made a new extreme (with small tolerance for rounding)
+              const madeNewExtreme = direction === "long"
+                ? currentExtreme > lastExtreme * 0.999 // New high if > 99.9% of previous high
+                : currentExtreme < lastExtreme * 1.001; // New low if < 100.1% of previous low
+              
+              if (!madeNewExtreme) {
+                // No new high/low in 3 bars - exit
+                const oldPhase = exec.phase;
+                const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
+                console.log(
+                  `[MOMENTUM_SLOW_EXIT] ${oldPhase} -> ${newPhase} | No new ${direction === "long" ? "high" : "low"} in ${exec.barsSince1R} bars since 1R (current: ${currentExtreme.toFixed(2)}, last: ${lastExtreme.toFixed(2)}) - Taking profit`
+                );
+                exec.phase = newPhase;
+                exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
+                this.clearTradeState(exec);
+              }
+            }
           }
         }
       } // Close: if (exec.phase === "IN_TRADE" && ...) for trade management (line 3987)
