@@ -358,10 +358,11 @@ if (alpacaKey && alpacaSecret) {
         for await (const bar of alpacaFeed.subscribeBars(symbol)) {
           try {
             const normalizedBar = normalizeBar(bar);
-            console.log(
-              `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
-            );
-            
+            if (process.env.VERBOSE_TICK === "1") {
+              console.log(
+                `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
+              );
+            }
             // a) Update forming5mBar with 1m bar (no LLM call)
             const events1m = await orch.processTick(
               {
@@ -425,10 +426,11 @@ if (alpacaKey && alpacaSecret) {
         for await (const bar of alpacaFeed.pollBars(symbol, 60000)) {
           try {
             const normalizedBar = normalizeBar(bar);
-            console.log(
-              `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
-            );
-            
+            if (process.env.VERBOSE_TICK === "1") {
+              console.log(
+                `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
+              );
+            }
             // a) Update forming5mBar with 1m bar (no LLM call)
             const events1m = await orch.processTick(
               {

@@ -73,14 +73,17 @@ export class Orchestrator {
   // BiasFlipEntry constants
   private readonly BIAS_FLIP_MIN_CONF = 60;
   private readonly BIAS_FLIP_TTL_MS = 12 * 60 * 1000;       // 12 minutes
-  private readonly BIAS_FLIP_COOLDOWN_MS = 10 * 60 * 1000;  // 10 minutes
+  private readonly BIAS_FLIP_COOLDOWN_MS = 5 * 60 * 1000;   // 5 minutes (was 10 – allow flip gate to re-arm sooner)
   private readonly BIAS_FLIP_MIN_RANGE_ATR = 0.20;          // avoid micro candles
-  
-  // Bias Engine constants
-  private readonly BIAS_ENGINE_ENTER_ACCEPT = 6;  // Minutes to enter regime
-  private readonly BIAS_ENGINE_EXIT_ACCEPT = 3;  // Minutes to exit regime (hysteresis)
+
+  // Bias Engine constants – tuned for speed: flip when tape changes
+  private readonly BIAS_ENGINE_ENTER_ACCEPT = 4;  // 4 bars to enter regime (was 6 – faster tape reaction)
+  private readonly BIAS_ENGINE_EXIT_ACCEPT = 3;   // Minutes to exit regime (hysteresis)
   private readonly BIAS_ENGINE_REPAIR_CONFIRM_MIN = 2;  // Minimum minutes in REPAIR before finalizing (confirmation period)
   private readonly BIAS_ENGINE_COOLDOWN_MS = 5 * 60 * 1000;  // 5 minutes cooldown between full flips
+
+  /** Min LLM confidence (1m) to allow nudge from NEUTRAL/REPAIR when tape agrees */
+  private readonly LLM_NUDGE_MIN_CONFIDENCE = 80;
   
   // Ignition setup constants
   private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
@@ -139,11 +142,13 @@ export class Orchestrator {
     const closeVal = snapshot.close;
     if (!Number.isFinite(closeVal)) return null;
 
-    // Debug: log bucket math and timestamp progression
-    const prevTs = this.forming5mBar?.endTs ?? null;
-    console.log(
-      `[BUCKET_DEBUG] ts=${snapshot.ts} startTs=${startTs} endTs=${endTs} formingBucketStart=${this.formingBucketStart ?? "null"} prevTs=${prevTs ?? "null"} tsDelta=${prevTs !== null ? snapshot.ts - prevTs : "n/a"}`
-    );
+    // Debug: log bucket math only when VERBOSE_TICK=1 (reduces I/O on hot path)
+    if (process.env.VERBOSE_TICK === "1") {
+      const prevTs = this.forming5mBar?.endTs ?? null;
+      console.log(
+        `[BUCKET_DEBUG] ts=${snapshot.ts} startTs=${startTs} endTs=${endTs} formingBucketStart=${this.formingBucketStart ?? "null"} prevTs=${prevTs ?? "null"} tsDelta=${prevTs !== null ? snapshot.ts - prevTs : "n/a"}`
+      );
+    }
 
     // Handle bucket rollover: start new bucket (BarAggregator handles closed bar push)
     if (this.formingBucketStart !== null && startTs !== this.formingBucketStart) {
@@ -696,13 +701,13 @@ export class Orchestrator {
       return { armed: false, reason: `phase_disallows_arming (${exec.phase})` };
     }
     
-    // Calculate EMA and VWAP for pullback zone detection
+    // VWAP/EMA for pullback zone: use 5m when we have enough bars; else 1m so we can arm in ~5 min with LLM nudge
     const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
-    const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
-    
-    // Calculate EMA9 (fast EMA)
+    const vwap5m = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+    const vwap = vwap5m ?? exec.micro?.vwap1m;
+
     let emaFast: number | undefined;
-    if (closed5mBars.length >= 9) {
+    if (closed5mBars.length >= 6) {
       const closes = closed5mBars.slice(-20).map(b => b.close);
       const alpha = 2 / (9 + 1);
       let ema = closes[0];
@@ -710,6 +715,8 @@ export class Orchestrator {
         ema = alpha * closes[i] + (1 - alpha) * ema;
       }
       emaFast = ema;
+    } else {
+      emaFast = exec.micro?.emaFast1m;
     }
     
     // Pullback zone condition: price must be in pullback zone
@@ -1818,6 +1825,111 @@ export class Orchestrator {
     );
   }
 
+  /**
+   * When we're NEUTRAL (including REPAIR) and the 1m LLM has a strong directional read with tape agreement,
+   * nudge bias so we don't wait for the 5m structure break. LLM leads before the bot.
+   * Uses last closed 5m bar for pullback levels, or forming 5m bar when no 5m has closed yet (nudge in first 1–4 min).
+   */
+  private maybeNudgeBiasFromLlm1m(
+    exec: MinimalExecutionState,
+    ts: number,
+    close: number,
+    lastClosed5m: { high: number; low: number; close: number } | null,
+    forming5mBar?: { high: number; low: number } | null
+  ): void {
+    if (exec.bias !== "NEUTRAL" || exec.phase === "IN_TRADE") return;
+    const barForPullback = lastClosed5m ?? (forming5mBar ? { high: forming5mBar.high, low: forming5mBar.low, close } : null);
+    if (!barForPullback) return;
+
+    const llmDir = exec.llm1mDirection;
+    const llmConf = exec.llm1mConfidence ?? 0;
+    if (llmDir !== "LONG" && llmDir !== "SHORT") return;
+    if (llmConf < this.LLM_NUDGE_MIN_CONFIDENCE) return;
+
+    const micro = exec.micro;
+    if (!micro) return;
+    const vwap = micro.vwap1m;
+    const ema = micro.emaFast1m;
+    const atr = micro.atr1m;
+    if (vwap === undefined || ema === undefined) return;
+
+    const aboveVwap = micro.aboveVwapCount ?? 0;
+    const aboveEma = micro.aboveEmaCount ?? 0;
+    const belowVwap = micro.belowVwapCount ?? 0;
+    const belowEma = micro.belowEmaCount ?? 0;
+    const minDist = atr ? Math.max(0.05, 0.10 * atr) : 0.05;
+    const farAbove = close > vwap + minDist && close > ema + minDist;
+    const farBelow = close < vwap - minDist && close < ema - minDist;
+
+    // Fewer bars when LLM leads before any 5m close (forming bar) or when in REPAIR
+    const inRepair = exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR";
+    const usingFormingBar = !lastClosed5m;  // we have barForPullback from forming bar
+    const tapeBarsRequired = (inRepair || usingFormingBar)
+      ? Math.max(2, this.BIAS_ENGINE_ENTER_ACCEPT - 1)
+      : this.BIAS_ENGINE_ENTER_ACCEPT;
+    const tapeAgreesLong =
+      aboveVwap >= tapeBarsRequired &&
+      aboveEma >= tapeBarsRequired &&
+      farAbove;
+    const tapeAgreesShort =
+      belowVwap >= tapeBarsRequired &&
+      belowEma >= tapeBarsRequired &&
+      farBelow;
+
+    if (llmDir === "LONG" && !tapeAgreesLong) return;
+    if (llmDir === "SHORT" && !tapeAgreesShort) return;
+
+    if (!exec.biasEngine) {
+      exec.biasEngine = {
+        state: "NEUTRAL",
+        score: 0,
+        acceptBullCount: 0,
+        acceptBearCount: 0,
+      };
+    }
+    const be = exec.biasEngine;
+
+    if (llmDir === "LONG") {
+      be.state = "BULLISH";
+      be.lastFlipTs = ts;
+      exec.bias = "BULLISH";
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+      exec.baseBiasConfidence = Math.min(100, llmConf);
+      exec.biasConfidence = exec.baseBiasConfidence;
+      exec.lastBiasFlipTs = ts;
+      exec.pullbackHigh = barForPullback.high;
+      exec.pullbackLow = barForPullback.low;
+      exec.pullbackTs = ts;
+      exec.phase = "BIAS_ESTABLISHED";
+      exec.expectedResolution = "CONTINUATION";
+      exec.waitReason = "waiting_for_pullback";
+      exec.setup = "PULLBACK_CONTINUATION";  // so 1m arming can run before next 5m close
+      console.log(
+        `[BIAS_LLM_NUDGE] NEUTRAL -> BULLISH | llmConf=${llmConf} tape=above_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
+      );
+    } else {
+      be.state = "BEARISH";
+      be.lastFlipTs = ts;
+      exec.bias = "BEARISH";
+      exec.biasPrice = close;
+      exec.biasTs = ts;
+      exec.baseBiasConfidence = Math.min(100, llmConf);
+      exec.biasConfidence = exec.baseBiasConfidence;
+      exec.lastBiasFlipTs = ts;
+      exec.pullbackHigh = barForPullback.high;
+      exec.pullbackLow = barForPullback.low;
+      exec.pullbackTs = ts;
+      exec.phase = "BIAS_ESTABLISHED";
+      exec.expectedResolution = "CONTINUATION";
+      exec.waitReason = "waiting_for_pullback";
+      exec.setup = "PULLBACK_CONTINUATION";  // so 1m arming can run before next 5m close
+      console.log(
+        `[BIAS_LLM_NUDGE] NEUTRAL -> BEARISH | llmConf=${llmConf} tape=below_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
+      );
+    }
+  }
+
   // Map LLM action to market bias (sticky, only flips on invalidation)
   // Helper to normalize LLM bias string to MarketBias enum (handles casing safely)
   private normalizeBias(llmBias: string | undefined): "BEARISH" | "BULLISH" | "NEUTRAL" {
@@ -1864,16 +1976,64 @@ export class Orchestrator {
     const be = exec.biasEngine;
     if (!be) return;
 
-    // Only finalize if we are in REPAIR
-    if (be.state !== "REPAIR_BULL" && be.state !== "REPAIR_BEAR") return;
-
-    // Require actual 5m structure break
     const sh = exec.swingHigh5m;
     const sl = exec.swingLow5m;
     if (sh === undefined || sl === undefined) return;
 
     const breakUp = close > sh;
     const breakDown = close < sl;
+
+    // Cold start: establish initial bias from first 5m structure break (no REPAIR needed)
+    if (exec.bias === "NEUTRAL" && be.state === "NEUTRAL") {
+      if (breakUp) {
+        be.state = "BULLISH";
+        be.lastFlipTs = ts;
+        exec.bias = "BULLISH";
+        exec.biasPrice = close;
+        exec.biasTs = ts;
+        exec.baseBiasConfidence = 65;
+        exec.biasConfidence = 65;
+        exec.lastBiasFlipTs = ts;
+        exec.pullbackHigh = sh;
+        exec.pullbackLow = sl;
+        exec.pullbackTs = ts;
+        if (exec.phase !== "IN_TRADE") {
+          exec.phase = "BIAS_ESTABLISHED";
+          exec.expectedResolution = "CONTINUATION";
+          exec.waitReason = "waiting_for_pullback";
+        }
+        console.log(
+          `[BIAS_COLD_START] NEUTRAL -> BULLISH | close=${close.toFixed(2)} > swingHigh5m=${sh.toFixed(2)} pullback=[${sl.toFixed(2)}, ${sh.toFixed(2)}]`
+        );
+        return;
+      }
+      if (breakDown) {
+        be.state = "BEARISH";
+        be.lastFlipTs = ts;
+        exec.bias = "BEARISH";
+        exec.biasPrice = close;
+        exec.biasTs = ts;
+        exec.baseBiasConfidence = 65;
+        exec.biasConfidence = 65;
+        exec.lastBiasFlipTs = ts;
+        exec.pullbackHigh = sh;
+        exec.pullbackLow = sl;
+        exec.pullbackTs = ts;
+        if (exec.phase !== "IN_TRADE") {
+          exec.phase = "BIAS_ESTABLISHED";
+          exec.expectedResolution = "CONTINUATION";
+          exec.waitReason = "waiting_for_pullback";
+        }
+        console.log(
+          `[BIAS_COLD_START] NEUTRAL -> BEARISH | close=${close.toFixed(2)} < swingLow5m=${sl.toFixed(2)} pullback=[${sl.toFixed(2)}, ${sh.toFixed(2)}]`
+        );
+        return;
+      }
+      return;
+    }
+
+    // Only finalize from REPAIR
+    if (be.state !== "REPAIR_BULL" && be.state !== "REPAIR_BEAR") return;
 
     if (be.state === "REPAIR_BULL" && breakUp) {
       be.state = "BULLISH";
@@ -1888,6 +2048,9 @@ export class Orchestrator {
       exec.baseBiasConfidence = 65;
       exec.biasConfidence = 65;
       exec.lastBiasFlipTs = ts;
+      exec.pullbackHigh = sh;
+      exec.pullbackLow = sl;
+      exec.pullbackTs = ts;
 
       // Clear stale artifacts
       this.deactivateGate(exec);
@@ -1924,6 +2087,9 @@ export class Orchestrator {
       exec.baseBiasConfidence = 65;
       exec.biasConfidence = 65;
       exec.lastBiasFlipTs = ts;
+      exec.pullbackHigh = sh;
+      exec.pullbackLow = sl;
+      exec.pullbackTs = ts;
 
       // Clear stale artifacts
       this.deactivateGate(exec);
@@ -2883,9 +3049,9 @@ export class Orchestrator {
     }
 
     // ============================================================================
-    // STEP 1.75: Update 5m structure anchors (used for finalizing bias flips)
+    // STEP 1.75: Update 5m structure anchors (used for finalizing bias flips + cold start)
     // ============================================================================
-    const lookback = 12; // last 60 minutes (12 * 5m bars)
+    const lookback = 6; // last 30 minutes (6 * 5m bars) – shorter for faster reaction
     const recent = closed5mBars.slice(-lookback);
     if (recent.length >= 3) {
       exec.swingHigh5m = Math.max(...recent.map(b => b.high));
@@ -2979,13 +3145,13 @@ export class Orchestrator {
         exec.setupTriggerPrice = undefined;
         exec.setupStopPrice = undefined;
       } else if (lastClosed5m) {
-        // Optional: Bias flip cooldown - don't arm setup on same bar as flip
-        const biasFlipCooldownMs = 5 * 60 * 1000;  // 5 minutes (one 5m bar)
+        // Short cooldown after bias flip so setup/gate can arm soon (was 5 min – reduced for speed)
+        const biasFlipCooldownMs = 2 * 60 * 1000;  // 2 minutes
         const timeSinceBiasFlip = exec.lastBiasFlipTs ? (ts - exec.lastBiasFlipTs) : Infinity;
         const inBiasFlipCooldown = timeSinceBiasFlip < biasFlipCooldownMs;
-        
+
         if (inBiasFlipCooldown) {
-          // Bias just flipped - wait one bar before arming new setup
+          // Bias just flipped – brief wait before arming new setup
           exec.setup = "NONE";
           exec.setupTriggerPrice = undefined;
           exec.setupStopPrice = undefined;
@@ -3307,7 +3473,7 @@ export class Orchestrator {
     const forming5mBar = this.updateForming5mBar(snapshot);
     const is5mClose = previousBucketStart !== null && this.formingBucketStart !== previousBucketStart;
     
-    if (forming5mBar) {
+    if (forming5mBar && process.env.VERBOSE_TICK === "1") {
       const progress = forming5mBar.progressMinutes;
       console.log(
         `[FORMING5M] start=${forming5mBar.startTs} progress=${progress}/5 o=${forming5mBar.open.toFixed(2)} h=${forming5mBar.high.toFixed(2)} l=${forming5mBar.low.toFixed(2)} c=${forming5mBar.close.toFixed(2)} v=${forming5mBar.volume}`
@@ -3454,23 +3620,25 @@ export class Orchestrator {
       }
     }
 
-    // Log micro state for observability
-    console.log("[MICRO]", {
-      vwap1m: exec.micro.vwap1m?.toFixed(2),
-      ema1m: exec.micro.emaFast1m?.toFixed(2),
-      atr1m: exec.micro.atr1m?.toFixed(2),
-      sh1m: exec.micro.lastSwingHigh1m?.toFixed(2),
-      sl1m: exec.micro.lastSwingLow1m?.toFixed(2),
-      aboveVwap: exec.micro.aboveVwapCount,
-      aboveEma: exec.micro.aboveEmaCount,
-      belowVwap: exec.micro.belowVwapCount,
-      belowEma: exec.micro.belowEmaCount,
-      pausedUntil: exec.deploymentPauseUntilTs ? new Date(exec.deploymentPauseUntilTs).toISOString() : undefined,
-      pauseReason: exec.deploymentPauseReason,
-    });
+    // Log micro state only when VERBOSE_TICK=1 (reduces I/O on hot path)
+    if (process.env.VERBOSE_TICK === "1") {
+      console.log("[MICRO]", {
+        vwap1m: exec.micro.vwap1m?.toFixed(2),
+        ema1m: exec.micro.emaFast1m?.toFixed(2),
+        atr1m: exec.micro.atr1m?.toFixed(2),
+        sh1m: exec.micro.lastSwingHigh1m?.toFixed(2),
+        sl1m: exec.micro.lastSwingLow1m?.toFixed(2),
+        aboveVwap: exec.micro.aboveVwapCount,
+        aboveEma: exec.micro.aboveEmaCount,
+        belowVwap: exec.micro.belowVwapCount,
+        belowEma: exec.micro.belowEmaCount,
+        pausedUntil: exec.deploymentPauseUntilTs ? new Date(exec.deploymentPauseUntilTs).toISOString() : undefined,
+        pauseReason: exec.deploymentPauseReason,
+      });
+    }
 
     // ============================================================================
-    // LLM 1m direction opinion (additive, does not affect bias/phase/setup)
+    // LLM 1m direction opinion (additive; can nudge bias when NEUTRAL)
     // ============================================================================
     if (this.llmService) {
       const { maybeUpdateLlmDirection1m } = await import("../llm/llmDirection1m.js");
@@ -3497,6 +3665,13 @@ export class Orchestrator {
           },
         });
       }
+    }
+
+    // Allow 1m LLM to nudge bias when we're still NEUTRAL – LLM leads before 5m; use forming bar if no 5m closed yet
+    const lastClosed5mForNudge = closed5mBars.length > 0 ? closed5mBars[closed5mBars.length - 1] : null;
+    const forming5mForNudge = forming5mBar ? { high: forming5mBar.high, low: forming5mBar.low } : null;
+    if (exec.phase !== "IN_TRADE") {
+      this.maybeNudgeBiasFromLlm1m(exec, ts, close, lastClosed5mForNudge, forming5mForNudge);
     }
 
     // ============================================================================
@@ -3844,8 +4019,11 @@ export class Orchestrator {
           forming5mBar.progressMinutes >= 1 && 
           forming5mBar.progressMinutes <= 4) {
         // Use forming5mBar as "current 1m bar" and lastClosed5m as "previous 1m bar" proxy
-        // This allows responsive arming on 1m turn signals before 5m confirms
-        const atrFor1mArming = this.calculateATR(closed5mBars);
+        // Arm as soon as LLM has nudged: use 1m ATR when we have few 5m bars so we're not stuck 30 min
+        const atrFor1mArming = closed5mBars.length >= 3
+          ? this.calculateATR(closed5mBars)
+          : (exec.micro?.atr1m ?? 0);
+        if (atrFor1mArming > 0) {
         const previous5mFor1m = closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined;
         
         // Convert forming5mBar to bar format for tryArmPullbackGate
@@ -3892,6 +4070,7 @@ export class Orchestrator {
           console.log(
             `[GATE_ARMED] setup=PULLBACK_CONTINUATION bias=${exec.bias} trigger=${armResult1m.trigger.toFixed(2)} stop=${armResult1m.stop.toFixed(2)} reason=${armResult1m.reason} expiryInMin=${expiryInMin} (1m_turn_signal)`
           );
+        }
         }
       }
       
