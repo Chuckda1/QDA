@@ -4920,7 +4920,33 @@ export class Orchestrator {
           }
           
           // Derive direction from bias if thesisDirection not set (defensive)
-          const direction = exec.thesisDirection ?? (exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : undefined);
+          let direction = exec.thesisDirection ?? (exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : undefined);
+          
+          // Defensive: Log and fix if direction is undefined (should never happen)
+          if (!direction) {
+            console.error(
+              `[TRADE_MANAGEMENT_ERROR] Cannot determine direction: bias=${exec.bias} thesisDirection=${exec.thesisDirection} entryType=${exec.entryType} - Setting from bias`
+            );
+            // Force set direction from bias as fallback
+            direction = exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : undefined;
+            if (direction) {
+              exec.thesisDirection = direction;
+              console.log(`[TRADE_MANAGEMENT_FIX] Set thesisDirection=${direction} from bias=${exec.bias}`);
+            }
+          }
+          
+          // Periodic logging for debugging (every 5m close)
+          if (is5mClose && direction) {
+            const stopDistance = direction === "long" 
+              ? (current5m.close - exec.stopPrice).toFixed(2)
+              : (exec.stopPrice - current5m.close).toFixed(2);
+            const stopHit = direction === "long" 
+              ? current5m.close <= exec.stopPrice
+              : current5m.close >= exec.stopPrice;
+            console.log(
+              `[TRADE_MANAGEMENT] IN_TRADE: entry=${exec.entryPrice?.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} current=${current5m.close.toFixed(2)} direction=${direction} stopDistance=${stopDistance} stopHit=${stopHit}`
+            );
+          }
           
           // Check stop (FIXED: use close instead of wick for close-based logic)
           if (direction === "long" && current5m.close <= exec.stopPrice) {
@@ -4940,9 +4966,17 @@ export class Orchestrator {
             exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
+          } else if (direction === "short" && current5m.close >= exec.stopPrice) {
+            const oldPhase = exec.phase;
+            console.log(
+              `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
+            );
+            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
+            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
+            this.clearTradeState(exec);
           }
-          // Check targets with partial profit-taking logic
-          else if (exec.targets && exec.targets.length > 0) {
+          // Check targets with partial profit-taking logic (only if stop not hit and direction is set)
+          else if (direction && exec.targets && exec.targets.length > 0) {
             // Find which target was hit (if any)
             const targetHit = exec.targets.find((target, index) => {
               const targetKey = index === 0 ? 't1' : index === 1 ? 't2' : 't3';
