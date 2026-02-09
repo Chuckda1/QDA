@@ -31,6 +31,8 @@ export type TelegramSnapshot = {
   expectedResolution?: string;
   setup?: string;
   setupTriggerPrice?: number;
+  /** "extended" | "in_pullback" for trigger display context (never n/a) */
+  triggerContext?: "extended" | "in_pullback";
   setupStopPrice?: number;
   setupDetectedAt?: number;
   lastBiasFlipTs?: number;
@@ -134,6 +136,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
   const expectedResolution = mind.expectedResolution ?? undefined;
   const setup = mind.setup ?? undefined;
   const setupTriggerPrice = Number.isFinite(mind.setupTriggerPrice) ? Number(mind.setupTriggerPrice) : undefined;
+  const triggerContext = (mind.triggerContext === "extended" || mind.triggerContext === "in_pullback") ? mind.triggerContext : undefined;
   const setupStopPrice = Number.isFinite(mind.setupStopPrice) ? Number(mind.setupStopPrice) : undefined;
   const setupDetectedAt = Number.isFinite(mind.setupDetectedAt) ? Number(mind.setupDetectedAt) : undefined;
   const lastBiasFlipTs = Number.isFinite(mind.lastBiasFlipTs) ? Number(mind.lastBiasFlipTs) : undefined;
@@ -189,6 +192,7 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     expectedResolution,
     setup,
     setupTriggerPrice,
+    triggerContext,
     setupStopPrice,
     setupDetectedAt,
     lastBiasFlipTs,

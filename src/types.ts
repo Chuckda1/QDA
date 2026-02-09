@@ -118,6 +118,8 @@ export interface MinimalMindStateResponse {
   expectedResolution?: ExpectedResolution; // New: what should happen next in pullback
   setup?: SetupType; // New: explicit setup type (REJECTION, BREAKDOWN, etc.)
   setupTriggerPrice?: number; // Price level that triggers entry for this setup
+  /** "extended" | "in_pullback" for display context (never n/a) */
+  triggerContext?: "extended" | "in_pullback";
   setupStopPrice?: number; // Stop price for this setup
   /** When set (LLM nextLevel + high confidence), entry uses this instead of setupTriggerPrice */
   effectiveTriggerPrice?: number;
@@ -168,10 +170,12 @@ export type BiasEngine = {
 };
 
 // Trade Phase (fast, changes quickly)
+// Phase = price behavior: PULLBACK_IN_PROGRESS only when price is in zone; EXTENSION when past zone
 export type MinimalExecutionPhase =
   | "NEUTRAL_PHASE"
   | "BIAS_ESTABLISHED"
   | "PULLBACK_IN_PROGRESS"
+  | "EXTENSION"
   | "PULLBACK_REJECTION"
   | "PULLBACK_BREAKDOWN"
   | "CONTINUATION_IN_PROGRESS"
@@ -360,6 +364,8 @@ export type MinimalExecutionState = {
   pullbackHigh?: number;
   pullbackLow?: number;
   pullbackTs?: number;
+  /** When we entered EXTENSION phase (for re-anchor after 2 bars extended) */
+  extendedPhaseSinceTs?: number;
   /** When bias was set by LLM nudge: timestamp and bar range for momentum entry / protect pullback */
   lastNudgeTs?: number;
   nudgeBarHigh?: number;

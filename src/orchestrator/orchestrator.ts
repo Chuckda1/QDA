@@ -92,6 +92,10 @@ export class Orchestrator {
   private readonly NUDGE_PULLBACK_PROTECT_MS = 5 * 60 * 1000;  // 5 minutes
   /** Gate reason string for nudge momentum gate (so we can allow entry on trigger break) */
   private readonly GATE_REASON_NUDGE_MOMENTUM = "llm_nudge_momentum";
+  /** Distance beyond pullback zone (in ATR) to label phase as EXTENSION not pullback */
+  private readonly EXTENSION_THRESHOLD_ATR = 0.3;
+  /** After this long in EXTENSION, re-anchor pullback zone to recent bars for practical trigger */
+  private readonly EXTENSION_REANCHOR_MS = 2 * 5 * 60 * 1000;  // 2 bars = 10 min
 
   // Ignition setup constants
   private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
@@ -2564,12 +2568,11 @@ export class Orchestrator {
     closed5mBars: Array<{ high: number; low: number; close: number }>,
     ts: number // FIX: Pass timestamp to avoid split-brain (system time vs tick time)
   ): NoTradeDiagnostic | null {
-    // Emit when: phase === PULLBACK_IN_PROGRESS OR setup === "NONE" (with bias)
+    // Emit when: PULLBACK_IN_PROGRESS, EXTENSION, or setup === "NONE" (with bias)
     // Only if price moved > 0.75 ATR (to prevent spam)
     if (atr <= 0) return null;
     
-    // Check if we should emit diagnostic
-    const shouldEmit = (exec.phase === "PULLBACK_IN_PROGRESS") || 
+    const shouldEmit = (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION") || 
                        (exec.setup === "NONE" && exec.bias !== "NEUTRAL");
     if (!shouldEmit) return null;
 
@@ -3144,22 +3147,46 @@ export class Orchestrator {
         console.log(
           `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence} engineState=${beState}`
         );
-      } else if (exec.phase === "BIAS_ESTABLISHED" && lastClosed5m) {
-        // Check if pullback is developing
+      } else if ((exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION") && lastClosed5m) {
         const current5m = forming5mBar ?? lastClosed5m;
-        if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
-          const inPullback = (exec.bias === "BEARISH" && current5m.close < exec.pullbackHigh) ||
-                           (exec.bias === "BULLISH" && current5m.close > exec.pullbackLow);
-          if (inPullback) {
+        const atr = this.calculateATR(closed5mBars);
+        if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined && atr > 0) {
+          const buffer = this.EXTENSION_THRESHOLD_ATR * atr;
+          const inZone = current5m.close > exec.pullbackLow && current5m.close < exec.pullbackHigh;
+          const extendedBull = exec.bias === "BULLISH" && current5m.close > exec.pullbackHigh + buffer;
+          const extendedBear = exec.bias === "BEARISH" && current5m.close < exec.pullbackLow - buffer;
+          const extended = extendedBull || extendedBear;
+
+          if (inZone) {
             exec.phase = "PULLBACK_IN_PROGRESS";
             exec.expectedResolution = "CONTINUATION";
-            console.log(
-              `[PHASE_TRANSITION] ${previousPhase} -> PULLBACK_IN_PROGRESS | BIAS=${exec.bias}`
-            );
+            exec.extendedPhaseSinceTs = undefined;
+            if (previousPhase !== "PULLBACK_IN_PROGRESS") {
+              console.log(
+                `[PHASE_TRANSITION] ${previousPhase} -> PULLBACK_IN_PROGRESS | BIAS=${exec.bias} (price in zone)`
+              );
+            }
+          } else if (extended) {
+            exec.phase = "EXTENSION";
+            if (exec.extendedPhaseSinceTs === undefined) exec.extendedPhaseSinceTs = ts;
+            if (previousPhase !== "EXTENSION") {
+              console.log(
+                `[PHASE_TRANSITION] ${previousPhase} -> EXTENSION | BIAS=${exec.bias} (price past zone)`
+              );
+            }
+          } else {
+            exec.phase = "BIAS_ESTABLISHED";
+            exec.extendedPhaseSinceTs = undefined;
+            if (previousPhase !== "BIAS_ESTABLISHED") {
+              console.log(
+                `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias}`
+              );
+            }
           }
         }
       }
     } else if (exec.bias === "NEUTRAL") {
+      exec.extendedPhaseSinceTs = undefined;
       if (exec.phase !== "NEUTRAL_PHASE") {
         exec.phase = "NEUTRAL_PHASE";
         exec.waitReason = "waiting_for_bias";
@@ -3167,6 +3194,37 @@ export class Orchestrator {
           `[PHASE_TRANSITION] ${previousPhase} -> NEUTRAL_PHASE | BIAS=NEUTRAL`
         );
       }
+    }
+
+    // Re-anchor pullback zone when extended so trigger is practical (e.g. 692 not stale 690.77)
+    if (
+      exec.phase === "EXTENSION" &&
+      exec.extendedPhaseSinceTs !== undefined &&
+      (ts - exec.extendedPhaseSinceTs) >= this.EXTENSION_REANCHOR_MS &&
+      lastClosed5m &&
+      closed5mBars.length >= 2
+    ) {
+      const prev5m = closed5mBars[closed5mBars.length - 2];
+      const newHigh = Math.max(lastClosed5m.high, prev5m.high);
+      const newLow = Math.min(lastClosed5m.low, prev5m.low);
+      const atrRe = this.calculateATR(closed5mBars);
+      exec.pullbackHigh = newHigh;
+      exec.pullbackLow = newLow;
+      exec.pullbackTs = ts;
+      if (atrRe > 0) {
+        exec.setupTriggerPrice = exec.bias === "BULLISH"
+          ? newHigh + 0.1 * atrRe
+          : newLow - 0.1 * atrRe;
+      }
+      exec.extendedPhaseSinceTs = ts;
+      this.deactivateGate(exec);
+      if (exec.opportunity) {
+        exec.opportunity.status = "INVALIDATED";
+        exec.opportunity = undefined;
+      }
+      console.log(
+        `[REANCHOR] pullback zone -> [${newLow.toFixed(2)}, ${newHigh.toFixed(2)}] trigger=${exec.setupTriggerPrice?.toFixed(2)} (extended, practical zone)`
+      );
     }
 
     // ============================================================================
@@ -4847,10 +4905,12 @@ export class Orchestrator {
       if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined) {
         refPrice = exec.entryPrice;
         refLabel = "entry";
-      } else if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "CONTINUATION_IN_PROGRESS" || exec.phase === "REENTRY_WINDOW") {
+      } else if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION" || exec.phase === "CONTINUATION_IN_PROGRESS" || exec.phase === "REENTRY_WINDOW") {
         if (exec.bias === "BEARISH" && exec.pullbackHigh !== undefined) {
           refPrice = exec.pullbackHigh;
-          if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+          if (exec.phase === "EXTENSION") {
+            refLabel = "pullback high (extended)";
+          } else if (exec.phase === "CONTINUATION_IN_PROGRESS") {
             refLabel = "pullback high (continuation)";
           } else if (exec.phase === "REENTRY_WINDOW") {
             refLabel = "pullback high (re-entry window)";
@@ -4859,7 +4919,9 @@ export class Orchestrator {
           }
         } else if (exec.bias === "BULLISH" && exec.pullbackLow !== undefined) {
           refPrice = exec.pullbackLow;
-          if (exec.phase === "CONTINUATION_IN_PROGRESS") {
+          if (exec.phase === "EXTENSION") {
+            refLabel = "pullback low (extended)";
+          } else if (exec.phase === "CONTINUATION_IN_PROGRESS") {
             refLabel = "pullback low (continuation)";
           } else if (exec.phase === "REENTRY_WINDOW") {
             refLabel = "pullback low (re-entry window)";
@@ -4881,7 +4943,7 @@ export class Orchestrator {
       // Generate no-trade diagnostic if applicable (for PULLBACK_IN_PROGRESS with inactive entry)
       // Also generate if no setup detected (setup === "NONE")
       let noTradeDiagnostic: NoTradeDiagnostic | undefined = undefined;
-      if (exec.phase === "PULLBACK_IN_PROGRESS" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
+      if (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION" || (exec.setup === "NONE" && exec.bias !== "NEUTRAL")) {
         const atr = this.calculateATR(closed5mBars);
         const diagnostic = this.generateNoTradeDiagnostic(exec, close, atr, closed5mBars, ts);
         if (diagnostic) {
@@ -4936,6 +4998,7 @@ export class Orchestrator {
         expectedResolution: exec.expectedResolution ?? undefined,
         setup: exec.setup ?? undefined, // Explicit setup type
         setupTriggerPrice: exec.setupTriggerPrice,
+        triggerContext: exec.phase === "EXTENSION" ? "extended" : exec.phase === "PULLBACK_IN_PROGRESS" ? "in_pullback" : undefined,
         setupStopPrice: exec.setupStopPrice,
         setupDetectedAt: exec.setupDetectedAt,
         lastBiasFlipTs: exec.lastBiasFlipTs,

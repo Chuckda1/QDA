@@ -20,6 +20,7 @@ function getBiasEmoji(bias?: string): string {
 // Helper to get emoji for phase (no-trade/patience zone)
 function getPhaseEmoji(phase?: string): string {
   const patiencePhases = ["PULLBACK_IN_PROGRESS", "CONSOLIDATION_AFTER_REJECTION", "REENTRY_WINDOW", "BIAS_ESTABLISHED"];
+  if (phase === "EXTENSION") return "🟠";
   if (phase && patiencePhases.includes(phase)) return "🟨";
   return "⚪";
 }
@@ -147,13 +148,17 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
       entryLine = `${entryEmoji} ENTRY: WAITING (trigger: ${snapshot.setupTriggerPrice ? formatPrice(snapshot.setupTriggerPrice) : "n/a"})`;
     }
   } else {
-    // Standard setup formatting
+    const triggerLabel = snapshot.setupTriggerPrice != null
+      ? (snapshot.triggerContext ? `trigger: ${formatPrice(snapshot.setupTriggerPrice)} (${snapshot.triggerContext === "extended" ? "extended" : "in pullback"})` : `trigger: ${formatPrice(snapshot.setupTriggerPrice)}`)
+      : "";
     setupLine = snapshot.setup 
-      ? `${setupEmoji} SETUP: ${snapshot.setup}${snapshot.setupTriggerPrice ? ` (trigger: ${formatPrice(snapshot.setupTriggerPrice)})` : ""}`
+      ? `${setupEmoji} SETUP: ${snapshot.setup}${triggerLabel ? ` (${triggerLabel})` : ""}`
       : undefined;
     
-    entryLine = snapshot.setup && snapshot.setup !== "NONE" && snapshot.setupTriggerPrice
-      ? `${entryEmoji} ENTRY: WAITING (trigger: ${formatPrice(snapshot.setupTriggerPrice)})`
+    entryLine = snapshot.setup && snapshot.setup !== "NONE"
+      ? snapshot.setupTriggerPrice != null
+        ? `${entryEmoji} ENTRY: WAITING (${triggerLabel})`
+        : `${entryEmoji} ENTRY: WAITING (${snapshot.triggerContext === "extended" ? "extended" : snapshot.triggerContext === "in_pullback" ? "in pullback" : "waiting for level"})`
       : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
   }
 
