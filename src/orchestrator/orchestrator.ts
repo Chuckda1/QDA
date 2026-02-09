@@ -4030,6 +4030,7 @@ export class Orchestrator {
               );
               exec.targets = targetResultReentry.targets;
               exec.targetZones = targetResultReentry.targetZones;
+              exec.thesisDirection = exec.bias === "BULLISH" ? "long" : "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
               exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
@@ -4550,6 +4551,7 @@ export class Orchestrator {
               const targetResult = this.computeTargets(dir as "long" | "short", exec.entryPrice, exec.stopPrice, atrMom, closedBarsWithVol, vwapMom, undefined, undefined, undefined);
               exec.targets = targetResult.targets;
               exec.targetZones = targetResult.targetZones;
+              exec.thesisDirection = dir as "long" | "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
               exec.reason = `Entered (nudge momentum) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
@@ -4603,6 +4605,7 @@ export class Orchestrator {
               exec.targets = targetResult.targets;
               exec.targetZones = targetResult.targetZones;
 
+              exec.thesisDirection = ignitionDir as "long" | "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
               exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
@@ -4718,6 +4721,7 @@ export class Orchestrator {
                   exec.targets = targetResultLong.targets;
                   exec.targetZones = targetResultLong.targetZones;
 
+                  exec.thesisDirection = "long"; // Explicitly set for stop/target checks
                   exec.phase = "IN_TRADE";
                   exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                   exec.waitReason = "in_trade";
@@ -4844,6 +4848,7 @@ export class Orchestrator {
                   exec.targets = targetResultShort.targets;
                   exec.targetZones = targetResultShort.targetZones;
 
+                  exec.thesisDirection = "short"; // Explicitly set for stop/target checks
                   exec.phase = "IN_TRADE";
                   exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                   exec.waitReason = "in_trade";
@@ -4899,11 +4904,13 @@ export class Orchestrator {
         );
       }
 
-      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && exec.targets) {
+      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined) {
         const current5m = forming5mBar ?? lastClosed5m;
         if (current5m) {
+          // Derive direction from bias if thesisDirection not set (defensive)
+          const direction = exec.thesisDirection ?? (exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : undefined);
           // Check stop (FIXED: use close instead of wick for close-based logic)
-          if (exec.thesisDirection === "long" && current5m.close <= exec.stopPrice) {
+          if (direction === "long" && current5m.close <= exec.stopPrice) {
             const oldPhase = exec.phase;
             const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             console.log(
@@ -4912,7 +4919,7 @@ export class Orchestrator {
             exec.phase = newPhase;
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
-          } else if (exec.thesisDirection === "short" && current5m.close >= exec.stopPrice) {
+          } else if (direction === "short" && current5m.close >= exec.stopPrice) {
             const oldPhase = exec.phase;
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
@@ -4921,14 +4928,14 @@ export class Orchestrator {
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
           }
-          // Check targets
-          else if (exec.targets.some(target => 
-            (exec.thesisDirection === "long" && current5m.high >= target) ||
-            (exec.thesisDirection === "short" && current5m.low <= target)
+          // Check targets (only if targets exist)
+          else if (exec.targets && exec.targets.some(target => 
+            (direction === "long" && current5m.high >= target) ||
+            (direction === "short" && current5m.low <= target)
           )) {
             const hitTarget = exec.targets.find(target =>
-              (exec.thesisDirection === "long" && current5m.high >= target) ||
-              (exec.thesisDirection === "short" && current5m.low <= target)
+              (direction === "long" && current5m.high >= target) ||
+              (direction === "short" && current5m.low <= target)
             );
             const oldPhase = exec.phase;
             const newPhase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
