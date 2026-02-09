@@ -2814,6 +2814,94 @@ export class Orchestrator {
     return { blocked: false };
   }
 
+  /**
+   * Pullback Validity Filter: require at least 2 of 3 for a valid pullback entry.
+   * 1) ATR expansion: volatility reset (current ATR or bar range > prior period).
+   * 2) Price tagged value: in recent bars, price came within 0.15*ATR of VWAP or EMA.
+   * 3) Higher low (bullish) or lower high (bearish) formed after retrace.
+   */
+  private pullbackValidityFilter(
+    bias: MarketBias,
+    currentPrice: number,
+    pullbackHigh: number | undefined,
+    pullbackLow: number | undefined,
+    atr: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    vwap: number | undefined,
+    emaFast: number | undefined
+  ): { valid: boolean; reason?: string } {
+    if (atr <= 0) return { valid: false, reason: "pullback_validity_invalid_atr" };
+    const bars = closed5mBars;
+    const lookback = Math.min(8, bars.length);
+    if (lookback < 3) return { valid: false, reason: "pullback_validity_insufficient_bars" };
+
+    const recent = bars.slice(-lookback);
+    const tol = 0.15 * atr;
+
+    // 1) ATR expansion: current 5-bar ATR vs previous 5-bar ATR
+    let atrExpansion = false;
+    if (bars.length >= 10) {
+      const currentAtr = this.calculateATR(bars.slice(-5));
+      const priorAtr = this.calculateATR(bars.slice(-10, -5));
+      if (priorAtr > 0 && currentAtr >= priorAtr * 1.05) atrExpansion = true;
+    } else if (bars.length >= 6) {
+      const currentAtr = this.calculateATR(bars.slice(-3));
+      const priorAtr = this.calculateATR(bars.slice(-6, -3));
+      if (priorAtr > 0 && currentAtr >= priorAtr * 1.05) atrExpansion = true;
+    }
+
+    // 2) Price tagged value (VWAP or EMA) in recent bars
+    let taggedValue = false;
+    if (vwap !== undefined || emaFast !== undefined) {
+      for (const b of recent) {
+        if (bias === "BULLISH") {
+          const nearVwap = vwap !== undefined && b.low <= vwap + tol;
+          const nearEma = emaFast !== undefined && b.low <= emaFast + tol;
+          if (nearVwap || nearEma) {
+            taggedValue = true;
+            break;
+          }
+        } else {
+          const nearVwap = vwap !== undefined && b.high >= vwap - tol;
+          const nearEma = emaFast !== undefined && b.high >= emaFast - tol;
+          if (nearVwap || nearEma) {
+            taggedValue = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3) Higher low (bullish) or lower high (bearish) after retrace
+    let structureOk = false;
+    if (recent.length >= 4) {
+      if (bias === "BULLISH") {
+        const lows = recent.map((b, i) => ({ low: b.low, i }));
+        const minEntry = lows.reduce((acc, x) => (x.low < acc.low ? x : acc), lows[0]);
+        const afterMin = recent.slice(minEntry.i + 1);
+        if (afterMin.length > 0) {
+          const laterMin = Math.min(...afterMin.map((b) => b.low));
+          if (laterMin > minEntry.low) structureOk = true;
+        }
+      } else {
+        const highs = recent.map((b, i) => ({ high: b.high, i }));
+        const maxEntry = highs.reduce((acc, x) => (x.high > acc.high ? x : acc), highs[0]);
+        const afterMax = recent.slice(maxEntry.i + 1);
+        if (afterMax.length > 0) {
+          const laterMax = Math.max(...afterMax.map((b) => b.high));
+          if (laterMax < maxEntry.high) structureOk = true;
+        }
+      }
+    }
+
+    const count = [atrExpansion, taggedValue, structureOk].filter(Boolean).length;
+    const valid = count >= 2;
+    const reason = valid
+      ? undefined
+      : `pullback_validity_1_of_3 (atrExp=${atrExpansion} tagged=${taggedValue} structure=${structureOk})`;
+    return { valid, reason };
+  }
+
   // Detect momentum pause or compression (transition to re-entry window)
   private detectMomentumPause(
     bias: MarketBias,
@@ -4439,6 +4527,13 @@ export class Orchestrator {
           // 6) Entry execution (unchanged from your block)
           // ------------------------------------------------------------
           if (canEnter) {
+            // Never enter from EXTENSION (stall at highs/lows); defensive guard if entry path ever allows EXTENSION
+            if ((exec.phase as MinimalExecutionPhase) === "EXTENSION") {
+              exec.entryBlocked = true;
+              exec.entryBlockReason = "phase_extended";
+              exec.waitReason = "phase_extended";
+              console.log(`[ENTRY_BLOCKED] phase=EXTENSION - no entry when extended`);
+            } else {
             // NUDGE MOMENTUM entry: break of nudge bar (no deep pullback required)
             if (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)) {
               const oldPhase = exec.phase;
@@ -4546,6 +4641,35 @@ export class Orchestrator {
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
               } else {
+                const closedBarsWithVolumeLong = closed5mBars.filter(
+                    (bar) => "volume" in bar
+                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
+                const vwapLong =
+                  closedBarsWithVolumeLong.length > 0
+                    ? this.calculateVWAP(closedBarsWithVolumeLong)
+                    : undefined;
+                const emaFastLong =
+                  closed5mBars.length >= 6
+                    ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
+                    : exec.micro?.emaFast1m;
+                const validity = this.pullbackValidityFilter(
+                  exec.bias,
+                  current5m.close,
+                  exec.pullbackHigh,
+                  exec.pullbackLow,
+                  atrForBlock,
+                  closed5mBars,
+                  vwapLong,
+                  emaFastLong
+                );
+                if (!validity.valid) {
+                  exec.entryBlocked = true;
+                  exec.entryBlockReason = validity.reason;
+                  exec.waitReason = validity.reason ?? "pullback_validity";
+                  console.log(
+                    `[ENTRY_BLOCKED] BIAS=${exec.bias} reason=${validity.reason} - Pullback validity filter`
+                  );
+                } else {
                 // Hard assert: PULLBACK_ENTRY requires PULLBACK_CONTINUATION setup
                 if (exec.setup !== "PULLBACK_CONTINUATION") {
                   console.error(`[ENTRY_ABORTED] PULLBACK_ENTRY blocked: setup=${exec.setup ?? "NONE"} (required: PULLBACK_CONTINUATION)`);
@@ -4575,15 +4699,9 @@ export class Orchestrator {
                     : current5m.low - atrLong * 0.1;
 
                   exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
-
-                  const closedBarsWithVolumeLong = closed5mBars.filter(
-                    (bar) => "volume" in bar
-                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
-
-                  const vwapLong =
-                    closedBarsWithVolumeLong.length > 0
-                      ? this.calculateVWAP(closedBarsWithVolumeLong)
-                      : undefined;
+                  const minStopDistanceLong = Math.max(0.5 * atrLong, 0.10);
+                  const maxStopPriceLong = exec.entryPrice - minStopDistanceLong;
+                  if (exec.stopPrice > maxStopPriceLong) exec.stopPrice = maxStopPriceLong;
 
                   const targetResultLong = this.computeTargets(
                     "long",
@@ -4621,6 +4739,7 @@ export class Orchestrator {
                     )}`
                   );
                 }
+                }
               }
             }
 
@@ -4648,6 +4767,35 @@ export class Orchestrator {
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
               } else {
+                const closedBarsWithVolumeShort = closed5mBars.filter(
+                  (bar) => "volume" in bar
+                ) as Array<{ high: number; low: number; close: number; volume: number }>;
+                const vwapShort =
+                  closedBarsWithVolumeShort.length > 0
+                    ? this.calculateVWAP(closedBarsWithVolumeShort)
+                    : undefined;
+                const emaFastShort =
+                  closed5mBars.length >= 6
+                    ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
+                    : exec.micro?.emaFast1m;
+                const validityShort = this.pullbackValidityFilter(
+                  exec.bias,
+                  current5m.close,
+                  exec.pullbackHigh,
+                  exec.pullbackLow,
+                  atrForBlock,
+                  closed5mBars,
+                  vwapShort,
+                  emaFastShort
+                );
+                if (!validityShort.valid) {
+                  exec.entryBlocked = true;
+                  exec.entryBlockReason = validityShort.reason;
+                  exec.waitReason = validityShort.reason ?? "pullback_validity";
+                  console.log(
+                    `[ENTRY_BLOCKED] BIAS=${exec.bias} reason=${validityShort.reason} - Pullback validity filter`
+                  );
+                } else {
                 // Hard assert: PULLBACK_ENTRY requires PULLBACK_CONTINUATION setup
                 if (exec.setup !== "PULLBACK_CONTINUATION") {
                   console.error(`[ENTRY_ABORTED] PULLBACK_ENTRY blocked: setup=${exec.setup ?? "NONE"} (required: PULLBACK_CONTINUATION)`);
@@ -4677,15 +4825,9 @@ export class Orchestrator {
                     : current5m.high + atrShort * 0.1;
 
                   exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
-
-                  const closedBarsWithVolumeShort = closed5mBars.filter(
-                    (bar) => "volume" in bar
-                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
-
-                  const vwapShort =
-                    closedBarsWithVolumeShort.length > 0
-                      ? this.calculateVWAP(closedBarsWithVolumeShort)
-                      : undefined;
+                  const minStopDistanceShort = Math.max(0.5 * atrShort, 0.10);
+                  const minStopPriceShort = exec.entryPrice + minStopDistanceShort;
+                  if (exec.stopPrice < minStopPriceShort) exec.stopPrice = minStopPriceShort;
 
                   const targetResultShort = this.computeTargets(
                     "short",
@@ -4723,7 +4865,9 @@ export class Orchestrator {
                     )}`
                   );
                 }
+                }
               }
+            }
             }
           }
         }
