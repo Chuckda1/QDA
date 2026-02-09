@@ -477,7 +477,24 @@ export interface BotState {
   lastLLMDecision?: string;
 }
 
-export type DomainEventType = "MIND_STATE_UPDATED" | "LLM_1M_OPINION";
+export type DomainEventType =
+  | "MIND_STATE_UPDATED"
+  | "LLM_1M_OPINION"
+  | "GATE_ARMED"
+  | "OPPORTUNITY_TRIGGERED"
+  | "TRADE_ENTRY"
+  | "TRADE_EXIT";
+
+/** Payload for trading alert events (GATE_ARMED, OPPORTUNITY_TRIGGERED, TRADE_ENTRY, TRADE_EXIT) */
+export type TradingAlertPayload = {
+  direction: "LONG" | "SHORT";
+  triggerPrice?: number;
+  stopPrice?: number;
+  entryPrice?: number;
+  reason?: string;
+  exitReason?: string;
+  result?: "WIN" | "LOSS" | "FLAT";
+};
 
 export type MinimalDebugInfo = {
   barsClosed5m: number;
@@ -516,5 +533,7 @@ export interface DomainEvent {
     botState?: MinimalExecutionPhase; // Optional for LLM_1M_OPINION events
     waitFor?: string | null;
     debug?: MinimalDebugInfo;
+    // For GATE_ARMED | OPPORTUNITY_TRIGGERED | TRADE_ENTRY | TRADE_EXIT
+    alertPayload?: TradingAlertPayload;
   };
 }

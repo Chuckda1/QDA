@@ -3,7 +3,7 @@ import { formatEtTimestamp } from "./telegramNormalizer.js";
 import type { NoTradeBlocker, NoTradeBlockerSeverity } from "../types.js";
 
 export type TelegramAlert = {
-  type: "MIND" | "LLM_1M_OPINION";
+  type: "MIND" | "LLM_1M_OPINION" | "ALERT";
   lines: string[];
   text: string;
 };
@@ -51,6 +51,36 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     const text = `🧠 LLM(1m): ${direction} ${confidence} | px=${price} | based on 5m candles`;
     return {
       type: "LLM_1M_OPINION",
+      lines: [text],
+      text,
+    };
+  }
+
+  // Trading alerts (discrete events: gate armed, trigger, entry, exit)
+  if (snapshot.type === "ALERT" && snapshot.alertKind && snapshot.alertPayload) {
+    const p = snapshot.alertPayload;
+    const price = formatPrice(snapshot.price);
+    const label =
+      snapshot.alertKind === "GATE_ARMED"
+        ? "GATE ARMED"
+        : snapshot.alertKind === "OPPORTUNITY_TRIGGERED"
+          ? "TRIGGER HIT"
+          : snapshot.alertKind === "TRADE_ENTRY"
+            ? "IN TRADE"
+            : "EXIT";
+    const parts: string[] = [
+      `🚨 ALERT: ${label}`,
+      `${p.direction} | px=${price}`,
+    ];
+    if (p.triggerPrice !== undefined) parts.push(`trigger ${formatPrice(p.triggerPrice)}`);
+    if (p.stopPrice !== undefined) parts.push(`stop ${formatPrice(p.stopPrice)}`);
+    if (p.entryPrice !== undefined) parts.push(`entry ${formatPrice(p.entryPrice)}`);
+    if (p.reason) parts.push(`| ${p.reason}`);
+    if (p.exitReason) parts.push(`| ${p.exitReason}`);
+    if (p.result) parts.push(`(${p.result})`);
+    const text = parts.join(" ");
+    return {
+      type: "ALERT",
       lines: [text],
       text,
     };

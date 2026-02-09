@@ -44,10 +44,19 @@ export class MessageGovernor {
     };
   }
 
+  private static readonly SENDABLE_TYPES: Set<string> = new Set([
+    "MIND_STATE_UPDATED",
+    "LLM_1M_OPINION",
+    "GATE_ARMED",
+    "OPPORTUNITY_TRIGGERED",
+    "TRADE_ENTRY",
+    "TRADE_EXIT",
+  ]);
+
   shouldSend(event: DomainEvent, _bot: TelegramBotLike, _chatId: number): boolean {
     const key = `${event.type}_${event.timestamp}`;
     if (this.dedupeKeys.has(key)) return false;
-    if (event.type !== "MIND_STATE_UPDATED" && event.type !== "LLM_1M_OPINION") return false;
+    if (!MessageGovernor.SENDABLE_TYPES.has(event.type)) return false;
     this.dedupeKeys.set(key, event.timestamp);
     return true;
   }

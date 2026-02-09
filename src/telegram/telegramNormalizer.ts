@@ -1,6 +1,6 @@
-import type { DomainEvent, MinimalMindStateResponse } from "../types.js";
+import type { DomainEvent, MinimalMindStateResponse, TradingAlertPayload } from "../types.js";
 
-export type TelegramSnapshotType = "MIND" | "LLM_1M_OPINION";
+export type TelegramSnapshotType = "MIND" | "LLM_1M_OPINION" | "ALERT";
 
 import type { MinimalDebugInfo } from "../types.js";
 
@@ -74,6 +74,9 @@ export type TelegramSnapshot = {
   coachLine?: string;
   nextLevel?: number;
   likelihoodHit?: number;
+  // For type === "ALERT"
+  alertKind?: "GATE_ARMED" | "OPPORTUNITY_TRIGGERED" | "TRADE_ENTRY" | "TRADE_EXIT";
+  alertPayload?: TradingAlertPayload;
 };
 
 export const formatEtTimestamp = (ts: number): string =>
@@ -97,9 +100,25 @@ export function normalizeTelegramSnapshot(event: DomainEvent): TelegramSnapshot 
     };
   }
 
+  // Trading alert events (discrete: gate armed, trigger, entry, exit)
+  const alertTypes = ["GATE_ARMED", "OPPORTUNITY_TRIGGERED", "TRADE_ENTRY", "TRADE_EXIT"] as const;
+  if (alertTypes.includes(event.type as (typeof alertTypes)[number])) {
+    const payload = event.data?.alertPayload;
+    if (!payload) return null;
+    return {
+      type: "ALERT",
+      symbol: event.data.symbol,
+      price: event.data.price,
+      direction: payload.direction,
+      ts: formatEtTimestamp(event.timestamp),
+      alertKind: event.type as (typeof alertTypes)[number],
+      alertPayload: payload,
+    };
+  }
+
   // Original MIND_STATE_UPDATED handling
   if (event.type !== "MIND_STATE_UPDATED") return null;
-  
+
   // Type guard ensures mindState exists
   if (!hasMindState(event)) {
     return null;

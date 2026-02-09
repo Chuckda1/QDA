@@ -23,6 +23,7 @@ import type {
   OpportunitySide,
   OpportunityStatus,
   OpportunityTriggerType,
+  TradingAlertPayload,
   RawBar,
   ResolutionGate,
   SetupType,
@@ -2911,7 +2912,6 @@ export class Orchestrator {
         exec.phase = "BIAS_ESTABLISHED";
         exec.expectedResolution = "CONTINUATION";
         exec.waitReason = "waiting_for_pullback";
-        shouldPublishEvent = true;
         console.log(
           `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence} engineState=${beState}`
         );
@@ -2924,7 +2924,6 @@ export class Orchestrator {
           if (inPullback) {
             exec.phase = "PULLBACK_IN_PROGRESS";
             exec.expectedResolution = "CONTINUATION";
-            shouldPublishEvent = true;
             console.log(
               `[PHASE_TRANSITION] ${previousPhase} -> PULLBACK_IN_PROGRESS | BIAS=${exec.bias}`
             );
@@ -2935,7 +2934,6 @@ export class Orchestrator {
       if (exec.phase !== "NEUTRAL_PHASE") {
         exec.phase = "NEUTRAL_PHASE";
         exec.waitReason = "waiting_for_bias";
-        shouldPublishEvent = true;
         console.log(
           `[PHASE_TRANSITION] ${previousPhase} -> NEUTRAL_PHASE | BIAS=NEUTRAL`
         );
@@ -3082,8 +3080,6 @@ export class Orchestrator {
     // ============================================================================
     const latchCreated = this.ensureOpportunityLatch(exec, ts, close, atr);
     if (latchCreated) {
-      // Force event emission after latching to update Telegram immediately
-      shouldPublishEvent = true;
       console.log(
         `[OPP_LATCHED_EVENT] Forcing state snapshot after opportunity latch - bias=${exec.bias} phase=${exec.phase}`
       );
@@ -3326,9 +3322,11 @@ export class Orchestrator {
     let shouldPublishEvent = false;
     let debugInfo: MinimalDebugInfo | undefined = undefined;
     
-    // Track previous state to detect changes (for use in state transitions)
-      const previousBias = exec.bias;
-      const previousPhase = exec.phase;
+    // Track previous state to detect changes (for discrete alerts and throttle)
+    const previousBias = exec.bias;
+    const previousPhase = exec.phase;
+    const previousGateStatus = exec.resolutionGate?.status;
+    const previousOppStatus = exec.opportunity?.status;
 
     // ============================================================================
     // MICRO INDICATORS (1m timeframe for countertrend detection)
@@ -3581,7 +3579,6 @@ export class Orchestrator {
             const oldPhase = exec.phase;
             exec.phase = "REENTRY_WINDOW";
             exec.waitReason = "waiting_for_reentry_pullback";
-          shouldPublishEvent = true;
             console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} NOTE: Continuation paused, monitoring for re-entry`
             );
@@ -3607,7 +3604,6 @@ export class Orchestrator {
             const oldPhase = exec.phase;
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = blockCheck.reason ?? "reentry_window_expired";
-            shouldPublishEvent = true;
         console.log(
               `[STATE_TRANSITION] ${oldPhase} -> ${exec.phase} | BIAS=${exec.bias} reason=${exec.waitReason} - Re-entry window expired`
             );
@@ -3655,7 +3651,6 @@ export class Orchestrator {
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
               exec.entryBlockReason = undefined;
-              shouldPublishEvent = true;
               console.log(
                 `[STATE_TRANSITION] ${oldPhase} -> IN_TRADE | TYPE=REENTRY_AFTER_CONTINUATION BIAS=${exec.bias} entry=${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} NOTE: ${exec.bias} continuation re-entry after compression`
               );
@@ -3727,7 +3722,6 @@ export class Orchestrator {
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = "continuation_without_structure";
             exec.expectedResolution = "FAILURE";
-            shouldPublishEvent = true;
             const expiryReason = ts > exec.resolutionGate.expiryTs 
               ? "Time expired" 
               : "Continuation occurred without structure";
@@ -3752,7 +3746,6 @@ export class Orchestrator {
             exec.phase = "CONSOLIDATION_AFTER_REJECTION";
             exec.waitReason = "structure_broken";
             exec.expectedResolution = "FAILURE";
-            shouldPublishEvent = true;
             const invalidationReason = exec.bias === "BEARISH" && exec.pullbackHigh && current5m.close > exec.pullbackHigh
               ? `Price ${current5m.close.toFixed(2)} > pullbackHigh ${exec.pullbackHigh.toFixed(2)}`
               : exec.bias === "BULLISH" && exec.pullbackLow && current5m.close < exec.pullbackLow
@@ -3807,7 +3800,6 @@ export class Orchestrator {
           );
           
           if (biasFlipExecuted) {
-            shouldPublishEvent = true;
             // Skip pullback entry logic if bias flip executed
             // Continue to stop/target checks below
           }
@@ -3944,7 +3936,6 @@ export class Orchestrator {
                 2
               )}`
             );
-            shouldPublishEvent = true;
           } else {
             // Opportunity latched but not triggered yet
             exec.waitReason = `waiting_for_${exec.opportunity.trigger.type.toLowerCase()}_trigger`;
@@ -3978,7 +3969,6 @@ export class Orchestrator {
           exec.waitReason = exec.deploymentPauseReason ?? "deployment_pause";
           exec.entryBlocked = true;
           exec.entryBlockReason = `Deployment paused: ${exec.deploymentPauseReason ?? "micro_countertrend"}`;
-          shouldPublishEvent = true;
           console.log(
             `[ENTRY_BLOCKED] Deployment pause active - ${exec.deploymentPauseReason} | pausedUntil=${new Date(exec.deploymentPauseUntilTs!).toISOString()}`
           );
@@ -4019,7 +4009,6 @@ export class Orchestrator {
           exec.entryBlocked = true;
           exec.entryBlockReason =
             "No tradable opportunity ready (need LATCHED/TRIGGERED or gate ARMED)";
-          shouldPublishEvent = true;
           console.log(
             `[ENTRY_BLOCKED] Not ready - BIAS=${exec.bias} PHASE=${exec.phase} oppStatus=${oppStatus} gateStatus=${gateStatus} - Waiting for pullback zone`
           );
@@ -4186,8 +4175,6 @@ export class Orchestrator {
                 exec.opportunity.status = "CONSUMED";
               }
 
-              shouldPublishEvent = true;
-
               console.log(
                 `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
               );
@@ -4209,7 +4196,6 @@ export class Orchestrator {
                 exec.entryBlocked = true;
                 exec.entryBlockReason = blockCheck.reason;
                 exec.waitReason = blockCheck.reason ?? "entry_blocked";
-                shouldPublishEvent = true;
                 console.log(
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
@@ -4220,7 +4206,6 @@ export class Orchestrator {
                   exec.entryBlocked = true;
                   exec.entryBlockReason = "setup_not_pullback_continuation";
                   exec.waitReason = "setup_not_pullback_continuation";
-                  shouldPublishEvent = true;
                 } else {
                   const oldPhase = exec.phase;
                   const entryInfo = this.detectEntryType(
@@ -4279,8 +4264,6 @@ export class Orchestrator {
                     exec.opportunity.status = "CONSUMED";
                   }
 
-                  shouldPublishEvent = true;
-
                   console.log(
                     `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
                       2
@@ -4312,7 +4295,6 @@ export class Orchestrator {
                 exec.entryBlocked = true;
                 exec.entryBlockReason = blockCheck.reason;
                 exec.waitReason = blockCheck.reason ?? "entry_blocked";
-                shouldPublishEvent = true;
                 console.log(
                   `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
                 );
@@ -4323,7 +4305,6 @@ export class Orchestrator {
                   exec.entryBlocked = true;
                   exec.entryBlockReason = "setup_not_pullback_continuation";
                   exec.waitReason = "setup_not_pullback_continuation";
-                  shouldPublishEvent = true;
                 } else {
                   const oldPhase = exec.phase;
                   const entryInfo = this.detectEntryType(
@@ -4382,8 +4363,6 @@ export class Orchestrator {
                     exec.opportunity.status = "CONSUMED";
                   }
 
-                  shouldPublishEvent = true;
-
                   console.log(
                     `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
                       2
@@ -4437,7 +4416,6 @@ export class Orchestrator {
             exec.phase = newPhase;
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
-            shouldPublishEvent = true; // Exit - publish event
           } else if (exec.thesisDirection === "short" && current5m.close >= exec.stopPrice) {
             const oldPhase = exec.phase;
             console.log(
@@ -4446,7 +4424,6 @@ export class Orchestrator {
             exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
-            shouldPublishEvent = true; // Exit - publish event
           }
           // Check targets
           else if (exec.targets.some(target => 
@@ -4465,16 +4442,83 @@ export class Orchestrator {
             exec.phase = newPhase;
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
-            shouldPublishEvent = true; // Exit - publish event
           }
         }
       } // Close: if (exec.phase === "IN_TRADE" && ...) for trade management (line 3987)
       } // Close: if (exec.bias !== "NEUTRAL" && ...) for pullback entry logic - line 3596
 
-    // Publish event if state changed, important event occurred, or heartbeat needed
-    // CRITICAL: This ensures blocked states still emit messages (heartbeat mechanism)
-    const shouldEmit = shouldPublishEvent || exec.phase !== previousPhase || exec.bias !== previousBias;
-    
+    // ============================================================================
+    // Trading alerts: emit discrete events for gate armed, trigger, entry, exit
+    // ============================================================================
+    const dir = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+    let hasDiscreteEvent = false;
+
+    if (exec.resolutionGate?.status === "ARMED" && previousGateStatus !== "ARMED") {
+      const payload: TradingAlertPayload = {
+        direction: dir,
+        triggerPrice: exec.resolutionGate.triggerPrice,
+        stopPrice: exec.resolutionGate.stopPrice,
+        reason: exec.resolutionGate.reason,
+      };
+      events.push({
+        type: "GATE_ARMED",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+      });
+      hasDiscreteEvent = true;
+    }
+    if (exec.opportunity?.status === "TRIGGERED" && previousOppStatus !== "TRIGGERED") {
+      const triggerPrice = exec.opportunity.trigger?.price;
+      const payload: TradingAlertPayload = {
+        direction: exec.opportunity.side === "SHORT" ? "SHORT" : "LONG",
+        triggerPrice,
+        reason: exec.opportunity.trigger?.type ?? "trigger",
+      };
+      events.push({
+        type: "OPPORTUNITY_TRIGGERED",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+      });
+      hasDiscreteEvent = true;
+    }
+    if (exec.phase === "IN_TRADE" && previousPhase !== "IN_TRADE") {
+      const payload: TradingAlertPayload = {
+        direction: dir,
+        entryPrice: exec.entryPrice,
+        stopPrice: exec.stopPrice,
+        reason: exec.reason ?? exec.entryTrigger,
+      };
+      events.push({
+        type: "TRADE_ENTRY",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+      });
+      hasDiscreteEvent = true;
+    }
+    if (previousPhase === "IN_TRADE" && exec.phase !== "IN_TRADE") {
+      const payload: TradingAlertPayload = {
+        direction: dir,
+        exitReason: exec.waitReason ?? exec.reason,
+      };
+      events.push({
+        type: "TRADE_EXIT",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+      });
+      hasDiscreteEvent = true;
+    }
+
+    // Only emit MIND_STATE_UPDATED when phase/bias changed, or discrete alert, or heartbeat
+    const shouldEmit =
+      shouldPublishEvent ||
+      exec.phase !== previousPhase ||
+      exec.bias !== previousBias ||
+      hasDiscreteEvent;
+
     if (shouldEmit) {
       // Track last message timestamp for silent mode detection
       this.lastMessageTs = ts;
