@@ -7,6 +7,12 @@ import type { LLMService } from "./llmService.js";
 type LlmDirection1mResponse = {
   direction: "LONG" | "SHORT" | "NEUTRAL";
   confidence: number;
+  /** Short coaching line: what to do next / what's forming (e.g. "Wait for break above 450", "Setup forming; test 448 next") */
+  coachLine?: string;
+  /** Next level price is likely to test or hit in the next 30-60 min */
+  nextLevel?: number;
+  /** Likelihood (0-100) that price reaches nextLevel in that window */
+  likelihoodHit?: number;
 };
 
 type Closed5mBar = {
@@ -34,6 +40,8 @@ const MIN_PUBLISH_GAP_MS = 3 * 60_000; // 3 minutes
 const SAME_DIR_REFRESH_MS = 15 * 60_000; // 15 minutes
 const CONF_JUMP = 12;
 const THROTTLE_MS = 60_000; // 1 minute
+const BARS_WINDOW = 45; // 5m bars; room for botState + micro + bars1m
+const BARS_1M_WINDOW = 20; // Last 20 1m bars (chart-like tape)
 
 /**
  * Maybe update LLM direction opinion (throttled, publishes only on strong direction)
@@ -65,13 +73,9 @@ export async function maybeUpdateLlmDirection1m(
   // Update last call timestamp
   exec.llm1mLastCallTs = ts;
 
-  // Build raw snapshot (last 60 closed 5m bars only, no thesis fields)
-  const barsToUse = closed5mBars.slice(-60);
-  const rawSnapshot = {
-    symbol,
-    closed5mBars: barsToUse,
-    forming5mBar: forming5mBar || undefined,
-  };
+  // Build snapshot: bars (last N for token efficiency) + current price + bot state + micro tape
+  const barsToUse = closed5mBars.slice(-BARS_WINDOW);
+  const rawSnapshot = buildLlmSnapshot(exec, price, symbol, barsToUse, forming5mBar || undefined);
 
   // Call LLM with strict JSON parsing
   let llmResponse: LlmDirection1mResponse | null = null;
@@ -84,15 +88,21 @@ export async function maybeUpdateLlmDirection1m(
     llmResponse = { direction: "NEUTRAL", confidence: 0 };
   }
 
-  // Store latest read on exec (NOT bias)
+  // Store latest read on exec (NOT bias), including coaching
   if (llmResponse) {
     exec.llm1mDirection = llmResponse.direction;
     exec.llm1mConfidence = llmResponse.confidence;
     exec.llm1mTs = ts;
+    exec.llm1mCoachLine = llmResponse.coachLine;
+    exec.llm1mNextLevel = llmResponse.nextLevel;
+    exec.llm1mLikelihoodHit = llmResponse.likelihoodHit;
   } else {
     exec.llm1mDirection = "NEUTRAL";
     exec.llm1mConfidence = 0;
     exec.llm1mTs = ts;
+    exec.llm1mCoachLine = undefined;
+    exec.llm1mNextLevel = undefined;
+    exec.llm1mLikelihoodHit = undefined;
   }
 
   // Decide whether to publish
@@ -121,14 +131,117 @@ export async function maybeUpdateLlmDirection1m(
   };
 }
 
+type Bar1m = { ts: number; o: number; h: number; l: number; c: number; v: number };
+
+/** Snapshot passed to the LLM: candles + current price + bot state + micro tape + 1m bars */
+type LlmSnapshot = {
+  symbol: string;
+  currentPrice: number;
+  closed5mBars: Closed5mBar[];
+  forming5mBar?: Forming5mBar;
+  /** Last N 1m bars (chart-like) for LLM to use its own structure read */
+  bars1m?: Bar1m[];
+  botState: {
+    bias: string;
+    phase: string;
+    setup?: string;
+    setupTriggerPrice?: number;
+    setupStopPrice?: number;
+    entryPrice?: number;
+    stopPrice?: number;
+    targets?: number[];
+  };
+  micro?: {
+    vwap1m?: number;
+    emaFast1m?: number;
+    atr1m?: number;
+    lastSwingHigh1m?: number;
+    lastSwingLow1m?: number;
+    aboveVwapCount?: number;
+    belowVwapCount?: number;
+    aboveEmaCount?: number;
+    belowEmaCount?: number;
+  };
+};
+
+function buildLlmSnapshot(
+  exec: MinimalExecutionState,
+  price: number,
+  symbol: string,
+  closed5mBars: Closed5mBar[],
+  forming5mBar: Forming5mBar | undefined
+): LlmSnapshot {
+  const inTrade = exec.phase === "IN_TRADE";
+  const botState: LlmSnapshot["botState"] = {
+    bias: exec.bias ?? "NEUTRAL",
+    phase: exec.phase ?? "NEUTRAL_PHASE",
+    setup: exec.setup,
+    setupTriggerPrice: exec.setupTriggerPrice,
+    setupStopPrice: exec.setupStopPrice,
+    ...(inTrade && {
+      entryPrice: exec.entryPrice,
+      stopPrice: exec.stopPrice,
+      targets: exec.targets?.slice(0, 3),
+    }),
+  };
+  const micro = exec.micro
+    ? {
+        vwap1m: exec.micro.vwap1m,
+        emaFast1m: exec.micro.emaFast1m,
+        atr1m: exec.micro.atr1m,
+        lastSwingHigh1m: exec.micro.lastSwingHigh1m,
+        lastSwingLow1m: exec.micro.lastSwingLow1m,
+        aboveVwapCount: exec.micro.aboveVwapCount,
+        belowVwapCount: exec.micro.belowVwapCount,
+        aboveEmaCount: exec.micro.aboveEmaCount,
+        belowEmaCount: exec.micro.belowEmaCount,
+      }
+    : undefined;
+  const bars1m = exec.microBars1m?.slice(-BARS_1M_WINDOW).map((b) => ({
+    ts: b.ts,
+    o: b.open,
+    h: b.high,
+    l: b.low,
+    c: b.close,
+    v: b.volume,
+  }));
+
+  return {
+    symbol,
+    currentPrice: price,
+    closed5mBars,
+    forming5mBar,
+    bars1m: bars1m?.length ? bars1m : undefined,
+    botState,
+    micro,
+  };
+}
+
 /**
- * Build LLM prompt from raw snapshot
+ * Build LLM prompt from snapshot (candles + current price + bot state + micro)
  */
-function buildPrompt(snapshot: { symbol: string; closed5mBars: Closed5mBar[]; forming5mBar?: Forming5mBar }): string {
-  const systemPrompt = `You are a short-horizon market direction classifier. Using ONLY the provided 5-minute OHLCV candles, decide the dominant price direction for the NEXT 30–60 minutes. Return STRICT JSON only.`;
+function buildPrompt(snapshot: LlmSnapshot): string {
+  const systemPrompt = `You are a short-horizon market direction classifier and trading coach. You receive:
+- currentPrice: the latest 1m close (use this as "price right now").
+- closed5mBars + forming5mBar: recent 5m OHLCV candles.
+- bars1m: last 20 1m OHLCV bars (chart-like tape). You may use bar data and your own structure read in addition to botState and micro.
+- botState: the execution system's current state (bias, phase, setup, trigger/stop; if in trade, entry/stop/targets). Use these levels when coaching when they exist.
+- micro: 1m tape (VWAP, EMA, ATR, swing high/low, consecutive bars above/below VWAP/EMA). Align your nextLevel and coachLine with these levels when relevant.
+
+You may use your own read from the bars (momentum, structure, levels) as well as botState/micro. Prefer botState trigger/targets when they exist for coachLine; for nextLevel you may use micro levels or levels you infer from bars1m/closed5mBars.
+
+Output:
+1. direction: dominant price direction for the NEXT 30–60 minutes (LONG, SHORT, or NEUTRAL).
+2. confidence: 0-100 confidence in that direction.
+3. coachLine: one short sentence coaching the trader. Reference botState levels when they exist. Keep under 80 chars.
+4. nextLevel: one price level price is likely to test or hit in the next 30-60 min (number, or null if unclear).
+5. likelihoodHit: 0-100 likelihood that price reaches nextLevel in that window (omit if nextLevel is null).
+
+Return STRICT JSON only. No markdown. No explanation. Include all five keys every time.`;
 
   const userContent = {
     symbol: snapshot.symbol,
+    currentPrice: snapshot.currentPrice,
     closed5mBars: snapshot.closed5mBars.map((b) => ({
       ts: b.ts,
       o: b.open,
@@ -147,6 +260,9 @@ function buildPrompt(snapshot: { symbol: string; closed5mBars: Closed5mBar[]; fo
           v: snapshot.forming5mBar.volume,
         }
       : undefined,
+    botState: snapshot.botState,
+    micro: snapshot.micro,
+    bars1m: snapshot.bars1m,
   };
 
   return `${systemPrompt}\n\n${JSON.stringify(userContent, null, 2)}`;
@@ -205,7 +321,17 @@ function parseLlmResponse(content: string): LlmDirection1mResponse {
       throw new Error(`Invalid confidence: ${confidence}`);
     }
 
-    return { direction, confidence };
+    const coachLine = typeof parsed.coachLine === "string" && parsed.coachLine.trim().length > 0
+      ? parsed.coachLine.trim().slice(0, 120)
+      : undefined;
+    const nextLevel = typeof parsed.nextLevel === "number" && Number.isFinite(parsed.nextLevel)
+      ? parsed.nextLevel
+      : parsed.nextLevel === null ? undefined : undefined;
+    const likelihoodHit = typeof parsed.likelihoodHit === "number" && Number.isFinite(parsed.likelihoodHit)
+      ? Math.max(0, Math.min(100, Math.round(parsed.likelihoodHit)))
+      : undefined;
+
+    return { direction, confidence, coachLine, nextLevel, likelihoodHit };
   } catch (error: any) {
     console.error(`[LLM_1M_DIRECTION] Parse error: ${error.message ?? error}`);
     console.error(`[LLM_1M_DIRECTION] Raw content: ${content}`);

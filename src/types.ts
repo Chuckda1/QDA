@@ -119,6 +119,8 @@ export interface MinimalMindStateResponse {
   setup?: SetupType; // New: explicit setup type (REJECTION, BREAKDOWN, etc.)
   setupTriggerPrice?: number; // Price level that triggers entry for this setup
   setupStopPrice?: number; // Stop price for this setup
+  /** When set (LLM nextLevel + high confidence), entry uses this instead of setupTriggerPrice */
+  effectiveTriggerPrice?: number;
   setupDetectedAt?: number; // Timestamp when setup was detected
   lastBiasFlipTs?: number; // Timestamp of last bias flip (for IGNITION window)
   price?: number; // Current price (first-class)
@@ -134,6 +136,10 @@ export interface MinimalMindStateResponse {
   marketCondition?: MarketCondition; // Market condition (TRENDING, COMPRESSION, etc.)
   conditionReason?: string; // Reason for current market condition
   conditionExpiresAtTs?: number; // When condition expires (TTL)
+  // LLM coaching (1m loop): short guidance + next level / likelihood
+  coachLine?: string;
+  nextLevel?: number;
+  likelihoodHit?: number;
 }
 
 export type MinimalMindStateResult = {
@@ -332,6 +338,8 @@ export type MinimalExecutionState = {
   setupDetectedAt?: number; // Timestamp when setup was detected
   setupTriggerPrice?: number; // Price level that triggers entry for this setup
   setupStopPrice?: number; // Stop price for this setup
+  /** When set (LLM nextLevel + high confidence), entry uses this instead of setupTriggerPrice */
+  effectiveTriggerPrice?: number;
   // REJECTION setup persistence tracking
   rejectionCandleLow?: number; // Low of the rejection candle (for REJECTION setups)
   rejectionCandleHigh?: number; // High of the rejection candle (for REJECTION setups)
@@ -355,6 +363,8 @@ export type MinimalExecutionState = {
   entryPrice?: number;
   entryTs?: number;
   stopPrice?: number;
+  /** LLM-based position size multiplier (1.0 = base). Set at entry from llm1m alignment/confidence. */
+  positionSizeMultiplier?: number;
   targets?: number[]; // Legacy: [T1, T2] - kept for backward compatibility
   targetZones?: {
     rTargets: { t1: number; t2: number; t3: number }; // Risk-unit targets
@@ -434,6 +444,10 @@ export type MinimalExecutionState = {
   llm1mLastPublishedDir?: "LONG" | "SHORT" | "NEUTRAL";
   llm1mLastPublishedConf?: number;
   llm1mLastPublishedTs?: number;
+  // LLM 1m coaching: short guidance, next level, likelihood to hit (0-100)
+  llm1mCoachLine?: string;
+  llm1mNextLevel?: number;
+  llm1mLikelihoodHit?: number;
 };
 
 // BiasFlipEntry Gate State

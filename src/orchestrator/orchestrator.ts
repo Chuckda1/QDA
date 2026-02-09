@@ -16,7 +16,6 @@ import type {
   MinimalDebugInfo,
   MinimalExecutionPhase,
   MinimalExecutionState,
-  MinimalLLMSnapshot,
   MinimalSetupCandidate,
   NoTradeDiagnostic,
   NoTradeReasonCode,
@@ -57,16 +56,10 @@ export class Orchestrator {
   }> = [];
   private forming5mBar: Forming5mBar | null = null;
   private formingBucketStart: number | null = null;
-  private readonly minimalLlmBars: number;
   private lastDiagnosticPrice: number | null = null; // Track price for diagnostic emission
   private lastProcessedTs: number | null = null; // Track last processed timestamp for out-of-order detection
   private lastHeartbeatTs: number | null = null; // Track last heartbeat emission timestamp
   private lastMessageTs: number | null = null; // Track last message emission timestamp (for silent mode detection)
-  private llmCircuitBreaker: {
-    failures: number;
-    lastFailureTs: number | null;
-    isOpen: boolean;
-  } = { failures: 0, lastFailureTs: null, isOpen: false };
   // Daily context tracking
   private currentETDate: string = ""; // Track current ET date string (YYYY-MM-DD)
   private prevDayClose?: number; // Previous day's close
@@ -100,7 +93,6 @@ export class Orchestrator {
     this.instanceId = instanceId;
     this.orchId = randomUUID();
     this.llmService = llmService;
-    this.minimalLlmBars = parseInt(process.env.MINIMAL_LLM_BARS || "5", 10);
     this.state = {
       startedAt: Date.now(),
       session: getMarketSessionLabel(),
@@ -113,7 +105,7 @@ export class Orchestrator {
       },
     };
     console.log(
-      `[MINIMAL] orchestrator_init id=${this.orchId} instance=${this.instanceId} minimalLlmBars=${this.minimalLlmBars}`
+      `[MINIMAL] orchestrator_init id=${this.orchId} instance=${this.instanceId}`
     );
   }
 
@@ -1745,7 +1737,7 @@ export class Orchestrator {
   // ============================================================================
   private maybeDetectIgnition(exec: MinimalExecutionState, ts: number, close: number): void {
     if (exec.phase === "IN_TRADE") return;
-    if (exec.bias === "NEUTRAL") return;
+    // Allow NEUTRAL for LLM-led IGNITION (LLM can lead when bot has not flipped yet)
 
     const micro = exec.micro;
     if (!micro) return;
@@ -1757,49 +1749,71 @@ export class Orchestrator {
     if (vwap === undefined || ema === undefined || atr === undefined) return;
     if (atr < this.IGNITION_MIN_ATR) return;
 
-    // must be right after a flip
     const flipAge = exec.lastBiasFlipTs ? (ts - exec.lastBiasFlipTs) : Infinity;
-    if (flipAge > this.IGNITION_WINDOW_MS) return;
-
     const minDist = Math.max(0.05, this.IGNITION_MIN_DIST_ATR * atr);
 
+    const llmDir = exec.llm1mDirection;
+    const llmConf = exec.llm1mConfidence ?? 0;
+    const llmAgrees =
+      (llmDir === "LONG" && exec.bias === "BULLISH") ||
+      (llmDir === "SHORT" && exec.bias === "BEARISH")
+        ? llmConf >= 75
+        : false;
+
+    // Bot-led IGNITION: bias aligned, LLM agrees, must be right after a flip
     const strongBull =
       exec.bias === "BULLISH" &&
+      flipAge <= this.IGNITION_WINDOW_MS &&
+      (micro.aboveVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      (micro.aboveEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      close > Math.max(vwap, ema) + minDist &&
+      llmAgrees;
+
+    const strongBear =
+      exec.bias === "BEARISH" &&
+      flipAge <= this.IGNITION_WINDOW_MS &&
+      (micro.belowVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      (micro.belowEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
+      close < Math.min(vwap, ema) - minDist &&
+      llmAgrees;
+
+    // LLM-led IGNITION: LLM very strong (≥85), bot not aligned — let LLM lead
+    const llmLedBull =
+      llmDir === "LONG" &&
+      llmConf >= 85 &&
+      (exec.bias === "NEUTRAL" || exec.bias === "BEARISH") &&
       (micro.aboveVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
       (micro.aboveEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
       close > Math.max(vwap, ema) + minDist;
 
-    const strongBear =
-      exec.bias === "BEARISH" &&
+    const llmLedBear =
+      llmDir === "SHORT" &&
+      llmConf >= 85 &&
+      (exec.bias === "NEUTRAL" || exec.bias === "BULLISH") &&
       (micro.belowVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
       (micro.belowEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
       close < Math.min(vwap, ema) - minDist;
 
-    if (!strongBull && !strongBear) return;
+    if (!strongBull && !strongBear && !llmLedBull && !llmLedBear) return;
 
-    // Don't overwrite a real setup
     if (exec.setup && exec.setup !== "NONE") return;
 
-    // Create a very short-lived setup: "enter if we break the last 1m swing"
-    const trigger =
-      exec.bias === "BULLISH"
-        ? (micro.lastSwingHigh1m ?? close)
-        : (micro.lastSwingLow1m ?? close);
-
-    // Stop: behind VWAP/EMA or ATR-based, whichever is tighter but meaningful
-    const stop =
-      exec.bias === "BULLISH"
-        ? Math.min(vwap, ema) - this.IGNITION_RISK_ATR * atr
-        : Math.max(vwap, ema) + this.IGNITION_RISK_ATR * atr;
+    const isLong = strongBull || llmLedBull;
+    const isShort = strongBear || llmLedBear;
+    const trigger = isLong ? (micro.lastSwingHigh1m ?? close) : (micro.lastSwingLow1m ?? close);
+    const stop = isLong
+      ? Math.min(vwap, ema) - this.IGNITION_RISK_ATR * atr
+      : Math.max(vwap, ema) + this.IGNITION_RISK_ATR * atr;
 
     exec.setup = "IGNITION";
-    exec.setupVariant = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+    exec.setupVariant = isLong ? "LONG" : "SHORT";
     exec.setupTriggerPrice = trigger;
     exec.setupStopPrice = stop;
     exec.setupDetectedAt = ts;
 
+    const source = (strongBull || strongBear) ? "bot" : "llm_led";
     console.log(
-      `[IGNITION_SETUP] bias=${exec.bias} flipAgeMs=${flipAge} trigger=${trigger.toFixed(2)} stop=${stop.toFixed(2)} atr=${atr.toFixed(2)}`
+      `[IGNITION_SETUP] source=${source} variant=${exec.setupVariant} bias=${exec.bias} flipAgeMs=${flipAge} trigger=${trigger.toFixed(2)} stop=${stop.toFixed(2)} atr=${atr.toFixed(2)}`
     );
   }
 
@@ -1823,6 +1837,20 @@ export class Orchestrator {
       return this.normalizeBias(llmBias);
     }
     return "NEUTRAL";
+  }
+
+  /** LLM-confidence position sizing: scale size when LLM aligns or disagrees with bias. */
+  private computeLlmPositionSizeMultiplier(exec: MinimalExecutionState): number {
+    const llmConfidence = exec.llm1mConfidence ?? 0;
+    const llmDirection = exec.llm1mDirection ?? "NEUTRAL";
+    const llmAligned =
+      llmDirection === (exec.bias === "BULLISH" ? "LONG" : exec.bias === "BEARISH" ? "SHORT" : "NEUTRAL") ||
+      llmDirection === "NEUTRAL";
+    if (llmAligned && llmConfidence >= 80) return 1.5;
+    if (llmAligned && llmConfidence >= 70) return 1.2;
+    if (llmDirection !== "NEUTRAL" && llmDirection !== (exec.bias === "BULLISH" ? "LONG" : "SHORT"))
+      return 0.5;
+    return 1.0;
   }
 
   // ============================================================================
@@ -3487,129 +3515,9 @@ export class Orchestrator {
     // ============================================================================
     this.updateMarketCondition(exec, ts, close);
 
-    // ============================================================================
-    // ============================================================================
-    // RULE 1: LLM must NEVER be called on 1m path - ONLY on 5m closes
-    // ============================================================================
-    // LLM reasoning should only run on closed 5m bars, never on forming or 1m ingestion
-    // The engine already knows how to reason intrabar - LLM adds zero value there
-    // 
-    // LLM calls are stateless by design. No prior context is reused.
-    // Each call contains ONLY:
-    // - A fixed system prompt (constant)
-    // - The current snapshot (closed5mBars + forming5mBar + dailyContextLite)
-    // Previous assistant replies are NEVER included in subsequent requests.
-    // ============================================================================
-    
-    // Declare LLM decision at function scope
+    // 5m LLM removed: direction/timing use 1m LLM only. reduce5mClose still runs with null.
     let llmDecision: { action: string; bias: string; confidence: number; maturity?: string; waiting_for?: string } | null = null;
-    
-    // Explicit guard: LLM is ONLY called on 5m bar closes
-    if (!is5mClose) {
-      // LLM is NOT called on 1m ticks or forming bars - this prevents request storms
-      // All processing continues normally, just without LLM input
-    } else if (this.llmService && closed5mBars.length >= this.minimalLlmBars) {
-      // ============================================================================
-      // RULE 3: LLM errors must be NON-FATAL (graceful degradation)
-      // ============================================================================
-      // Circuit breaker: if too many failures, skip LLM calls temporarily
-      const circuitBreakerCooldown = 60 * 1000; // 1 minute cooldown
-      const maxFailures = 3;
-      
-      if (this.llmCircuitBreaker.isOpen) {
-        const timeSinceFailure = this.llmCircuitBreaker.lastFailureTs 
-          ? ts - this.llmCircuitBreaker.lastFailureTs 
-          : Infinity;
-        if (timeSinceFailure > circuitBreakerCooldown) {
-          // Reset circuit breaker after cooldown
-          this.llmCircuitBreaker.isOpen = false;
-          this.llmCircuitBreaker.failures = 0;
-          console.log(`[CIRCUIT_BREAKER] Resetting - attempting LLM call`);
-        } else {
-        console.log(
-            `[CIRCUIT_BREAKER] OPEN - skipping LLM call (failures=${this.llmCircuitBreaker.failures} lastFailure=${timeSinceFailure}ms ago)`
-          );
-          // Graceful degradation: maintain current bias and phase, continue without LLM
-        }
-      }
-      
-      if (!this.llmCircuitBreaker.isOpen) {
-        // Build daily context
-        const currentETDate = getETDateString(new Date(ts));
-        const exec = this.state.minimalExecution;
-        const dailyContextLite = this.buildDailyContextLite(exec, closed5mBars, currentETDate);
-        
-        // Fix B: Include just-closed bar in LLM snapshot to eliminate 1-bar lag
-        // Build snapshot bars: buffer + just-closed bar (if rollover happened)
-        let snapshotBars = closed5mBars.slice(-60); // Last 60 from buffer
-        if (justClosedBar) {
-          // Convert Forming5mBar to closed bar format and append
-          const closedBarForSnapshot = {
-            ts: justClosedBar.endTs - 1, // Use endTs - 1ms to ensure it's before the new bucket
-            open: justClosedBar.open,
-            high: justClosedBar.high,
-            low: justClosedBar.low,
-            close: justClosedBar.close,
-            volume: justClosedBar.volume,
-          };
-          snapshotBars = [...snapshotBars, closedBarForSnapshot].slice(-60); // Keep last 60
-        }
-        
-        const llmSnapshot: MinimalLLMSnapshot = {
-          symbol,
-          nowTs: ts,
-          closed5mBars: snapshotBars, // Includes just-closed bar (no lag)
-          forming5mBar: null, // Never pass forming bar to LLM
-          dailyContextLite, // Lightweight daily anchor
-        };
 
-        console.log(
-          `[LLM5M] bufferClosed5m=${closed5mBars.length} snapshotClosed5m=${snapshotBars.length} callingLLM=true (5m close detected) barsWindow=60 dailyContext=${dailyContextLite ? "yes" : "no"}${justClosedBar ? " [JUST_CLOSED_INCLUDED]" : ""}`
-        );
-        
-        try {
-          const result = await this.llmService.getArmDecisionRaw5m({
-            snapshot: llmSnapshot,
-          });
-          llmDecision = result.decision;
-          
-          // Store for debugging/logging only - NEVER sent back to LLM
-          // LLM calls are stateless - no prior responses are reused
-          this.state.lastLLMCallAt = ts;
-          this.state.lastLLMDecision = llmDecision.action;
-          
-          // Reset circuit breaker on success
-          this.llmCircuitBreaker.failures = 0;
-          this.llmCircuitBreaker.lastFailureTs = null;
-          this.llmCircuitBreaker.isOpen = false;
-        } catch (error: any) {
-          // RULE 3: LLM errors must be NON-FATAL - graceful degradation
-          this.llmCircuitBreaker.failures += 1;
-          this.llmCircuitBreaker.lastFailureTs = ts;
-          
-          if (this.llmCircuitBreaker.failures >= maxFailures) {
-            this.llmCircuitBreaker.isOpen = true;
-            console.log(
-              `[LLM_UNAVAILABLE] Circuit breaker OPEN after ${this.llmCircuitBreaker.failures} failures - maintaining current state (bias=${exec.bias} phase=${exec.phase})`
-            );
-          } else {
-            console.log(
-              `[LLM_UNAVAILABLE] Error (${this.llmCircuitBreaker.failures}/${maxFailures}): ${error.message ?? error} - maintaining current state`
-            );
-          }
-          
-          // Graceful degradation: maintain current bias and phase
-          // Bot can continue trading without LLM temporarily
-          // Update derived confidence even without LLM (uses existing baseBiasConfidence)
-          if (exec.bias !== "NEUTRAL") {
-            exec.biasConfidence = this.calculateDerivedConfidence(exec, close, closed5mBars, ts);
-            exec.thesisConfidence = exec.biasConfidence;
-          }
-          llmDecision = null; // Signal that LLM call failed
-        }
-      } // Close: if (!this.llmCircuitBreaker.isOpen)
-    } // Close: if (this.llmService && is5mClose && closed5mBars.length > 0)
-    
     // ============================================================================
     // Call the authoritative reducer on every 5m close
     // CRITICAL: LLM never sets phase directly - phase is engine-owned
@@ -3625,48 +3533,7 @@ export class Orchestrator {
         llmDecision
       );
       shouldPublishEvent = reducerResult.shouldPublishEvent || shouldPublishEvent;
-      
-      // Handle A+ immediate entry (special case - bypasses normal flow)
-      if (llmDecision && llmDecision.action === "A+" && (llmDecision.bias === "bearish" || llmDecision.bias === "bullish")) {
-        const llmDirection: "long" | "short" = llmDecision.bias === "bearish" ? "short" : "long";
-        const current5m = forming5mBar ?? lastClosed5m;
-        if (current5m) {
-          const entryInfo = this.detectEntryType(exec.bias, current5m, closed5mBars.length >= 2 ? closed5mBars[closed5mBars.length - 2] : undefined);
-          
-          exec.entryPrice = current5m.close;
-          exec.entryTs = ts;
-          exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
-          exec.entryTrigger = entryInfo.trigger || "A+ maturity flip";
-          exec.pullbackHigh = current5m.high;
-          exec.pullbackLow = current5m.low;
-          exec.pullbackTs = ts;
-          exec.stopPrice = llmDirection === "long" ? current5m.low : current5m.high;
-          const atr = this.calculateATR(closed5mBars);
-          const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
-          const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
-          const targetResult = this.computeTargets(
-            llmDirection,
-            exec.entryPrice,
-            exec.stopPrice,
-            atr,
-            closedBarsWithVolume,
-            vwap,
-            exec.pullbackHigh,
-            exec.pullbackLow,
-            exec.impulseRange
-          );
-          exec.targets = targetResult.targets;
-          exec.targetZones = targetResult.targetZones;
-          exec.phase = "IN_TRADE";
-          exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-          exec.waitReason = "a+_maturity_flip_entry";
-          shouldPublishEvent = true;
-          console.log(
-            `[A+_ENTRY] ${exec.bias} entry at ${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
-          );
-        }
-      }
-      
+
       // Emit NO_TRADE diagnostic if applicable
       if (reducerResult.noTradeReason) {
         console.log(
@@ -4184,21 +4051,30 @@ export class Orchestrator {
             exec.setupVariant = undefined;
             exec.setupTriggerPrice = undefined;
             exec.setupStopPrice = undefined;
+            exec.effectiveTriggerPrice = undefined;
             exec.setupDetectedAt = undefined;
             console.log(`[IGNITION_EXPIRED] cleared after TTL`);
           }
+
+          // LLM nudge: use nextLevel as trigger when confidence high and direction aligned
+          if (exec.setup === "IGNITION" && exec.setupVariant && exec.llm1mNextLevel != null && (exec.llm1mConfidence ?? 0) >= 80 &&
+              ((exec.setupVariant === "LONG" && exec.llm1mDirection === "LONG") || (exec.setupVariant === "SHORT" && exec.llm1mDirection === "SHORT")))
+            exec.effectiveTriggerPrice = exec.llm1mNextLevel;
+          else if (exec.setup !== "IGNITION")
+            exec.effectiveTriggerPrice = undefined;
 
           // Entry signal for pullback continuation (5m-based)
           const entrySignalFires =
             (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) ||
             (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh)));
 
-          // Ignition signal (1m-based, immediate after flip)
+          // Ignition signal: use setupVariant for LLM-led direction; use effectiveTriggerPrice when set
+          const ignitionTriggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
+          const ignitionLong = exec.setupVariant === "LONG" || exec.bias === "BULLISH";
           const ignitionSignal =
             exec.setup === "IGNITION" &&
-            exec.setupTriggerPrice !== undefined &&
-            ((exec.bias === "BULLISH" && close > exec.setupTriggerPrice) ||
-             (exec.bias === "BEARISH" && close < exec.setupTriggerPrice));
+            ignitionTriggerLevel !== undefined &&
+            ((ignitionLong && close > ignitionTriggerLevel) || (!ignitionLong && close < ignitionTriggerLevel));
 
           // Entry permission: setup exists + appropriate signal fires
           // Pullback continuation uses 5m entry signal, ignition uses 1m trigger break
@@ -4240,8 +4116,9 @@ export class Orchestrator {
             exec.waitReason = "waiting_for_ignition_trigger";
             exec.entryBlocked = false;
             exec.entryBlockReason = undefined;
+            const triggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
             console.log(
-              `[ENTRY_WAITING] IGNITION setup exists but trigger not yet broken - BIAS=${exec.bias} trigger=${exec.setupTriggerPrice?.toFixed(2) ?? "n/a"} close=${close.toFixed(2)}`
+              `[ENTRY_WAITING] IGNITION setup exists but trigger not yet broken - variant=${exec.setupVariant} trigger=${triggerLevel?.toFixed(2) ?? "n/a"} close=${close.toFixed(2)}`
             );
           }
           // If setup exists and signal fires, but canEnter is still false, explain why.
@@ -4265,12 +4142,14 @@ export class Orchestrator {
               const oldPhase = exec.phase;
               const micro = exec.micro;
               const atr = micro?.atr1m ?? this.calculateATR(closed5mBars);
-              
+              const ignitionDir = exec.setupVariant === "LONG" || exec.bias === "BULLISH" ? "long" : "short";
+
               exec.entryPrice = close;
               exec.entryTs = ts;
               exec.entryType = "IGNITION_ENTRY";
-              exec.entryTrigger = `IGNITION: ${exec.bias === "BULLISH" ? "Breakout above" : "Breakdown below"} swing ${exec.bias === "BULLISH" ? "high" : "low"}`;
-              exec.stopPrice = exec.setupStopPrice ?? (exec.bias === "BULLISH" 
+              exec.entryTrigger = `IGNITION: ${ignitionDir === "long" ? "Breakout above" : "Breakdown below"} swing ${ignitionDir === "long" ? "high" : "low"}`;
+              exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
+              exec.stopPrice = exec.setupStopPrice ?? (ignitionDir === "long"
                 ? close - this.IGNITION_RISK_ATR * atr
                 : close + this.IGNITION_RISK_ATR * atr);
 
@@ -4283,7 +4162,7 @@ export class Orchestrator {
                 : undefined;
 
               const targetResult = this.computeTargets(
-                exec.bias === "BULLISH" ? "long" : "short",
+                ignitionDir,
                 exec.entryPrice,
                 exec.stopPrice,
                 atr,
@@ -4354,6 +4233,7 @@ export class Orchestrator {
                   exec.entryTs = ts;
                   exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
                   exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                  exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
                   exec.pullbackHigh = current5m.high;
                   exec.pullbackLow = current5m.low;
                   exec.pullbackTs = ts;
@@ -4456,6 +4336,7 @@ export class Orchestrator {
                   exec.entryTs = ts;
                   exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
                   exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                  exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
                   exec.pullbackHigh = current5m.high;
                   exec.pullbackLow = current5m.low;
                   exec.pullbackTs = ts;
@@ -4748,6 +4629,10 @@ export class Orchestrator {
         oppExpiresAt: exec.opportunity?.expiresAtTs,
         last5mCloseTs: lastClosed5m?.ts,
         source: is5mClose ? ("5m" as const) : ("1m" as const),
+        // LLM 1m coaching (into/out of setup)
+        coachLine: exec.llm1mCoachLine,
+        nextLevel: exec.llm1mNextLevel,
+        likelihoodHit: exec.llm1mLikelihoodHit,
       };
 
       events.push({
@@ -4824,6 +4709,9 @@ export class Orchestrator {
           oppExpiresAt: exec.opportunity?.expiresAtTs,
           last5mCloseTs: lastClosed5m?.ts,
           source: is5mClose ? ("5m" as const) : ("1m" as const),
+          coachLine: exec.llm1mCoachLine,
+          nextLevel: exec.llm1mNextLevel,
+          likelihoodHit: exec.llm1mLikelihoodHit,
         };
         
         events.push({
@@ -4894,12 +4782,7 @@ export class Orchestrator {
       console.log(`[PRELOAD] Daily context loaded: prevClose=${dailyContext.prevClose.toFixed(2)} prevHigh=${dailyContext.prevHigh.toFixed(2)} prevLow=${dailyContext.prevLow.toFixed(2)}`);
     }
     
-    // If we have enough bars, log readiness
-    if (this.recentBars5m.length >= this.minimalLlmBars) {
-      console.log(`[PRELOAD] Ready for LLM call: ${this.recentBars5m.length} bars >= ${this.minimalLlmBars} minimal`);
-    } else {
-      console.log(`[PRELOAD] Not ready for LLM call: ${this.recentBars5m.length} bars < ${this.minimalLlmBars} minimal`);
-    }
+    console.log(`[PRELOAD] Loaded ${this.recentBars5m.length} closed 5m bars`);
   }
 
   private async handleMinimal5m(snapshot: TickSnapshot): Promise<DomainEvent[]> {

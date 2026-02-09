@@ -132,6 +132,16 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     ? `📊 MARKET: ${snapshot.marketCondition}${snapshot.conditionReason ? ` (${snapshot.conditionReason})` : ""}`
     : undefined;
 
+  // LLM coaching line (into/out of setup)
+  const coachLine = snapshot.coachLine?.trim();
+  const nextLevel = Number.isFinite(snapshot.nextLevel) ? (snapshot.nextLevel as number) : undefined;
+  const likelihoodHit = Number.isFinite(snapshot.likelihoodHit) ? (snapshot.likelihoodHit as number) : undefined;
+  const nextPart = nextLevel !== undefined && likelihoodHit !== undefined ? `Next: ${formatPrice(nextLevel)} (${likelihoodHit}% likely)` : null;
+  const coachLineFormatted =
+    coachLine || nextPart
+      ? `🎯 Coach: ${[coachLine, nextPart].filter(Boolean).join(" | ")}`
+      : undefined;
+
   const lines = [
     `${biasEmoji} PRICE: ${price}`, // Always first with bias emoji
     refLine, // Reference price if available
@@ -141,6 +151,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     setupLine, // Setup type if available
     entryLine, // Entry status
     snapshot.reason ? `NOTE: ${snapshot.reason}` : undefined,
+    coachLineFormatted, // LLM coaching (into/out of setup)
     expectedLine, // Expected resolution if available
     invalidation,
     `⏳ WAITING FOR: ${waitFor}`,

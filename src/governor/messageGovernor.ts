@@ -45,9 +45,9 @@ export class MessageGovernor {
   }
 
   shouldSend(event: DomainEvent, _bot: TelegramBotLike, _chatId: number): boolean {
-    if (event.type !== "MIND_STATE_UPDATED") return false;
     const key = `${event.type}_${event.timestamp}`;
     if (this.dedupeKeys.has(key)) return false;
+    if (event.type !== "MIND_STATE_UPDATED" && event.type !== "LLM_1M_OPINION") return false;
     this.dedupeKeys.set(key, event.timestamp);
     return true;
   }
