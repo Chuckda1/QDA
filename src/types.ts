@@ -360,6 +360,10 @@ export type MinimalExecutionState = {
   pullbackHigh?: number;
   pullbackLow?: number;
   pullbackTs?: number;
+  /** When bias was set by LLM nudge: timestamp and bar range for momentum entry / protect pullback */
+  lastNudgeTs?: number;
+  nudgeBarHigh?: number;
+  nudgeBarLow?: number;
   entryPrice?: number;
   entryTs?: number;
   stopPrice?: number;

@@ -84,7 +84,15 @@ export class Orchestrator {
 
   /** Min LLM confidence (1m) to allow nudge from NEUTRAL/REPAIR when tape agrees */
   private readonly LLM_NUDGE_MIN_CONFIDENCE = 80;
-  
+  /** After nudge: allow momentum entry (break of nudge bar) for this long; gate expiry */
+  private readonly NUDGE_MOMENTUM_TTL_MS = 5 * 60 * 1000;  // 5 minutes
+  /** After nudge: require one extra bar before allowing REPAIR (avoid flip-flop) */
+  private readonly NUDGE_REPAIR_HYSTERESIS_MS = 3 * 60 * 1000;  // 3 minutes
+  /** After nudge: when finalizing from REPAIR, prefer nudge pullback range if tighter (within this window) */
+  private readonly NUDGE_PULLBACK_PROTECT_MS = 5 * 60 * 1000;  // 5 minutes
+  /** Gate reason string for nudge momentum gate (so we can allow entry on trigger break) */
+  private readonly GATE_REASON_NUDGE_MOMENTUM = "llm_nudge_momentum";
+
   // Ignition setup constants
   private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
   private readonly IGNITION_MIN_ATR = 0.18;                // avoid dead tape
@@ -1714,10 +1722,15 @@ export class Orchestrator {
 
     // --- State machine: ONLY neutralize, never finalize ---
     // 1m can only kick you out of a wrong thesis, not declare a new one
-    if (be.state === "BEARISH" && bullAccept) {
+    // After recent LLM nudge, require one extra bar before REPAIR (avoid flip-flop)
+    const justNudged = exec.lastNudgeTs != null && (ts - exec.lastNudgeTs) < this.NUDGE_REPAIR_HYSTERESIS_MS;
+    const exitAcceptRequired = justNudged ? this.BIAS_ENGINE_EXIT_ACCEPT + 1 : this.BIAS_ENGINE_EXIT_ACCEPT;
+    if (be.state === "BEARISH" && bullAccept &&
+        aboveVwap >= exitAcceptRequired && aboveEma >= exitAcceptRequired) {
       this.enterRepair(exec, ts, close, "REPAIR_BULL");
     }
-    if (be.state === "BULLISH" && bearAccept) {
+    if (be.state === "BULLISH" && bearAccept &&
+        belowVwap >= exitAcceptRequired && belowEma >= exitAcceptRequired) {
       this.enterRepair(exec, ts, close, "REPAIR_BEAR");
     }
 
@@ -1889,6 +1902,10 @@ export class Orchestrator {
     }
     const be = exec.biasEngine;
 
+    exec.lastNudgeTs = ts;
+    exec.nudgeBarHigh = barForPullback.high;
+    exec.nudgeBarLow = barForPullback.low;
+
     if (llmDir === "LONG") {
       be.state = "BULLISH";
       be.lastFlipTs = ts;
@@ -1905,6 +1922,22 @@ export class Orchestrator {
       exec.expectedResolution = "CONTINUATION";
       exec.waitReason = "waiting_for_pullback";
       exec.setup = "PULLBACK_CONTINUATION";  // so 1m arming can run before next 5m close
+      // Dip entry: trigger at pullback low so we enter on the dip (e.g. 693→692→693→694: enter at 692)
+      const atr1m = exec.micro?.atr1m;
+      if (atr1m && atr1m > 0 && (!exec.resolutionGate || exec.resolutionGate.status !== "ARMED")) {
+        exec.resolutionGate = {
+          status: "ARMED",
+          direction: "long",
+          triggerPrice: barForPullback.low + 0.1 * atr1m,
+          stopPrice: barForPullback.low - 0.15 * atr1m,
+          expiryTs: ts + this.NUDGE_MOMENTUM_TTL_MS,
+          armedTs: ts,
+          reason: this.GATE_REASON_NUDGE_MOMENTUM,
+        };
+        console.log(
+          `[GATE_ARMED] llm_nudge_dip LONG trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} (buy dip) stop=${exec.resolutionGate.stopPrice.toFixed(2)}`
+        );
+      }
       console.log(
         `[BIAS_LLM_NUDGE] NEUTRAL -> BULLISH | llmConf=${llmConf} tape=above_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
       );
@@ -1923,7 +1956,23 @@ export class Orchestrator {
       exec.phase = "BIAS_ESTABLISHED";
       exec.expectedResolution = "CONTINUATION";
       exec.waitReason = "waiting_for_pullback";
-      exec.setup = "PULLBACK_CONTINUATION";  // so 1m arming can run before next 5m close
+      exec.setup = "PULLBACK_CONTINUATION";
+      // Dip entry: trigger at pullback high so we enter on the rally into resistance (short the bounce)
+      const atr1m = exec.micro?.atr1m;
+      if (atr1m && atr1m > 0 && (!exec.resolutionGate || exec.resolutionGate.status !== "ARMED")) {
+        exec.resolutionGate = {
+          status: "ARMED",
+          direction: "short",
+          triggerPrice: barForPullback.high - 0.1 * atr1m,
+          stopPrice: barForPullback.high + 0.15 * atr1m,
+          expiryTs: ts + this.NUDGE_MOMENTUM_TTL_MS,
+          armedTs: ts,
+          reason: this.GATE_REASON_NUDGE_MOMENTUM,
+        };
+        console.log(
+          `[GATE_ARMED] llm_nudge_dip SHORT trigger=${exec.resolutionGate.triggerPrice.toFixed(2)} (sell rally) stop=${exec.resolutionGate.stopPrice.toFixed(2)}`
+        );
+      }
       console.log(
         `[BIAS_LLM_NUDGE] NEUTRAL -> BEARISH | llmConf=${llmConf} tape=below_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
       );
@@ -2048,8 +2097,15 @@ export class Orchestrator {
       exec.baseBiasConfidence = 65;
       exec.biasConfidence = 65;
       exec.lastBiasFlipTs = ts;
-      exec.pullbackHigh = sh;
-      exec.pullbackLow = sl;
+      const nudgeRecent = exec.lastNudgeTs != null && (ts - exec.lastNudgeTs) < this.NUDGE_PULLBACK_PROTECT_MS;
+      const nudgeTighter = exec.nudgeBarHigh != null && exec.nudgeBarLow != null && (exec.nudgeBarHigh - exec.nudgeBarLow) <= (sh - sl);
+      if (nudgeRecent && nudgeTighter) {
+        exec.pullbackHigh = exec.nudgeBarHigh;
+        exec.pullbackLow = exec.nudgeBarLow;
+      } else {
+        exec.pullbackHigh = sh;
+        exec.pullbackLow = sl;
+      }
       exec.pullbackTs = ts;
 
       // Clear stale artifacts
@@ -2087,8 +2143,15 @@ export class Orchestrator {
       exec.baseBiasConfidence = 65;
       exec.biasConfidence = 65;
       exec.lastBiasFlipTs = ts;
-      exec.pullbackHigh = sh;
-      exec.pullbackLow = sl;
+      const nudgeRecentBear = exec.lastNudgeTs != null && (ts - exec.lastNudgeTs) < this.NUDGE_PULLBACK_PROTECT_MS;
+      const nudgeTighterBear = exec.nudgeBarHigh != null && exec.nudgeBarLow != null && (exec.nudgeBarHigh - exec.nudgeBarLow) <= (sh - sl);
+      if (nudgeRecentBear && nudgeTighterBear) {
+        exec.pullbackHigh = exec.nudgeBarHigh;
+        exec.pullbackLow = exec.nudgeBarLow;
+      } else {
+        exec.pullbackHigh = sh;
+        exec.pullbackLow = sl;
+      }
       exec.pullbackTs = ts;
 
       // Clear stale artifacts
@@ -4236,6 +4299,20 @@ export class Orchestrator {
             (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) ||
             (exec.bias === "BEARISH" && (isBullish || (previous5m && higherHigh)));
 
+          // LLM nudge momentum: enter on break of nudge bar when gate is armed (capitalize on nudge without waiting for deep pullback)
+          const isNudgeMomentumWindow =
+            exec.lastNudgeTs != null &&
+            (ts - exec.lastNudgeTs) <= this.NUDGE_MOMENTUM_TTL_MS &&
+            exec.nudgeBarHigh != null &&
+            exec.nudgeBarLow != null;
+          const gateIsNudgeMomentum = exec.resolutionGate?.reason === this.GATE_REASON_NUDGE_MOMENTUM;
+          const triggerPrice = exec.resolutionGate?.triggerPrice;
+          // Dip entry: LONG when price pulls back to trigger (close at or below); SHORT when price rallies to trigger (close at or above)
+          const momentumBreakLong =
+            gateReady && gateIsNudgeMomentum && exec.bias === "BULLISH" && triggerPrice != null && close <= triggerPrice;
+          const momentumBreakShort =
+            gateReady && gateIsNudgeMomentum && exec.bias === "BEARISH" && triggerPrice != null && close >= triggerPrice;
+
           // Ignition signal: use setupVariant for LLM-led direction; use effectiveTriggerPrice when set
           const ignitionTriggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
           const ignitionLong = exec.setupVariant === "LONG" || exec.bias === "BULLISH";
@@ -4245,11 +4322,11 @@ export class Orchestrator {
             ((ignitionLong && close > ignitionTriggerLevel) || (!ignitionLong && close < ignitionTriggerLevel));
 
           // Entry permission: setup exists + appropriate signal fires
-          // Pullback continuation uses 5m entry signal, ignition uses 1m trigger break
+          // Pullback: 5m entry signal OR nudge momentum break (break of nudge bar high/low)
           const isPullback = exec.setup === "PULLBACK_CONTINUATION";
           const isIgnition = exec.setup === "IGNITION";
-          const canEnter = 
-            (isPullback && entrySignalFires) ||
+          const canEnter =
+            (isPullback && (entrySignalFires || (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)))) ||
             (isIgnition && ignitionSignal);
 
           // ------------------------------------------------------------
@@ -4271,13 +4348,12 @@ export class Orchestrator {
           }
           // If setup exists but entry signal hasn't fired yet, this is "waiting", not blocked.
           else if (exec.setup === "PULLBACK_CONTINUATION" && !entrySignalFires) {
-            exec.waitReason = "waiting_for_entry_signal";
+            exec.waitReason =
+              isNudgeMomentumWindow && gateIsNudgeMomentum ? "waiting_for_momentum_trigger" : "waiting_for_entry_signal";
             exec.entryBlocked = false;
             exec.entryBlockReason = undefined;
-            // Optional publish if you want visibility that you're staged and waiting
-            // shouldPublishEvent = true;
             console.log(
-              `[ENTRY_WAITING] Setup=${exec.setup} exists but entry signal not yet fired - BIAS=${exec.bias}`
+              `[ENTRY_WAITING] Setup=${exec.setup} ${exec.waitReason} - BIAS=${exec.bias}`
             );
           }
           else if (exec.setup === "IGNITION" && !ignitionSignal) {
@@ -4305,8 +4381,38 @@ export class Orchestrator {
           // 6) Entry execution (unchanged from your block)
           // ------------------------------------------------------------
           if (canEnter) {
+            // NUDGE MOMENTUM entry: break of nudge bar (no deep pullback required)
+            if (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)) {
+              const oldPhase = exec.phase;
+              const atrMom = exec.micro?.atr1m ?? this.calculateATR(closed5mBars);
+              const dir = momentumBreakLong ? "long" : "short";
+              exec.entryPrice = close;
+              exec.entryTs = ts;
+              exec.entryType = "PULLBACK_ENTRY";
+              exec.entryTrigger = `LLM nudge dip: ${dir === "long" ? "buy" : "sell"} ${dir === "long" ? "dip to" : "rally to"} nudge ${dir === "long" ? "low" : "high"}`;
+              exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
+              exec.stopPrice = exec.resolutionGate?.stopPrice ?? (dir === "long" ? close - 0.5 * atrMom : close + 0.5 * atrMom);
+              const closedBarsWithVol = closed5mBars.filter((b) => "volume" in b) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapMom = closedBarsWithVol.length > 0 ? this.calculateVWAP(closedBarsWithVol) : undefined;
+              const targetResult = this.computeTargets(dir as "long" | "short", exec.entryPrice, exec.stopPrice, atrMom, closedBarsWithVol, vwapMom, undefined, undefined, undefined);
+              exec.targets = targetResult.targets;
+              exec.targetZones = targetResult.targetZones;
+              exec.phase = "IN_TRADE";
+              exec.reason = `Entered (nudge momentum) — ${exec.entryTrigger}`;
+              exec.waitReason = "in_trade";
+              exec.entryBlocked = false;
+              exec.entryBlockReason = undefined;
+              exec.lastNudgeTs = undefined;
+              exec.nudgeBarHigh = undefined;
+              exec.nudgeBarLow = undefined;
+              if (exec.opportunity) exec.opportunity.status = "CONSUMED";
+              if (exec.resolutionGate) exec.resolutionGate.status = "TRIGGERED";
+              console.log(
+                `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | NUDGE_DIP ${dir} entry=${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)}`
+              );
+            }
             // IGNITION entry (1m-based, immediate after flip)
-            if (isIgnition && ignitionSignal) {
+            else if (isIgnition && ignitionSignal) {
               const oldPhase = exec.phase;
               const micro = exec.micro;
               const atr = micro?.atr1m ?? this.calculateATR(closed5mBars);
@@ -4349,6 +4455,9 @@ export class Orchestrator {
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
               exec.entryBlockReason = undefined;
+              exec.lastNudgeTs = undefined;
+              exec.nudgeBarHigh = undefined;
+              exec.nudgeBarLow = undefined;
 
               if (exec.opportunity) {
                 exec.opportunity.status = "CONSUMED";
@@ -4438,6 +4547,9 @@ export class Orchestrator {
                   exec.waitReason = "in_trade";
                   exec.entryBlocked = false;
                   exec.entryBlockReason = undefined;
+                  exec.lastNudgeTs = undefined;
+                  exec.nudgeBarHigh = undefined;
+                  exec.nudgeBarLow = undefined;
 
                   if (exec.opportunity) {
                     exec.opportunity.status = "CONSUMED";
@@ -4537,6 +4649,9 @@ export class Orchestrator {
                   exec.waitReason = "in_trade";
                   exec.entryBlocked = false;
                   exec.entryBlockReason = undefined;
+                  exec.lastNudgeTs = undefined;
+                  exec.nudgeBarHigh = undefined;
+                  exec.nudgeBarLow = undefined;
 
                   if (exec.opportunity) {
                     exec.opportunity.status = "CONSUMED";
