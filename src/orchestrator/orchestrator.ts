@@ -4998,7 +4998,7 @@ export class Orchestrator {
         expectedResolution: exec.expectedResolution ?? undefined,
         setup: exec.setup ?? undefined, // Explicit setup type
         setupTriggerPrice: exec.setupTriggerPrice,
-        triggerContext: exec.phase === "EXTENSION" ? "extended" : exec.phase === "PULLBACK_IN_PROGRESS" ? "in_pullback" : undefined,
+        triggerContext: (exec.phase === "EXTENSION" ? "extended" : exec.phase === "PULLBACK_IN_PROGRESS" ? "in_pullback" : undefined) as "extended" | "in_pullback" | undefined,
         setupStopPrice: exec.setupStopPrice,
         setupDetectedAt: exec.setupDetectedAt,
         lastBiasFlipTs: exec.lastBiasFlipTs,
