@@ -2907,6 +2907,68 @@ export class Orchestrator {
     return { valid, reason };
   }
 
+  // Momentum confirmation gate: Block entries in balance zones with declining volatility
+  // This prevents entries when price is chopping near VWAP with no momentum
+  private momentumConfirmationGate(
+    bias: MarketBias,
+    currentPrice: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    vwap: number | undefined,
+    atr: number
+  ): { blocked: boolean; reason?: string } {
+    if (atr <= 0 || closed5mBars.length < 6) {
+      return { blocked: false };
+    }
+
+    // Check 1: ATR Trend - Block if ATR is declining (volatility compression = balance)
+    if (closed5mBars.length >= 10) {
+      const recent = closed5mBars.slice(-6);
+      const currentAtr = this.calculateATR(recent.slice(-3));
+      const priorAtr = this.calculateATR(recent.slice(-6, -3));
+      if (priorAtr > 0 && currentAtr < priorAtr * 0.95) {
+        // ATR declining - check if we're also in balance zone
+        if (vwap !== undefined) {
+          const distanceFromVwap = Math.abs(currentPrice - vwap);
+          const vwapTolerance = 0.2 * atr;
+          
+          // Block if price is within 0.2*ATR of VWAP AND ATR is declining
+          if (distanceFromVwap < vwapTolerance) {
+            return { blocked: true, reason: "balance_zone_no_momentum" };
+          }
+        }
+      }
+    }
+
+    // Check 2: Balance Zone Detection - Price chopping in tight range
+    if (closed5mBars.length >= 6) {
+      const recent = closed5mBars.slice(-6);
+      const recentHigh = Math.max(...recent.map(b => b.high));
+      const recentLow = Math.min(...recent.map(b => b.low));
+      const recentRange = recentHigh - recentLow;
+      const avgRange = recent.map(b => b.high - b.low).reduce((a, b) => a + b, 0) / recent.length;
+      
+      // If range is tight relative to ATR and we're near VWAP, it's balance
+      if (vwap !== undefined && recentRange < 0.6 * atr && avgRange < 0.5 * atr) {
+        const distanceFromVwap = Math.abs(currentPrice - vwap);
+        if (distanceFromVwap < 0.3 * atr) {
+          return { blocked: true, reason: "balance_zone_chopping" };
+        }
+      }
+    }
+
+    // Check 3: VWAP Displacement - For bullish, need price above VWAP; for bearish, below
+    if (vwap !== undefined) {
+      const vwapTolerance = 0.15 * atr;
+      if (bias === "BULLISH" && currentPrice < vwap - vwapTolerance) {
+        return { blocked: true, reason: "momentum_below_vwap" };
+      } else if (bias === "BEARISH" && currentPrice > vwap + vwapTolerance) {
+        return { blocked: true, reason: "momentum_above_vwap" };
+      }
+    }
+
+    return { blocked: false };
+  }
+
   // Detect momentum pause or compression (transition to re-entry window)
   private detectMomentumPause(
     bias: MarketBias,
@@ -4685,7 +4747,29 @@ export class Orchestrator {
                   exec.entryBlockReason = "setup_not_pullback_continuation";
                   exec.waitReason = "setup_not_pullback_continuation";
                 } else {
-                  const oldPhase = exec.phase;
+                  // Momentum confirmation gate: Block entries in balance zones with no momentum
+                  const atrForMomentum = this.calculateATR(closed5mBars);
+                  const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+                  const vwapForMomentum = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+                  
+                  const momentumCheck = this.momentumConfirmationGate(
+                    exec.bias,
+                    current5m.close,
+                    closed5mBars,
+                    vwapForMomentum,
+                    atrForMomentum
+                  );
+                  
+                  if (momentumCheck.blocked) {
+                    exec.entryBlocked = true;
+                    exec.entryBlockReason = momentumCheck.reason;
+                    exec.waitReason = momentumCheck.reason ?? "momentum_not_confirmed";
+                    shouldPublishEvent = true;
+                    console.log(
+                      `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${momentumCheck.reason} - Momentum gate blocked entry (balance zone / no momentum)`
+                    );
+                  } else {
+                    const oldPhase = exec.phase;
                   const entryInfo = this.detectEntryType(
                     exec.bias,
                     current5m,
@@ -4812,23 +4896,45 @@ export class Orchestrator {
                   exec.entryBlockReason = "setup_not_pullback_continuation";
                   exec.waitReason = "setup_not_pullback_continuation";
                 } else {
-                  const oldPhase = exec.phase;
-                  const entryInfo = this.detectEntryType(
+                  // Momentum confirmation gate: Block entries in balance zones with no momentum
+                  const atrForMomentum = this.calculateATR(closed5mBars);
+                  const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+                  const vwapForMomentum = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+                  
+                  const momentumCheck = this.momentumConfirmationGate(
                     exec.bias,
-                    current5m,
-                    previous5m ?? undefined
+                    current5m.close,
+                    closed5mBars,
+                    vwapForMomentum,
+                    atrForMomentum
                   );
+                  
+                  if (momentumCheck.blocked) {
+                    exec.entryBlocked = true;
+                    exec.entryBlockReason = momentumCheck.reason;
+                    exec.waitReason = momentumCheck.reason ?? "momentum_not_confirmed";
+                    shouldPublishEvent = true;
+                    console.log(
+                      `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${momentumCheck.reason} - Momentum gate blocked entry (balance zone / no momentum)`
+                    );
+                  } else {
+                    const oldPhase = exec.phase;
+                    const entryInfo = this.detectEntryType(
+                      exec.bias,
+                      current5m,
+                      previous5m ?? undefined
+                    );
 
-                  exec.entryPrice = current5m.close;
-                  exec.entryTs = ts;
-                  exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
-                  exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                  exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
-                  exec.pullbackHigh = current5m.high;
-                  exec.pullbackLow = current5m.low;
-                  exec.pullbackTs = ts;
+                    exec.entryPrice = current5m.close;
+                    exec.entryTs = ts;
+                    exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
+                    exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                    exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
+                    exec.pullbackHigh = current5m.high;
+                    exec.pullbackLow = current5m.low;
+                    exec.pullbackTs = ts;
 
-                  const atrShort = this.calculateATR(closed5mBars);
+                    const atrShort = this.calculateATR(closed5mBars);
                   const stopFallback = previous5m
                     ? Math.max(previous5m.high, current5m.high) + atrShort * 0.1
                     : current5m.high + atrShort * 0.1;
