@@ -4770,72 +4770,73 @@ export class Orchestrator {
                     );
                   } else {
                     const oldPhase = exec.phase;
-                  const entryInfo = this.detectEntryType(
-                    exec.bias,
-                    current5m,
-                    previous5m ?? undefined
-                  );
+                    const entryInfo = this.detectEntryType(
+                      exec.bias,
+                      current5m,
+                      previous5m ?? undefined
+                    );
 
-                  exec.entryPrice = current5m.close;
-                  exec.entryTs = ts;
-                  exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
-                  exec.entryTrigger = entryInfo.trigger || "Pullback entry";
-                  exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
-                  exec.pullbackHigh = current5m.high;
-                  exec.pullbackLow = current5m.low;
-                  exec.pullbackTs = ts;
+                    exec.entryPrice = current5m.close;
+                    exec.entryTs = ts;
+                    exec.entryType = entryInfo.type || "PULLBACK_ENTRY";
+                    exec.entryTrigger = entryInfo.trigger || "Pullback entry";
+                    exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
+                    exec.pullbackHigh = current5m.high;
+                    exec.pullbackLow = current5m.low;
+                    exec.pullbackTs = ts;
 
-                  const atrLong = this.calculateATR(closed5mBars);
-                  const stopFallback = previous5m
-                    ? Math.min(previous5m.low, current5m.low) - atrLong * 0.1
-                    : current5m.low - atrLong * 0.1;
+                    const atrLong = this.calculateATR(closed5mBars);
+                    const stopFallback = previous5m
+                      ? Math.min(previous5m.low, current5m.low) - atrLong * 0.1
+                      : current5m.low - atrLong * 0.1;
 
-                  exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
-                  const minStopDistanceLong = Math.max(0.5 * atrLong, 0.10);
-                  const maxStopPriceLong = exec.entryPrice - minStopDistanceLong;
-                  if (exec.stopPrice > maxStopPriceLong) exec.stopPrice = maxStopPriceLong;
+                    exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
+                    const minStopDistanceLong = Math.max(0.5 * atrLong, 0.10);
+                    const maxStopPriceLong = exec.entryPrice - minStopDistanceLong;
+                    if (exec.stopPrice > maxStopPriceLong) exec.stopPrice = maxStopPriceLong;
 
-                  const targetResultLong = this.computeTargets(
-                    "long",
-                    exec.entryPrice,
-                    exec.stopPrice,
-                    atrLong,
-                    closedBarsWithVolumeLong,
-                    vwapLong,
-                    exec.pullbackHigh,
-                    exec.pullbackLow,
-                    exec.impulseRange
-                  );
+                    const targetResultLong = this.computeTargets(
+                      "long",
+                      exec.entryPrice,
+                      exec.stopPrice,
+                      atrLong,
+                      closedBarsWithVolumeLong,
+                      vwapLong,
+                      exec.pullbackHigh,
+                      exec.pullbackLow,
+                      exec.impulseRange
+                    );
 
-                  exec.targets = targetResultLong.targets;
-                  exec.targetZones = targetResultLong.targetZones;
+                    exec.targets = targetResultLong.targets;
+                    exec.targetZones = targetResultLong.targetZones;
 
-                  exec.thesisDirection = "long"; // Explicitly set for stop/target checks
-                  exec.phase = "IN_TRADE";
-                  exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-                  exec.waitReason = "in_trade";
-                  exec.entryBlocked = false;
-                  exec.entryBlockReason = undefined;
-                  exec.lastNudgeTs = undefined;
-                  exec.nudgeBarHigh = undefined;
-                  exec.nudgeBarLow = undefined;
+                    exec.thesisDirection = "long"; // Explicitly set for stop/target checks
+                    exec.phase = "IN_TRADE";
+                    exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
+                    exec.waitReason = "in_trade";
+                    exec.entryBlocked = false;
+                    exec.entryBlockReason = undefined;
+                    exec.lastNudgeTs = undefined;
+                    exec.nudgeBarHigh = undefined;
+                    exec.nudgeBarLow = undefined;
 
-                  if (exec.opportunity) {
-                    exec.opportunity.status = "CONSUMED";
-                  }
+                    if (exec.opportunity) {
+                      exec.opportunity.status = "CONSUMED";
+                    }
 
-                  console.log(
-                    `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
-                      2
-                    )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
-                      2
-                    )}`
-                  );
+                    console.log(
+                      `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
+                        2
+                      )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
+                        2
+                      )}`
+                    );
                 }
                 }
               }
             }
-
+            }
+            }
             // Enter ON pullback for BEARISH bias
             if (
               exec.bias === "BEARISH" &&
@@ -4935,51 +4936,51 @@ export class Orchestrator {
                     exec.pullbackTs = ts;
 
                     const atrShort = this.calculateATR(closed5mBars);
-                  const stopFallback = previous5m
-                    ? Math.max(previous5m.high, current5m.high) + atrShort * 0.1
-                    : current5m.high + atrShort * 0.1;
+                    const stopFallback = previous5m
+                      ? Math.max(previous5m.high, current5m.high) + atrShort * 0.1
+                      : current5m.high + atrShort * 0.1;
 
-                  exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
-                  const minStopDistanceShort = Math.max(0.5 * atrShort, 0.10);
-                  const minStopPriceShort = exec.entryPrice + minStopDistanceShort;
-                  if (exec.stopPrice < minStopPriceShort) exec.stopPrice = minStopPriceShort;
+                    exec.stopPrice = exec.opportunity?.stop.price ?? stopFallback;
+                    const minStopDistanceShort = Math.max(0.5 * atrShort, 0.10);
+                    const minStopPriceShort = exec.entryPrice + minStopDistanceShort;
+                    if (exec.stopPrice < minStopPriceShort) exec.stopPrice = minStopPriceShort;
 
-                  const targetResultShort = this.computeTargets(
-                    "short",
-                    exec.entryPrice,
-                    exec.stopPrice,
-                    atrShort,
-                    closedBarsWithVolumeShort,
-                    vwapShort,
-                    exec.pullbackHigh,
-                    exec.pullbackLow,
-                    exec.impulseRange
-                  );
+                    const targetResultShort = this.computeTargets(
+                      "short",
+                      exec.entryPrice,
+                      exec.stopPrice,
+                      atrShort,
+                      closedBarsWithVolumeShort,
+                      vwapShort,
+                      exec.pullbackHigh,
+                      exec.pullbackLow,
+                      exec.impulseRange
+                    );
 
-                  exec.targets = targetResultShort.targets;
-                  exec.targetZones = targetResultShort.targetZones;
+                    exec.targets = targetResultShort.targets;
+                    exec.targetZones = targetResultShort.targetZones;
 
-                  exec.thesisDirection = "short"; // Explicitly set for stop/target checks
-                  exec.phase = "IN_TRADE";
-                  exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-                  exec.waitReason = "in_trade";
-                  exec.entryBlocked = false;
-                  exec.entryBlockReason = undefined;
-                  exec.lastNudgeTs = undefined;
-                  exec.nudgeBarHigh = undefined;
-                  exec.nudgeBarLow = undefined;
+                    exec.thesisDirection = "short"; // Explicitly set for stop/target checks
+                    exec.phase = "IN_TRADE";
+                    exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
+                    exec.waitReason = "in_trade";
+                    exec.entryBlocked = false;
+                    exec.entryBlockReason = undefined;
+                    exec.lastNudgeTs = undefined;
+                    exec.nudgeBarHigh = undefined;
+                    exec.nudgeBarLow = undefined;
 
-                  if (exec.opportunity) {
-                    exec.opportunity.status = "CONSUMED";
-                  }
+                    if (exec.opportunity) {
+                      exec.opportunity.status = "CONSUMED";
+                    }
 
-                  console.log(
-                    `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
-                      2
-                    )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
-                      2
-                    )}`
-                  );
+                    console.log(
+                      `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(
+                        2
+                      )} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(
+                        2
+                      )}`
+                    );
                 }
                 }
               }
