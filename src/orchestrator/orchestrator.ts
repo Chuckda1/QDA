@@ -389,6 +389,77 @@ export class Orchestrator {
     return sum / recentBars.length;
   }
 
+  // Calculate RSI (Relative Strength Index) - 14 period default
+  private calculateRSI(bars: Array<{ close: number }>, period: number = 14): number | undefined {
+    if (bars.length < period + 1) return undefined;
+    
+    const recentBars = bars.slice(-(period + 1));
+    const gains: number[] = [];
+    const losses: number[] = [];
+    
+    for (let i = 1; i < recentBars.length; i++) {
+      const change = recentBars[i].close - recentBars[i - 1].close;
+      if (change > 0) {
+        gains.push(change);
+        losses.push(0);
+      } else {
+        gains.push(0);
+        losses.push(Math.abs(change));
+      }
+    }
+    
+    const avgGain = gains.reduce((a, b) => a + b, 0) / period;
+    const avgLoss = losses.reduce((a, b) => a + b, 0) / period;
+    
+    if (avgLoss === 0) return 100; // All gains, RSI = 100
+    
+    const rs = avgGain / avgLoss;
+    const rsi = 100 - (100 / (1 + rs));
+    
+    return rsi;
+  }
+
+  // Calculate MACD (Moving Average Convergence Divergence) with histogram
+  // Returns: { macd: number, signal: number, histogram: number } | undefined
+  private calculateMACD(
+    bars: Array<{ close: number }>,
+    fastPeriod: number = 12,
+    slowPeriod: number = 26,
+    signalPeriod: number = 9
+  ): { macd: number; signal: number; histogram: number } | undefined {
+    if (bars.length < slowPeriod + signalPeriod) return undefined;
+    
+    // Calculate fast EMA
+    const fastEMA = this.calculateEMA(bars, fastPeriod);
+    
+    // Calculate slow EMA
+    const slowEMA = this.calculateEMA(bars, slowPeriod);
+    
+    // MACD line = fast EMA - slow EMA
+    const macd = fastEMA - slowEMA;
+    
+    // For signal line, we need MACD values over time
+    // Simplified: use recent bars to calculate signal EMA of MACD
+    // This is an approximation - for full accuracy, we'd need to track MACD values over time
+    if (bars.length < slowPeriod + signalPeriod + 1) return undefined;
+    
+    // Calculate MACD values for signal line
+    const macdValues: Array<{ close: number }> = [];
+    for (let i = slowPeriod; i < bars.length; i++) {
+      const fastEMASlice = this.calculateEMA(bars.slice(0, i + 1), fastPeriod);
+      const slowEMASlice = this.calculateEMA(bars.slice(0, i + 1), slowPeriod);
+      macdValues.push({ close: fastEMASlice - slowEMASlice });
+    }
+    
+    // Signal line = EMA of MACD
+    const signal = this.calculateEMA(macdValues, signalPeriod);
+    
+    // Histogram = MACD - Signal
+    const histogram = macd - signal;
+    
+    return { macd, signal, histogram };
+  }
+
   // Build daily context lite for LLM
   private buildDailyContextLite(
     exec: MinimalExecutionState,
@@ -2030,7 +2101,13 @@ export class Orchestrator {
   // 1m engine can only neutralize (enter REPAIR), never finalize
   // Only 5m structure breaks can finalize a full flip (BULLISH/BEARISH)
   // ============================================================================
-  private finalizeBiasFrom5m(exec: MinimalExecutionState, ts: number, close: number): void {
+  private finalizeBiasFrom5m(
+    exec: MinimalExecutionState,
+    ts: number,
+    close: number,
+    closed5mBars?: Array<{ high: number; low: number; close: number }>,
+    vwap?: number
+  ): void {
     const be = exec.biasEngine;
     if (!be) return;
 
@@ -2140,6 +2217,20 @@ export class Orchestrator {
     }
 
     if (be.state === "REPAIR_BEAR" && breakDown) {
+      // Bearish flip confirmation: Require structure (lower low + failed VWAP reclaim)
+      let bearishConfirmed = true; // Default to true if we don't have data
+      if (closed5mBars && closed5mBars.length >= 10 && vwap !== undefined) {
+        const confirmation = this.confirmBearishFlip(close, closed5mBars, vwap, sl);
+        bearishConfirmed = confirmation.confirmed;
+        if (!bearishConfirmed) {
+          console.log(
+            `[BEARISH_FLIP_BLOCKED] ${confirmation.reason} - Waiting for structure confirmation before flipping to BEARISH`
+          );
+          // Stay in REPAIR_BEAR state, don't flip yet
+          return;
+        }
+      }
+
       be.state = "BEARISH";
       be.lastFlipTs = ts;
       be.repairStartTs = undefined;
@@ -2969,6 +3060,305 @@ export class Orchestrator {
     return { blocked: false };
   }
 
+  // Momentum Kill Switch: Invalidates bias when momentum fails (RSI < 40, MACD expanding down, price < VWAP)
+  // This prevents the bot from maintaining bullish bias when momentum has clearly failed
+  // Returns: { shouldInvalidate: boolean; reason?: string; newBias?: MarketBias }
+  private momentumKillSwitch(
+    exec: MinimalExecutionState,
+    currentPrice: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    vwap: number | undefined,
+    atr: number
+  ): { shouldInvalidate: boolean; reason?: string; newBias?: MarketBias } {
+    // Only check if we have a non-neutral bias and are not in trade
+    if (exec.bias === "NEUTRAL" || exec.phase === "IN_TRADE") {
+      return { shouldInvalidate: false };
+    }
+
+    // Need minimum bars for RSI/MACD
+    if (closed5mBars.length < 30) {
+      return { shouldInvalidate: false };
+    }
+
+    // Calculate RSI
+    const rsi = this.calculateRSI(closed5mBars.map(b => ({ close: b.close })), 14);
+    if (rsi === undefined) {
+      return { shouldInvalidate: false };
+    }
+
+    // Calculate MACD
+    const macdResult = this.calculateMACD(closed5mBars.map(b => ({ close: b.close })));
+    if (macdResult === undefined) {
+      return { shouldInvalidate: false };
+    }
+
+    // Get MACD histogram trend (require 2+ bars decreasing/increasing for robustness)
+    let macdDecreasing2Plus = false;
+    let macdIncreasing2Plus = false;
+    if (closed5mBars.length >= 36) {
+      // Calculate MACD for last 3 bars to check trend
+      const histograms: number[] = [];
+      for (let i = closed5mBars.length - 3; i < closed5mBars.length; i++) {
+        const barsSlice = closed5mBars.slice(0, i + 1);
+        const macd = this.calculateMACD(barsSlice.map(b => ({ close: b.close })));
+        if (macd) {
+          histograms.push(macd.histogram);
+        }
+      }
+      
+      // Check if histogram is decreasing for 2+ consecutive bars
+      if (histograms.length >= 3) {
+        const current = histograms[2];
+        const prev1 = histograms[1];
+        const prev2 = histograms[0];
+        macdDecreasing2Plus = current < prev1 && prev1 < prev2 && current < 0;
+        macdIncreasing2Plus = current > prev1 && prev1 > prev2 && current > 0;
+      }
+    }
+
+    // Check VWAP
+    if (vwap === undefined) {
+      return { shouldInvalidate: false };
+    }
+
+    // Momentum failure conditions for BULLISH bias
+    if (exec.bias === "BULLISH") {
+      const rsiBelowThreshold = rsi < 40;
+      const macdExpandingDown = macdDecreasing2Plus; // Require 2+ bars decreasing
+      const priceBelowVwap = currentPrice < vwap;
+
+      // Require at least 2 of 3 conditions for momentum failure
+      const failureCount = [rsiBelowThreshold, macdExpandingDown, priceBelowVwap].filter(Boolean).length;
+      
+      if (failureCount >= 2) {
+        const reasons: string[] = [];
+        if (rsiBelowThreshold) reasons.push(`RSI=${rsi.toFixed(2)}<40`);
+        if (macdExpandingDown) reasons.push(`MACD_expanding_down`);
+        if (priceBelowVwap) reasons.push(`price=${currentPrice.toFixed(2)}<VWAP=${vwap.toFixed(2)}`);
+        
+        return {
+          shouldInvalidate: true,
+          reason: `momentum_failure: ${reasons.join(", ")}`,
+          newBias: "NEUTRAL"
+        };
+      }
+    }
+
+    // Momentum failure conditions for BEARISH bias
+    if (exec.bias === "BEARISH") {
+      const rsiAboveThreshold = rsi > 60;
+      const macdExpandingUp = macdIncreasing2Plus; // Require 2+ bars increasing
+      const priceAboveVwap = currentPrice > vwap;
+
+      // Require at least 2 of 3 conditions for momentum failure
+      const failureCount = [rsiAboveThreshold, macdExpandingUp, priceAboveVwap].filter(Boolean).length;
+      
+      if (failureCount >= 2) {
+        const reasons: string[] = [];
+        if (rsiAboveThreshold) reasons.push(`RSI=${rsi.toFixed(2)}>60`);
+        if (macdExpandingUp) reasons.push(`MACD_expanding_up`);
+        if (priceAboveVwap) reasons.push(`price=${currentPrice.toFixed(2)}>VWAP=${vwap.toFixed(2)}`);
+        
+        return {
+          shouldInvalidate: true,
+          reason: `momentum_failure: ${reasons.join(", ")}`,
+          newBias: "NEUTRAL"
+        };
+      }
+    }
+
+    return { shouldInvalidate: false };
+  }
+
+  // Late Entry Detection: Detects when entry comes after most of the move has already happened
+  // Returns: { isLate: boolean; reason?: string; confidencePenalty?: number; targetReduction?: number }
+  private detectLateEntry(
+    bias: MarketBias,
+    currentPrice: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    atr: number,
+    vwap: number | undefined
+  ): { isLate: boolean; reason?: string; confidencePenalty?: number; targetReduction?: number } {
+    if (closed5mBars.length < 30) {
+      return { isLate: false };
+    }
+
+    // Calculate RSI
+    const rsi = this.calculateRSI(closed5mBars.map(b => ({ close: b.close })), 14);
+    if (rsi === undefined) {
+      return { isLate: false };
+    }
+
+    // Check for oversold/overbought extremes (late entry signal)
+    const isOversold = rsi < 32;
+    const isOverbought = rsi > 68;
+
+    // Check if ATR has already spiked (initial impulse already printed)
+    let atrSpiked = false;
+    if (closed5mBars.length >= 20) {
+      const recentBars = closed5mBars.slice(-6);
+      const olderBars = closed5mBars.slice(-20, -6);
+      const recentAtr = this.calculateATR(recentBars);
+      const olderAtr = this.calculateATR(olderBars);
+      
+      // ATR spiked if recent ATR is significantly higher than older ATR
+      if (olderAtr > 0 && recentAtr > olderAtr * 1.3) {
+        atrSpiked = true;
+      }
+    }
+
+    // Late entry conditions for SHORT entries (bearish bias)
+    if (bias === "BEARISH") {
+      if (isOversold && atrSpiked) {
+        return {
+          isLate: true,
+          reason: `late_entry_oversold: RSI=${rsi.toFixed(2)}<32 ATR_spiked=${atrSpiked}`,
+          confidencePenalty: 20, // Reduce confidence by 20 points
+          targetReduction: 0.5 // Reduce targets by 50% (scalp instead of swing)
+        };
+      }
+      if (isOversold) {
+        return {
+          isLate: true,
+          reason: `late_entry_oversold: RSI=${rsi.toFixed(2)}<32`,
+          confidencePenalty: 15,
+          targetReduction: 0.3
+        };
+      }
+    }
+
+    // Late entry conditions for LONG entries (bullish bias)
+    if (bias === "BULLISH") {
+      if (isOverbought && atrSpiked) {
+        return {
+          isLate: true,
+          reason: `late_entry_overbought: RSI=${rsi.toFixed(2)}>68 ATR_spiked=${atrSpiked}`,
+          confidencePenalty: 20,
+          targetReduction: 0.5
+        };
+      }
+      if (isOverbought) {
+        return {
+          isLate: true,
+          reason: `late_entry_overbought: RSI=${rsi.toFixed(2)}>68`,
+          confidencePenalty: 15,
+          targetReduction: 0.3
+        };
+      }
+    }
+
+    return { isLate: false };
+  }
+
+  // Apply late entry penalties to targets and confidence
+  private applyLateEntryPenalties(
+    exec: MinimalExecutionState,
+    targetResult: { targets: number[]; targetZones: any }
+  ): void {
+    if (!exec.lateEntryPenalty) return;
+
+    const penalty = exec.lateEntryPenalty;
+    const targetReduction = 1 - penalty.targetReduction; // Convert reduction to multiplier
+
+    // Apply confidence penalty
+    if (exec.biasConfidence !== undefined) {
+      exec.biasConfidence = Math.max(0, exec.biasConfidence - penalty.confidencePenalty);
+    }
+
+    // Apply target reduction
+    if (targetResult.targets && targetResult.targets.length > 0) {
+      const risk = exec.entryPrice && exec.stopPrice ? Math.abs(exec.entryPrice - exec.stopPrice) : 0;
+      if (risk > 0) {
+        // Reduce targets proportionally
+        targetResult.targets = targetResult.targets.map((target, index) => {
+          if (index === 0) {
+            // T1: reduce by penalty amount
+            const originalDistance = target - (exec.entryPrice ?? 0);
+            return (exec.entryPrice ?? 0) + originalDistance * targetReduction;
+          } else {
+            // T2, T3: reduce more aggressively
+            const originalDistance = target - (exec.entryPrice ?? 0);
+            return (exec.entryPrice ?? 0) + originalDistance * (targetReduction * 0.8);
+          }
+        });
+      }
+    }
+
+    // Apply target zone reduction
+    if (targetResult.targetZones) {
+      if (targetResult.targetZones.rTargets) {
+        const entry = exec.entryPrice ?? 0;
+        targetResult.targetZones.rTargets.t1 = entry + (targetResult.targetZones.rTargets.t1 - entry) * targetReduction;
+        targetResult.targetZones.rTargets.t2 = entry + (targetResult.targetZones.rTargets.t2 - entry) * (targetReduction * 0.8);
+        targetResult.targetZones.rTargets.t3 = entry + (targetResult.targetZones.rTargets.t3 - entry) * (targetReduction * 0.6);
+      }
+      if (targetResult.targetZones.expectedZone) {
+        const mid = (targetResult.targetZones.expectedZone.lower + targetResult.targetZones.expectedZone.upper) / 2;
+        const range = targetResult.targetZones.expectedZone.upper - targetResult.targetZones.expectedZone.lower;
+        const newRange = range * targetReduction;
+        targetResult.targetZones.expectedZone.lower = mid - newRange / 2;
+        targetResult.targetZones.expectedZone.upper = mid + newRange / 2;
+      }
+      if (targetResult.targetZones.expectedEnd) {
+        const entry = exec.entryPrice ?? 0;
+        targetResult.targetZones.expectedEnd = entry + (targetResult.targetZones.expectedEnd - entry) * targetReduction;
+      }
+    }
+
+    console.log(
+      `[LATE_ENTRY_PENALTY_APPLIED] ${penalty.reason} - Confidence reduced by ${penalty.confidencePenalty}, targets reduced by ${(penalty.targetReduction * 100).toFixed(0)}%`
+    );
+  }
+
+  // Bearish flip confirmation: Requires structure (lower low + failed VWAP reclaim) before allowing BEARISH bias
+  // Returns: { confirmed: boolean; reason?: string }
+  private confirmBearishFlip(
+    currentPrice: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    vwap: number | undefined,
+    swingLow5m: number | undefined
+  ): { confirmed: boolean; reason?: string } {
+    if (closed5mBars.length < 10 || vwap === undefined || swingLow5m === undefined) {
+      return { confirmed: false, reason: "insufficient_data" };
+    }
+
+    // Check 1: Lower low formation (structure confirmation)
+    const recentBars = closed5mBars.slice(-10);
+    const currentLow = Math.min(...recentBars.map(b => b.low));
+    const olderBars = closed5mBars.slice(-20, -10);
+    const olderLow = olderBars.length > 0 ? Math.min(...olderBars.map(b => b.low)) : undefined;
+    
+    const hasLowerLow = olderLow !== undefined && currentLow < olderLow;
+    
+    // Check 2: Failed VWAP reclaim (price stays below VWAP)
+    // Count how many recent bars closed below VWAP
+    const barsBelowVwap = recentBars.filter(b => b.close < vwap).length;
+    const failedVwapReclaim = barsBelowVwap >= 6; // At least 6 of last 10 bars below VWAP
+    
+    // Check 3: Price is below swing low (breakdown confirmation)
+    const brokeSwingLow = currentPrice < swingLow5m;
+    
+    // Require at least 2 of 3 conditions for bearish flip confirmation
+    const confirmationCount = [hasLowerLow, failedVwapReclaim, brokeSwingLow].filter(Boolean).length;
+    
+    if (confirmationCount >= 2) {
+      const reasons: string[] = [];
+      if (hasLowerLow) reasons.push("lower_low");
+      if (failedVwapReclaim) reasons.push("failed_vwap_reclaim");
+      if (brokeSwingLow) reasons.push("broke_swing_low");
+      
+      return {
+        confirmed: true,
+        reason: `bearish_flip_confirmed: ${reasons.join(", ")}`
+      };
+    }
+    
+    return {
+      confirmed: false,
+      reason: `bearish_flip_not_confirmed: lowerLow=${hasLowerLow} failedVwapReclaim=${failedVwapReclaim} brokeSwingLow=${brokeSwingLow}`
+    };
+  }
+
   // Detect momentum pause or compression (transition to re-entry window)
   private detectMomentumPause(
     bias: MarketBias,
@@ -3282,7 +3672,10 @@ export class Orchestrator {
     // ============================================================================
     // STEP 1.8: Finalize bias from 5m structure (ONLY authority for full flips)
     // ============================================================================
-    this.finalizeBiasFrom5m(exec, ts, close);
+    // Get closed5mBars and vwap for bearish flip confirmation
+    const closedBarsForBias = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+    const vwapForBias = closedBarsForBias.length > 0 ? this.calculateVWAP(closedBarsForBias) : undefined;
+    this.finalizeBiasFrom5m(exec, ts, close, closed5mBars, vwapForBias);
 
     // ============================================================================
     // STEP 2: Update phase deterministically (engine-owned, never from LLM)
@@ -3956,6 +4349,50 @@ export class Orchestrator {
     // Don't flip bias while in trade (protect active positions)
     if (exec.phase !== "IN_TRADE") {
       this.updateBiasEngine(exec, ts, close);
+      
+      // Momentum Kill Switch: Invalidate bias when momentum fails (RSI < 40, MACD expanding down, price < VWAP)
+      // This prevents maintaining bullish bias when momentum has clearly failed
+      if (closed5mBars.length >= 30 && exec.bias !== "NEUTRAL") {
+        const atr = this.calculateATR(closed5mBars);
+        const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+        const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+        
+        if (vwap !== undefined) {
+          const killSwitch = this.momentumKillSwitch(
+            exec,
+            close,
+            closed5mBars,
+            vwap,
+            atr
+          );
+          
+          if (killSwitch.shouldInvalidate) {
+            const oldBias = exec.bias;
+            exec.bias = killSwitch.newBias ?? "NEUTRAL";
+            exec.biasConfidence = 0;
+            exec.baseBiasConfidence = 0;
+            exec.setup = "NONE";
+            exec.entryBlocked = true;
+            exec.entryBlockReason = killSwitch.reason;
+            exec.waitReason = "momentum_failure";
+            
+            // Clear opportunity if bias invalidated
+            if (exec.opportunity) {
+              exec.opportunity.status = "INVALIDATED";
+              exec.opportunity = undefined;
+            }
+            
+            // Clear resolution gate
+            exec.resolutionGate = undefined;
+            
+            console.log(
+              `[MOMENTUM_KILL_SWITCH] BIAS=${oldBias} -> ${exec.bias} | ${killSwitch.reason} - Momentum failure detected, bias invalidated`
+            );
+            shouldPublishEvent = true;
+          }
+        }
+      }
+      
       this.maybeDetectIgnition(exec, ts, close);
     }
 
@@ -4602,6 +5039,31 @@ export class Orchestrator {
               exec.waitReason = "phase_extended";
               console.log(`[ENTRY_BLOCKED] phase=EXTENSION - no entry when extended`);
             } else {
+              // Check for late entry (RSI < 32/68, ATR already spiked) - apply penalties
+              const atrForLate = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeLate = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapForLate = closedBarsWithVolumeLate.length > 0 ? this.calculateVWAP(closedBarsWithVolumeLate) : undefined;
+              
+              const lateEntryCheck = this.detectLateEntry(
+                exec.bias,
+                current5m.close,
+                closed5mBars,
+                atrForLate,
+                vwapForLate
+              );
+              
+              // Store late entry info for use in target computation
+              exec.lateEntryPenalty = lateEntryCheck.isLate ? {
+                confidencePenalty: lateEntryCheck.confidencePenalty ?? 0,
+                targetReduction: lateEntryCheck.targetReduction ?? 0,
+                reason: lateEntryCheck.reason
+              } : undefined;
+              
+              if (lateEntryCheck.isLate) {
+                console.log(
+                  `[LATE_ENTRY_DETECTED] ${lateEntryCheck.reason} - Applying penalties: confidence=${lateEntryCheck.confidencePenalty} targetReduction=${((lateEntryCheck.targetReduction ?? 0) * 100).toFixed(0)}%`
+                );
+              }
             // NUDGE MOMENTUM entry: break of nudge bar (no deep pullback required)
             if (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)) {
               const oldPhase = exec.phase;
@@ -4669,6 +5131,7 @@ export class Orchestrator {
                 undefined
               );
 
+              this.applyLateEntryPenalties(exec, targetResult);
               exec.targets = targetResult.targets;
               exec.targetZones = targetResult.targetZones;
 
@@ -4807,6 +5270,7 @@ export class Orchestrator {
                       exec.impulseRange
                     );
 
+                    this.applyLateEntryPenalties(exec, targetResultLong);
                     exec.targets = targetResultLong.targets;
                     exec.targetZones = targetResultLong.targetZones;
 
@@ -4957,6 +5421,7 @@ export class Orchestrator {
                       exec.impulseRange
                     );
 
+                    this.applyLateEntryPenalties(exec, targetResultShort);
                     exec.targets = targetResultShort.targets;
                     exec.targetZones = targetResultShort.targetZones;
 

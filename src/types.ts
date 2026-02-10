@@ -401,6 +401,12 @@ export type MinimalExecutionState = {
   continuationExtension?: number; // Distance from pullback level when continuation detected
   entryBlocked?: boolean; // True when no-chase rules prevent entry
   entryBlockReason?: string; // Reason for entry blocking
+  // Late entry detection (entry after most of move already happened)
+  lateEntryPenalty?: {
+    confidencePenalty: number; // Points to subtract from biasConfidence
+    targetReduction: number; // Multiplier to reduce targets (0.5 = 50% reduction)
+    reason?: string;
+  };
   // Deployment pause (micro countertrend throttle)
   deploymentPauseUntilTs?: number; // Timestamp when deployment pause expires
   deploymentPauseReason?: string; // Reason for deployment pause
