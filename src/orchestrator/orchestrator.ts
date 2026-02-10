@@ -4950,6 +4950,8 @@ export class Orchestrator {
             console.log(
               `[TRADE_MANAGEMENT] IN_TRADE: entry=${exec.entryPrice?.toFixed(2)} stop=${exec.stopPrice.toFixed(2)} current=${current5m.close.toFixed(2)} direction=${direction} stopDistance=${stopDistance} stopHit=${stopHit}`
             );
+            // Emit update on every 5m close when in trade for status updates
+            shouldPublishEvent = true;
           }
           
           // Check stop (FIXED: use close instead of wick for close-based logic)
@@ -4999,6 +5001,9 @@ export class Orchestrator {
                 `[TARGET_HIT] ${targetKey.toUpperCase()} hit at ${targetHit.toFixed(2)} - Consider scaling out`
               );
               
+              // Trigger Telegram update when target is hit
+              shouldPublishEvent = true;
+              
               // For 1R: move stop to breakeven
               if (targetKey === 't1') {
                 if (direction === "long") {
@@ -5031,6 +5036,8 @@ export class Orchestrator {
                 exec.phase = newPhase;
                 exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
                 this.clearTradeState(exec);
+                // Phase change will trigger shouldEmit, but set this for safety
+                shouldPublishEvent = true;
               }
             }
           }
@@ -5066,6 +5073,8 @@ export class Orchestrator {
                 exec.phase = newPhase;
                 exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
                 this.clearTradeState(exec);
+                // Trigger Telegram update when momentum exit triggers
+                shouldPublishEvent = true;
               }
             }
           }
