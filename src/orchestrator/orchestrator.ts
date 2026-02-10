@@ -3359,6 +3359,137 @@ export class Orchestrator {
     };
   }
 
+  // Classify momentum at TP hit: "increasing" or "slowing"
+  // Uses MACD histogram slope and RSI to determine if momentum is accelerating or decelerating
+  private classifyMomentumAtTP(
+    direction: "long" | "short",
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    currentPrice: number,
+    vwap: number | undefined
+  ): "increasing" | "slowing" {
+    if (closed5mBars.length < 30) {
+      return "slowing"; // Default to slowing if insufficient data
+    }
+
+    const rsi = this.calculateRSI(closed5mBars.map(b => ({ close: b.close })), 14);
+    const macd = this.calculateMACD(closed5mBars.map(b => ({ close: b.close })));
+
+    if (rsi === undefined || macd === undefined) {
+      return "slowing";
+    }
+
+    // Get MACD histogram trend (last 3 bars)
+    let macdSlope: "rising" | "falling" | "flat" = "flat";
+    if (closed5mBars.length >= 36) {
+      const histograms: number[] = [];
+      for (let i = closed5mBars.length - 3; i < closed5mBars.length; i++) {
+        const barsSlice = closed5mBars.slice(0, i + 1);
+        const macdSlice = this.calculateMACD(barsSlice.map(b => ({ close: b.close })));
+        if (macdSlice) {
+          histograms.push(macdSlice.histogram);
+        }
+      }
+      
+      if (histograms.length >= 3) {
+        const current = histograms[2];
+        const prev1 = histograms[1];
+        const prev2 = histograms[0];
+        if (current > prev1 && prev1 > prev2) {
+          macdSlope = "rising";
+        } else if (current < prev1 && prev1 < prev2) {
+          macdSlope = "falling";
+        }
+      }
+    }
+
+    // Check for lower lows (short) or higher highs (long) - momentum increasing
+    const recentBars = closed5mBars.slice(-6);
+    const currentLow = Math.min(...recentBars.map(b => b.low));
+    const currentHigh = Math.max(...recentBars.map(b => b.high));
+    const olderBars = closed5mBars.slice(-12, -6);
+    const olderLow = olderBars.length > 0 ? Math.min(...olderBars.map(b => b.low)) : undefined;
+    const olderHigh = olderBars.length > 0 ? Math.max(...olderBars.map(b => b.high)) : undefined;
+
+    if (direction === "short") {
+      // SHORT: Momentum slowing if:
+      // - MACD histogram rising toward 0 (less negative)
+      // - RSI < 32 (oversold, mean reversion risk)
+      // - Price making higher lows (reversal signal)
+      const macdSlowing = macdSlope === "rising" && macd.histogram < 0; // Histogram rising from negative
+      const rsiSlowing = rsi < 32; // Oversold
+      const priceSlowing = olderLow !== undefined && currentLow > olderLow; // Higher low = slowing down
+      
+      // SHORT: Momentum increasing if:
+      // - MACD histogram falling (more negative)
+      // - Lower lows forming
+      // - RSI not oversold yet
+      const macdIncreasing = macdSlope === "falling" && macd.histogram < -0.1; // Histogram falling deeper negative
+      const priceIncreasing = olderLow !== undefined && currentLow < olderLow; // Lower low = accelerating
+      const rsiIncreasing = rsi > 35; // Not oversold yet
+
+      const slowingCount = [macdSlowing, rsiSlowing, priceSlowing].filter(Boolean).length;
+      const increasingCount = [macdIncreasing, priceIncreasing, rsiIncreasing].filter(Boolean).length;
+
+      return increasingCount >= 2 ? "increasing" : "slowing";
+    } else {
+      // LONG: Momentum slowing if:
+      // - MACD histogram falling toward 0 (less positive)
+      // - RSI > 68 (overbought, mean reversion risk)
+      // - Price making lower highs (reversal signal)
+      const macdSlowing = macdSlope === "falling" && macd.histogram > 0; // Histogram falling from positive
+      const rsiSlowing = rsi > 68; // Overbought
+      const priceSlowing = olderHigh !== undefined && currentHigh < olderHigh; // Lower high = slowing down
+      
+      // LONG: Momentum increasing if:
+      // - MACD histogram rising (more positive)
+      // - Higher highs forming
+      // - RSI not overbought yet
+      const macdIncreasing = macdSlope === "rising" && macd.histogram > 0.1; // Histogram rising deeper positive
+      const priceIncreasing = olderHigh !== undefined && currentHigh > olderHigh; // Higher high = accelerating
+      const rsiIncreasing = rsi < 65; // Not overbought yet
+
+      const slowingCount = [macdSlowing, rsiSlowing, priceSlowing].filter(Boolean).length;
+      const increasingCount = [macdIncreasing, priceIncreasing, rsiIncreasing].filter(Boolean).length;
+
+      return increasingCount >= 2 ? "increasing" : "slowing";
+    }
+  }
+
+  // Generate coaching text for TP hits based on target level and momentum
+  private generateTPCoaching(
+    targetKey: 't1' | 't2' | 't3',
+    direction: "long" | "short",
+    momentum: "increasing" | "slowing",
+    entryPrice: number,
+    currentPrice: number
+  ): string {
+    const isLong = direction === "long";
+    const profitPct = isLong 
+      ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)
+      : ((entryPrice - currentPrice) / entryPrice * 100).toFixed(1);
+
+    if (targetKey === 't1') {
+      if (momentum === "slowing") {
+        return `1R hit (${profitPct}% profit). Momentum slowing → Scale 50% + move stop to breakeven. Protect profits.`;
+      } else {
+        return `1R hit (${profitPct}% profit). Momentum increasing → Scale 25-33% + move stop to breakeven. Hold runner for 2R.`;
+      }
+    } else if (targetKey === 't2') {
+      if (momentum === "slowing") {
+        return `2R hit (${profitPct}% profit). Momentum slowing → Scale 50% more + trail stop tight. Consider full exit.`;
+      } else {
+        return `2R hit (${profitPct}% profit). Momentum increasing → Scale 25% more + trail stop wider. Hold runner for 3R.`;
+      }
+    } else {
+      // t3
+      if (momentum === "slowing") {
+        return `3R hit (${profitPct}% profit). Momentum slowing → Exit remainder or very tight trail. Lock in profits.`;
+      } else {
+        return `3R hit (${profitPct}% profit). Momentum still strong → Exit 50% + trail stop aggressively. Consider holding small runner.`;
+      }
+    }
+  }
+
   // Detect momentum pause or compression (transition to re-entry window)
   private detectMomentumPause(
     bias: MarketBias,
@@ -5565,16 +5696,50 @@ export class Orchestrator {
               // Initialize targetsHit if needed
               if (!exec.targetsHit) exec.targetsHit = { t1: false, t2: false, t3: false };
               
-              // Mark target as hit
-              exec.targetsHit[targetKey] = true;
-              
-              // Alert for partial profit-taking
-              console.log(
-                `[TARGET_HIT] ${targetKey.toUpperCase()} hit at ${targetHit.toFixed(2)} - Consider scaling out`
-              );
-              
-              // Trigger Telegram update when target is hit
-              shouldPublishEvent = true;
+              // Skip if already alerted (prevent duplicates)
+              if (exec.targetsHit[targetKey]) {
+                // Already processed this target
+              } else {
+                // Mark target as hit
+                exec.targetsHit[targetKey] = true;
+                
+                // Classify momentum at TP hit
+                const closedBarsWithVolumeForMomentum = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+                const vwapForMomentum = closedBarsWithVolumeForMomentum.length > 0 ? this.calculateVWAP(closedBarsWithVolumeForMomentum) : undefined;
+                const momentum = this.classifyMomentumAtTP(
+                  direction as "long" | "short",
+                  closed5mBars,
+                  current5m.close,
+                  vwapForMomentum
+                );
+                
+                // Generate coaching text
+                const coaching = this.generateTPCoaching(
+                  targetKey,
+                  direction as "long" | "short",
+                  momentum,
+                  exec.entryPrice!,
+                  current5m.close
+                );
+                
+                // Store for alert emission (will be emitted in events array below)
+                exec.lastTargetHit = {
+                  targetKey,
+                  targetPrice: targetHit,
+                  timestamp: ts,
+                  direction: direction as "long" | "short",
+                  momentum,
+                  coaching
+                };
+                
+                // Alert for partial profit-taking
+                console.log(
+                  `[TARGET_HIT] ${targetKey.toUpperCase()} hit at ${targetHit.toFixed(2)} - Momentum: ${momentum} - ${coaching}`
+                );
+                
+                // Trigger Telegram update when target is hit
+                shouldPublishEvent = true;
+              }
               
               // For 1R: move stop to breakeven
               if (targetKey === 't1') {
@@ -5717,6 +5882,38 @@ export class Orchestrator {
         data: { timestamp: ts, symbol, price: close, alertPayload: payload },
       });
       hasDiscreteEvent = true;
+    }
+
+    // ============================================================================
+    // TP ALERT EMISSION: Emit TRADING_ALERT for target hits
+    // ============================================================================
+    // This MUST run even if entry is blocked - trade management alerts bypass entry gating
+    // The alert is emitted here (not in trade management block) to ensure it's not blocked
+    if (exec.lastTargetHit && exec.lastTargetHit.timestamp === ts) {
+      const payload: TradingAlertPayload = {
+        direction: exec.lastTargetHit.direction === "long" ? "LONG" : "SHORT",
+        targetKey: exec.lastTargetHit.targetKey,
+        targetPrice: exec.lastTargetHit.targetPrice,
+        entryPrice: exec.entryPrice,
+        stopPrice: exec.stopPrice,
+        momentum: exec.lastTargetHit.momentum,
+        coaching: exec.lastTargetHit.coaching,
+        reason: `Take profit ${exec.lastTargetHit.targetKey.toUpperCase()} hit`,
+      };
+      events.push({
+        type: "TRADING_ALERT",
+        timestamp: ts,
+        instanceId: this.instanceId,
+        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+      });
+      hasDiscreteEvent = true;
+      // Log before clearing
+      const targetHitInfo = exec.lastTargetHit;
+      console.log(
+        `[TP_ALERT_EMITTED] ${targetHitInfo.targetKey.toUpperCase()} hit at ${targetHitInfo.targetPrice.toFixed(2)} - Momentum: ${targetHitInfo.momentum} - ${targetHitInfo.coaching}`
+      );
+      // Clear after emitting to prevent duplicates
+      exec.lastTargetHit = undefined;
     }
 
     // Only emit MIND_STATE_UPDATED when phase/bias changed, or discrete alert, or heartbeat
@@ -5886,7 +6083,10 @@ export class Orchestrator {
         last5mCloseTs: lastClosed5m?.ts,
         source: is5mClose ? ("5m" as const) : ("1m" as const),
         // LLM 1m coaching (into/out of setup)
-        coachLine: exec.llm1mCoachLine,
+        // Filter coaching to prevent contradictions: if bias=BEARISH and no long setup, don't show long coaching
+        coachLine: (exec.bias === "BEARISH" && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION" && exec.llm1mCoachLine?.toLowerCase().includes("long")) 
+          ? undefined 
+          : exec.llm1mCoachLine,
         nextLevel: exec.llm1mNextLevel,
         likelihoodHit: exec.llm1mLikelihoodHit,
       };
@@ -5965,7 +6165,11 @@ export class Orchestrator {
           oppExpiresAt: exec.opportunity?.expiresAtTs,
           last5mCloseTs: lastClosed5m?.ts,
           source: is5mClose ? ("5m" as const) : ("1m" as const),
-          coachLine: exec.llm1mCoachLine,
+          // LLM 1m coaching (into/out of setup)
+          // Filter coaching to prevent contradictions: if bias=BEARISH and no long setup, don't show long coaching
+          coachLine: (exec.bias === "BEARISH" && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION" && exec.llm1mCoachLine?.toLowerCase().includes("long")) 
+            ? undefined 
+            : exec.llm1mCoachLine,
           nextLevel: exec.llm1mNextLevel,
           likelihoodHit: exec.llm1mLikelihoodHit,
         };

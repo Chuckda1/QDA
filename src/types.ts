@@ -407,6 +407,15 @@ export type MinimalExecutionState = {
     targetReduction: number; // Multiplier to reduce targets (0.5 = 50% reduction)
     reason?: string;
   };
+  // Track last target hit for alert emission
+  lastTargetHit?: {
+    targetKey: 't1' | 't2' | 't3';
+    targetPrice: number;
+    timestamp: number;
+    direction: "long" | "short";
+    momentum: "increasing" | "slowing";
+    coaching: string;
+  };
   // Deployment pause (micro countertrend throttle)
   deploymentPauseUntilTs?: number; // Timestamp when deployment pause expires
   deploymentPauseReason?: string; // Reason for deployment pause
@@ -505,9 +514,10 @@ export type DomainEventType =
   | "GATE_ARMED"
   | "OPPORTUNITY_TRIGGERED"
   | "TRADE_ENTRY"
-  | "TRADE_EXIT";
+  | "TRADE_EXIT"
+  | "TRADING_ALERT";
 
-/** Payload for trading alert events (GATE_ARMED, OPPORTUNITY_TRIGGERED, TRADE_ENTRY, TRADE_EXIT) */
+/** Payload for trading alert events (GATE_ARMED, OPPORTUNITY_TRIGGERED, TRADE_ENTRY, TRADE_EXIT, TRADING_ALERT) */
 export type TradingAlertPayload = {
   direction: "LONG" | "SHORT";
   triggerPrice?: number;
@@ -516,6 +526,11 @@ export type TradingAlertPayload = {
   reason?: string;
   exitReason?: string;
   result?: "WIN" | "LOSS" | "FLAT";
+  // For TRADING_ALERT (TP hits)
+  targetKey?: "t1" | "t2" | "t3";
+  targetPrice?: number;
+  momentum?: "increasing" | "slowing";
+  coaching?: string;
 };
 
 export type MinimalDebugInfo = {
