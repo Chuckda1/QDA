@@ -4883,8 +4883,12 @@ export class Orchestrator {
         }
         } // Close: else block for entry evaluation (readyToEvaluateEntry) - line 3704
       } // Close: else block for deployment pause (not paused) - line 3662
+      } // Close: if (exec.phase !== "IN_TRADE") for pullback entry logic - line 4222
 
-      // Check trade management if in trade
+      // ============================================================================
+      // TRADE MANAGEMENT: Check stops and targets when IN_TRADE
+      // ============================================================================
+      // This MUST run regardless of the pullback entry logic block below
       // Real-time target updates: recompute targets on each 5m close
       if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && is5mClose) {
         const atr = this.calculateATR(closed5mBars);
@@ -4956,14 +4960,6 @@ export class Orchestrator {
               `[STATE_TRANSITION] ${oldPhase} -> ${newPhase} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
             );
             exec.phase = newPhase;
-            exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
-            this.clearTradeState(exec);
-          } else if (direction === "short" && current5m.close >= exec.stopPrice) {
-            const oldPhase = exec.phase;
-            console.log(
-              `[STATE_TRANSITION] ${oldPhase} -> ${exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS"} | Stop hit at ${current5m.close.toFixed(2)} (stop=${exec.stopPrice.toFixed(2)}) close-based`
-            );
-            exec.phase = exec.bias === "NEUTRAL" ? "NEUTRAL_PHASE" : "PULLBACK_IN_PROGRESS";
             exec.waitReason = exec.bias === "NEUTRAL" ? "waiting_for_bias" : "waiting_for_pullback";
             this.clearTradeState(exec);
           } else if (direction === "short" && current5m.close >= exec.stopPrice) {
@@ -5074,13 +5070,13 @@ export class Orchestrator {
             }
           }
         }
-      } // Close: if (exec.phase === "IN_TRADE" && ...) for trade management (line 3987)
-      } // Close: if (exec.bias !== "NEUTRAL" && ...) for pullback entry logic - line 3596
+      } // Close: if (exec.phase === "IN_TRADE" && ...) for trade management
+      // ============================================================================
 
-    // ============================================================================
-    // Trading alerts: emit discrete events for gate armed, trigger, entry, exit
-    // ============================================================================
-    const dir = exec.bias === "BULLISH" ? "LONG" : "SHORT";
+      // ============================================================================
+      // Trading alerts: emit discrete events for gate armed, trigger, entry, exit
+      // ============================================================================
+      const dir = exec.bias === "BULLISH" ? "LONG" : "SHORT";
     let hasDiscreteEvent = false;
 
     if (exec.resolutionGate?.status === "ARMED" && previousGateStatus !== "ARMED") {
