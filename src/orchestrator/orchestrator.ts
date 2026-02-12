@@ -1376,9 +1376,14 @@ export class Orchestrator {
   private clearTradeState(exec: MinimalExecutionState): void {
     // Only clear pullback levels if we're not in PULLBACK_IN_PROGRESS (need them for failure detection)
     if (exec.phase !== "PULLBACK_IN_PROGRESS") {
-    exec.pullbackHigh = undefined;
-    exec.pullbackLow = undefined;
-    exec.pullbackTs = undefined;
+      const oldHigh = exec.pullbackHigh;
+      const oldLow = exec.pullbackLow;
+      exec.pullbackHigh = undefined;
+      exec.pullbackLow = undefined;
+      exec.pullbackTs = undefined;
+      console.log(
+        `[BOUNDARY_CLEARED] pullbackHigh=${oldHigh} pullbackLow=${oldLow} phase=${exec.phase} reason=clearTradeState ts=${Date.now()}`
+      );
     }
     exec.entryPrice = undefined;
     exec.entryTs = undefined;
@@ -1618,17 +1623,45 @@ export class Orchestrator {
     const phase = exec.phase;
     const expectedResolution = exec.expectedResolution;
     
+    // Diagnostic: Log setup detection start
+    console.log(
+      `[SETUP_DETECT_START] bias=${bias} phase=${phase} expectedResolution=${expectedResolution} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} boundariesDefined=${exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined}`
+    );
+    
     // No setup if no bias
     if (bias === "NEUTRAL") {
+      console.log(
+        `[SETUP_DETECT_BLOCKED] reason=bias_neutral`
+      );
       return { setup: "NONE" };
     }
     
     // PULLBACK_CONTINUATION: Trend pullback then continuation
     // Allowed when: bias is established, phase indicates pullback, and expected resolution is continuation
-    if ((phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS") &&
+    const phaseAllowsSetup = phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS";
+    const boundariesDefined = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined;
+    
+    if (!phaseAllowsSetup) {
+      console.log(
+        `[SETUP_DETECT_BLOCKED] reason=phase_not_allowed phase=${phase} allowedPhases=[BIAS_ESTABLISHED, PULLBACK_IN_PROGRESS]`
+      );
+    } else if (!boundariesDefined) {
+      console.log(
+        `[SETUP_DETECT_BLOCKED] reason=boundaries_missing`
+      );
+    } else if (expectedResolution !== "CONTINUATION") {
+      console.log(
+        `[SETUP_DETECT_BLOCKED] reason=expectedResolution_not_continuation expectedResolution=${expectedResolution}`
+      );
+    } else if (atr <= 0) {
+      console.log(
+        `[SETUP_DETECT_BLOCKED] reason=atr_invalid atr=${atr}`
+      );
+    }
+    
+    if (phaseAllowsSetup &&
         expectedResolution === "CONTINUATION" &&
-        exec.pullbackHigh !== undefined &&
-        exec.pullbackLow !== undefined &&
+        boundariesDefined &&
         atr > 0) {
       
       // Calculate trigger and stop based on bias
@@ -1637,13 +1670,17 @@ export class Orchestrator {
       
       if (bias === "BEARISH") {
         // Bearish: trigger on break below pullback low
-        triggerPrice = exec.pullbackLow - 0.1 * atr;
-        stopPrice = exec.pullbackHigh + 0.1 * atr;
+        triggerPrice = exec.pullbackLow! - 0.1 * atr;
+        stopPrice = exec.pullbackHigh! + 0.1 * atr;
       } else {
         // Bullish: trigger on break above pullback high
-        triggerPrice = exec.pullbackHigh + 0.1 * atr;
-        stopPrice = exec.pullbackLow - 0.1 * atr;
+        triggerPrice = exec.pullbackHigh! + 0.1 * atr;
+        stopPrice = exec.pullbackLow! - 0.1 * atr;
       }
+      
+      console.log(
+        `[SETUP_DETECT_SUCCESS] setup=PULLBACK_CONTINUATION triggerPrice=${triggerPrice} stopPrice=${stopPrice} bias=${bias}`
+      );
       
       return {
         setup: "PULLBACK_CONTINUATION",
@@ -1656,6 +1693,9 @@ export class Orchestrator {
     // Extended rip then fade / extended dump then bounce
     
     // No setup detected
+    console.log(
+      `[SETUP_DETECT_BLOCKED] reason=no_conditions_met phaseAllowsSetup=${phaseAllowsSetup} expectedResolution=${expectedResolution} boundariesDefined=${boundariesDefined} atr=${atr}`
+    );
     return { setup: "NONE" };
   }
   
@@ -1998,6 +2038,9 @@ export class Orchestrator {
       exec.pullbackHigh = barForPullback.high;
       exec.pullbackLow = barForPullback.low;
       exec.pullbackTs = ts;
+      console.log(
+        `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${exec.pullbackTs} source=LLM_NUDGE_BULLISH swingHigh5m=${exec.swingHigh5m} swingLow5m=${exec.swingLow5m} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+      );
       exec.phase = "BIAS_ESTABLISHED";
       exec.expectedResolution = "CONTINUATION";
       exec.waitReason = "waiting_for_pullback";
@@ -2021,6 +2064,15 @@ export class Orchestrator {
       console.log(
         `[BIAS_LLM_NUDGE] NEUTRAL -> BULLISH | llmConf=${llmConf} tape=above_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
       );
+      console.log(
+        `[LLM_BIAS_OVERRIDE] bias=BULLISH phase=BIAS_ESTABLISHED source=LLM_NUDGE llmConf=${llmConf} tapeAgrees=true pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} nudgeTs=${ts}`
+      );
+      // Track LLM phase side effect
+      if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+        console.log(
+          `[LLM_PHASE_SIDE_EFFECT] phase=${exec.phase} lastNudgeTs=${exec.lastNudgeTs} nudgeBoundaries=[${exec.nudgeBarLow}, ${exec.nudgeBarHigh}] currentBoundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}] match=${exec.pullbackHigh === exec.nudgeBarHigh && exec.pullbackLow === exec.nudgeBarLow}`
+        );
+      }
     } else {
       be.state = "BEARISH";
       be.lastFlipTs = ts;
@@ -2033,6 +2085,9 @@ export class Orchestrator {
       exec.pullbackHigh = barForPullback.high;
       exec.pullbackLow = barForPullback.low;
       exec.pullbackTs = ts;
+      console.log(
+        `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${exec.pullbackTs} source=LLM_NUDGE_BEARISH swingHigh5m=${exec.swingHigh5m} swingLow5m=${exec.swingLow5m} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+      );
       exec.phase = "BIAS_ESTABLISHED";
       exec.expectedResolution = "CONTINUATION";
       exec.waitReason = "waiting_for_pullback";
@@ -2056,6 +2111,15 @@ export class Orchestrator {
       console.log(
         `[BIAS_LLM_NUDGE] NEUTRAL -> BEARISH | llmConf=${llmConf} tape=below_vwap_ema pullback=[${barForPullback.low.toFixed(2)}, ${barForPullback.high.toFixed(2)}]${!lastClosed5m ? " (forming5m)" : ""}`
       );
+      console.log(
+        `[LLM_BIAS_OVERRIDE] bias=BEARISH phase=BIAS_ESTABLISHED source=LLM_NUDGE llmConf=${llmConf} tapeAgrees=true pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} nudgeTs=${ts}`
+      );
+      // Track LLM phase side effect
+      if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+        console.log(
+          `[LLM_PHASE_SIDE_EFFECT] phase=${exec.phase} lastNudgeTs=${exec.lastNudgeTs} nudgeBoundaries=[${exec.nudgeBarLow}, ${exec.nudgeBarHigh}] currentBoundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}] match=${exec.pullbackHigh === exec.nudgeBarHigh && exec.pullbackLow === exec.nudgeBarLow}`
+        );
+      }
     }
   }
 
@@ -2132,6 +2196,9 @@ export class Orchestrator {
         exec.pullbackHigh = sh;
         exec.pullbackLow = sl;
         exec.pullbackTs = ts;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${exec.pullbackTs} source=COLD_START_BULLISH swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
         if (exec.phase !== "IN_TRADE") {
           exec.phase = "BIAS_ESTABLISHED";
           exec.expectedResolution = "CONTINUATION";
@@ -2154,6 +2221,9 @@ export class Orchestrator {
         exec.pullbackHigh = sh;
         exec.pullbackLow = sl;
         exec.pullbackTs = ts;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${exec.pullbackTs} source=COLD_START_BEARISH swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
         if (exec.phase !== "IN_TRADE") {
           exec.phase = "BIAS_ESTABLISHED";
           exec.expectedResolution = "CONTINUATION";
@@ -2185,12 +2255,20 @@ export class Orchestrator {
       exec.lastBiasFlipTs = ts;
       const nudgeRecent = exec.lastNudgeTs != null && (ts - exec.lastNudgeTs) < this.NUDGE_PULLBACK_PROTECT_MS;
       const nudgeTighter = exec.nudgeBarHigh != null && exec.nudgeBarLow != null && (exec.nudgeBarHigh - exec.nudgeBarLow) <= (sh - sl);
+      const oldHigh = exec.pullbackHigh;
+      const oldLow = exec.pullbackLow;
       if (nudgeRecent && nudgeTighter) {
         exec.pullbackHigh = exec.nudgeBarHigh;
         exec.pullbackLow = exec.nudgeBarLow;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${ts} source=REPAIR_BULL_NUDGE_TIGHTER oldHigh=${oldHigh} oldLow=${oldLow} swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
       } else {
         exec.pullbackHigh = sh;
         exec.pullbackLow = sl;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${ts} source=REPAIR_BULL_STRUCTURE oldHigh=${oldHigh} oldLow=${oldLow} swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
       }
       exec.pullbackTs = ts;
 
@@ -2245,12 +2323,20 @@ export class Orchestrator {
       exec.lastBiasFlipTs = ts;
       const nudgeRecentBear = exec.lastNudgeTs != null && (ts - exec.lastNudgeTs) < this.NUDGE_PULLBACK_PROTECT_MS;
       const nudgeTighterBear = exec.nudgeBarHigh != null && exec.nudgeBarLow != null && (exec.nudgeBarHigh - exec.nudgeBarLow) <= (sh - sl);
+      const oldHigh = exec.pullbackHigh;
+      const oldLow = exec.pullbackLow;
       if (nudgeRecentBear && nudgeTighterBear) {
         exec.pullbackHigh = exec.nudgeBarHigh;
         exec.pullbackLow = exec.nudgeBarLow;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${ts} source=REPAIR_BEAR_NUDGE_TIGHTER oldHigh=${oldHigh} oldLow=${oldLow} swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
       } else {
         exec.pullbackHigh = sh;
         exec.pullbackLow = sl;
+        console.log(
+          `[BOUNDARY_SET] pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${ts} source=REPAIR_BEAR_STRUCTURE oldHigh=${oldHigh} oldLow=${oldLow} swingHigh5m=${sh} swingLow5m=${sl} nudgeBarHigh=${exec.nudgeBarHigh} nudgeBarLow=${exec.nudgeBarLow}`
+        );
       }
       exec.pullbackTs = ts;
 
@@ -3680,7 +3766,14 @@ export class Orchestrator {
   }
 
   // Generate phase-aware reason that never contradicts bias
-  private getPhaseAwareReason(bias: MarketBias, phase: MinimalExecutionPhase, waitReason?: string, execReason?: string): string {
+  private getPhaseAwareReason(
+    bias: MarketBias, 
+    phase: MinimalExecutionPhase, 
+    waitReason?: string, 
+    execReason?: string,
+    exec?: MinimalExecutionState,
+    closed5mBars?: Array<{ high: number; low: number; close: number; volume?: number }>
+  ): string {
     // If in trade and entry-aligned reason exists, use it (single pipeline proof)
     if (phase === "IN_TRADE" && execReason) {
       return execReason;
@@ -3720,6 +3813,28 @@ export class Orchestrator {
       
       case "REENTRY_WINDOW":
         return `Post-continuation pause detected, awaiting shallow pullback`;
+      
+      case "EXTENSION":
+        // If we had a trigger hit but are now in extension, provide retest coaching
+        if ((waitReason?.includes("ignition_trigger") || waitReason?.includes("trigger") || waitReason?.includes("retest")) && exec && closed5mBars) {
+          const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+          const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+          const ema = closed5mBars.length >= 6 ? this.calculateEMA(closed5mBars.map(b => ({ close: b.close })), 9) : undefined;
+          const triggerLevel = exec.setupTriggerPrice ?? exec.opportunity?.trigger?.price;
+          
+          if (bias === "BEARISH") {
+            const retestLevel = vwap ?? ema ?? triggerLevel;
+            return retestLevel 
+              ? `Price extended below trigger. Wait for retest to ${retestLevel.toFixed(2)} (VWAP/EMA) before short entry.`
+              : `Price extended below trigger. Wait for retest to breakdown level before short entry.`;
+          } else {
+            const retestLevel = vwap ?? ema ?? triggerLevel;
+            return retestLevel
+              ? `Price extended above trigger. Wait for retest to ${retestLevel.toFixed(2)} (VWAP/EMA) before long entry.`
+              : `Price extended above trigger. Wait for retest to breakout level before long entry.`;
+          }
+        }
+        return `${biasLabel.charAt(0).toUpperCase() + biasLabel.slice(1)} extension - price past pullback zone, awaiting retest`;
       
       default:
         // Fallback to waitReason if provided, but never say "neutral bias" when bias exists
@@ -3817,6 +3932,20 @@ export class Orchestrator {
     const beState = exec.biasEngine?.state;
     const stable = beState === "BULLISH" || beState === "BEARISH";
 
+    // Diagnostic: Log phase classification start
+    const boundaryAge = exec.pullbackTs ? ts - exec.pullbackTs : 0;
+    console.log(
+      `[PHASE_CLASSIFY_START] bias=${exec.bias} phase=${exec.phase} confidence=${exec.biasConfidence} beState=${beState} stable=${stable} boundariesDefined=${exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} pullbackTs=${exec.pullbackTs} boundaryAge=${boundaryAge}ms`
+    );
+
+    // Diagnostic: Check if phase transition is blocked
+    if (exec.bias !== "NEUTRAL" && exec.phase === "NEUTRAL_PHASE") {
+      const conditionsMet = stable && exec.biasConfidence !== undefined && exec.biasConfidence >= 65;
+      console.log(
+        `[PHASE_TRANSITION_BLOCKED] bias=${exec.bias} phase=NEUTRAL_PHASE beState=${beState} stable=${stable} confidence=${exec.biasConfidence} threshold=65 conditionsMet=${conditionsMet}`
+      );
+    }
+
     if (stable && exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
       // Bias is established with sufficient confidence AND bias engine is stable
       if (exec.phase === "NEUTRAL_PHASE") {
@@ -3826,15 +3955,34 @@ export class Orchestrator {
         console.log(
           `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias} confidence=${exec.biasConfidence} engineState=${beState}`
         );
+        console.log(
+          `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> BIAS_ESTABLISHED reason=initial_establishment`
+        );
       } else if ((exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION") && lastClosed5m) {
         const current5m = forming5mBar ?? lastClosed5m;
         const atr = this.calculateATR(closed5mBars);
+        
+        // Diagnostic: Check if boundaries are missing
+        if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
+          console.log(
+            `[PHASE_BOUNDARY_MISSING] phase=${exec.phase} bias=${exec.bias} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} boundariesDefined=false`
+          );
+        }
+        
         if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined && atr > 0) {
           const buffer = this.EXTENSION_THRESHOLD_ATR * atr;
           const inZone = current5m.close > exec.pullbackLow && current5m.close < exec.pullbackHigh;
           const extendedBull = exec.bias === "BULLISH" && current5m.close > exec.pullbackHigh + buffer;
           const extendedBear = exec.bias === "BEARISH" && current5m.close < exec.pullbackLow - buffer;
           const extended = extendedBull || extendedBear;
+          
+          // Diagnostic: Log phase classification check details
+          const distFromHigh = current5m.close - exec.pullbackHigh;
+          const distFromLow = exec.pullbackLow - current5m.close;
+          const willSetPhase = inZone ? "PULLBACK_IN_PROGRESS" : extended ? "EXTENSION" : "BIAS_ESTABLISHED";
+          console.log(
+            `[PHASE_CLASSIFY_CHECK] currentPrice=${current5m.close} pullbackZone=[${exec.pullbackLow}, ${exec.pullbackHigh}] buffer=${buffer} distFromHigh=${distFromHigh.toFixed(2)} distFromLow=${distFromLow.toFixed(2)} inZone=${inZone} extendedBull=${extendedBull} extendedBear=${extendedBear} extended=${extended} willSetPhase=${willSetPhase}`
+          );
 
           if (inZone) {
             exec.phase = "PULLBACK_IN_PROGRESS";
@@ -3844,13 +3992,42 @@ export class Orchestrator {
               console.log(
                 `[PHASE_TRANSITION] ${previousPhase} -> PULLBACK_IN_PROGRESS | BIAS=${exec.bias} (price in zone)`
               );
+              console.log(
+                `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> PULLBACK_IN_PROGRESS reason=inZone boundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}]`
+              );
             }
           } else if (extended) {
             exec.phase = "EXTENSION";
             if (exec.extendedPhaseSinceTs === undefined) exec.extendedPhaseSinceTs = ts;
+            
+            // Diagnostic: Extension stuck detection
+            const extendedAge = exec.extendedPhaseSinceTs ? ts - exec.extendedPhaseSinceTs : 0;
+            const shouldReanchor = extendedAge >= this.EXTENSION_REANCHOR_MS;
+            const priceTrend = exec.bias === "BULLISH" ? (current5m.close > exec.pullbackHigh) : (current5m.close < exec.pullbackLow);
+            console.log(
+              `[EXTENSION_STATE] phase=EXTENSION extendedSince=${exec.extendedPhaseSinceTs} age=${extendedAge}ms reanchorThreshold=${this.EXTENSION_REANCHOR_MS} shouldReanchor=${shouldReanchor} priceTrend=${priceTrend ? "continuing" : "reversing"} setup=${exec.setup} gateArmed=${exec.resolutionGate?.status === "ARMED"}`
+            );
+            
+            // Update waitReason for extension: if we had a trigger hit, switch to retest coaching
+            if (exec.waitReason?.includes("ignition_trigger") || exec.waitReason?.includes("trigger")) {
+              const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+              const triggerLevel = exec.setupTriggerPrice ?? exec.opportunity?.trigger?.price;
+              if (vwap || triggerLevel) {
+                exec.waitReason = `waiting_for_retest_to_${(vwap ?? triggerLevel)!.toFixed(2)}`;
+              } else {
+                exec.waitReason = "waiting_for_retest";
+              }
+            } else if (!exec.waitReason || exec.waitReason === "waiting_for_pullback") {
+              exec.waitReason = "waiting_for_retest";
+            }
+            
             if (previousPhase !== "EXTENSION") {
               console.log(
-                `[PHASE_TRANSITION] ${previousPhase} -> EXTENSION | BIAS=${exec.bias} (price past zone)`
+                `[PHASE_TRANSITION] ${previousPhase} -> EXTENSION | BIAS=${exec.bias} (price past zone) waitReason=${exec.waitReason}`
+              );
+              console.log(
+                `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> EXTENSION reason=extended boundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}]`
               );
             }
           } else {
@@ -3859,6 +4036,9 @@ export class Orchestrator {
             if (previousPhase !== "BIAS_ESTABLISHED") {
               console.log(
                 `[PHASE_TRANSITION] ${previousPhase} -> BIAS_ESTABLISHED | BIAS=${exec.bias}`
+              );
+              console.log(
+                `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> BIAS_ESTABLISHED reason=between boundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}]`
               );
             }
           }
@@ -3871,6 +4051,9 @@ export class Orchestrator {
         exec.waitReason = "waiting_for_bias";
         console.log(
           `[PHASE_TRANSITION] ${previousPhase} -> NEUTRAL_PHASE | BIAS=NEUTRAL`
+        );
+        console.log(
+          `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> NEUTRAL_PHASE reason=bias_neutral`
         );
       }
     }
@@ -3887,9 +4070,14 @@ export class Orchestrator {
       const newHigh = Math.max(lastClosed5m.high, prev5m.high);
       const newLow = Math.min(lastClosed5m.low, prev5m.low);
       const atrRe = this.calculateATR(closed5mBars);
+      const oldHigh = exec.pullbackHigh;
+      const oldLow = exec.pullbackLow;
       exec.pullbackHigh = newHigh;
       exec.pullbackLow = newLow;
       exec.pullbackTs = ts;
+      console.log(
+        `[BOUNDARY_REANCHOR] oldHigh=${oldHigh} oldLow=${oldLow} newHigh=${exec.pullbackHigh} newLow=${exec.pullbackLow} extendedSince=${exec.extendedPhaseSinceTs} age=${ts - (exec.extendedPhaseSinceTs ?? 0)}ms`
+      );
       if (atrRe > 0) {
         exec.setupTriggerPrice = exec.bias === "BULLISH"
           ? newHigh + 0.1 * atrRe
@@ -4166,6 +4354,56 @@ export class Orchestrator {
       consistencyWarnings.push(
         `WARN: ${exec.entryType} entered with setup=NONE`
       );
+    }
+
+    // ------------------------------------------------------------------
+    // Enhanced diagnostics: Phase/Bias alignment
+    // ------------------------------------------------------------------
+    if (exec.bias !== "NEUTRAL" && exec.phase === "NEUTRAL_PHASE") {
+      const beState = exec.biasEngine?.state;
+      const stable = beState === "BULLISH" || beState === "BEARISH";
+      console.log(
+        `[CONSISTENCY_ERROR] bias=${exec.bias} phase=NEUTRAL_PHASE confidence=${exec.biasConfidence} beState=${beState} stable=${stable}`
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Enhanced diagnostics: Extension without setup
+    // ------------------------------------------------------------------
+    if (exec.phase === "EXTENSION" && exec.setup === "NONE") {
+      const extendedAge = exec.extendedPhaseSinceTs ? ts - exec.extendedPhaseSinceTs : 0;
+      consistencyWarnings.push(
+        `WARN: phase=EXTENSION setup=NONE gate=${exec.resolutionGate?.status ?? "none"} opportunity=${exec.opportunity?.status ?? "none"} extendedSince=${exec.extendedPhaseSinceTs} age=${extendedAge}ms`
+      );
+      console.log(
+        `[CONSISTENCY_WARN] phase=EXTENSION setup=NONE gate=${exec.resolutionGate?.status ?? "none"} opportunity=${exec.opportunity?.status ?? "none"} extendedSince=${exec.extendedPhaseSinceTs} age=${extendedAge}ms`
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Enhanced diagnostics: Boundaries undefined when they shouldn't be
+    // ------------------------------------------------------------------
+    if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
+      if (exec.phase !== "NEUTRAL_PHASE" && exec.phase !== "IN_TRADE") {
+        consistencyWarnings.push(
+          `WARN: phase=${exec.phase} boundariesUndefined=true bias=${exec.bias}`
+        );
+        console.log(
+          `[CONSISTENCY_WARN] phase=${exec.phase} boundariesUndefined=true bias=${exec.bias} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow}`
+        );
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Enhanced diagnostics: Setup/Phase coupling
+    // ------------------------------------------------------------------
+    if (exec.setup && exec.setup !== "NONE") {
+      const phaseAllowsSetup = exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS";
+      if (!phaseAllowsSetup) {
+        console.log(
+          `[SETUP_PHASE_DEP] phase=${exec.phase} setup=${exec.setup} phaseAllowsSetup=${phaseAllowsSetup} setupDetected=true`
+        );
+      }
     }
 
     // ------------------------------------------------------------------
@@ -4956,10 +5194,91 @@ export class Orchestrator {
           if (triggerCheck.triggered) {
             exec.opportunity.status = "TRIGGERED";
             console.log(
+              `[TRIGGER_DETECTED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(2)} triggerPrice=${exec.opportunity.trigger.price} setup=${exec.setup} phase=${exec.phase}`
+            );
+            console.log(
               `[OPPORTUNITY_TRIGGERED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(
                 2
               )}`
             );
+            
+            // ============================================================================
+            // FIX: When BREAK trigger fires, immediately create IGNITION setup with correct trigger
+            // ============================================================================
+            // This bypasses SETUP_COOLDOWN because the trigger already fired
+            // Use the actual trigger price from the opportunity (the breakdown level), not swing low/high
+            if (exec.opportunity.trigger.type === "BREAK" && exec.setup === "NONE") {
+              const actualTriggerPrice = exec.opportunity.trigger.price; // The actual breakdown level (693.74)
+              const atr = this.calculateATR(closed5mBars);
+              const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+              const micro = exec.micro;
+              const atr1m = micro?.atr1m ?? atr;
+              
+              if (exec.opportunity.side === "SHORT") {
+                // SHORT breakdown: trigger is the breakdown level, stop above pullback high
+                const stopPrice = exec.pullbackHigh !== undefined 
+                  ? exec.pullbackHigh + 0.1 * atr
+                  : current5m.close + 0.5 * atr;
+                
+                exec.setup = "IGNITION";
+                exec.setupVariant = "SHORT";
+                exec.setupTriggerPrice = actualTriggerPrice; // Use actual breakdown level, not swing low
+                exec.setupStopPrice = stopPrice;
+                exec.setupDetectedAt = ts;
+                
+                console.log(
+                  `[BREAK_TRIGGER_SETUP] SHORT created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} (actual breakdown) stop=${stopPrice.toFixed(2)} price=${current5m.close.toFixed(2)} reason=${triggerCheck.reason}`
+                );
+                
+                // Since trigger already fired, mark gate as TRIGGERED immediately (entry can happen on next tick)
+                if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+                  exec.resolutionGate = {
+                    status: "TRIGGERED", // Already triggered, ready for entry
+                    direction: "short",
+                    triggerPrice: actualTriggerPrice,
+                    stopPrice: stopPrice,
+                    expiryTs: ts + 2 * 5 * 60 * 1000, // 2 timeframes
+                    armedTs: ts,
+                    reason: `Breakdown trigger already fired at ${actualTriggerPrice.toFixed(2)}`,
+                  };
+                  console.log(
+                    `[GATE_TRIGGERED] SHORT gate immediately TRIGGERED (breakdown already happened) | trigger=${actualTriggerPrice.toFixed(2)}`
+                  );
+                }
+              } else {
+                // LONG breakout: trigger is the breakout level, stop below pullback low
+                const stopPrice = exec.pullbackLow !== undefined
+                  ? exec.pullbackLow - 0.1 * atr
+                  : current5m.close - 0.5 * atr;
+                
+                exec.setup = "IGNITION";
+                exec.setupVariant = "LONG";
+                exec.setupTriggerPrice = actualTriggerPrice; // Use actual breakout level, not swing high
+                exec.setupStopPrice = stopPrice;
+                exec.setupDetectedAt = ts;
+                
+                console.log(
+                  `[BREAK_TRIGGER_SETUP] LONG created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} (actual breakout) stop=${stopPrice.toFixed(2)} price=${current5m.close.toFixed(2)} reason=${triggerCheck.reason}`
+                );
+                
+                // Since trigger already fired, mark gate as TRIGGERED immediately
+                if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+                  exec.resolutionGate = {
+                    status: "TRIGGERED",
+                    direction: "long",
+                    triggerPrice: actualTriggerPrice,
+                    stopPrice: stopPrice,
+                    expiryTs: ts + 2 * 5 * 60 * 1000,
+                    armedTs: ts,
+                    reason: `Breakout trigger already fired at ${actualTriggerPrice.toFixed(2)}`,
+                  };
+                  console.log(
+                    `[GATE_TRIGGERED] LONG gate immediately TRIGGERED (breakout already happened) | trigger=${actualTriggerPrice.toFixed(2)}`
+                  );
+                }
+              }
+            }
           } else {
             // Opportunity latched but not triggered yet
             exec.waitReason = `waiting_for_${exec.opportunity.trigger.type.toLowerCase()}_trigger`;
@@ -5007,7 +5326,8 @@ export class Orchestrator {
             (exec.opportunity!.status === "LATCHED" ||
               exec.opportunity!.status === "TRIGGERED");
 
-          const gateReady = exec.resolutionGate?.status === "ARMED";
+          // Gate is ready if ARMED (waiting for trigger) OR TRIGGERED (trigger already fired, ready for entry)
+          const gateReady = exec.resolutionGate?.status === "ARMED" || exec.resolutionGate?.status === "TRIGGERED";
 
           // If you want OpportunityLatch optional and gate primary, this keeps that:
           const readyToEvaluateEntry = oppReady || gateReady;
@@ -5098,10 +5418,13 @@ export class Orchestrator {
           // Ignition signal: use setupVariant for LLM-led direction; use effectiveTriggerPrice when set
           const ignitionTriggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
           const ignitionLong = exec.setupVariant === "LONG" || exec.bias === "BULLISH";
+          // If gate is already TRIGGERED, trigger already fired - allow immediate entry
+          const gateAlreadyTriggered = exec.resolutionGate?.status === "TRIGGERED";
           const ignitionSignal =
             exec.setup === "IGNITION" &&
             ignitionTriggerLevel !== undefined &&
-            ((ignitionLong && close > ignitionTriggerLevel) || (!ignitionLong && close < ignitionTriggerLevel));
+            (gateAlreadyTriggered || // Trigger already fired, allow entry
+             ((ignitionLong && close > ignitionTriggerLevel) || (!ignitionLong && close < ignitionTriggerLevel))); // Or price breaks trigger now
 
           // Entry permission: setup exists + appropriate signal fires
           // Pullback: 5m entry signal OR nudge momentum break (break of nudge bar high/low)
@@ -5736,6 +6059,9 @@ export class Orchestrator {
                 console.log(
                   `[TARGET_HIT] ${targetKey.toUpperCase()} hit at ${targetHit.toFixed(2)} - Momentum: ${momentum} - ${coaching}`
                 );
+                console.log(
+                  `[TP_HIT] target=${targetKey} price=${targetHit.toFixed(2)} timestamp=${ts} direction=${direction} momentum=${momentum} entryPrice=${exec.entryPrice?.toFixed(2)}`
+                );
                 
                 // Trigger Telegram update when target is hit
                 shouldPublishEvent = true;
@@ -5854,6 +6180,54 @@ export class Orchestrator {
         data: { timestamp: ts, symbol, price: close, alertPayload: payload },
       });
       hasDiscreteEvent = true;
+      
+      // ============================================================================
+      // FIX: User-facing alert when trigger hits but entry is blocked
+      // ============================================================================
+      // Check if entry is blocked and emit a clear explanation
+      const entryBlocked = exec.entryBlocked || exec.setup === "NONE" || exec.resolutionGate?.status !== "TRIGGERED";
+      if (entryBlocked) {
+        let blockReason = "unknown";
+        let retestPlan = "";
+        
+        if (exec.setup === "NONE") {
+          blockReason = "setup_not_armed";
+          const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
+          const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
+          const ema = closed5mBars.length >= 6 ? this.calculateEMA(closed5mBars.map(b => ({ close: b.close })), 9) : undefined;
+          const retestLevel = vwap ?? ema ?? triggerPrice;
+          retestPlan = retestLevel ? `Wait for retest to ${retestLevel.toFixed(2)} (VWAP/EMA)` : "Wait for retest to trigger level";
+        } else if (exec.resolutionGate?.status !== "TRIGGERED") {
+          blockReason = "gate_not_triggered";
+          retestPlan = "Gate not yet triggered - waiting for price confirmation";
+        } else if (exec.entryBlocked) {
+          blockReason = exec.entryBlockReason ?? "entry_blocked";
+          retestPlan = "Entry blocked by risk management rules";
+        }
+        
+        const alertPayload: TradingAlertPayload = {
+          direction: exec.opportunity.side === "SHORT" ? "SHORT" : "LONG",
+          triggerPrice,
+          reason: `Trigger hit ${exec.opportunity.side}, but entry blocked because ${blockReason}. Next best plan: ${retestPlan}`,
+        };
+        events.push({
+          type: "TRADING_ALERT",
+          timestamp: ts,
+          instanceId: this.instanceId,
+          data: { timestamp: ts, symbol, price: close, alertPayload },
+        });
+        hasDiscreteEvent = true;
+        console.log(
+          `[TRIGGER_BLOCKED] ${exec.opportunity.side} trigger hit at ${triggerPrice?.toFixed(2)} but entry blocked: ${blockReason} | ${retestPlan}`
+        );
+        console.log(
+          `[TRIGGER_NOT_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} blockReason=${blockReason} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status}`
+        );
+      } else {
+        console.log(
+          `[TRIGGER_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status}`
+        );
+      }
     }
     if (exec.phase === "IN_TRADE" && previousPhase !== "IN_TRADE") {
       const payload: TradingAlertPayload = {
@@ -5889,31 +6263,68 @@ export class Orchestrator {
     // ============================================================================
     // This MUST run even if entry is blocked - trade management alerts bypass entry gating
     // The alert is emitted here (not in trade management block) to ensure it's not blocked
-    if (exec.lastTargetHit && exec.lastTargetHit.timestamp === ts) {
-      const payload: TradingAlertPayload = {
-        direction: exec.lastTargetHit.direction === "long" ? "LONG" : "SHORT",
-        targetKey: exec.lastTargetHit.targetKey,
-        targetPrice: exec.lastTargetHit.targetPrice,
-        entryPrice: exec.entryPrice,
-        stopPrice: exec.stopPrice,
-        momentum: exec.lastTargetHit.momentum,
-        coaching: exec.lastTargetHit.coaching,
-        reason: `Take profit ${exec.lastTargetHit.targetKey.toUpperCase()} hit`,
-      };
-      events.push({
-        type: "TRADING_ALERT",
-        timestamp: ts,
-        instanceId: this.instanceId,
-        data: { timestamp: ts, symbol, price: close, alertPayload: payload },
-      });
-      hasDiscreteEvent = true;
-      // Log before clearing
-      const targetHitInfo = exec.lastTargetHit;
-      console.log(
-        `[TP_ALERT_EMITTED] ${targetHitInfo.targetKey.toUpperCase()} hit at ${targetHitInfo.targetPrice.toFixed(2)} - Momentum: ${targetHitInfo.momentum} - ${targetHitInfo.coaching}`
-      );
-      // Clear after emitting to prevent duplicates
-      exec.lastTargetHit = undefined;
+    if (exec.lastTargetHit) {
+      const timestampMatch = exec.lastTargetHit.timestamp === ts;
+      const timestampDelta = ts - exec.lastTargetHit.timestamp;
+      const withinWindow = timestampDelta >= 0 && timestampDelta < 60000; // Within 1 minute
+      
+      if (timestampMatch) {
+        const payload: TradingAlertPayload = {
+          direction: exec.lastTargetHit.direction === "long" ? "LONG" : "SHORT",
+          targetKey: exec.lastTargetHit.targetKey,
+          targetPrice: exec.lastTargetHit.targetPrice,
+          entryPrice: exec.entryPrice,
+          stopPrice: exec.stopPrice,
+          momentum: exec.lastTargetHit.momentum,
+          coaching: exec.lastTargetHit.coaching,
+          reason: `Take profit ${exec.lastTargetHit.targetKey.toUpperCase()} hit`,
+        };
+        events.push({
+          type: "TRADING_ALERT",
+          timestamp: ts,
+          instanceId: this.instanceId,
+          data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+        });
+        hasDiscreteEvent = true;
+        // Log before clearing
+        const targetHitInfo = exec.lastTargetHit;
+        console.log(
+          `[TP_ALERT_EMIT] target=${targetHitInfo.targetKey} price=${targetHitInfo.targetPrice.toFixed(2)} timestamp=${targetHitInfo.timestamp} currentTs=${ts} emitted=true`
+        );
+        console.log(
+          `[TP_ALERT_EMITTED] ${targetHitInfo.targetKey.toUpperCase()} hit at ${targetHitInfo.targetPrice.toFixed(2)} - Momentum: ${targetHitInfo.momentum} - ${targetHitInfo.coaching}`
+        );
+        // Clear after emitting to prevent duplicates
+        exec.lastTargetHit = undefined;
+      } else {
+        console.log(
+          `[TP_ALERT_MISSED] target=${exec.lastTargetHit.targetKey} timestamp=${exec.lastTargetHit.timestamp} currentTs=${ts} delta=${timestampDelta}ms withinWindow=${withinWindow} timestampMatch=${timestampMatch}`
+        );
+        // If within window but not exact match, still emit (robust fix)
+        if (withinWindow && !timestampMatch) {
+          const payload: TradingAlertPayload = {
+            direction: exec.lastTargetHit.direction === "long" ? "LONG" : "SHORT",
+            targetKey: exec.lastTargetHit.targetKey,
+            targetPrice: exec.lastTargetHit.targetPrice,
+            entryPrice: exec.entryPrice,
+            stopPrice: exec.stopPrice,
+            momentum: exec.lastTargetHit.momentum,
+            coaching: exec.lastTargetHit.coaching,
+            reason: `Take profit ${exec.lastTargetHit.targetKey.toUpperCase()} hit`,
+          };
+          events.push({
+            type: "TRADING_ALERT",
+            timestamp: ts,
+            instanceId: this.instanceId,
+            data: { timestamp: ts, symbol, price: close, alertPayload: payload },
+          });
+          hasDiscreteEvent = true;
+          console.log(
+            `[TP_ALERT_EMIT] target=${exec.lastTargetHit.targetKey} price=${exec.lastTargetHit.targetPrice.toFixed(2)} timestamp=${exec.lastTargetHit.timestamp} currentTs=${ts} emitted=true (withinWindow)`
+          );
+          exec.lastTargetHit = undefined;
+        }
+      }
     }
 
     // Only emit MIND_STATE_UPDATED when phase/bias changed, or discrete alert, or heartbeat
@@ -6042,7 +6453,7 @@ export class Orchestrator {
         mindId: randomUUID(),
         direction: exec.thesisDirection ?? "none", // Legacy compatibility
         confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-        reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
+        reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason, exec, closed5mBars),
         bias: exec.bias,
         phase: exec.phase,
         entryStatus: entryStatusValue,
@@ -6152,7 +6563,7 @@ export class Orchestrator {
           mindId: randomUUID(),
           direction: exec.thesisDirection ?? "none",
           confidence: exec.biasConfidence ?? exec.thesisConfidence ?? 0,
-          reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason),
+          reason: this.getPhaseAwareReason(exec.bias, exec.phase, effectiveWaitReason, exec.reason, exec, closed5mBars),
           bias: exec.bias,
           phase: exec.phase,
           entryStatus: exec.entryBlocked ? ("blocked" as const) : ("inactive" as const),
