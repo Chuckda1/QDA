@@ -56,4 +56,19 @@ export class BarAggregator {
     c.volume += bar.volume;
     return null;
   }
+
+  /**
+   * Fix #5: Get current forming bar (expose internal state to prevent duplication)
+   * Returns the current forming bar or null if no bar is being formed
+   */
+  getCurrentFormingBar(): Bar | null {
+    return this.cur;
+  }
+
+  /**
+   * Fix #5: Get current bucket start timestamp
+   */
+  getBucketStartTs(): number | null {
+    return this.bucketStartTs;
+  }
 }
