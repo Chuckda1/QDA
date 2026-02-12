@@ -491,6 +491,30 @@ export type MinimalExecutionState = {
   llm1mCoachLine?: string;
   llm1mNextLevel?: number;
   llm1mLikelihoodHit?: number;
+  // Phase 1: Trade Integrity - Entry Snapshot (immutable once IN_TRADE)
+  entrySnapshot?: {
+    entryPrice: number;
+    stopPrice: number;
+    entryTs: number;
+    entryType: EntryType;
+    entryTrigger: string;
+    thesisDirection: "long" | "short";
+    targets: number[];
+    targetZones: {
+      rTargets: { t1: number; t2: number; t3: number };
+      atrTargets: { t1: number; t2: number };
+      magnetLevels: {
+        microLow?: number;
+        majorLow?: number;
+        microHigh?: number;
+        majorHigh?: number;
+        vwap?: number;
+      };
+      measuredMove?: number;
+      expectedZone: { lower: number; upper: number };
+      expectedEnd: number;
+    };
+  };
 };
 
 // BiasFlipEntry Gate State

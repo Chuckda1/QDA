@@ -720,6 +720,14 @@ export class Orchestrator {
   ): void {
     if (prevSetup === nextSetup) return;
 
+    // Phase 1.2: CRITICAL - Skip gate reset and waitReason overwrite while IN_TRADE
+    if (exec.phase === "IN_TRADE") {
+      console.log(
+        `[GATE_RESET_SKIP] phase=IN_TRADE - preserving gate state and waitReason to prevent trade state corruption`
+      );
+      return; // Don't reset gate or waitReason while IN_TRADE
+    }
+
     // Always clear any armed/invalidated gate when setup changes
     if (exec.resolutionGate) {
       const prevGateStatus = exec.resolutionGate.status;
@@ -736,14 +744,12 @@ export class Orchestrator {
     exec.setupStopPrice = undefined;
     exec.setupDetectedAt = ts; // Track when new setup started
     
-    // Clear entry state if not in trade
-    if (exec.phase !== "IN_TRADE") {
-      exec.entryPrice = undefined;
-      exec.entryTs = undefined;
-      exec.entryType = undefined;
-      exec.entryTrigger = undefined;
-      exec.stopPrice = undefined;
-    }
+    // Clear entry state (we already returned if IN_TRADE above, so this is safe)
+    exec.entryPrice = undefined;
+    exec.entryTs = undefined;
+    exec.entryType = undefined;
+    exec.entryTrigger = undefined;
+    exec.stopPrice = undefined;
     
     // Note: We do NOT clear pullbackHigh/pullbackLow here because they are structure-based,
     // not setup-specific. They should only be cleared when structure actually breaks.
@@ -1387,6 +1393,35 @@ export class Orchestrator {
     return { triggered: false };
   }
 
+  // Phase 1.3: Create entry snapshot on trade entry (immutable once IN_TRADE)
+  private createEntrySnapshot(exec: MinimalExecutionState): void {
+    if (!exec.entryPrice || !exec.stopPrice || !exec.entryType || !exec.targetZones) {
+      console.error(
+        `[ENTRY_SNAPSHOT_ERROR] Cannot create snapshot: entryPrice=${exec.entryPrice} stopPrice=${exec.stopPrice} entryType=${exec.entryType} targetZones=${!!exec.targetZones}`
+      );
+      return;
+    }
+
+    exec.entrySnapshot = {
+      entryPrice: exec.entryPrice,
+      stopPrice: exec.stopPrice,
+      entryTs: exec.entryTs ?? Date.now(),
+      entryType: exec.entryType,
+      entryTrigger: exec.entryTrigger ?? "unknown",
+      thesisDirection: (exec.thesisDirection === "long" || exec.thesisDirection === "short") 
+        ? exec.thesisDirection 
+        : (exec.bias === "BULLISH" ? "long" : exec.bias === "BEARISH" ? "short" : "long"), // Default to "long" if none
+      targets: exec.targets ?? [],
+      targetZones: exec.targetZones,
+    };
+
+    if (exec.entrySnapshot) {
+      console.log(
+        `[ENTRY_SNAPSHOT_CREATED] entryPrice=${exec.entrySnapshot.entryPrice.toFixed(2)} stopPrice=${exec.entrySnapshot.stopPrice.toFixed(2)} entryType=${exec.entrySnapshot.entryType} risk=${Math.abs(exec.entrySnapshot.entryPrice - exec.entrySnapshot.stopPrice).toFixed(2)}`
+      );
+    }
+  }
+
   private clearTradeState(exec: MinimalExecutionState): void {
     // Only clear pullback levels if we're not in PULLBACK_IN_PROGRESS (need them for failure detection)
     if (exec.phase !== "PULLBACK_IN_PROGRESS") {
@@ -1406,6 +1441,8 @@ export class Orchestrator {
     exec.entryType = undefined;
     exec.entryTrigger = undefined;
     exec.reason = undefined; // Clear entry-aligned narrative on exit
+    // Phase 1.3: Clear entry snapshot on exit
+    exec.entrySnapshot = undefined;
     // Clear bias flip gate on exit
     exec.biasFlipGate = undefined;
     // Clear target hit tracking and momentum tracking
@@ -1598,6 +1635,9 @@ export class Orchestrator {
     );
     exec.targets = targetResult.targets;
     exec.targetZones = targetResult.targetZones;
+
+    // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+    this.createEntrySnapshot(exec);
 
     if (exec.opportunity) {
       exec.opportunity.status = "CONSUMED";
@@ -2551,11 +2591,16 @@ export class Orchestrator {
     };
   } {
     const risk = Math.abs(entry - stop);
+    // Phase 1.5: CRITICAL - Validate risk > 0 to prevent target collapse
     if (!Number.isFinite(risk) || risk <= 0 || atr <= 0) {
-      // Fallback to basic R targets only
-      const basicT1 = direction === "long" ? entry + risk : entry - risk;
-      const basicT2 = direction === "long" ? entry + risk * 2 : entry - risk * 2;
-      const basicT3 = direction === "long" ? entry + risk * 3 : entry - risk * 3;
+      // Risk is 0 or invalid - use minimum risk (0.1 * atr) instead of collapsing targets
+      const minRisk = Math.max(0.1 * atr, 0.10); // Minimum 0.10 or 0.1 * ATR
+      console.error(
+        `[TARGET_COMPUTE_ERROR] risk=${risk} atr=${atr} - using minimum risk=${minRisk.toFixed(2)} to prevent target collapse`
+      );
+      const basicT1 = direction === "long" ? entry + minRisk : entry - minRisk;
+      const basicT2 = direction === "long" ? entry + minRisk * 2 : entry - minRisk * 2;
+      const basicT3 = direction === "long" ? entry + minRisk * 3 : entry - minRisk * 3;
       return {
         targets: [basicT1, basicT2, basicT3],
         targetZones: {
@@ -4055,17 +4100,19 @@ export class Orchestrator {
           `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> BIAS_ESTABLISHED reason=initial_establishment`
         );
       } else if ((exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "EXTENSION") && lastClosed5m) {
-        const current5m = forming5mBar ?? lastClosed5m;
-        const atr = this.calculateATR(closed5mBars);
-        
-        // Diagnostic: Check if boundaries are missing
-        if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
-          console.log(
-            `[PHASE_BOUNDARY_MISSING] phase=${exec.phase} bias=${exec.bias} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} boundariesDefined=false`
-          );
-        }
-        
-        if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined && atr > 0) {
+        // Phase 1.4: CRITICAL - Phase classification only runs for non-IN_TRADE phases
+        // (This block already filters for BIAS_ESTABLISHED/PULLBACK_IN_PROGRESS/EXTENSION, so IN_TRADE is excluded)
+          const current5m = forming5mBar ?? lastClosed5m;
+          const atr = this.calculateATR(closed5mBars);
+          
+          // Diagnostic: Check if boundaries are missing
+          if (exec.pullbackHigh === undefined || exec.pullbackLow === undefined) {
+            console.log(
+              `[PHASE_BOUNDARY_MISSING] phase=${exec.phase} bias=${exec.bias} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} boundariesDefined=false`
+            );
+          }
+          
+          if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined && atr > 0) {
           const buffer = this.EXTENSION_THRESHOLD_ATR * atr;
           const inZone = current5m.close > exec.pullbackLow && current5m.close < exec.pullbackHigh;
           const extendedBull = exec.bias === "BULLISH" && current5m.close > exec.pullbackHigh + buffer;
@@ -4223,7 +4270,12 @@ export class Orchestrator {
     // - Setup is NONE, OR
     // - Setup TTL expired, OR
     // - Setup was invalidated above
-    if (exec.setup === "NONE" || !exec.setup || now >= setupTTLExpiry) {
+    // Phase 1.1: CRITICAL - Skip setup detection while IN_TRADE
+    if (exec.phase === "IN_TRADE") {
+      console.log(
+        `[SETUP_DETECT_SKIP] phase=IN_TRADE - skipping setup detection to preserve trade state`
+      );
+    } else if (exec.setup === "NONE" || !exec.setup || now >= setupTTLExpiry) {
       if (exec.bias === "NEUTRAL") {
         exec.setup = "NONE";
         exec.setupTriggerPrice = undefined;
@@ -5033,6 +5085,8 @@ export class Orchestrator {
               exec.targetZones = targetResultReentry.targetZones;
               exec.thesisDirection = exec.bias === "BULLISH" ? "long" : "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
+              // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+              this.createEntrySnapshot(exec);
               exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -5678,6 +5732,8 @@ export class Orchestrator {
               exec.targetZones = targetResult.targetZones;
               exec.thesisDirection = dir as "long" | "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
+              // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+              this.createEntrySnapshot(exec);
               exec.reason = `Entered (nudge momentum) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -5733,6 +5789,8 @@ export class Orchestrator {
 
               exec.thesisDirection = ignitionDir as "long" | "short"; // Explicitly set for stop/target checks
               exec.phase = "IN_TRADE";
+              // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+              this.createEntrySnapshot(exec);
               exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
               exec.waitReason = "in_trade";
               exec.entryBlocked = false;
@@ -5872,6 +5930,8 @@ export class Orchestrator {
 
                     exec.thesisDirection = "long"; // Explicitly set for stop/target checks
                     exec.phase = "IN_TRADE";
+                    // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+                    this.createEntrySnapshot(exec);
                     exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                     exec.waitReason = "in_trade";
                     exec.entryBlocked = false;
@@ -6023,6 +6083,8 @@ export class Orchestrator {
 
                     exec.thesisDirection = "short"; // Explicitly set for stop/target checks
                     exec.phase = "IN_TRADE";
+                    // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
+                    this.createEntrySnapshot(exec);
                     exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
                     exec.waitReason = "in_trade";
                     exec.entryBlocked = false;
@@ -6058,15 +6120,17 @@ export class Orchestrator {
       // ============================================================================
       // This MUST run regardless of the pullback entry logic block below
       // Real-time target updates: recompute targets on each 5m close
-      if (exec.phase === "IN_TRADE" && exec.entryPrice !== undefined && exec.stopPrice !== undefined && is5mClose) {
+      // Phase 1.5: CRITICAL - Use entrySnapshot for recomputation (not mutable exec.entryPrice/stopPrice)
+      if (exec.phase === "IN_TRADE" && exec.entrySnapshot && is5mClose) {
         const atr = this.calculateATR(closed5mBars);
         const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
         const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
-        const direction = exec.bias === "BULLISH" ? "long" : "short";
+        const direction = exec.entrySnapshot.thesisDirection;
+        // Phase 1.5: Use entrySnapshot values (immutable) instead of exec.entryPrice/stopPrice (mutable)
         const targetResult = this.computeTargets(
           direction,
-          exec.entryPrice,
-          exec.stopPrice,
+          exec.entrySnapshot.entryPrice,
+          exec.entrySnapshot.stopPrice,
           atr,
           closedBarsWithVolume,
           vwap,
@@ -6077,7 +6141,7 @@ export class Orchestrator {
         exec.targets = targetResult.targets;
         exec.targetZones = targetResult.targetZones;
         console.log(
-          `[TARGETS_UPDATED] Entry=${exec.entryPrice.toFixed(2)} R_Targets: T1=${targetResult.targetZones.rTargets.t1.toFixed(2)} T2=${targetResult.targetZones.rTargets.t2.toFixed(2)} T3=${targetResult.targetZones.rTargets.t3.toFixed(2)} ExpectedZone=${targetResult.targetZones.expectedZone.lower.toFixed(2)}-${targetResult.targetZones.expectedZone.upper.toFixed(2)}`
+          `[TARGETS_RECOMPUTED] using entrySnapshot entry=${exec.entrySnapshot.entryPrice.toFixed(2)} stop=${exec.entrySnapshot.stopPrice.toFixed(2)} R_Targets: T1=${targetResult.targetZones.rTargets.t1.toFixed(2)} T2=${targetResult.targetZones.rTargets.t2.toFixed(2)} T3=${targetResult.targetZones.rTargets.t3.toFixed(2)} ExpectedZone=${targetResult.targetZones.expectedZone.lower.toFixed(2)}-${targetResult.targetZones.expectedZone.upper.toFixed(2)}`
         );
       }
 
