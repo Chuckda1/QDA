@@ -3961,13 +3961,23 @@ export class Orchestrator {
           const ema = closed5mBars.length >= 6 ? this.calculateEMA(closed5mBars.map(b => ({ close: b.close })), 9) : undefined;
           const triggerLevel = exec.setupTriggerPrice ?? exec.opportunity?.trigger?.price;
           
+          // Determine retest level and source
+          const retestLevel = vwap ?? ema ?? triggerLevel;
+          const retestSource = vwap !== undefined ? "VWAP5M" : ema !== undefined ? "EMA9_5M" : triggerLevel !== undefined ? "TRIGGER" : "NONE";
+          
+          // Log retest level source for debugging
+          // Note: closed5mBars may not have ts property, so we use length as identifier
+          const lastBar = closed5mBars[closed5mBars.length - 1];
+          const lastClosedTs = lastBar && 'ts' in lastBar ? (lastBar as any).ts : undefined;
+          console.log(
+            `[RETEST_LEVEL] source=${retestSource} vwap=${vwap?.toFixed(2) ?? "n/a"} ema=${ema?.toFixed(2) ?? "n/a"} trigger=${triggerLevel?.toFixed(2) ?? "n/a"} chosen=${retestLevel?.toFixed(2) ?? "n/a"} lenClosed=${closed5mBars.length} lastClosedTs=${lastClosedTs ?? "n/a"}`
+          );
+          
           if (bias === "BEARISH") {
-            const retestLevel = vwap ?? ema ?? triggerLevel;
             return retestLevel 
               ? `Price extended below trigger. Wait for retest to ${retestLevel.toFixed(2)} (VWAP/EMA) before short entry.`
               : `Price extended below trigger. Wait for retest to breakdown level before short entry.`;
           } else {
-            const retestLevel = vwap ?? ema ?? triggerLevel;
             return retestLevel
               ? `Price extended above trigger. Wait for retest to ${retestLevel.toFixed(2)} (VWAP/EMA) before long entry.`
               : `Price extended above trigger. Wait for retest to breakout level before long entry.`;

@@ -364,21 +364,8 @@ if (alpacaKey && alpacaSecret) {
                 `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
               );
             }
-            // a) Update forming5mBar with 1m bar (no LLM call)
-            const events1m = await orch.processTick(
-              {
-                ts: normalizedBar.ts,
-                symbol: normalizedBar.symbol,
-                close: normalizedBar.close,
-                open: normalizedBar.open,
-                high: normalizedBar.high,
-                low: normalizedBar.low,
-                volume: normalizedBar.volume
-              },
-              "1m"
-            );
             
-            // b) Push 1m bar to aggregator, get closed 5m if bucket completed
+            // 1) Push 1m bar into 5m aggregator FIRST
             const closed5m = agg5m.push1m({
               ts: normalizedBar.ts,
               symbol: normalizedBar.symbol,
@@ -389,8 +376,7 @@ if (alpacaKey && alpacaSecret) {
               volume: normalizedBar.volume,
             });
             
-            // c) If closed 5m bar exists, process it (triggers LLM)
-            // Fix #4: Removed duplicate CLOSE5M log - orchestrator.ts already logs this
+            // 2) If a 5m bar closed, commit it FIRST (so VWAP/EMA/lenClosed are correct)
             if (closed5m !== null) {
               bars5mCount++;
               const events5m = await orch.processTick(
@@ -406,9 +392,25 @@ if (alpacaKey && alpacaSecret) {
                 "5m"
               );
               await publisher.publishOrdered(events5m);
+              // Proof log: 5m close processed before 1m mind-state
+              console.log(
+                `[ORDER_OK] processed 5m close before 1m mind-state | closed5m.ts=${closed5m.ts} tick.ts=${normalizedBar.ts}`
+              );
             }
             
-            // Publish 1m events if any (for state updates)
+            // 3) Now process the 1m tick (mind-state will see the committed closed5mBars)
+            const events1m = await orch.processTick(
+              {
+                ts: normalizedBar.ts,
+                symbol: normalizedBar.symbol,
+                close: normalizedBar.close,
+                open: normalizedBar.open,
+                high: normalizedBar.high,
+                low: normalizedBar.low,
+                volume: normalizedBar.volume
+              },
+              "1m"
+            );
             await publisher.publishOrdered(events1m);
           } catch (processError: any) {
             // Log processing errors but continue the loop
@@ -430,21 +432,8 @@ if (alpacaKey && alpacaSecret) {
                 `[INGEST] 1m ts=${normalizedBar.ts} o=${normalizedBar.open} h=${normalizedBar.high} l=${normalizedBar.low} c=${normalizedBar.close} v=${normalizedBar.volume}`
               );
             }
-            // a) Update forming5mBar with 1m bar (no LLM call)
-            const events1m = await orch.processTick(
-              {
-                ts: normalizedBar.ts,
-                symbol: normalizedBar.symbol,
-                close: normalizedBar.close,
-                open: normalizedBar.open,
-                high: normalizedBar.high,
-                low: normalizedBar.low,
-                volume: normalizedBar.volume
-              },
-              "1m"
-            );
             
-            // b) Push 1m bar to aggregator, get closed 5m if bucket completed
+            // 1) Push 1m bar into 5m aggregator FIRST
             const closed5m = agg5m.push1m({
               ts: normalizedBar.ts,
               symbol: normalizedBar.symbol,
@@ -455,8 +444,7 @@ if (alpacaKey && alpacaSecret) {
               volume: normalizedBar.volume,
             });
             
-            // c) If closed 5m bar exists, process it (triggers LLM)
-            // Fix #4: Removed duplicate CLOSE5M log - orchestrator.ts already logs this
+            // 2) If a 5m bar closed, commit it FIRST (so VWAP/EMA/lenClosed are correct)
             if (closed5m !== null) {
               bars5mCount++;
               const events5m = await orch.processTick(
@@ -472,9 +460,25 @@ if (alpacaKey && alpacaSecret) {
                 "5m"
               );
               await publisher.publishOrdered(events5m);
+              // Proof log: 5m close processed before 1m mind-state
+              console.log(
+                `[ORDER_OK] processed 5m close before 1m mind-state | closed5m.ts=${closed5m.ts} tick.ts=${normalizedBar.ts}`
+              );
             }
             
-            // Publish 1m events if any (for state updates)
+            // 3) Now process the 1m tick (mind-state will see the committed closed5mBars)
+            const events1m = await orch.processTick(
+              {
+                ts: normalizedBar.ts,
+                symbol: normalizedBar.symbol,
+                close: normalizedBar.close,
+                open: normalizedBar.open,
+                high: normalizedBar.high,
+                low: normalizedBar.low,
+                volume: normalizedBar.volume
+              },
+              "1m"
+            );
             await publisher.publishOrdered(events1m);
           } catch (processError: any) {
             // Log processing errors but continue the loop

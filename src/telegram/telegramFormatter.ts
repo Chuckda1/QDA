@@ -57,18 +57,21 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     };
   }
 
+  // Helper to get alert label
+  const getAlertLabel = (alertKind: string): string => {
+    const labelMap: Record<string, string> = {
+      "GATE_ARMED": "GATE ARMED",
+      "OPPORTUNITY_TRIGGERED": "TRIGGER HIT",
+      "TRADE_ENTRY": "IN TRADE",
+    };
+    return labelMap[alertKind] ?? "EXIT";
+  };
+
   // Trading alerts (discrete events: gate armed, trigger, entry, exit)
   if (snapshot.type === "ALERT" && snapshot.alertKind && snapshot.alertPayload) {
     const p = snapshot.alertPayload;
     const price = formatPrice(snapshot.price);
-    const label =
-      snapshot.alertKind === "GATE_ARMED"
-        ? "GATE ARMED"
-        : snapshot.alertKind === "OPPORTUNITY_TRIGGERED"
-          ? "TRIGGER HIT"
-          : snapshot.alertKind === "TRADE_ENTRY"
-            ? "IN TRADE"
-            : "EXIT";
+    const label = getAlertLabel(snapshot.alertKind);
     const parts: string[] = [
       `🚨 ALERT: ${label}`,
       `${p.direction} | px=${price}`,
@@ -106,61 +109,62 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     ? `${biasEmoji} REF: ${refPrice} (${snapshot.refLabel})`
     : undefined;
   
+  // Helper to format expected resolution text
+  const formatExpectedResolutionText = (resolution: string, bias?: string): string => {
+    if (resolution === "CONTINUATION") {
+      return bias === "BEARISH" ? "Continuation down" : "Continuation up";
+    }
+    if (resolution === "FAILURE") {
+      return bias === "BEARISH" ? "Pullback failure → continuation down" : "Pullback failure → continuation up";
+    }
+    return resolution;
+  };
+
   // Format expected resolution with emoji
-  let expectedLine: string | undefined;
-  if (snapshot.expectedResolution) {
-    const expectedText = snapshot.expectedResolution === "CONTINUATION" 
-      ? (snapshot.bias === "BEARISH" ? "Continuation down" : "Continuation up")
-      : snapshot.expectedResolution === "FAILURE"
-      ? (snapshot.bias === "BEARISH" ? "Pullback failure → continuation down" : "Pullback failure → continuation up")
-      : snapshot.expectedResolution;
-    expectedLine = `${expectedEmoji} EXPECTATION: ${expectedText}`;
-  }
+  const expectedLine = snapshot.expectedResolution
+    ? `${expectedEmoji} EXPECTATION: ${formatExpectedResolutionText(snapshot.expectedResolution, snapshot.bias)}`
+    : undefined;
 
   // Format setup with emoji
   const setupEmoji = snapshot.setup && snapshot.setup !== "NONE" ? "🎯" : "⚪";
-  let setupLine: string | undefined;
-  let entryLine: string | undefined;
   
-  // Special handling for IGNITION setup with actionable info
-  if (snapshot.setup === "IGNITION" && snapshot.setupDetectedAt && snapshot.lastBiasFlipTs && snapshot.ts) {
-    const now = Date.now();
-    const flipAge = now - snapshot.lastBiasFlipTs;
-    const setupAge = snapshot.setupDetectedAt ? (now - snapshot.setupDetectedAt) : 0;
-    const windowMs = 3 * 60 * 1000; // IGNITION_WINDOW_MS
-    const ttlMs = 2 * 60 * 1000; // IGNITION_TTL_MS
-    const windowRemaining = Math.max(0, windowMs - flipAge);
-    const ttlRemaining = snapshot.setupDetectedAt ? Math.max(0, ttlMs - setupAge) : undefined;
-    
-    const windowText = windowRemaining > 0 
-      ? `window open (${Math.round(windowRemaining / 1000)}s left)`
-      : "window closed";
-    const ttlText = ttlRemaining !== undefined && ttlRemaining > 0
-      ? `expires in ${Math.round(ttlRemaining / 1000)}s`
-      : ttlRemaining === 0 ? "expired" : undefined;
-    
-    setupLine = `${setupEmoji} SETUP: IGNITION ${windowText}${ttlText ? ` | ${ttlText}` : ""}`;
-    
-    if (snapshot.setupTriggerPrice && snapshot.setupStopPrice) {
-      const triggerDir = snapshot.bias === "BULLISH" ? ">" : "<";
-      entryLine = `${entryEmoji} ENTRY: WAITING | Trigger ${triggerDir} ${formatPrice(snapshot.setupTriggerPrice)} | Stop ${triggerDir === ">" ? "<" : ">"} ${formatPrice(snapshot.setupStopPrice)}`;
-    } else {
-      entryLine = `${entryEmoji} ENTRY: WAITING (trigger: ${snapshot.setupTriggerPrice ? formatPrice(snapshot.setupTriggerPrice) : "n/a"})`;
+  // Helper to format trigger label
+  const formatTriggerLabel = (): string => {
+    if (snapshot.setupTriggerPrice == null) return "";
+    const priceText = `trigger: ${formatPrice(snapshot.setupTriggerPrice)}`;
+    if (snapshot.triggerContext) {
+      const contextText = snapshot.triggerContext === "extended" ? "extended" : "in pullback";
+      return `${priceText} (${contextText})`;
     }
-  } else {
-    const triggerLabel = snapshot.setupTriggerPrice != null
-      ? (snapshot.triggerContext ? `trigger: ${formatPrice(snapshot.setupTriggerPrice)} (${snapshot.triggerContext === "extended" ? "extended" : "in pullback"})` : `trigger: ${formatPrice(snapshot.setupTriggerPrice)}`)
-      : "";
-    setupLine = snapshot.setup 
-      ? `${setupEmoji} SETUP: ${snapshot.setup}${triggerLabel ? ` (${triggerLabel})` : ""}`
-      : undefined;
+    return priceText;
+  };
+  
+  // Format setup line
+  const triggerLabel = formatTriggerLabel();
+  const setupLine = snapshot.setup 
+    ? `${setupEmoji} SETUP: ${snapshot.setup}${triggerLabel ? ` (${triggerLabel})` : ""}`
+    : undefined;
+  
+  // Format entry line
+  const formatEntryLine = (): string => {
+    if (snapshot.entryStatus === "active") return `${entryEmoji} ENTRY: ACTIVE`;
+    if (snapshot.entryStatus === "blocked") return `${entryEmoji} ENTRY: BLOCKED`;
     
-    entryLine = snapshot.setup && snapshot.setup !== "NONE"
-      ? snapshot.setupTriggerPrice != null
-        ? `${entryEmoji} ENTRY: WAITING (${triggerLabel})`
-        : `${entryEmoji} ENTRY: WAITING (${snapshot.triggerContext === "extended" ? "extended" : snapshot.triggerContext === "in_pullback" ? "in pullback" : "waiting for level"})`
-      : `${entryEmoji} ENTRY: ${snapshot.entryStatus === "active" ? "ACTIVE" : snapshot.entryStatus === "blocked" ? "BLOCKED" : "NONE"}`;
-  }
+    if (snapshot.setup && snapshot.setup !== "NONE") {
+      if (snapshot.setupTriggerPrice != null) {
+        return `${entryEmoji} ENTRY: WAITING (${triggerLabel})`;
+      }
+      const contextText = snapshot.triggerContext === "extended" 
+        ? "extended" 
+        : snapshot.triggerContext === "in_pullback" 
+          ? "in pullback" 
+          : "waiting for level";
+      return `${entryEmoji} ENTRY: WAITING (${contextText})`;
+    }
+    
+    return `${entryEmoji} ENTRY: NONE`;
+  };
+  const entryLine = formatEntryLine();
 
   // Market condition line (if available)
   const marketConditionLine = snapshot.marketCondition
@@ -274,8 +278,7 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
   // NO_TRADE: single source of truth
   // ------------------------------
   if (!inTrade) {
-    // Always show setup line as STATUS only (not a reason)
-    lines.push(`⚪ SETUP: ${snapshot.setup ?? "NONE"}`);
+    // Note: setupLine is already added in main block (line 190), no need to duplicate here
 
     const view = buildTradeReadinessView(
       inTrade,
@@ -304,77 +307,86 @@ export function buildTelegramAlert(snapshot: TelegramSnapshot): TelegramAlert | 
     }
   }
 
-  // Add timestamps for debugging (if available)
-  if (snapshot.oppLatchedAt || snapshot.oppExpiresAt || snapshot.last5mCloseTs || snapshot.source) {
+  // Helper to format timestamp lines
+  const formatTimestampLines = (): string[] => {
     const timestampLines: string[] = [];
     if (snapshot.source) {
       timestampLines.push(`📡 SOURCE: ${snapshot.source.toUpperCase()}`);
     }
     if (snapshot.last5mCloseTs) {
-      const last5mCloseTime = formatEtTimestamp(snapshot.last5mCloseTs);
-      timestampLines.push(`🕐 LAST 5M CLOSE: ${last5mCloseTime}`);
+      timestampLines.push(`🕐 LAST 5M CLOSE: ${formatEtTimestamp(snapshot.last5mCloseTs)}`);
     }
     if (snapshot.oppLatchedAt) {
-      const latchedTime = formatEtTimestamp(snapshot.oppLatchedAt);
-      timestampLines.push(`🔒 OPP LATCHED: ${latchedTime}`);
+      timestampLines.push(`🔒 OPP LATCHED: ${formatEtTimestamp(snapshot.oppLatchedAt)}`);
     }
     if (snapshot.oppExpiresAt) {
       const expiresTime = formatEtTimestamp(snapshot.oppExpiresAt);
       const timeUntilExpiry = snapshot.oppExpiresAt - Date.now();
       const minutesUntilExpiry = Math.floor(timeUntilExpiry / (60 * 1000));
-      timestampLines.push(`⏰ OPP EXPIRES: ${expiresTime} (${minutesUntilExpiry > 0 ? `in ${minutesUntilExpiry}m` : 'expired'})`);
+      const expiryText = minutesUntilExpiry > 0 ? `in ${minutesUntilExpiry}m` : 'expired';
+      timestampLines.push(`⏰ OPP EXPIRES: ${expiresTime} (${expiryText})`);
     }
-    if (timestampLines.length > 0) {
-      lines.push(""); // Blank line separator
-      lines.push(...timestampLines);
-    }
+    return timestampLines;
+  };
+
+  // Add timestamps for debugging (if available)
+  const timestampLines = formatTimestampLines();
+  if (timestampLines.length > 0) {
+    lines.push(""); // Blank line separator
+    lines.push(...timestampLines);
   }
 
-  // Add target zones if in trade
-  if (snapshot.entryStatus === "active" && snapshot.entryPrice && snapshot.stopPrice && snapshot.targetZones) {
-    const risk = Math.abs(snapshot.entryPrice - snapshot.stopPrice);
-    const riskStr = risk.toFixed(2);
+  // Helper to format target zone lines
+  const formatTargetZoneLines = (): string[] => {
+    if (!snapshot.entryStatus || snapshot.entryStatus !== "active" || !snapshot.entryPrice || !snapshot.stopPrice || !snapshot.targetZones) {
+      return [];
+    }
     
-    lines.push(""); // Blank line separator
-    lines.push(`📊 ENTRY: ${formatPrice(snapshot.entryPrice)} STOP: ${formatPrice(snapshot.stopPrice)} (R=${riskStr})`);
+    const targetLines: string[] = [];
+    const risk = Math.abs(snapshot.entryPrice - snapshot.stopPrice);
+    targetLines.push(`📊 ENTRY: ${formatPrice(snapshot.entryPrice)} STOP: ${formatPrice(snapshot.stopPrice)} (R=${risk.toFixed(2)})`);
     
     // R targets
     if (snapshot.targetZones.rTargets) {
       const r = snapshot.targetZones.rTargets;
-      lines.push(`🎯 TARGETS: 1R=${formatPrice(r.t1)} | 2R=${formatPrice(r.t2)} | 3R=${formatPrice(r.t3)}`);
+      targetLines.push(`🎯 TARGETS: 1R=${formatPrice(r.t1)} | 2R=${formatPrice(r.t2)} | 3R=${formatPrice(r.t3)}`);
     }
     
     // ATR targets
     if (snapshot.targetZones.atrTargets) {
       const atr = snapshot.targetZones.atrTargets;
-      lines.push(`📈 ATR: T1=${formatPrice(atr.t1)} | T2=${formatPrice(atr.t2)}`);
+      targetLines.push(`📈 ATR: T1=${formatPrice(atr.t1)} | T2=${formatPrice(atr.t2)}`);
     }
     
     // Magnet levels
     const magnets: string[] = [];
-    if (snapshot.targetZones.magnetLevels?.microLow) {
-      magnets.push(`microLow=${formatPrice(snapshot.targetZones.magnetLevels.microLow)}`);
-    }
-    if (snapshot.targetZones.magnetLevels?.majorLow) {
-      magnets.push(`majorLow=${formatPrice(snapshot.targetZones.magnetLevels.majorLow)}`);
-    }
-    if (snapshot.targetZones.magnetLevels?.vwap) {
-      magnets.push(`vwap=${formatPrice(snapshot.targetZones.magnetLevels.vwap)}`);
-    }
+    const magnetLevels = snapshot.targetZones.magnetLevels;
+    if (magnetLevels?.microLow) magnets.push(`microLow=${formatPrice(magnetLevels.microLow)}`);
+    if (magnetLevels?.majorLow) magnets.push(`majorLow=${formatPrice(magnetLevels.majorLow)}`);
+    if (magnetLevels?.vwap) magnets.push(`vwap=${formatPrice(magnetLevels.vwap)}`);
     if (magnets.length > 0) {
-      lines.push(`🧲 MAGNET: ${magnets.join(" | ")}`);
+      targetLines.push(`🧲 MAGNET: ${magnets.join(" | ")}`);
     }
     
     // Expected zone
     if (snapshot.targetZones.expectedZone) {
       const zone = snapshot.targetZones.expectedZone;
-      lines.push(`📍 EXPECTED_ZONE: ${formatPrice(zone.lower)} – ${formatPrice(zone.upper)}`);
+      targetLines.push(`📍 EXPECTED_ZONE: ${formatPrice(zone.lower)} – ${formatPrice(zone.upper)}`);
     }
     
-    // Measured move if available
+    // Measured move
     if (snapshot.targetZones.measuredMove) {
-      lines.push(`📏 MEASURED_MOVE: ${formatPrice(snapshot.targetZones.measuredMove)}`);
+      targetLines.push(`📏 MEASURED_MOVE: ${formatPrice(snapshot.targetZones.measuredMove)}`);
     }
+    
+    return targetLines;
+  };
+
+  // Add target zones if in trade
+  const targetZoneLines = formatTargetZoneLines();
+  if (targetZoneLines.length > 0) {
+    lines.push(""); // Blank line separator
+    lines.push(...targetZoneLines);
   }
 
   // Add debug line for minimal mode
