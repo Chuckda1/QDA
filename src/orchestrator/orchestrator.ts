@@ -329,8 +329,22 @@ export class Orchestrator {
 
   // Calculate simple ATR approximation from recent bars
   private calculateATR(bars: Array<{ high: number; low: number; close: number }>, period: number = 14): number {
-    if (bars.length < 2) return 0;
+    if (bars.length < 2) {
+      // Fix #13: Log when ATR can't be calculated
+      if (bars.length > 0) {
+        console.log(
+          `[PARTIAL_WINDOW] ATR calculation skipped - only ${bars.length} bar(s) available (need >= 2)`
+        );
+      }
+      return 0;
+    }
     const recentBars = bars.slice(-period);
+    // Fix #13: Log when using partial window for ATR
+    if (recentBars.length < period && recentBars.length >= 3) {
+      console.log(
+        `[PARTIAL_WINDOW] ATR using ${recentBars.length} bars (less than ${period}) - may be less accurate`
+      );
+    }
     let sum = 0;
     for (let i = 1; i < recentBars.length; i++) {
       const tr = Math.max(
@@ -1628,12 +1642,24 @@ export class Orchestrator {
       `[SETUP_DETECT_START] bias=${bias} phase=${phase} expectedResolution=${expectedResolution} pullbackHigh=${exec.pullbackHigh} pullbackLow=${exec.pullbackLow} boundariesDefined=${exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined}`
     );
     
-    // No setup if no bias
-    if (bias === "NEUTRAL") {
+    // Fix #12: Allow setup detection even with NEUTRAL bias if we have structure
+    // This breaks the chicken-egg problem: need bias to detect setup, need setup to establish bias
+    // If we have pullback boundaries and phase, we can detect setup even with weak/neutral bias
+    const hasStructure = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined && phase !== "NEUTRAL_PHASE";
+    
+    if (bias === "NEUTRAL" && !hasStructure) {
       console.log(
-        `[SETUP_DETECT_BLOCKED] reason=bias_neutral`
+        `[SETUP_DETECT_BLOCKED] reason=bias_neutral_no_structure`
       );
       return { setup: "NONE" };
+    }
+    
+    // If bias is NEUTRAL but we have structure, allow setup detection (weak bias case)
+    if (bias === "NEUTRAL" && hasStructure) {
+      console.log(
+        `[SETUP_DETECT_WEAK_BIAS] bias=NEUTRAL but hasStructure=true - allowing setup detection`
+      );
+      // Continue to setup detection logic below
     }
     
     // PULLBACK_CONTINUATION: Trend pullback then continuation
@@ -2562,11 +2588,20 @@ export class Orchestrator {
       vwap?: number;
     } = {};
 
+    // Fix #13: Allow partial-window processing with logging
     if (closed5mBars.length >= 6) {
       // Micro low/high (last 6-12 bars = 30-60 minutes)
       const microBars = closed5mBars.slice(-12);
       magnetLevels.microLow = Math.min(...microBars.map(b => b.low));
       magnetLevels.microHigh = Math.max(...microBars.map(b => b.high));
+    } else if (closed5mBars.length >= 3) {
+      // Partial window: use available bars with reduced confidence
+      const microBars = closed5mBars.slice(-closed5mBars.length);
+      magnetLevels.microLow = Math.min(...microBars.map(b => b.low));
+      magnetLevels.microHigh = Math.max(...microBars.map(b => b.high));
+      console.log(
+        `[PARTIAL_WINDOW] Using ${closed5mBars.length} bars for micro levels (less than 6) - context may be limited`
+      );
     }
 
     if (closed5mBars.length >= 24) {
@@ -2574,6 +2609,14 @@ export class Orchestrator {
       const majorBars = closed5mBars.slice(-36);
       magnetLevels.majorLow = Math.min(...majorBars.map(b => b.low));
       magnetLevels.majorHigh = Math.max(...majorBars.map(b => b.high));
+    } else if (closed5mBars.length >= 12) {
+      // Partial window: use available bars
+      const majorBars = closed5mBars.slice(-closed5mBars.length);
+      magnetLevels.majorLow = Math.min(...majorBars.map(b => b.low));
+      magnetLevels.majorHigh = Math.max(...majorBars.map(b => b.high));
+      console.log(
+        `[PARTIAL_WINDOW] Using ${closed5mBars.length} bars for major levels (less than 24) - context may be limited`
+      );
     }
 
     if (vwap !== undefined && vwap > 0) {
@@ -2705,9 +2748,15 @@ export class Orchestrator {
 
     // Momentum Confirmation (0-15 points)
     // Check if recent price action confirms bias direction
+    // Fix #13: Allow partial-window processing with logging
     let momentumConfirmation = 0;
     if (closed5mBars.length >= 2) {
       const recentBars = closed5mBars.slice(-3);
+      if (closed5mBars.length < 6) {
+        console.log(
+          `[PARTIAL_WINDOW] Momentum confirmation using ${closed5mBars.length} bars (less than 6) - context may be limited`
+        );
+      }
       if (exec.bias === "BEARISH") {
         // Bearish: check if recent closes are declining
         const declining = recentBars.every((bar, i) => 
@@ -2932,9 +2981,15 @@ export class Orchestrator {
     let momentumConfirmed = false;
     
     // Option 1: Range expansion (current bar range > average of last N bars)
-    if (closed5mBars && closed5mBars.length >= 3) {
+    // Fix #13: Allow partial-window processing
+    if (closed5mBars && closed5mBars.length >= 2) {
       const currentRange = Math.abs(current5m.high - current5m.low);
-      const recentBars = closed5mBars.slice(-5); // Last 5 bars
+      const recentBars = closed5mBars.slice(-Math.min(5, closed5mBars.length)); // Last 5 bars or available
+      if (closed5mBars.length < 3) {
+        console.log(
+          `[PARTIAL_WINDOW] Range expansion check using ${closed5mBars.length} bars (less than 3) - context may be limited`
+        );
+      }
       const avgRange = recentBars.reduce((sum, b) => sum + Math.abs(b.high - b.low), 0) / recentBars.length;
       if (currentRange > avgRange * 1.2) {
         momentumConfirmed = true;
@@ -4831,23 +4886,41 @@ export class Orchestrator {
     // ============================================================================
     // Call the authoritative reducer on every 5m close
     // CRITICAL: LLM never sets phase directly - phase is engine-owned
+    // Fix #11: Allow reduce5mClose to run even with minimal bars (with guards inside)
     // ============================================================================
-    if (is5mClose && lastClosed5m) {
-      const reducerResult = this.reduce5mClose(
-        exec,
-        ts,
-        close,
-        closed5mBars,
-        lastClosed5m,
-        forming5mBar,
-        llmDecision
-      );
-      shouldPublishEvent = reducerResult.shouldPublishEvent || shouldPublishEvent;
+    if (is5mClose) {
+      // Use forming5mBar as lastClosed5m if no closed bars yet (for early processing)
+      const effectiveLastClosed5m = lastClosed5m ?? (forming5mBar ? {
+        ts: forming5mBar.endTs ?? ts,
+        open: forming5mBar.open,
+        high: forming5mBar.high,
+        low: forming5mBar.low,
+        close: forming5mBar.close,
+        volume: forming5mBar.volume
+      } : null);
+      
+      if (effectiveLastClosed5m) {
+        const reducerResult = this.reduce5mClose(
+          exec,
+          ts,
+          close,
+          closed5mBars,
+          effectiveLastClosed5m,
+          forming5mBar,
+          llmDecision
+        );
+        shouldPublishEvent = reducerResult.shouldPublishEvent || shouldPublishEvent;
 
-      // Emit NO_TRADE diagnostic if applicable
-      if (reducerResult.noTradeReason) {
+        // Emit NO_TRADE diagnostic if applicable
+        if (reducerResult.noTradeReason) {
+          console.log(
+            `[NO_TRADE] price=${close.toFixed(2)} bias=${exec.bias} phase=${exec.phase} expected=${exec.expectedResolution ?? "n/a"} gate=${exec.resolutionGate?.status ?? "n/a"} reason=${reducerResult.noTradeReason}`
+          );
+        }
+      } else if (closed5mBars.length === 0) {
+        // Fix #11: Log when reduce5mClose can't run due to no bars
         console.log(
-          `[NO_TRADE] price=${close.toFixed(2)} bias=${exec.bias} phase=${exec.phase} expected=${exec.expectedResolution ?? "n/a"} gate=${exec.resolutionGate?.status ?? "n/a"} reason=${reducerResult.noTradeReason}`
+          `[REDUCE5M_SKIP] No bars available yet - closed5mBars.length=${closed5mBars.length} forming5mBar=${!!forming5mBar}`
         );
       }
     }
@@ -6114,7 +6187,7 @@ export class Orchestrator {
                   current5m.close
                 );
                 
-                // Store for alert emission (will be emitted in events array below)
+                // Store for alert emission
                 exec.lastTargetHit = {
                   targetKey,
                   targetPrice: targetHit,
@@ -6130,6 +6203,27 @@ export class Orchestrator {
                 );
                 console.log(
                   `[TP_HIT] target=${targetKey} price=${targetHit.toFixed(2)} timestamp=${ts} direction=${direction} momentum=${momentum} entryPrice=${exec.entryPrice?.toFixed(2)}`
+                );
+                
+                // Fix #14: Emit TP alert immediately when target is hit (don't wait for later check)
+                const tpAlertPayload: TradingAlertPayload = {
+                  direction: direction === "long" ? "LONG" : "SHORT",
+                  targetKey,
+                  targetPrice: targetHit,
+                  entryPrice: exec.entryPrice,
+                  stopPrice: exec.stopPrice,
+                  momentum,
+                  coaching,
+                  reason: `Take profit ${targetKey.toUpperCase()} hit`,
+                };
+                events.push({
+                  type: "TRADING_ALERT",
+                  timestamp: ts,
+                  instanceId: this.instanceId,
+                  data: { timestamp: ts, symbol, price: current5m.close, alertPayload: tpAlertPayload },
+                });
+                console.log(
+                  `[TP_ALERT_EMIT] target=${targetKey} price=${targetHit.toFixed(2)} timestamp=${ts} emitted=true (immediate)`
                 );
                 
                 // Trigger Telegram update when target is hit
@@ -6576,7 +6670,19 @@ export class Orchestrator {
         source: is5mClose ? ("5m" as const) : ("1m" as const),
         // LLM 1m coaching (into/out of setup)
         // Filter coaching to prevent contradictions: if bias=BEARISH and no long setup, don't show long coaching
-        coachLine: (exec.bias === "BEARISH" && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION" && exec.llm1mCoachLine?.toLowerCase().includes("long")) 
+        // Fix #15: Expand coaching filtering to handle both BEARISH+long and BULLISH+short contradictions
+        coachLine: (() => {
+          const coachLine = exec.llm1mCoachLine;
+          if (!coachLine) return undefined;
+          const lower = coachLine.toLowerCase();
+          const isLong = lower.includes("long") || lower.includes("buy") || lower.includes("bull");
+          const isShort = lower.includes("short") || lower.includes("sell") || lower.includes("bear");
+          
+          // Filter contradictory coaching
+          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          return coachLine;
+        })() 
           ? undefined 
           : exec.llm1mCoachLine,
         nextLevel: exec.llm1mNextLevel,
@@ -6659,7 +6765,19 @@ export class Orchestrator {
           source: is5mClose ? ("5m" as const) : ("1m" as const),
           // LLM 1m coaching (into/out of setup)
           // Filter coaching to prevent contradictions: if bias=BEARISH and no long setup, don't show long coaching
-          coachLine: (exec.bias === "BEARISH" && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION" && exec.llm1mCoachLine?.toLowerCase().includes("long")) 
+          // Fix #15: Expand coaching filtering to handle both BEARISH+long and BULLISH+short contradictions
+        coachLine: (() => {
+          const coachLine = exec.llm1mCoachLine;
+          if (!coachLine) return undefined;
+          const lower = coachLine.toLowerCase();
+          const isLong = lower.includes("long") || lower.includes("buy") || lower.includes("bull");
+          const isShort = lower.includes("short") || lower.includes("sell") || lower.includes("bear");
+          
+          // Filter contradictory coaching
+          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          return coachLine;
+        })() 
             ? undefined 
             : exec.llm1mCoachLine,
           nextLevel: exec.llm1mNextLevel,

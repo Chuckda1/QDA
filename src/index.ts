@@ -109,7 +109,8 @@ function logStructuredPulse(orch: Orchestrator, governor: MessageGovernor, symbo
     lastLLMDecision: s.lastLLMDecision || null,
   };
   console.log(`[PULSE] ${JSON.stringify(pulse)}`);
-  bars5mCount = 0;
+  // Fix #9: Don't reset bars5mCount - keep it cumulative for reliable tracking
+  // bars5mCount = 0; // REMOVED - prevents loss of information
 }
 
 // Initialize Telegram
