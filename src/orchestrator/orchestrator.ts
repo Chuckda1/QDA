@@ -1785,20 +1785,40 @@ export class Orchestrator {
     const belowVwap = micro.belowVwapCount ?? 0;
     const belowEma  = micro.belowEmaCount ?? 0;
 
-    // Small distance filter to avoid "acceptance" while hugging VWAP/EMA
+    // Fix #7: VWAP deadband + persistence
     const minDist = atr ? Math.max(0.05, 0.10 * atr) : 0.05;
-    const farAbove = close > vwap + minDist && close > ema + minDist;
-    const farBelow = close < vwap - minDist && close < ema - minDist;
+    const deadband = atr ? 0.15 * atr : 0.10;  // Wider deadband to prevent whipsaw
+    const farAbove = close > vwap + minDist + deadband && close > ema + minDist + deadband;
+    const farBelow = close < vwap - minDist - deadband && close < ema - minDist - deadband;
+    
+    // Track consecutive closes above/below with deadband
+    exec.consecutiveAboveVwap = (close > vwap + deadband) ? (exec.consecutiveAboveVwap ?? 0) + 1 : 0;
+    exec.consecutiveBelowVwap = (close < vwap - deadband) ? (exec.consecutiveBelowVwap ?? 0) + 1 : 0;
+    exec.consecutiveAboveEma = (close > ema + deadband) ? (exec.consecutiveAboveEma ?? 0) + 1 : 0;
+    exec.consecutiveBelowEma = (close < ema - deadband) ? (exec.consecutiveBelowEma ?? 0) + 1 : 0;
+    
+    // Require 3+ consecutive closes before accepting (persistence requirement)
+    const bullAcceptWithPersistence = 
+      exec.consecutiveAboveVwap >= 3 &&
+      exec.consecutiveAboveEma >= 3 &&
+      aboveVwap >= this.BIAS_ENGINE_ENTER_ACCEPT;
+    
+    const bearAcceptWithPersistence = 
+      exec.consecutiveBelowVwap >= 3 &&
+      exec.consecutiveBelowEma >= 3 &&
+      belowVwap >= this.BIAS_ENGINE_ENTER_ACCEPT;
+    
+    console.log(
+      `[VWAP_COMPARISON] close=${close} vwap=${vwap} ema=${ema} deadband=${deadband} farAbove=${farAbove} farBelow=${farBelow} consecutiveAboveVwap=${exec.consecutiveAboveVwap} consecutiveBelowVwap=${exec.consecutiveBelowVwap}`
+    );
 
-    // Entry acceptance (fast)
+    // Entry acceptance (fast) - Fix #7: Use persistence requirement
     const bullAccept =
-      aboveVwap >= this.BIAS_ENGINE_ENTER_ACCEPT &&
-      aboveEma  >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      bullAcceptWithPersistence &&
       farAbove;
 
     const bearAccept =
-      belowVwap >= this.BIAS_ENGINE_ENTER_ACCEPT &&
-      belowEma  >= this.BIAS_ENGINE_ENTER_ACCEPT &&
+      bearAcceptWithPersistence &&
       farBelow;
 
     // Exit evidence (hysteresis; slower)
@@ -1990,9 +2010,26 @@ export class Orchestrator {
     const aboveEma = micro.aboveEmaCount ?? 0;
     const belowVwap = micro.belowVwapCount ?? 0;
     const belowEma = micro.belowEmaCount ?? 0;
+    // Fix #7: VWAP deadband + persistence (same as in updateBiasEngine)
     const minDist = atr ? Math.max(0.05, 0.10 * atr) : 0.05;
-    const farAbove = close > vwap + minDist && close > ema + minDist;
-    const farBelow = close < vwap - minDist && close < ema - minDist;
+    const deadband = atr ? 0.15 * atr : 0.10;  // Wider deadband to prevent whipsaw
+    const farAbove = close > vwap + minDist + deadband && close > ema + minDist + deadband;
+    const farBelow = close < vwap - minDist - deadband && close < ema - minDist - deadband;
+    
+    // Track consecutive closes for persistence
+    exec.consecutiveAboveVwap = (close > vwap + deadband) ? (exec.consecutiveAboveVwap ?? 0) + 1 : 0;
+    exec.consecutiveBelowVwap = (close < vwap - deadband) ? (exec.consecutiveBelowVwap ?? 0) + 1 : 0;
+    exec.consecutiveAboveEma = (close > ema + deadband) ? (exec.consecutiveAboveEma ?? 0) + 1 : 0;
+    exec.consecutiveBelowEma = (close < ema - deadband) ? (exec.consecutiveBelowEma ?? 0) + 1 : 0;
+    
+    // Require 3+ consecutive closes (persistence requirement)
+    const tapeAgreesLongWithPersistence =
+      exec.consecutiveAboveVwap >= 3 &&
+      exec.consecutiveAboveEma >= 3;
+    
+    const tapeAgreesShortWithPersistence =
+      exec.consecutiveBelowVwap >= 3 &&
+      exec.consecutiveBelowEma >= 3;
 
     // Fewer bars when LLM leads before any 5m close (forming bar) or when in REPAIR
     const inRepair = exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR";
@@ -2001,10 +2038,12 @@ export class Orchestrator {
       ? Math.max(2, this.BIAS_ENGINE_ENTER_ACCEPT - 1)
       : this.BIAS_ENGINE_ENTER_ACCEPT;
     const tapeAgreesLong =
+      tapeAgreesLongWithPersistence &&
       aboveVwap >= tapeBarsRequired &&
       aboveEma >= tapeBarsRequired &&
       farAbove;
     const tapeAgreesShort =
+      tapeAgreesShortWithPersistence &&
       belowVwap >= tapeBarsRequired &&
       belowEma >= tapeBarsRequired &&
       farBelow;
@@ -3946,7 +3985,9 @@ export class Orchestrator {
       );
     }
 
-    if (stable && exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= 65) {
+    // Fix #8: Lower confidence threshold for initial establishment (50 instead of 65)
+    const minConfidence = exec.phase === "NEUTRAL_PHASE" ? 50 : 65;
+    if (stable && exec.bias !== "NEUTRAL" && exec.biasConfidence !== undefined && exec.biasConfidence >= minConfidence) {
       // Bias is established with sufficient confidence AND bias engine is stable
       if (exec.phase === "NEUTRAL_PHASE") {
         exec.phase = "BIAS_ESTABLISHED";
@@ -4703,6 +4744,14 @@ export class Orchestrator {
           },
         });
       }
+      // Fix #1: Update BotState with LLM call info
+      if (result.direction && result.confidence !== undefined) {
+        this.state.lastLLMCallAt = ts;
+        this.state.lastLLMDecision = `${result.direction} (${result.confidence}%)`;
+        console.log(
+          `[LLM_STATE_UPDATE] lastLLMCallAt=${this.state.lastLLMCallAt} lastLLMDecision="${this.state.lastLLMDecision}"`
+        );
+      }
     }
 
     // Allow 1m LLM to nudge bias when we're still NEUTRAL – LLM leads before 5m; use forming bar if no 5m closed yet
@@ -5317,6 +5366,20 @@ export class Orchestrator {
           );
           // Skip entry evaluation while paused - exit early
         } else {
+          // ------------------------------------------------------------
+          // Fix #3: Check and consume pendingTrigger if entry is now unblocked
+          // ------------------------------------------------------------
+          if (exec.pendingTrigger && !exec.entryBlocked && exec.setup !== "NONE" && exec.resolutionGate?.status === "TRIGGERED") {
+            // Entry is now unblocked - consume pending trigger
+            if (exec.opportunity) {
+              exec.opportunity.status = "TRIGGERED";
+              console.log(
+                `[TRIGGER_CONSUMED] pendingTrigger consumed - trigger=${exec.pendingTrigger.triggerPrice.toFixed(2)} side=${exec.pendingTrigger.side} reason=${exec.pendingTrigger.reason}`
+              );
+            }
+            exec.pendingTrigger = undefined;
+          }
+          
           // ------------------------------------------------------------
           // 3) Readiness invariant (no more latch-only scoping)
           // ------------------------------------------------------------
@@ -6182,7 +6245,7 @@ export class Orchestrator {
       hasDiscreteEvent = true;
       
       // ============================================================================
-      // FIX: User-facing alert when trigger hits but entry is blocked
+      // FIX #3: User-facing alert when trigger hits but entry is blocked + pendingTrigger latch
       // ============================================================================
       // Check if entry is blocked and emit a clear explanation
       const entryBlocked = exec.entryBlocked || exec.setup === "NONE" || exec.resolutionGate?.status !== "TRIGGERED";
@@ -6205,6 +6268,14 @@ export class Orchestrator {
           retestPlan = "Entry blocked by risk management rules";
         }
         
+        // Fix #3: Store pendingTrigger when entry is blocked
+        exec.pendingTrigger = {
+          timestamp: ts,
+          triggerPrice: triggerPrice ?? 0,
+          side: exec.opportunity.side === "SHORT" ? "SHORT" : "LONG",
+          reason: exec.opportunity.trigger?.type ?? "trigger"
+        };
+        
         const alertPayload: TradingAlertPayload = {
           direction: exec.opportunity.side === "SHORT" ? "SHORT" : "LONG",
           triggerPrice,
@@ -6221,11 +6292,15 @@ export class Orchestrator {
           `[TRIGGER_BLOCKED] ${exec.opportunity.side} trigger hit at ${triggerPrice?.toFixed(2)} but entry blocked: ${blockReason} | ${retestPlan}`
         );
         console.log(
-          `[TRIGGER_NOT_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} blockReason=${blockReason} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status}`
+          `[TRIGGER_NOT_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} blockReason=${blockReason} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status} pendingTrigger=${exec.pendingTrigger ? "stored" : "none"}`
         );
       } else {
+        // Entry not blocked - clear any pending trigger
+        if (exec.pendingTrigger) {
+          exec.pendingTrigger = undefined;
+        }
         console.log(
-          `[TRIGGER_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status}`
+          `[TRIGGER_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status} pendingTrigger=${exec.pendingTrigger ? "stored" : "none"}`
         );
       }
     }

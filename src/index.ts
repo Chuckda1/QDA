@@ -389,10 +389,8 @@ if (alpacaKey && alpacaSecret) {
             });
             
             // c) If closed 5m bar exists, process it (triggers LLM)
+            // Fix #4: Removed duplicate CLOSE5M log - orchestrator.ts already logs this
             if (closed5m !== null) {
-              console.log(
-                `[CLOSE5M] ts=${closed5m.ts} o=${closed5m.open} h=${closed5m.high} l=${closed5m.low} c=${closed5m.close} v=${closed5m.volume}`
-              );
               bars5mCount++;
               const events5m = await orch.processTick(
                 {
@@ -457,10 +455,8 @@ if (alpacaKey && alpacaSecret) {
             });
             
             // c) If closed 5m bar exists, process it (triggers LLM)
+            // Fix #4: Removed duplicate CLOSE5M log - orchestrator.ts already logs this
             if (closed5m !== null) {
-              console.log(
-                `[CLOSE5M] ts=${closed5m.ts} o=${closed5m.open} h=${closed5m.high} l=${closed5m.low} c=${closed5m.close} v=${closed5m.volume}`
-              );
               bars5mCount++;
               const events5m = await orch.processTick(
                 {

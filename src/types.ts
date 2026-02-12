@@ -419,6 +419,13 @@ export type MinimalExecutionState = {
   // Deployment pause (micro countertrend throttle)
   deploymentPauseUntilTs?: number; // Timestamp when deployment pause expires
   deploymentPauseReason?: string; // Reason for deployment pause
+  // Pending trigger latch (Fix #3: remember trigger hit when entry blocked)
+  pendingTrigger?: {
+    timestamp: number;
+    triggerPrice: number;
+    side: "LONG" | "SHORT";
+    reason: string;
+  };
   // Micro indicators (1m timeframe for countertrend detection)
   micro?: {
     vwap1m?: number; // Session VWAP on 1m bars
@@ -431,6 +438,11 @@ export type MinimalExecutionState = {
     aboveEmaCount?: number; // Consecutive closes above EMA
     belowEmaCount?: number; // Consecutive closes below EMA
   };
+  // Fix #7: VWAP deadband + persistence tracking
+  consecutiveAboveVwap?: number; // Consecutive closes above VWAP + deadband
+  consecutiveBelowVwap?: number; // Consecutive closes below VWAP - deadband
+  consecutiveAboveEma?: number; // Consecutive closes above EMA + deadband
+  consecutiveBelowEma?: number; // Consecutive closes below EMA - deadband
   // Rolling window for 1m micro indicators
   microBars1m?: Array<{ ts: number; open: number; high: number; low: number; close: number; volume: number }>;
   microVwapPv?: number; // Running sum of price * volume for VWAP
