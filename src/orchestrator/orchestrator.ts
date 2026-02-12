@@ -4549,6 +4549,12 @@ export class Orchestrator {
     const willRollover = previousBucketStart !== null && currentBucketStart !== previousBucketStart;
     const justClosedBar = willRollover && this.forming5mBar ? this.forming5mBar : null;
     
+    // Fix #6: Update last5mCloseTs BEFORE rollover is logged to prevent race condition
+    // The closed bar timestamp should be endTs - 1 (one ms before bucket end) to match BarAggregator pattern
+    if (justClosedBar && justClosedBar.endTs) {
+      this.state.last5mCloseTs = justClosedBar.endTs - 1;
+    }
+    
     const forming5mBar = this.updateForming5mBar(snapshot);
     const is5mClose = previousBucketStart !== null && this.formingBucketStart !== previousBucketStart;
     
