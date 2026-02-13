@@ -140,14 +140,6 @@ export class Orchestrator {
     return { allowed: true };
   }
 
-  // Ignition setup constants
-  private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
-  private readonly IGNITION_MIN_ATR = 0.18;                // avoid dead tape
-  private readonly IGNITION_MIN_DIST_ATR = 0.25;           // distance from VWAP/EMA as fraction of ATR
-  private readonly IGNITION_MIN_ACCEPT = 8;                // stronger than bias flip threshold (6)
-  private readonly IGNITION_RISK_ATR = 0.9;                // stop distance
-  private readonly IGNITION_TTL_MS = 2 * 60 * 1000;        // must trigger soon or drop it
-
   constructor(instanceId: string, llmService?: LLMService) {
     this.instanceId = instanceId;
     this.orchId = randomUUID();
@@ -2000,91 +1992,6 @@ export class Orchestrator {
         `bullAccept=${bullAccept} bearAccept=${bearAccept} cooldown=${inCooldown}`
       );
     }
-  }
-
-  // ============================================================================
-  // IGNITION SETUP: Immediate entry after bias flip when momentum is strong
-  // ============================================================================
-  private maybeDetectIgnition(exec: MinimalExecutionState, ts: number, close: number): void {
-    if (exec.phase === "IN_TRADE") return;
-    // Allow NEUTRAL for LLM-led IGNITION (LLM can lead when bot has not flipped yet)
-
-    const micro = exec.micro;
-    if (!micro) return;
-
-    const vwap = micro.vwap1m;
-    const ema = micro.emaFast1m;
-    const atr = micro.atr1m;
-
-    if (vwap === undefined || ema === undefined || atr === undefined) return;
-    if (atr < this.IGNITION_MIN_ATR) return;
-
-    const flipAge = exec.lastBiasFlipTs ? (ts - exec.lastBiasFlipTs) : Infinity;
-    const minDist = Math.max(0.05, this.IGNITION_MIN_DIST_ATR * atr);
-
-    const llmDir = exec.llm1mDirection;
-    const llmConf = exec.llm1mConfidence ?? 0;
-    const llmAgrees =
-      (llmDir === "LONG" && exec.bias === "BULLISH") ||
-      (llmDir === "SHORT" && exec.bias === "BEARISH")
-        ? llmConf >= 75
-        : false;
-
-    // Bot-led IGNITION: bias aligned, LLM agrees, must be right after a flip
-    const strongBull =
-      exec.bias === "BULLISH" &&
-      flipAge <= this.IGNITION_WINDOW_MS &&
-      (micro.aboveVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      (micro.aboveEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      close > Math.max(vwap, ema) + minDist &&
-      llmAgrees;
-
-    const strongBear =
-      exec.bias === "BEARISH" &&
-      flipAge <= this.IGNITION_WINDOW_MS &&
-      (micro.belowVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      (micro.belowEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      close < Math.min(vwap, ema) - minDist &&
-      llmAgrees;
-
-    // LLM-led IGNITION: LLM very strong (≥85), bot not aligned — let LLM lead
-    const llmLedBull =
-      llmDir === "LONG" &&
-      llmConf >= 85 &&
-      (exec.bias === "NEUTRAL" || exec.bias === "BEARISH") &&
-      (micro.aboveVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      (micro.aboveEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      close > Math.max(vwap, ema) + minDist;
-
-    const llmLedBear =
-      llmDir === "SHORT" &&
-      llmConf >= 85 &&
-      (exec.bias === "NEUTRAL" || exec.bias === "BULLISH") &&
-      (micro.belowVwapCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      (micro.belowEmaCount ?? 0) >= this.IGNITION_MIN_ACCEPT &&
-      close < Math.min(vwap, ema) - minDist;
-
-    if (!strongBull && !strongBear && !llmLedBull && !llmLedBear) return;
-
-    if (exec.setup && exec.setup !== "NONE") return;
-
-    const isLong = strongBull || llmLedBull;
-    const isShort = strongBear || llmLedBear;
-    const trigger = isLong ? (micro.lastSwingHigh1m ?? close) : (micro.lastSwingLow1m ?? close);
-    const stop = isLong
-      ? Math.min(vwap, ema) - this.IGNITION_RISK_ATR * atr
-      : Math.max(vwap, ema) + this.IGNITION_RISK_ATR * atr;
-
-    exec.setup = "IGNITION";
-    exec.setupVariant = isLong ? "LONG" : "SHORT";
-    exec.setupTriggerPrice = trigger;
-    exec.setupStopPrice = stop;
-    exec.setupDetectedAt = ts;
-
-    const source = (strongBull || strongBear) ? "bot" : "llm_led";
-    console.log(
-      `[IGNITION_SETUP] source=${source} variant=${exec.setupVariant} bias=${exec.bias} flipAgeMs=${flipAge} trigger=${trigger.toFixed(2)} stop=${stop.toFixed(2)} atr=${atr.toFixed(2)}`
-    );
   }
 
   /**
@@ -5023,8 +4930,6 @@ export class Orchestrator {
           }
         }
       }
-      
-      this.maybeDetectIgnition(exec, ts, close);
     }
 
     // ============================================================================
@@ -5522,16 +5427,6 @@ export class Orchestrator {
                     `[IMPULSE_GATE_CREATED] SHORT BREAK gateStatus=TRIGGERED trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} (was ${hadGate ? gateStatusBefore : "missing"})`
                   );
                 }
-                if (exec.setup === "NONE" || exec.setup === "PULLBACK_CONTINUATION") {
-                  exec.setup = "IGNITION";
-                  exec.setupVariant = "SHORT";
-                  exec.setupTriggerPrice = actualTriggerPrice;
-                  exec.setupStopPrice = stopPrice;
-                  exec.setupDetectedAt = ts;
-                  console.log(
-                    `[BREAK_TRIGGER_SETUP] SHORT created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} reason=${triggerCheck.reason}`
-                  );
-                }
               } else {
                 const stopPrice =
                   exec.pullbackLow !== undefined
@@ -5549,16 +5444,6 @@ export class Orchestrator {
                   };
                   console.log(
                     `[IMPULSE_GATE_CREATED] LONG BREAK gateStatus=TRIGGERED trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} (was ${hadGate ? gateStatusBefore : "missing"})`
-                  );
-                }
-                if (exec.setup === "NONE" || exec.setup === "PULLBACK_CONTINUATION") {
-                  exec.setup = "IGNITION";
-                  exec.setupVariant = "LONG";
-                  exec.setupTriggerPrice = actualTriggerPrice;
-                  exec.setupStopPrice = stopPrice;
-                  exec.setupDetectedAt = ts;
-                  console.log(
-                    `[BREAK_TRIGGER_SETUP] LONG created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} reason=${triggerCheck.reason}`
                   );
                 }
               }
@@ -5671,28 +5556,7 @@ export class Orchestrator {
             higherHigh = current5m.high > previous5m.high;
           }
 
-          // Check if IGNITION setup expired
-          const ignitionExpired =
-            exec.setup === "IGNITION" &&
-            exec.setupDetectedAt !== undefined &&
-            (ts - exec.setupDetectedAt) > this.IGNITION_TTL_MS;
-
-          if (ignitionExpired) {
-            exec.setup = "NONE";
-            exec.setupVariant = undefined;
-            exec.setupTriggerPrice = undefined;
-            exec.setupStopPrice = undefined;
-            exec.effectiveTriggerPrice = undefined;
-            exec.setupDetectedAt = undefined;
-            console.log(`[IGNITION_EXPIRED] cleared after TTL`);
-          }
-
-          // LLM nudge: use nextLevel as trigger when confidence high and direction aligned
-          if (exec.setup === "IGNITION" && exec.setupVariant && exec.llm1mNextLevel != null && (exec.llm1mConfidence ?? 0) >= 80 &&
-              ((exec.setupVariant === "LONG" && exec.llm1mDirection === "LONG") || (exec.setupVariant === "SHORT" && exec.llm1mDirection === "SHORT")))
-            exec.effectiveTriggerPrice = exec.llm1mNextLevel;
-          else if (exec.setup !== "IGNITION")
-            exec.effectiveTriggerPrice = undefined;
+          exec.effectiveTriggerPrice = undefined;
 
           // Entry signal for pullback continuation (5m-based)
           const entrySignalFires =
@@ -5713,24 +5577,10 @@ export class Orchestrator {
           const momentumBreakShort =
             gateReady && gateIsNudgeMomentum && exec.bias === "BEARISH" && triggerPrice != null && close >= triggerPrice;
 
-          // Ignition signal: use setupVariant for LLM-led direction; use effectiveTriggerPrice when set
-          const ignitionTriggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
-          const ignitionLong = exec.setupVariant === "LONG" || exec.bias === "BULLISH";
-          // If gate is already TRIGGERED, trigger already fired - allow immediate entry
-          const gateAlreadyTriggered = exec.resolutionGate?.status === "TRIGGERED";
-          const ignitionSignal =
-            exec.setup === "IGNITION" &&
-            ignitionTriggerLevel !== undefined &&
-            (gateAlreadyTriggered || // Trigger already fired, allow entry
-             ((ignitionLong && close > ignitionTriggerLevel) || (!ignitionLong && close < ignitionTriggerLevel))); // Or price breaks trigger now
-
-          // Entry permission: setup exists + appropriate signal fires
-          // Pullback: 5m entry signal OR nudge momentum break (break of nudge bar high/low)
+          // Entry permission: pullback continuation only (5m entry signal OR nudge momentum break)
           const isPullback = exec.setup === "PULLBACK_CONTINUATION";
-          const isIgnition = exec.setup === "IGNITION";
           const canEnter =
-            (isPullback && (entrySignalFires || (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)))) ||
-            (isIgnition && ignitionSignal);
+            isPullback && (entrySignalFires || (isNudgeMomentumWindow && (momentumBreakLong || momentumBreakShort)));
 
           // ------------------------------------------------------------
           // 4.5) EXPLICIT WAIT HANDLING when canEnter is false
@@ -5759,18 +5609,8 @@ export class Orchestrator {
               `[ENTRY_WAITING] Setup=${exec.setup} ${exec.waitReason} - BIAS=${exec.bias}`
             );
           }
-          else if (exec.setup === "IGNITION" && !ignitionSignal) {
-            exec.waitReason = "waiting_for_ignition_trigger";
-            exec.entryBlocked = false;
-            exec.entryBlockReason = undefined;
-            const triggerLevel = exec.effectiveTriggerPrice ?? exec.setupTriggerPrice;
-            console.log(
-              `[ENTRY_WAITING] IGNITION setup exists but trigger not yet broken - variant=${exec.setupVariant} trigger=${triggerLevel?.toFixed(2) ?? "n/a"} close=${close.toFixed(2)}`
-            );
-          }
           // If setup exists and signal fires, but canEnter is still false, explain why.
-          // With the flattened readiness check, this should be rare, but keep it for safety.
-          else if (exec.setup && ((isPullback && entrySignalFires) || (isIgnition && ignitionSignal)) && !canEnter) {
+          else if (exec.setup && isPullback && entrySignalFires && !canEnter) {
             exec.waitReason = gateReady ? "gate_armed_but_entry_blocked" : "opp_ready_but_entry_blocked";
             exec.entryBlocked = true;
             exec.entryBlockReason = "Entry conditions incomplete (diagnostic)";
@@ -5876,66 +5716,6 @@ export class Orchestrator {
               if (exec.resolutionGate) exec.resolutionGate.status = "TRIGGERED";
               console.log(
                 `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | NUDGE_DIP ${dir} entry=${exec.entryPrice.toFixed(2)} stop=${exec.stopPrice.toFixed(2)}`
-              );
-            }
-            // IGNITION entry (1m-based, immediate after flip)
-            else if (isIgnition && ignitionSignal) {
-              const oldPhase = exec.phase;
-              const micro = exec.micro;
-              const atr = micro?.atr1m ?? this.calculateATR(closed5mBars);
-              const ignitionDir = exec.setupVariant === "LONG" || exec.bias === "BULLISH" ? "long" : "short";
-
-              exec.entryPrice = close;
-              exec.entryTs = ts;
-              exec.entryType = "IGNITION_ENTRY";
-              exec.entryTrigger = `IGNITION: ${ignitionDir === "long" ? "Breakout above" : "Breakdown below"} swing ${ignitionDir === "long" ? "high" : "low"}`;
-              exec.positionSizeMultiplier = this.computeLlmPositionSizeMultiplier(exec);
-              exec.stopPrice = exec.setupStopPrice ?? (ignitionDir === "long"
-                ? close - this.IGNITION_RISK_ATR * atr
-                : close + this.IGNITION_RISK_ATR * atr);
-
-              const closedBarsWithVolume = closed5mBars.filter(
-                (bar) => "volume" in bar
-              ) as Array<{ high: number; low: number; close: number; volume: number }>;
-
-              const vwap = closedBarsWithVolume.length > 0
-                ? this.calculateVWAP(closedBarsWithVolume)
-                : undefined;
-
-              const targetResult = this.computeTargets(
-                ignitionDir,
-                exec.entryPrice,
-                exec.stopPrice,
-                atr,
-                closedBarsWithVolume,
-                vwap,
-                undefined,
-                undefined,
-                undefined
-              );
-
-              this.applyLateEntryPenalties(exec, targetResult);
-              exec.targets = targetResult.targets;
-              exec.targetZones = targetResult.targetZones;
-
-              exec.thesisDirection = ignitionDir as "long" | "short"; // Explicitly set for stop/target checks
-              exec.phase = "IN_TRADE";
-              // Phase 1.3: Create entry snapshot (immutable once IN_TRADE)
-              this.createEntrySnapshot(exec);
-              exec.reason = `Entered (${exec.entryType}) — ${exec.entryTrigger}`;
-              exec.waitReason = "in_trade";
-              exec.entryBlocked = false;
-              exec.entryBlockReason = undefined;
-              exec.lastNudgeTs = undefined;
-              exec.nudgeBarHigh = undefined;
-              exec.nudgeBarLow = undefined;
-
-              if (exec.opportunity) {
-                exec.opportunity.status = "CONSUMED";
-              }
-
-              console.log(
-                `[ENTRY_EXECUTED] ${oldPhase} -> IN_TRADE | BIAS=${exec.bias} SETUP=${exec.setup} entry=${exec.entryPrice.toFixed(2)} type=${exec.entryType} trigger="${exec.entryTrigger}" stop=${exec.stopPrice.toFixed(2)}`
               );
             }
             // Enter ON pullback for BULLISH bias
@@ -6880,8 +6660,8 @@ export class Orchestrator {
           const isShort = lower.includes("short") || lower.includes("sell") || lower.includes("bear");
           
           // Filter contradictory coaching
-          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
-          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION") return undefined;
+          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION") return undefined;
           return coachLine;
         })() 
           ? undefined 
@@ -6975,8 +6755,8 @@ export class Orchestrator {
           const isShort = lower.includes("short") || lower.includes("sell") || lower.includes("bear");
           
           // Filter contradictory coaching
-          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
-          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION" && exec.setup !== "IGNITION") return undefined;
+          if (exec.bias === "BEARISH" && isLong && exec.setup !== "PULLBACK_CONTINUATION") return undefined;
+          if (exec.bias === "BULLISH" && isShort && exec.setup !== "PULLBACK_CONTINUATION") return undefined;
           return coachLine;
         })() 
             ? undefined 
