@@ -41,7 +41,8 @@ const STRONG_CONF = 80;
 const MIN_PUBLISH_GAP_MS = 3 * 60_000; // 3 minutes
 const SAME_DIR_REFRESH_MS = 15 * 60_000; // 15 minutes
 const CONF_JUMP = 12;
-const THROTTLE_MS = 60_000; // 1 minute
+const THROTTLE_MS = 60_000; // 1 minute when bias established (BULLISH/BEARISH)
+const THROTTLE_NEUTRAL_MS = 3 * 60_000; // 3 minutes when NEUTRAL so we still get LLM input for nudge without spamming
 const BARS_WINDOW = 45; // 5m bars; room for botState + micro + bars1m
 const BARS_1M_WINDOW = 20; // Last 20 1m bars (chart-like tape)
 const MIN_BARS_FOR_LLM = 10; // Minimum closed 5m bars before calling LLM
@@ -64,11 +65,6 @@ export async function maybeUpdateLlmDirection1m(
   biasEngineState?: string,
   micro?: { vwap1m?: number; atr1m?: number }
 ): Promise<{ shouldPublish: boolean; direction?: "LONG" | "SHORT" | "NEUTRAL"; confidence?: number }> {
-  // Throttle: max once per 60s
-  if (exec.llm1mLastCallTs !== undefined && (ts - exec.llm1mLastCallTs) < THROTTLE_MS) {
-    return { shouldPublish: false };
-  }
-
   // Require LLM service
   if (!llmService || !llmService.isEnabled()) {
     return { shouldPublish: false };
@@ -80,11 +76,18 @@ export async function maybeUpdateLlmDirection1m(
     return { shouldPublish: false };
   }
 
-  // LLM call gating: Skip if bias engine in REPAIR state or not stable
   const beState = biasEngineState ?? exec.biasEngine?.state;
   const stable = beState === "BULLISH" || beState === "BEARISH";
-  if (beState?.startsWith("REPAIR_") || !stable) {
-    console.log(`[LLM_GATE] Skipping LLM call: beState=${beState} stable=${stable}`);
+
+  // LLM call gating: Skip only when in REPAIR (let 5m structure finalize; avoid LLM noise during repair)
+  if (beState?.startsWith("REPAIR_")) {
+    console.log(`[LLM_GATE] Skipping LLM call: beState=${beState} (REPAIR - wait for 5m structure)`);
+    return { shouldPublish: false };
+  }
+
+  // Throttle: when NEUTRAL use 3 min so we get LLM input for nudge without spamming; when stable use 1 min
+  const throttleMs = stable ? THROTTLE_MS : THROTTLE_NEUTRAL_MS;
+  if (exec.llm1mLastCallTs !== undefined && (ts - exec.llm1mLastCallTs) < throttleMs) {
     return { shouldPublish: false };
   }
 
