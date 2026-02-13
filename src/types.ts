@@ -152,13 +152,13 @@ export type MinimalMindStateResult = {
 // Market Bias (sticky, changes slowly, only on structural invalidation)
 export type MarketBias = "BEARISH" | "BULLISH" | "NEUTRAL";
 
-// Bias Engine State (deterministic, 1m-based)
+// Bias Engine State (deterministic). See orchestrator BIAS LIFECYCLE comment: ESTABLISHED ↔ REPAIR; NEUTRAL only on structural invalidation.
 export type BiasEngineState = 
-  | "BEARISH"
-  | "REPAIR_BULL"  // Neutralizing from bearish, moving toward bullish
+  | "BEARISH"      // ESTABLISHED bearish
+  | "REPAIR_BULL"  // Momentum contradiction; bias still bearish; no new entries until 5m confirms or invalidates
   | "NEUTRAL"
-  | "REPAIR_BEAR"  // Neutralizing from bullish, moving toward bearish
-  | "BULLISH";
+  | "REPAIR_BEAR"  // Momentum contradiction; bias still bullish; no new entries until 5m confirms or invalidates
+  | "BULLISH";     // ESTABLISHED bullish
 
 export type BiasEngine = {
   state: BiasEngineState;

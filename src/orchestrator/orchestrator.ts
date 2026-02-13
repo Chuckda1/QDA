@@ -82,6 +82,10 @@ export class Orchestrator {
   private readonly BIAS_ENGINE_REPAIR_CONFIRM_MIN = 2;  // Minimum minutes in REPAIR before finalizing (confirmation period)
   private readonly BIAS_ENGINE_COOLDOWN_MS = 5 * 60 * 1000;  // 5 minutes cooldown between full flips
 
+  /** Min consecutive 1m closes (VWAP+EMA) to establish bias from tape alone when NEUTRAL (avoids stuck NEUTRAL when no 5m break / LLM neutral) */
+  private readonly TAPE_LED_ESTABLISH_MIN = 6;
+  /** Min distance from VWAP (in ATR) for tape-led establish when not farBelow/farAbove (avoids deadband blocking) */
+  private readonly TAPE_LED_DISTANCE_ATR = 0.15;
   /** Min LLM confidence (1m) to allow nudge from NEUTRAL/REPAIR when tape agrees */
   private readonly LLM_NUDGE_MIN_CONFIDENCE = 80;
   /** After nudge: allow momentum entry (break of nudge bar) for this long; gate expiry */
@@ -817,6 +821,9 @@ export class Orchestrator {
     if (exec.bias === "NEUTRAL") {
       return { armed: false, reason: "missing_bias" };
     }
+    if (exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR") {
+      return { armed: false, reason: "repair_no_new_entries" };
+    }
     
     // Confidence threshold (adjustable)
     const minConfidence = 65;
@@ -1220,7 +1227,9 @@ export class Orchestrator {
     
     const needsLatch = !existingOppValid;
 
+    const inRepair = exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR";
     if (needsLatch && 
+        !inRepair &&
         (exec.phase === "BIAS_ESTABLISHED" || exec.phase === "PULLBACK_IN_PROGRESS") &&
         atr > 0) {
       
@@ -1738,8 +1747,10 @@ export class Orchestrator {
     }
     
     // PULLBACK_CONTINUATION: Trend pullback then continuation
-    // Allowed when: bias is established, phase indicates pullback, and expected resolution is continuation
-    const phaseAllowsSetup = phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS";
+    // Allowed when: bias is established, phase indicates pullback, NOT in REPAIR, and expected resolution is continuation
+    const inRepair = exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR";
+    const phaseAllowsSetup =
+      (phase === "BIAS_ESTABLISHED" || phase === "PULLBACK_IN_PROGRESS") && !inRepair;
     const boundariesDefined = exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined;
     
     if (!phaseAllowsSetup) {
@@ -1814,22 +1825,42 @@ export class Orchestrator {
   // ============================================================================
   
   // ============================================================================
+  // BIAS LIFECYCLE (STATE MACHINE) – DO NOT bypass these rules
+  // ============================================================================
+  //
+  //   NEUTRAL
+  //      ↓ (structural establish: 5m break / cold start / nudge / tape-led)
+  //   ESTABLISHED (BULLISH | BEARISH)
+  //      ↓ (momentum contradiction only – RSI, VWAP reclaim, etc.)
+  //   REPAIR (REPAIR_BULL | REPAIR_BEAR)
+  //      ↓                    ↓
+  //   (5m structure confirms)  (5m structure invalidates)
+  //   ESTABLISHED              NEUTRAL
+  //
+  // RULES (enforced in code):
+  // 1. Bias NEVER jumps ESTABLISHED → NEUTRAL without structural invalidation.
+  // 2. Momentum alone NEVER neutralizes bias; it may only move ESTABLISHED → REPAIR.
+  // 3. Structural invalidation = 5m close above pullbackHigh / break swing high /
+  //    higher-high+higher-low sequence / sustained VWAP reclaim (bear); mirror for bull.
+  // 4. REPAIR: entries restricted (no pullback/nudge arming); only 5m can exit REPAIR
+  //    → ESTABLISHED (structure confirms) or → NEUTRAL (structure invalidates).
+  // 5. Trade outcome (stop hit) does NOT change bias; only structure does.
+  //
+  // ============================================================================
   // BIAS ENGINE: Deterministic 1m-based bias with hysteresis
   // ============================================================================
-  // Runs on every 1m ingest, uses acceptance counters + hysteresis
-  // HIERARCHY: 1m can only NEUTRALIZE (enter REPAIR), never finalize
-  // Only 5m structure breaks can finalize a full flip (BULLISH/BEARISH)
-  // ============================================================================
+  /** REPAIR: Keep structural bias and boundaries; pause new entries; await 5m structure confirmation or invalidation. */
   private enterRepair(exec: MinimalExecutionState, ts: number, close: number, repairState: BiasEngineState): void {
     const be = exec.biasEngine!;
     if (be.state === repairState) return;
 
+    const prevState = be.state;
     be.state = repairState;
     be.repairStartTs = ts;
     be.acceptBullCount = 0;
     be.acceptBearCount = 0;
 
-    // Clear wrong-side artifacts
+    // No new entries while in REPAIR; clear gate/setup/opportunity only
     this.deactivateGate(exec);
     exec.setup = "NONE";
     exec.setupTriggerPrice = undefined;
@@ -1839,24 +1870,26 @@ export class Orchestrator {
       exec.opportunity.status = "INVALIDATED";
       exec.opportunity = undefined;
     }
+    exec.entryBlocked = true;
+    exec.entryBlockReason = "repair_awaiting_structure_confirmation";
 
-    // Neutralize regime (do not commit - 5m will finalize)
-    exec.bias = "NEUTRAL";
-    exec.baseBiasConfidence = undefined;
-    exec.biasConfidence = undefined;
-    exec.biasInvalidationLevel = undefined;
-    exec.biasPrice = close;
-    exec.biasTs = ts;
-
-    // Clear stale resolution/phase expectations
-    exec.expectedResolution = undefined;
+    // Keep exec.bias and pullback boundaries; structure not invalidated yet
     if (exec.phase !== "IN_TRADE") {
-      exec.phase = "NEUTRAL_PHASE";
-      exec.waitReason = "waiting_for_bias";
+      exec.phase = "BIAS_ESTABLISHED";
+      exec.expectedResolution = "CONTINUATION";
+      exec.waitReason = "repair_awaiting_structure_confirmation";
     }
+    console.log(
+      `[BIAS_REPAIR_ENTER] ${prevState} -> ${repairState} | Micro momentum failure → REPAIR. Bias=${exec.bias} kept. Boundaries preserved. No new entries until 5m structure confirms or invalidates.`
+    );
   }
 
-  private updateBiasEngine(exec: MinimalExecutionState, ts: number, close: number): void {
+  private updateBiasEngine(
+    exec: MinimalExecutionState,
+    ts: number,
+    close: number,
+    closed5mBars?: Array<{ high: number; low: number; close: number }>
+  ): void {
     const micro = exec.micro;
     if (!micro) return;
 
@@ -1973,6 +2006,93 @@ export class Orchestrator {
     if (be.state === "BULLISH" && bearAccept &&
         belowVwap >= exitAcceptRequired && belowEma >= exitAcceptRequired) {
       this.enterRepair(exec, ts, close, "REPAIR_BEAR");
+    }
+
+    // Tape-led establishment: when stuck in NEUTRAL, strong 1m persistence can establish bias (no 5m break or LLM nudge required)
+    const sh = exec.swingHigh5m;
+    const sl = exec.swingLow5m;
+    const fallbackK = 6;
+    const canUseFallback = closed5mBars && closed5mBars.length >= 3;
+    const fallbackHigh = canUseFallback
+      ? Math.max(...closed5mBars!.slice(-fallbackK).map((b) => b.high))
+      : undefined;
+    const fallbackLow = canUseFallback
+      ? Math.min(...closed5mBars!.slice(-fallbackK).map((b) => b.low))
+      : undefined;
+    const anchorHigh = sh ?? fallbackHigh;
+    const anchorLow = sl ?? fallbackLow;
+    const anchorSource = sh !== undefined && sl !== undefined ? "swing_anchors" : (anchorHigh !== undefined && anchorLow !== undefined ? "fallback_anchors" : "none");
+
+    // Tape-led acceptance: consecutive counts + (farBelow/farAbove OR ATR-scaled distance) so deadband doesn't block
+    const distBelowVwap = vwap !== undefined ? vwap - close : 0;
+    const distAboveVwap = vwap !== undefined ? close - vwap : 0;
+    const minDistAtr = atr && atr > 0 ? this.TAPE_LED_DISTANCE_ATR * atr : 0.05;
+    const tapeLedBearAccept =
+      (exec.consecutiveBelowVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN &&
+      (exec.consecutiveBelowEma ?? 0) >= this.TAPE_LED_ESTABLISH_MIN &&
+      (farBelow || distBelowVwap >= minDistAtr);
+    const tapeLedBullAccept =
+      (exec.consecutiveAboveVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN &&
+      (exec.consecutiveAboveEma ?? 0) >= this.TAPE_LED_ESTABLISH_MIN &&
+      (farAbove || distAboveVwap >= minDistAtr);
+
+    if (exec.bias === "NEUTRAL" && be.state === "NEUTRAL" && !inCooldown) {
+      if (anchorHigh === undefined || anchorLow === undefined) {
+        if ((exec.consecutiveBelowVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN || (exec.consecutiveAboveVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN) {
+          console.log(
+            `[BIAS_TAPE_LED_BLOCKED] reason=missing_swing_anchors swingHigh5m=${sh ?? "n/a"} swingLow5m=${sl ?? "n/a"} closed5mBars=${closed5mBars?.length ?? 0} consecutiveBelowVwap=${exec.consecutiveBelowVwap} consecutiveAboveVwap=${exec.consecutiveAboveVwap}`
+          );
+        }
+      } else {
+        if (tapeLedBearAccept) {
+          be.state = "BEARISH";
+          be.lastFlipTs = ts;
+          exec.bias = "BEARISH";
+          exec.biasPrice = close;
+          exec.biasTs = ts;
+          exec.baseBiasConfidence = 65;
+          exec.biasConfidence = 65;
+          exec.lastBiasFlipTs = ts;
+          exec.pullbackHigh = anchorHigh;
+          exec.pullbackLow = anchorLow;
+          exec.pullbackTs = ts;
+          if (exec.phase !== "IN_TRADE") {
+            exec.phase = "BIAS_ESTABLISHED";
+            exec.expectedResolution = "CONTINUATION";
+            exec.waitReason = "waiting_for_pullback";
+          }
+          console.log(
+            `[BIAS_TAPE_LED] NEUTRAL -> BEARISH | tape persistence consecutiveBelow=${exec.consecutiveBelowVwap} farBelow=${farBelow} distBelowVwap=${distBelowVwap.toFixed(2)} minDistAtr=${minDistAtr.toFixed(2)} close=${close.toFixed(2)} pullback=[${anchorLow.toFixed(2)}, ${anchorHigh.toFixed(2)}] anchorSource=${anchorSource}`
+          );
+        } else if (tapeLedBullAccept) {
+          be.state = "BULLISH";
+          be.lastFlipTs = ts;
+          exec.bias = "BULLISH";
+          exec.biasPrice = close;
+          exec.biasTs = ts;
+          exec.baseBiasConfidence = 65;
+          exec.biasConfidence = 65;
+          exec.lastBiasFlipTs = ts;
+          exec.pullbackHigh = anchorHigh;
+          exec.pullbackLow = anchorLow;
+          exec.pullbackTs = ts;
+          if (exec.phase !== "IN_TRADE") {
+            exec.phase = "BIAS_ESTABLISHED";
+            exec.expectedResolution = "CONTINUATION";
+            exec.waitReason = "waiting_for_pullback";
+          }
+          console.log(
+            `[BIAS_TAPE_LED] NEUTRAL -> BULLISH | tape persistence consecutiveAbove=${exec.consecutiveAboveVwap} farAbove=${farAbove} distAboveVwap=${distAboveVwap.toFixed(2)} minDistAtr=${minDistAtr.toFixed(2)} close=${close.toFixed(2)} pullback=[${anchorLow.toFixed(2)}, ${anchorHigh.toFixed(2)}] anchorSource=${anchorSource}`
+          );
+        } else if (
+          (exec.consecutiveBelowVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN ||
+          (exec.consecutiveAboveVwap ?? 0) >= this.TAPE_LED_ESTABLISH_MIN
+        ) {
+          console.log(
+            `[BIAS_TAPE_LED_BLOCKED] reason=acceptance_criteria consecutiveBelowVwap=${exec.consecutiveBelowVwap} consecutiveBelowEma=${exec.consecutiveBelowEma} consecutiveAboveVwap=${exec.consecutiveAboveVwap} consecutiveAboveEma=${exec.consecutiveAboveEma} farBelow=${farBelow} farAbove=${farAbove} distBelowVwap=${distBelowVwap.toFixed(2)} distAboveVwap=${distAboveVwap.toFixed(2)} minDistAtr=${minDistAtr.toFixed(2)} tapeLedBearAccept=${tapeLedBearAccept} tapeLedBullAccept=${tapeLedBullAccept}`
+          );
+        }
+      }
     }
 
     // If already in REPAIR, just track state; NO finalization here
@@ -2233,6 +2353,107 @@ export class Orchestrator {
     return 1.0;
   }
 
+  /** Structural invalidation for BEARISH: only these transitions allow REPAIR_BEAR → NEUTRAL. Purely structural (no VWAP). */
+  private checkStructuralInvalidationForBear(
+    exec: MinimalExecutionState,
+    close: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    _vwap?: number
+  ): { invalidated: boolean; reason?: string } {
+    const sh = exec.swingHigh5m;
+    const sl = exec.swingLow5m;
+    const ph = exec.pullbackHigh;
+    const pl = exec.pullbackLow;
+    if (closed5mBars.length < 5) return { invalidated: false };
+    const atr = this.calculateATR(closed5mBars);
+    const buffer = atr > 0 ? 0.2 * atr : 0.10;
+
+    if (sh !== undefined && close > sh) {
+      return { invalidated: true, reason: `5m_close_above_swing_high close=${close.toFixed(2)} sh=${sh.toFixed(2)}` };
+    }
+    if (ph !== undefined && close > ph + buffer) {
+      return { invalidated: true, reason: `5m_close_above_pullbackHigh_plus_ATR close=${close.toFixed(2)} ph=${ph.toFixed(2)} buffer=${buffer.toFixed(2)}` };
+    }
+    const recent = closed5mBars.slice(-3);
+    if (recent.length >= 3) {
+      const h0 = recent[0].high; const l0 = recent[0].low;
+      const h1 = recent[1].high; const l1 = recent[1].low;
+      const h2 = recent[2].high; const l2 = recent[2].low;
+      if (h2 > h1 && h1 > h0 && l2 > l1 && l1 > l0) {
+        return { invalidated: true, reason: "higher_high_higher_low_sequence_5m" };
+      }
+    }
+    // VWAP clustering is tape/momentum, not structure; do NOT use it to invalidate bias.
+    return { invalidated: false };
+  }
+
+  /** Structural invalidation for BULLISH: only these allow REPAIR_BULL → NEUTRAL. Purely structural (no VWAP). */
+  private checkStructuralInvalidationForBull(
+    exec: MinimalExecutionState,
+    close: number,
+    closed5mBars: Array<{ high: number; low: number; close: number }>,
+    _vwap?: number
+  ): { invalidated: boolean; reason?: string } {
+    const sh = exec.swingHigh5m;
+    const sl = exec.swingLow5m;
+    const ph = exec.pullbackHigh;
+    const pl = exec.pullbackLow;
+    if (closed5mBars.length < 5) return { invalidated: false };
+    const atr = this.calculateATR(closed5mBars);
+    const buffer = atr > 0 ? 0.2 * atr : 0.10;
+
+    if (sl !== undefined && close < sl) {
+      return { invalidated: true, reason: `5m_close_below_swing_low close=${close.toFixed(2)} sl=${sl.toFixed(2)}` };
+    }
+    if (pl !== undefined && close < pl - buffer) {
+      return { invalidated: true, reason: `5m_close_below_pullbackLow_minus_ATR close=${close.toFixed(2)} pl=${pl.toFixed(2)} buffer=${buffer.toFixed(2)}` };
+    }
+    const recent = closed5mBars.slice(-3);
+    if (recent.length >= 3) {
+      const h0 = recent[0].high; const l0 = recent[0].low;
+      const h1 = recent[1].high; const l1 = recent[1].low;
+      const h2 = recent[2].high; const l2 = recent[2].low;
+      if (h2 < h1 && h1 < h0 && l2 < l1 && l1 < l0) {
+        return { invalidated: true, reason: "lower_high_lower_low_sequence_5m" };
+      }
+    }
+    // VWAP clustering is tape/momentum, not structure; do NOT use it to invalidate bias.
+    return { invalidated: false };
+  }
+
+  /** Transition from REPAIR to NEUTRAL on structural invalidation; clear boundaries and bias. */
+  private transitionToNeutralFromRepair(exec: MinimalExecutionState, ts: number, reason: string): void {
+    const be = exec.biasEngine!;
+    const prevState = be.state;
+    be.state = "NEUTRAL";
+    be.repairStartTs = undefined;
+    exec.bias = "NEUTRAL";
+    exec.baseBiasConfidence = undefined;
+    exec.biasConfidence = undefined;
+    exec.biasInvalidationLevel = undefined;
+    exec.pullbackHigh = undefined;
+    exec.pullbackLow = undefined;
+    exec.pullbackTs = undefined;
+    this.deactivateGate(exec);
+    exec.setup = "NONE";
+    exec.setupTriggerPrice = undefined;
+    exec.setupStopPrice = undefined;
+    exec.setupDetectedAt = undefined;
+    if (exec.opportunity) {
+      exec.opportunity.status = "INVALIDATED";
+      exec.opportunity = undefined;
+    }
+    exec.entryBlocked = false;
+    exec.entryBlockReason = undefined;
+    if (exec.phase !== "IN_TRADE") {
+      exec.phase = "NEUTRAL_PHASE";
+      exec.waitReason = "waiting_for_bias";
+    }
+    console.log(
+      `[BIAS_STRUCTURAL_INVALIDATION] ${prevState} -> NEUTRAL | 5m structural break → INVALIDATED. ${reason}`
+    );
+  }
+
   // ============================================================================
   // 5M STRUCTURE FINALIZATION: Only authority for full bias flips
   // ============================================================================
@@ -2314,7 +2535,21 @@ export class Orchestrator {
     // Only finalize from REPAIR
     if (be.state !== "REPAIR_BULL" && be.state !== "REPAIR_BEAR") return;
 
-    if (be.state === "REPAIR_BULL" && breakUp) {
+    // REPAIR_BULL: structural invalidation → NEUTRAL; else meaningful breakUp → revert to BULLISH
+    if (be.state === "REPAIR_BULL") {
+      if (closed5mBars && closed5mBars.length >= 5) {
+        const inv = this.checkStructuralInvalidationForBull(exec, close, closed5mBars, vwap);
+        if (inv.invalidated) {
+          this.transitionToNeutralFromRepair(exec, ts, inv.reason ?? "structural_invalidation");
+          return;
+        }
+      }
+      // Meaningful continuation: break of swing high AND (pullback high + buffer) to avoid micro noise
+      const atrRepair = closed5mBars && closed5mBars.length >= 3 ? this.calculateATR(closed5mBars) : 0;
+      const bufferRepair = atrRepair > 0 ? 0.1 * atrRepair : 0.10;
+      const ph = exec.pullbackHigh;
+      const meaningfulBreakUp = breakUp && (ph === undefined || close >= ph + bufferRepair);
+      if (meaningfulBreakUp) {
       be.state = "BULLISH";
       be.lastFlipTs = ts;
       be.repairStartTs = undefined;
@@ -2364,11 +2599,27 @@ export class Orchestrator {
       }
 
       console.log(
-        `[BIAS_FINALIZE_5M] REPAIR_BULL -> BULLISH | close=${close.toFixed(2)} > swingHigh5m=${sh.toFixed(2)}`
+        `[BIAS_FINALIZE_5M] REPAIR_BULL -> BULLISH | close=${close.toFixed(2)} > swingHigh5m=${sh.toFixed(2)} (meaningful break)`
       );
+      }
+      return;
     }
 
-    if (be.state === "REPAIR_BEAR" && breakDown) {
+    // REPAIR_BEAR: structural invalidation → NEUTRAL; else meaningful breakDown → revert to BEARISH
+    if (be.state === "REPAIR_BEAR") {
+      if (closed5mBars && closed5mBars.length >= 5) {
+        const inv = this.checkStructuralInvalidationForBear(exec, close, closed5mBars, vwap);
+        if (inv.invalidated) {
+          this.transitionToNeutralFromRepair(exec, ts, inv.reason ?? "structural_invalidation");
+          return;
+        }
+      }
+      // Meaningful continuation: break of swing low AND (pullback low - buffer) to avoid micro noise
+      const atrRepairBear = closed5mBars && closed5mBars.length >= 3 ? this.calculateATR(closed5mBars) : 0;
+      const bufferRepairBear = atrRepairBear > 0 ? 0.1 * atrRepairBear : 0.10;
+      const pl = exec.pullbackLow;
+      const meaningfulBreakDown = breakDown && (pl === undefined || close <= pl - bufferRepairBear);
+      if (meaningfulBreakDown) {
       // Bearish flip confirmation: Require structure (lower low + failed VWAP reclaim)
       let bearishConfirmed = true; // Default to true if we don't have data
       if (closed5mBars && closed5mBars.length >= 10 && vwap !== undefined) {
@@ -2432,8 +2683,9 @@ export class Orchestrator {
       }
 
       console.log(
-        `[BIAS_FINALIZE_5M] REPAIR_BEAR -> BEARISH | close=${close.toFixed(2)} < swingLow5m=${sl.toFixed(2)}`
+        `[BIAS_FINALIZE_5M] REPAIR_BEAR -> BEARISH | close=${close.toFixed(2)} < swingLow5m=${sl.toFixed(2)} (meaningful break)`
       );
+      }
     }
   }
 
@@ -3037,6 +3289,7 @@ export class Orchestrator {
   // Check if entry should be blocked (no-chase rules + hard retest gate)
   // Runs for BIAS_ESTABLISHED and PULLBACK_IN_PROGRESS (not only CONTINUATION_IN_PROGRESS).
   // Optional vwap/emaFast enable "extended above band" → waiting_for_retest block.
+  // Optional biasEngineState: when in REPAIR_*, always block (defense in depth; phase alone must not allow entries).
   private shouldBlockEntry(
     bias: MarketBias,
     phase: MinimalExecutionPhase,
@@ -3049,7 +3302,8 @@ export class Orchestrator {
       expectedEnd: number;
     },
     vwap?: number,
-    emaFast?: number
+    emaFast?: number,
+    biasEngineState?: BiasEngineState
   ): { blocked: boolean; reason?: string } {
     // Run blocking for phases where we are eligible to enter continuation (not only CONTINUATION_IN_PROGRESS)
     const phaseAllowsContinuationEntry =
@@ -3058,6 +3312,10 @@ export class Orchestrator {
       phase === "CONTINUATION_IN_PROGRESS";
     if (!phaseAllowsContinuationEntry) {
       return { blocked: false };
+    }
+    // REPAIR: no new entries until 5m structure confirms or invalidates (defense in depth)
+    if (biasEngineState === "REPAIR_BULL" || biasEngineState === "REPAIR_BEAR") {
+      return { blocked: true, reason: "repair_awaiting_structure_confirmation" };
     }
 
     if (pullbackHigh === undefined && pullbackLow === undefined) {
@@ -4886,7 +5144,7 @@ export class Orchestrator {
     // ============================================================================
     // Don't flip bias while in trade (protect active positions)
     if (exec.phase !== "IN_TRADE") {
-      this.updateBiasEngine(exec, ts, close);
+      this.updateBiasEngine(exec, ts, close, closed5mBars);
       
       // Momentum Kill Switch: Invalidate bias when momentum fails (RSI < 40, MACD expanding down, price < VWAP)
       // This prevents maintaining bullish bias when momentum has clearly failed
@@ -4905,26 +5163,10 @@ export class Orchestrator {
           );
           
           if (killSwitch.shouldInvalidate) {
-            const oldBias = exec.bias;
-            exec.bias = killSwitch.newBias ?? "NEUTRAL";
-            exec.biasConfidence = 0;
-            exec.baseBiasConfidence = 0;
-            exec.setup = "NONE";
-            exec.entryBlocked = true;
-            exec.entryBlockReason = killSwitch.reason;
-            exec.waitReason = "momentum_failure";
-            
-            // Clear opportunity if bias invalidated
-            if (exec.opportunity) {
-              exec.opportunity.status = "INVALIDATED";
-              exec.opportunity = undefined;
-            }
-            
-            // Clear resolution gate
-            exec.resolutionGate = undefined;
-            
+            const repairState = exec.bias === "BULLISH" ? "REPAIR_BULL" : "REPAIR_BEAR";
+            this.enterRepair(exec, ts, close, repairState);
             console.log(
-              `[MOMENTUM_KILL_SWITCH] BIAS=${oldBias} -> ${exec.bias} | ${killSwitch.reason} - Momentum failure detected, bias invalidated`
+              `[MOMENTUM_KILL_SWITCH] Micro momentum failure → REPAIR (${repairState}) | ${killSwitch.reason} - Bias preserved; awaiting 5m structure confirmation or invalidation`
             );
             shouldPublishEvent = true;
           }
@@ -5542,6 +5784,12 @@ export class Orchestrator {
           // ✅ critical: prevents bogus blocking when opp becomes TRIGGERED
           // Note: This is inside handleMinimal1m which returns events[], so we use else block to prevent fallthrough
         } else {
+          // REPAIR: no new entries until 5m structure confirms or invalidates
+          if (exec.biasEngine?.state === "REPAIR_BULL" || exec.biasEngine?.state === "REPAIR_BEAR") {
+            exec.entryBlocked = true;
+            exec.entryBlockReason = "repair_awaiting_structure_confirmation";
+            exec.waitReason = "repair_awaiting_structure_confirmation";
+          }
           // ------------------------------------------------------------
           // 4) Entry signal detection (now runs whenever readyToEvaluateEntry)
           // ------------------------------------------------------------
@@ -5742,7 +5990,8 @@ export class Orchestrator {
                 atrForBlock,
                 exec.targetZones,
                 vwapLong,
-                emaFastLong
+                emaFastLong,
+                exec.biasEngine?.state
               );
 
               if (blockCheck.blocked) {
@@ -5898,7 +6147,8 @@ export class Orchestrator {
                 atrForBlock,
                 exec.targetZones,
                 vwapShort,
-                emaFastShort
+                emaFastShort,
+                exec.biasEngine?.state
               );
 
               if (blockCheck.blocked) {
