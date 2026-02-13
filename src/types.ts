@@ -215,6 +215,17 @@ export type ResolutionGate = {
 };
 
 // ============================================================================
+// Breakdown Impulse Family (setup family, not a single pattern)
+// ============================================================================
+// Invariants (must be true): bias alignment; trigger type BREAK (prior 5m low/high broken);
+// VWAP/EMA displacement via ATR bands (e.g. farBelow/farAbove); max chase = k×ATR;
+// must not be dropped solely by phase transition to EXTENSION within impulse window.
+// Soft (scoring): wick/body quality, impulse speed, volume/ATR expansion, compression
+// before break, consecutive below/above VWAP. Score = structure + momentum + volatility + timing.
+// Trade when score ≥ threshold; ATR-scaled thresholds and time/bars windows; long/short symmetric.
+// ============================================================================
+
+// ============================================================================
 // OpportunityLatch: Single execution intent state that composes all gates
 // ============================================================================
 // This replaces the "separated gate mess" by becoming the single execution gate.
@@ -491,6 +502,15 @@ export type MinimalExecutionState = {
   llm1mCoachLine?: string;
   llm1mNextLevel?: number;
   llm1mLikelihoodHit?: number;
+  // LLM proposal (separate from canonical bias - bias engine owns exec.bias)
+  llmProposal?: {
+    direction: "LONG" | "SHORT" | "NEUTRAL";
+    confidence: number;
+    ts: number;
+    flipOk?: boolean; // Whether LLM allows bias flip
+  };
+  // LLM direction history for debouncing (last 5 calls)
+  llmDirectionHistory?: Array<{ direction: "LONG" | "SHORT" | "NEUTRAL"; confidence: number; ts: number }>;
   // Phase 1: Trade Integrity - Entry Snapshot (immutable once IN_TRADE)
   entrySnapshot?: {
     entryPrice: number;

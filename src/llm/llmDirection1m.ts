@@ -13,6 +13,8 @@ type LlmDirection1mResponse = {
   nextLevel?: number;
   /** Likelihood (0-100) that price reaches nextLevel in that window */
   likelihoodHit?: number;
+  /** Whether LLM allows bias flip (required field) */
+  flipOk?: boolean;
 };
 
 type Closed5mBar = {
@@ -42,6 +44,11 @@ const CONF_JUMP = 12;
 const THROTTLE_MS = 60_000; // 1 minute
 const BARS_WINDOW = 45; // 5m bars; room for botState + micro + bars1m
 const BARS_1M_WINDOW = 20; // Last 20 1m bars (chart-like tape)
+const MIN_BARS_FOR_LLM = 10; // Minimum closed 5m bars before calling LLM
+const VWAP_DEADBAND_ATR_MULT = 0.2; // Skip LLM if price within 0.2*ATR of VWAP
+const DEBOUNCE_HISTORY_SIZE = 5; // Track last 5 LLM directions
+const DEBOUNCE_MIN_SAME_DIR = 3; // Require ≥3 of last 4 calls to be same direction
+const DEBOUNCE_HIGH_CONF = 90; // Or confidence ≥90 to accept flip
 
 /**
  * Maybe update LLM direction opinion (throttled, publishes only on strong direction)
@@ -53,7 +60,9 @@ export async function maybeUpdateLlmDirection1m(
   closed5mBars: Closed5mBar[],
   forming5mBar: Forming5mBar | null | undefined,
   llmService: LLMService | undefined,
-  symbol: string
+  symbol: string,
+  biasEngineState?: string,
+  micro?: { vwap1m?: number; atr1m?: number }
 ): Promise<{ shouldPublish: boolean; direction?: "LONG" | "SHORT" | "NEUTRAL"; confidence?: number }> {
   // Throttle: max once per 60s
   if (exec.llm1mLastCallTs !== undefined && (ts - exec.llm1mLastCallTs) < THROTTLE_MS) {
@@ -65,9 +74,30 @@ export async function maybeUpdateLlmDirection1m(
     return { shouldPublish: false };
   }
 
-  // Require at least some closed bars
-  if (closed5mBars.length === 0) {
+  // LLM call gating: Skip if insufficient bars
+  if (closed5mBars.length < MIN_BARS_FOR_LLM) {
+    console.log(`[LLM_GATE] Skipping LLM call: closed5mBars.length=${closed5mBars.length} < ${MIN_BARS_FOR_LLM}`);
     return { shouldPublish: false };
+  }
+
+  // LLM call gating: Skip if bias engine in REPAIR state or not stable
+  const beState = biasEngineState ?? exec.biasEngine?.state;
+  const stable = beState === "BULLISH" || beState === "BEARISH";
+  if (beState?.startsWith("REPAIR_") || !stable) {
+    console.log(`[LLM_GATE] Skipping LLM call: beState=${beState} stable=${stable}`);
+    return { shouldPublish: false };
+  }
+
+  // LLM call gating: Skip if price too close to VWAP (chop detection)
+  if (micro?.vwap1m !== undefined && micro?.atr1m !== undefined) {
+    const vwap = micro.vwap1m;
+    const atr = micro.atr1m;
+    const distanceFromVwap = Math.abs(price - vwap);
+    const deadband = VWAP_DEADBAND_ATR_MULT * atr;
+    if (distanceFromVwap < deadband) {
+      console.log(`[LLM_GATE] Skipping LLM call: price=${price.toFixed(2)} vwap=${vwap.toFixed(2)} distance=${distanceFromVwap.toFixed(2)} < deadband=${deadband.toFixed(2)} (chop/near VWAP)`);
+      return { shouldPublish: false };
+    }
   }
 
   // Update last call timestamp
@@ -85,10 +115,30 @@ export async function maybeUpdateLlmDirection1m(
     llmResponse = parseLlmResponse(response);
   } catch (error: any) {
     console.error(`[LLM_1M_DIRECTION] Error: ${error.message ?? error}`);
-    llmResponse = { direction: "NEUTRAL", confidence: 0 };
+    llmResponse = { direction: "NEUTRAL", confidence: 0, flipOk: false };
   }
 
+  // LLM direction debounce: Track history and check if flip is allowed
+  if (!exec.llmDirectionHistory) {
+    exec.llmDirectionHistory = [];
+  }
+  
+  // Add current response to history
+  exec.llmDirectionHistory.push({
+    direction: llmResponse.direction,
+    confidence: llmResponse.confidence,
+    ts,
+  });
+  
+  // Keep only last N entries
+  if (exec.llmDirectionHistory.length > DEBOUNCE_HISTORY_SIZE) {
+    exec.llmDirectionHistory = exec.llmDirectionHistory.slice(-DEBOUNCE_HISTORY_SIZE);
+  }
+
+  // Debounce check will be done in shouldPublish logic below
+
   // Store latest read on exec (NOT bias), including coaching
+  // Also store as proposal (separate from canonical bias - bias engine owns exec.bias)
   if (llmResponse) {
     exec.llm1mDirection = llmResponse.direction;
     exec.llm1mConfidence = llmResponse.confidence;
@@ -96,6 +146,14 @@ export async function maybeUpdateLlmDirection1m(
     exec.llm1mCoachLine = llmResponse.coachLine;
     exec.llm1mNextLevel = llmResponse.nextLevel;
     exec.llm1mLikelihoodHit = llmResponse.likelihoodHit;
+    
+    // Store as proposal (separate from canonical bias)
+    exec.llmProposal = {
+      direction: llmResponse.direction,
+      confidence: llmResponse.confidence,
+      ts,
+      flipOk: llmResponse.flipOk,
+    };
   } else {
     exec.llm1mDirection = "NEUTRAL";
     exec.llm1mConfidence = 0;
@@ -103,16 +161,45 @@ export async function maybeUpdateLlmDirection1m(
     exec.llm1mCoachLine = undefined;
     exec.llm1mNextLevel = undefined;
     exec.llm1mLikelihoodHit = undefined;
+    exec.llmProposal = undefined;
   }
 
-  // Decide whether to publish
+  // Decide whether to publish (respect debounce for flips)
   const strong = llmResponse.direction !== "NEUTRAL" && llmResponse.confidence >= STRONG_CONF;
   const gapOk = exec.llm1mLastPublishedTs === undefined || (ts - exec.llm1mLastPublishedTs) >= MIN_PUBLISH_GAP_MS;
+  
+  // Check if flip is debounced
+  const lastPublishedDir = exec.llm1mLastPublishedDir;
+  const isFlip = lastPublishedDir !== undefined && lastPublishedDir !== "NEUTRAL" && 
+                 llmResponse.direction !== "NEUTRAL" && 
+                 llmResponse.direction !== lastPublishedDir;
+  
+  let flipAllowed = true;
+  if (isFlip) {
+    // Check last 4 calls (including current one we just added)
+    const recentHistory = exec.llmDirectionHistory?.slice(-4) ?? [];
+    const sameDirCount = recentHistory.filter(h => h.direction === llmResponse.direction).length;
+    const highConf = llmResponse.confidence >= DEBOUNCE_HIGH_CONF;
+    flipAllowed = sameDirCount >= DEBOUNCE_MIN_SAME_DIR || highConf || llmResponse.flipOk === true;
+    
+    if (!flipAllowed) {
+      console.log(
+        `[LLM_DEBOUNCE] Blocking flip: ${lastPublishedDir} -> ${llmResponse.direction} | ` +
+        `sameDirCount=${sameDirCount}/${recentHistory.length} (need ${DEBOUNCE_MIN_SAME_DIR}) highConf=${highConf} flipOk=${llmResponse.flipOk}`
+      );
+    } else {
+      console.log(
+        `[LLM_DEBOUNCE] Allowing flip: ${lastPublishedDir} -> ${llmResponse.direction} | ` +
+        `sameDirCount=${sameDirCount}/${recentHistory.length} highConf=${highConf} flipOk=${llmResponse.flipOk}`
+      );
+    }
+  }
 
   const shouldPublish =
     strong &&
     gapOk &&
-    (llmResponse.direction !== exec.llm1mLastPublishedDir || // flip
+    flipAllowed &&
+    (llmResponse.direction !== exec.llm1mLastPublishedDir || // flip (now debounced)
       (exec.llm1mLastPublishedTs !== undefined && ts - exec.llm1mLastPublishedTs >= SAME_DIR_REFRESH_MS) || // refresh same strong direction
       (exec.llm1mLastPublishedDir === llmResponse.direction &&
         exec.llm1mLastPublishedConf !== undefined &&
@@ -230,14 +317,20 @@ function buildPrompt(snapshot: LlmSnapshot): string {
 
 You may use your own read from the bars (momentum, structure, levels) as well as botState/micro. Prefer botState trigger/targets when they exist for coachLine; for nextLevel you may use micro levels or levels you infer from bars1m/closed5mBars.
 
+IMPORTANT: NEUTRAL Preference
+- When price is in chop/near VWAP (oscillating around mean), STRONGLY prefer NEUTRAL direction.
+- Only choose LONG or SHORT when there is clear directional structure or displacement.
+- If price is mean-reverting or balanced, choose NEUTRAL even if there's a slight directional drift.
+
 Output:
 1. direction: dominant price direction for the NEXT 30–60 minutes (LONG, SHORT, or NEUTRAL).
 2. confidence: 0-100 confidence in that direction.
 3. coachLine: one short sentence coaching the trader. Reference botState levels when they exist. Keep under 80 chars.
 4. nextLevel: one price level price is likely to test or hit in the next 30-60 min (number, or null if unclear).
 5. likelihoodHit: 0-100 likelihood that price reaches nextLevel in that window (omit if nextLevel is null).
+6. flipOk: boolean indicating whether you allow a bias flip if this direction differs from the current published direction. Set to true only when you have high conviction that the direction change is warranted. Default to false if uncertain.
 
-Return STRICT JSON only. No markdown. No explanation. Include all five keys every time.`;
+Return STRICT JSON only. No markdown. No explanation. Include all six keys every time.`;
 
   const userContent = {
     symbol: snapshot.symbol,
@@ -330,8 +423,10 @@ function parseLlmResponse(content: string): LlmDirection1mResponse {
     const likelihoodHit = typeof parsed.likelihoodHit === "number" && Number.isFinite(parsed.likelihoodHit)
       ? Math.max(0, Math.min(100, Math.round(parsed.likelihoodHit)))
       : undefined;
+    
+    const flipOk = typeof parsed.flipOk === "boolean" ? parsed.flipOk : false;
 
-    return { direction, confidence, coachLine, nextLevel, likelihoodHit };
+    return { direction, confidence, coachLine, nextLevel, likelihoodHit, flipOk };
   } catch (error: any) {
     console.error(`[LLM_1M_DIRECTION] Parse error: ${error.message ?? error}`);
     console.error(`[LLM_1M_DIRECTION] Raw content: ${content}`);

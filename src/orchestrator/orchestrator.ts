@@ -97,6 +97,49 @@ export class Orchestrator {
   /** After this long in EXTENSION, re-anchor pullback zone to recent bars for practical trigger */
   private readonly EXTENSION_REANCHOR_MS = 2 * 5 * 60 * 1000;  // 2 bars = 10 min
 
+  /** Breakdown Impulse Family: window after BREAK trigger in which entry is allowed even if phase flips to EXTENSION (ATR-scaled, time-bound) */
+  private readonly BREAK_IMPULSE_WINDOW_MS = 5 * 60 * 1000;  // 5 min (1 bar)
+  /** Max distance from trigger level (in ATR) to allow entry; beyond = chase, block with reason */
+  private readonly BREAK_IMPULSE_CHASE_ATR = 0.8;
+
+  /**
+   * True when a BREAK impulse is pending and within the allowed window (so entry may run even in EXTENSION).
+   * Invariant: BREAK trigger => gate exists; this checks we're still within the impulse window.
+   */
+  private isBreakImpulseEligible(exec: MinimalExecutionState, ts: number): boolean {
+    if (exec.opportunity?.trigger?.type !== "BREAK" || exec.opportunity?.status !== "TRIGGERED") return false;
+    const gate = exec.resolutionGate;
+    if (!gate || gate.status !== "TRIGGERED") return false;
+    const age = ts - gate.armedTs;
+    return age >= 0 && age <= this.BREAK_IMPULSE_WINDOW_MS;
+  }
+
+  /**
+   * Chase check for BREAK impulse: entry blocked if price has moved beyond trigger + k*ATR.
+   * Returns { allowed: true } or { allowed: false, reason: string }.
+   */
+  private checkBreakImpulseChase(
+    exec: MinimalExecutionState,
+    close: number,
+    atr: number
+  ): { allowed: true } | { allowed: false; reason: string } {
+    const gate = exec.resolutionGate;
+    if (!gate || atr <= 0) return { allowed: true };
+    const maxDist = this.BREAK_IMPULSE_CHASE_ATR * atr;
+    // Distance in direction of trade: SHORT = how far below trigger; LONG = how far above trigger
+    const dist =
+      gate.direction === "short"
+        ? gate.triggerPrice - close
+        : close - gate.triggerPrice;
+    if (dist > maxDist) {
+      return {
+        allowed: false,
+        reason: `chase_limit_exceeded (${dist.toFixed(2)} > ${maxDist.toFixed(2)} = ${this.BREAK_IMPULSE_CHASE_ATR}*ATR)`,
+      };
+    }
+    return { allowed: true };
+  }
+
   // Ignition setup constants
   private readonly IGNITION_WINDOW_MS = 3 * 60 * 1000;     // only valid right after flip
   private readonly IGNITION_MIN_ATR = 0.18;                // avoid dead tape
@@ -2056,6 +2099,9 @@ export class Orchestrator {
     lastClosed5m: { high: number; low: number; close: number } | null,
     forming5mBar?: { high: number; low: number } | null
   ): void {
+    // Structural bias lock: nudge only establishes bias when NEUTRAL. When bias is already BEARISH/BULLISH,
+    // we do not use LLM to flip direction (only REPAIR + 5m structure can flip). LLM can still output
+    // opposite direction for exits/alerts; we just don't use it to change exec.bias here.
     if (exec.bias !== "NEUTRAL" || exec.phase === "IN_TRADE") return;
     const barForPullback = lastClosed5m ?? (forming5mBar ? { high: forming5mBar.high, low: forming5mBar.low, close } : null);
     if (!barForPullback) return;
@@ -2103,6 +2149,8 @@ export class Orchestrator {
     const tapeBarsRequired = (inRepair || usingFormingBar)
       ? Math.max(2, this.BIAS_ENGINE_ENTER_ACCEPT - 1)
       : this.BIAS_ENGINE_ENTER_ACCEPT;
+
+    // Full tape agreement (VWAP + EMA persistence)
     const tapeAgreesLong =
       tapeAgreesLongWithPersistence &&
       aboveVwap >= tapeBarsRequired &&
@@ -2114,8 +2162,22 @@ export class Orchestrator {
       belowEma >= tapeBarsRequired &&
       farBelow;
 
-    if (llmDir === "LONG" && !tapeAgreesLong) return;
-    if (llmDir === "SHORT" && !tapeAgreesShort) return;
+    // VWAP-only establishment: lock bias when 3+ consecutive below/above VWAP + farBelow/farAbove (no EMA required).
+    // Fixes "structural leak" where bias never established despite LLM SHORT + 5 consecutive below VWAP.
+    const tapeAgreesLongVwapOnly =
+      exec.consecutiveAboveVwap >= 3 &&
+      aboveVwap >= tapeBarsRequired &&
+      farAbove;
+    const tapeAgreesShortVwapOnly =
+      exec.consecutiveBelowVwap >= 3 &&
+      belowVwap >= tapeBarsRequired &&
+      farBelow;
+
+    const tapeAgreesLongFinal = tapeAgreesLong || tapeAgreesLongVwapOnly;
+    const tapeAgreesShortFinal = tapeAgreesShort || tapeAgreesShortVwapOnly;
+
+    if (llmDir === "LONG" && !tapeAgreesLongFinal) return;
+    if (llmDir === "SHORT" && !tapeAgreesShortFinal) return;
 
     if (!exec.biasEngine) {
       exec.biasEngine = {
@@ -4176,8 +4238,9 @@ export class Orchestrator {
             }
             
             if (previousPhase !== "EXTENSION") {
+              const breakImpulseEligible = this.isBreakImpulseEligible(exec, ts);
               console.log(
-                `[PHASE_TRANSITION] ${previousPhase} -> EXTENSION | BIAS=${exec.bias} (price past zone) waitReason=${exec.waitReason}`
+                `[PHASE_TRANSITION] ${previousPhase} -> EXTENSION | BIAS=${exec.bias} (price past zone) waitReason=${exec.waitReason} breakImpulseEligible=${breakImpulseEligible} gate=${exec.resolutionGate?.status ?? "none"}`
               );
               console.log(
                 `[PHASE_TRANSITION_COMPLETE] ${previousPhase} -> EXTENSION reason=extended boundaries=[${exec.pullbackLow}, ${exec.pullbackHigh}]`
@@ -4844,6 +4907,7 @@ export class Orchestrator {
     // ============================================================================
     if (this.llmService) {
       const { maybeUpdateLlmDirection1m } = await import("../llm/llmDirection1m.js");
+      const beState = exec.biasEngine?.state;
       const result = await maybeUpdateLlmDirection1m(
         exec,
         ts,
@@ -4851,7 +4915,9 @@ export class Orchestrator {
         closed5mBars,
         forming5mBar,
         this.llmService,
-        symbol
+        symbol,
+        beState,
+        exec.micro
       );
       if (result.shouldPublish && result.direction && result.confidence !== undefined) {
         events.push({
@@ -5362,10 +5428,12 @@ export class Orchestrator {
       // Fixes: TRIGGERED fallthrough + "latch-only scope trap"
       // ============================================================
       // Check for pullback entry every 1m (responsive, not just on 5m close)
-      // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule)
+      // Skip entry attempts during CONTINUATION_IN_PROGRESS (no-chase rule).
+      // EXTENSION: still run entry when a BREAK impulse is within window (invariant: don't drop impulse solely due to phase).
+      const breakImpulseInExtension = exec.phase === "EXTENSION" && this.isBreakImpulseEligible(exec, ts);
       if (
         exec.bias !== "NEUTRAL" &&
-        (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED") &&
+        (exec.phase === "PULLBACK_IN_PROGRESS" || exec.phase === "BIAS_ESTABLISHED" || breakImpulseInExtension) &&
         current5m
       ) {
         const previous5m =
@@ -5385,88 +5453,88 @@ export class Orchestrator {
 
           if (triggerCheck.triggered) {
             exec.opportunity.status = "TRIGGERED";
+            const gateStatusBefore = exec.resolutionGate?.status;
+            const hadGate = !!exec.resolutionGate;
             console.log(
-              `[TRIGGER_DETECTED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(2)} triggerPrice=${exec.opportunity.trigger.price} setup=${exec.setup} phase=${exec.phase}`
+              `[TRIGGER_DETECTED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(2)} triggerPrice=${exec.opportunity.trigger.price} setup=${exec.setup} phase=${exec.phase} gateStatus=${gateStatusBefore ?? "none"}`
             );
             console.log(
               `[OPPORTUNITY_TRIGGERED] ${exec.opportunity.side} reason=${triggerCheck.reason} price=${current5m.close.toFixed(
                 2
               )}`
             );
-            
+
             // ============================================================================
-            // FIX: When BREAK trigger fires, immediately create IGNITION setup with correct trigger
+            // BREAKDOWN IMPULSE FAMILY: When BREAK trigger fires, ensure resolutionGate exists
             // ============================================================================
-            // This bypasses SETUP_COOLDOWN because the trigger already fired
-            // Use the actual trigger price from the opportunity (the breakdown level), not swing low/high
-            if (exec.opportunity.trigger.type === "BREAK" && exec.setup === "NONE") {
-              const actualTriggerPrice = exec.opportunity.trigger.price; // The actual breakdown level (693.74)
+            // Invariant: BREAK trigger => resolutionGate must exist (or impulse is lost when phase flips to EXTENSION).
+            // Create gate if missing; use actual broken level (previous5m low/high) when available; ATR-scaled stop.
+            // ============================================================================
+            if (exec.opportunity.trigger.type === "BREAK") {
               const atr = this.calculateATR(closed5mBars);
-              const closedBarsWithVolume = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
-              const vwap = closedBarsWithVolume.length > 0 ? this.calculateVWAP(closedBarsWithVolume) : undefined;
-              const micro = exec.micro;
-              const atr1m = micro?.atr1m ?? atr;
-              
+              const actualTriggerPrice =
+                exec.opportunity.side === "SHORT" && previous5m
+                  ? previous5m.low
+                  : exec.opportunity.side === "LONG" && previous5m
+                    ? previous5m.high
+                    : exec.opportunity.trigger.price;
+
               if (exec.opportunity.side === "SHORT") {
-                // SHORT breakdown: trigger is the breakdown level, stop above pullback high
-                const stopPrice = exec.pullbackHigh !== undefined 
-                  ? exec.pullbackHigh + 0.1 * atr
-                  : current5m.close + 0.5 * atr;
-                
-                exec.setup = "IGNITION";
-                exec.setupVariant = "SHORT";
-                exec.setupTriggerPrice = actualTriggerPrice; // Use actual breakdown level, not swing low
-                exec.setupStopPrice = stopPrice;
-                exec.setupDetectedAt = ts;
-                
-                console.log(
-                  `[BREAK_TRIGGER_SETUP] SHORT created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} (actual breakdown) stop=${stopPrice.toFixed(2)} price=${current5m.close.toFixed(2)} reason=${triggerCheck.reason}`
-                );
-                
-                // Since trigger already fired, mark gate as TRIGGERED immediately (entry can happen on next tick)
-                if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+                const stopPrice =
+                  exec.pullbackHigh !== undefined
+                    ? exec.pullbackHigh + 0.1 * atr
+                    : current5m.close + 0.5 * atr;
+                if (!exec.resolutionGate) {
                   exec.resolutionGate = {
-                    status: "TRIGGERED", // Already triggered, ready for entry
+                    status: "TRIGGERED",
                     direction: "short",
                     triggerPrice: actualTriggerPrice,
-                    stopPrice: stopPrice,
-                    expiryTs: ts + 2 * 5 * 60 * 1000, // 2 timeframes
+                    stopPrice,
+                    expiryTs: ts + 2 * 5 * 60 * 1000,
                     armedTs: ts,
-                    reason: `Breakdown trigger already fired at ${actualTriggerPrice.toFixed(2)}`,
+                    reason: `Breakdown trigger fired at ${actualTriggerPrice.toFixed(2)}`,
                   };
                   console.log(
-                    `[GATE_TRIGGERED] SHORT gate immediately TRIGGERED (breakdown already happened) | trigger=${actualTriggerPrice.toFixed(2)}`
+                    `[IMPULSE_GATE_CREATED] SHORT BREAK gateStatus=TRIGGERED trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} (was ${hadGate ? gateStatusBefore : "missing"})`
+                  );
+                }
+                if (exec.setup === "NONE" || exec.setup === "PULLBACK_CONTINUATION") {
+                  exec.setup = "IGNITION";
+                  exec.setupVariant = "SHORT";
+                  exec.setupTriggerPrice = actualTriggerPrice;
+                  exec.setupStopPrice = stopPrice;
+                  exec.setupDetectedAt = ts;
+                  console.log(
+                    `[BREAK_TRIGGER_SETUP] SHORT created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} reason=${triggerCheck.reason}`
                   );
                 }
               } else {
-                // LONG breakout: trigger is the breakout level, stop below pullback low
-                const stopPrice = exec.pullbackLow !== undefined
-                  ? exec.pullbackLow - 0.1 * atr
-                  : current5m.close - 0.5 * atr;
-                
-                exec.setup = "IGNITION";
-                exec.setupVariant = "LONG";
-                exec.setupTriggerPrice = actualTriggerPrice; // Use actual breakout level, not swing high
-                exec.setupStopPrice = stopPrice;
-                exec.setupDetectedAt = ts;
-                
-                console.log(
-                  `[BREAK_TRIGGER_SETUP] LONG created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} (actual breakout) stop=${stopPrice.toFixed(2)} price=${current5m.close.toFixed(2)} reason=${triggerCheck.reason}`
-                );
-                
-                // Since trigger already fired, mark gate as TRIGGERED immediately
-                if (exec.pullbackHigh !== undefined && exec.pullbackLow !== undefined) {
+                const stopPrice =
+                  exec.pullbackLow !== undefined
+                    ? exec.pullbackLow - 0.1 * atr
+                    : current5m.close - 0.5 * atr;
+                if (!exec.resolutionGate) {
                   exec.resolutionGate = {
                     status: "TRIGGERED",
                     direction: "long",
                     triggerPrice: actualTriggerPrice,
-                    stopPrice: stopPrice,
+                    stopPrice,
                     expiryTs: ts + 2 * 5 * 60 * 1000,
                     armedTs: ts,
-                    reason: `Breakout trigger already fired at ${actualTriggerPrice.toFixed(2)}`,
+                    reason: `Breakout trigger fired at ${actualTriggerPrice.toFixed(2)}`,
                   };
                   console.log(
-                    `[GATE_TRIGGERED] LONG gate immediately TRIGGERED (breakout already happened) | trigger=${actualTriggerPrice.toFixed(2)}`
+                    `[IMPULSE_GATE_CREATED] LONG BREAK gateStatus=TRIGGERED trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} (was ${hadGate ? gateStatusBefore : "missing"})`
+                  );
+                }
+                if (exec.setup === "NONE" || exec.setup === "PULLBACK_CONTINUATION") {
+                  exec.setup = "IGNITION";
+                  exec.setupVariant = "LONG";
+                  exec.setupTriggerPrice = actualTriggerPrice;
+                  exec.setupStopPrice = stopPrice;
+                  exec.setupDetectedAt = ts;
+                  console.log(
+                    `[BREAK_TRIGGER_SETUP] LONG created from BREAK trigger | trigger=${actualTriggerPrice.toFixed(2)} stop=${stopPrice.toFixed(2)} reason=${triggerCheck.reason}`
                   );
                 }
               }
@@ -5692,13 +5760,42 @@ export class Orchestrator {
           // 6) Entry execution (unchanged from your block)
           // ------------------------------------------------------------
           if (canEnter) {
-            // Never enter from EXTENSION (stall at highs/lows); defensive guard if entry path ever allows EXTENSION
+            // EXTENSION: allow entry only for BREAK impulse within window and within chase limit
             if ((exec.phase as MinimalExecutionPhase) === "EXTENSION") {
-              exec.entryBlocked = true;
-              exec.entryBlockReason = "phase_extended";
-              exec.waitReason = "phase_extended";
-              console.log(`[ENTRY_BLOCKED] phase=EXTENSION - no entry when extended`);
-            } else {
+              if (breakImpulseInExtension) {
+                const atrForChase = this.calculateATR(closed5mBars);
+                const chaseCheck = this.checkBreakImpulseChase(exec, close, atrForChase);
+                if (!chaseCheck.allowed) {
+                  exec.entryBlocked = true;
+                  exec.entryBlockReason = chaseCheck.reason;
+                  exec.waitReason = "break_impulse_chased";
+                  console.log(
+                    `[IMPULSE_DROP] reason=chased ${chaseCheck.reason}`
+                  );
+                  console.log(
+                    `[ENTRY_BLOCKED] phase=EXTENSION break_impulse ${chaseCheck.reason}`
+                  );
+                }
+                // else: allow entry (fall-through); log that we're entering from EXTENSION due to impulse
+                if (!exec.entryBlocked) {
+                  console.log(
+                    `[IMPULSE_ENTRY_EXTENSION] BREAK impulse within window - allowing entry despite phase=EXTENSION`
+                  );
+                }
+              } else {
+                exec.entryBlocked = true;
+                exec.entryBlockReason = "phase_extended";
+                exec.waitReason = "phase_extended";
+                const hadBreakImpulse = exec.opportunity?.trigger?.type === "BREAK" && exec.resolutionGate?.status === "TRIGGERED";
+                if (hadBreakImpulse) {
+                  console.log(
+                    `[IMPULSE_DROP] reason=impulse_window_expired (beyond ${this.BREAK_IMPULSE_WINDOW_MS / (60 * 1000)}m)`
+                  );
+                }
+                console.log(`[ENTRY_BLOCKED] phase=EXTENSION - no entry when extended`);
+              }
+            }
+            if (!exec.entryBlocked) {
               // Check for late entry (RSI < 32/68, ATR already spiked) - apply penalties
               const atrForLate = this.calculateATR(closed5mBars);
               const closedBarsWithVolumeLate = closed5mBars.filter(bar => 'volume' in bar) as Array<{ high: number; low: number; close: number; volume: number }>;
@@ -6118,10 +6215,10 @@ export class Orchestrator {
                 }
               }
             }
-            }
           }
         }
-        } // Close: else block for entry evaluation (readyToEvaluateEntry) - line 3704
+        } // Close: if (!exec.entryBlocked)
+        } // Close: if (canEnter) + else block for entry evaluation (readyToEvaluateEntry) - line 3704
       } // Close: else block for deployment pause (not paused) - line 3662
       } // Close: if (exec.phase !== "IN_TRADE") for pullback entry logic - line 4222
 
@@ -6466,7 +6563,7 @@ export class Orchestrator {
           `[TRIGGER_BLOCKED] ${exec.opportunity.side} trigger hit at ${triggerPrice?.toFixed(2)} but entry blocked: ${blockReason} | ${retestPlan}`
         );
         console.log(
-          `[TRIGGER_NOT_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} blockReason=${blockReason} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status} pendingTrigger=${exec.pendingTrigger ? "stored" : "none"}`
+          `[TRIGGER_NOT_CONSUMED] trigger=${triggerPrice?.toFixed(2)} side=${exec.opportunity.side} entryBlocked=${entryBlocked} blockReason=${blockReason} setup=${exec.setup} gateStatus=${exec.resolutionGate?.status ?? "none"} pendingTrigger=${exec.pendingTrigger ? "stored" : "none"} pendingImpulse=${exec.opportunity?.trigger?.type === "BREAK" && exec.resolutionGate?.status === "TRIGGERED" ? "eligible" : "none"}`
         );
       } else {
         // Entry not blocked - clear any pending trigger
