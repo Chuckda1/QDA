@@ -3127,8 +3127,9 @@ export class Orchestrator {
     return structuralBreak && momentumConfirmed && acceptanceConfirmed;
   }
 
-  // Check if entry should be blocked (no-chase rules)
-  // Includes target zone-based "don't chase" rules
+  // Check if entry should be blocked (no-chase rules + hard retest gate)
+  // Runs for BIAS_ESTABLISHED and PULLBACK_IN_PROGRESS (not only CONTINUATION_IN_PROGRESS).
+  // Optional vwap/emaFast enable "extended above band" → waiting_for_retest block.
   private shouldBlockEntry(
     bias: MarketBias,
     phase: MinimalExecutionPhase,
@@ -3139,10 +3140,16 @@ export class Orchestrator {
     targetZones?: {
       expectedZone: { lower: number; upper: number };
       expectedEnd: number;
-    }
+    },
+    vwap?: number,
+    emaFast?: number
   ): { blocked: boolean; reason?: string } {
-    // Only check blocking during continuation
-    if (phase !== "CONTINUATION_IN_PROGRESS") {
+    // Run blocking for phases where we are eligible to enter continuation (not only CONTINUATION_IN_PROGRESS)
+    const phaseAllowsContinuationEntry =
+      phase === "BIAS_ESTABLISHED" ||
+      phase === "PULLBACK_IN_PROGRESS" ||
+      phase === "CONTINUATION_IN_PROGRESS";
+    if (!phaseAllowsContinuationEntry) {
       return { blocked: false };
     }
 
@@ -3150,13 +3157,31 @@ export class Orchestrator {
       return { blocked: false };
     }
 
-    // Rule 1: Extended Distance
+    // --- Hard retest gate: extended above/below VWAP/EMA band → wait for retest ---
+    if (atr !== undefined && atr > 0) {
+      if (bias === "BULLISH") {
+        const bandUpper = vwap !== undefined && emaFast !== undefined
+          ? Math.max(vwap, emaFast)
+          : pullbackHigh; // fallback when no band
+        if (bandUpper !== undefined && currentPrice > bandUpper + this.EXTENSION_THRESHOLD_ATR * atr) {
+          return { blocked: true, reason: "waiting_for_retest" };
+        }
+      } else if (bias === "BEARISH") {
+        const bandLower = vwap !== undefined && emaFast !== undefined
+          ? Math.min(vwap, emaFast)
+          : pullbackLow;
+        if (bandLower !== undefined && currentPrice < bandLower - this.EXTENSION_THRESHOLD_ATR * atr) {
+          return { blocked: true, reason: "waiting_for_retest" };
+        }
+      }
+    }
+
+    // Rule 1: Extended distance (continuation extension vs pullback range)
     let continuationExtension = 0;
     let pullbackRange = 0;
-    
+
     if (bias === "BULLISH" && pullbackHigh !== undefined) {
       continuationExtension = currentPrice - pullbackHigh;
-      // Estimate pullback range (use a reasonable default if not available)
       pullbackRange = pullbackHigh - (pullbackLow ?? pullbackHigh * 0.998);
     } else if (bias === "BEARISH" && pullbackLow !== undefined) {
       continuationExtension = pullbackLow - currentPrice;
@@ -3167,8 +3192,7 @@ export class Orchestrator {
       return { blocked: true, reason: "continuation_extended" };
     }
 
-    // Don't-chase rule: if price is already > 0.8*ATR below ideal trigger (for shorts)
-    // or > 0.8*ATR above ideal trigger (for longs), don't enter
+    // Don't-chase rule: > 0.8*ATR above ideal trigger (longs) or below (shorts)
     if (atr !== undefined && atr > 0) {
       if (bias === "BEARISH" && pullbackLow !== undefined) {
         const idealTrigger = pullbackLow;
@@ -3185,7 +3209,7 @@ export class Orchestrator {
       }
     }
 
-    // Don't-chase rule: if price is already past expected zone, don't enter
+    // Don't-chase rule: price already past expected zone
     if (targetZones !== undefined) {
       if (bias === "BEARISH" && currentPrice < targetZones.expectedZone.lower) {
         return { blocked: true, reason: "price_past_expected_zone" };
@@ -5917,6 +5941,18 @@ export class Orchestrator {
             // Enter ON pullback for BULLISH bias
             else if (exec.bias === "BULLISH" && (isBearish || (previous5m && lowerLow))) {
               const atrForBlock = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeLong = closed5mBars.filter(
+                (bar) => "volume" in bar
+              ) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapLong =
+                closedBarsWithVolumeLong.length > 0
+                  ? this.calculateVWAP(closedBarsWithVolumeLong)
+                  : undefined;
+              const emaFastLong =
+                closed5mBars.length >= 6
+                  ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
+                  : exec.micro?.emaFast1m;
+
               const blockCheck = this.shouldBlockEntry(
                 exec.bias,
                 exec.phase,
@@ -5924,7 +5960,9 @@ export class Orchestrator {
                 exec.pullbackHigh,
                 exec.pullbackLow,
                 atrForBlock,
-                exec.targetZones
+                exec.targetZones,
+                vwapLong,
+                emaFastLong
               );
 
               if (blockCheck.blocked) {
@@ -5932,20 +5970,9 @@ export class Orchestrator {
                 exec.entryBlockReason = blockCheck.reason;
                 exec.waitReason = blockCheck.reason ?? "entry_blocked";
                 console.log(
-                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase / retest gate`
                 );
               } else {
-                const closedBarsWithVolumeLong = closed5mBars.filter(
-                    (bar) => "volume" in bar
-                  ) as Array<{ high: number; low: number; close: number; volume: number }>;
-                const vwapLong =
-                  closedBarsWithVolumeLong.length > 0
-                    ? this.calculateVWAP(closedBarsWithVolumeLong)
-                    : undefined;
-                const emaFastLong =
-                  closed5mBars.length >= 6
-                    ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
-                    : exec.micro?.emaFast1m;
                 const validity = this.pullbackValidityFilter(
                   exec.bias,
                   current5m.close,
@@ -6070,6 +6097,18 @@ export class Orchestrator {
               (isBullish || (previous5m && higherHigh))
             ) {
               const atrForBlock = this.calculateATR(closed5mBars);
+              const closedBarsWithVolumeShort = closed5mBars.filter(
+                (bar) => "volume" in bar
+              ) as Array<{ high: number; low: number; close: number; volume: number }>;
+              const vwapShort =
+                closedBarsWithVolumeShort.length > 0
+                  ? this.calculateVWAP(closedBarsWithVolumeShort)
+                  : undefined;
+              const emaFastShort =
+                closed5mBars.length >= 6
+                  ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
+                  : exec.micro?.emaFast1m;
+
               const blockCheck = this.shouldBlockEntry(
                 exec.bias,
                 exec.phase,
@@ -6077,7 +6116,9 @@ export class Orchestrator {
                 exec.pullbackHigh,
                 exec.pullbackLow,
                 atrForBlock,
-                exec.targetZones
+                exec.targetZones,
+                vwapShort,
+                emaFastShort
               );
 
               if (blockCheck.blocked) {
@@ -6085,20 +6126,9 @@ export class Orchestrator {
                 exec.entryBlockReason = blockCheck.reason;
                 exec.waitReason = blockCheck.reason ?? "entry_blocked";
                 console.log(
-                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase rule triggered`
+                  `[ENTRY_BLOCKED] BIAS=${exec.bias} phase=${exec.phase} reason=${blockCheck.reason} - No-chase / retest gate`
                 );
               } else {
-                const closedBarsWithVolumeShort = closed5mBars.filter(
-                  (bar) => "volume" in bar
-                ) as Array<{ high: number; low: number; close: number; volume: number }>;
-                const vwapShort =
-                  closedBarsWithVolumeShort.length > 0
-                    ? this.calculateVWAP(closedBarsWithVolumeShort)
-                    : undefined;
-                const emaFastShort =
-                  closed5mBars.length >= 6
-                    ? this.calculateEMA(closed5mBars.map((b) => ({ close: b.close })), 9)
-                    : exec.micro?.emaFast1m;
                 const validityShort = this.pullbackValidityFilter(
                   exec.bias,
                   current5m.close,
